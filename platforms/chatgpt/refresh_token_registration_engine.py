@@ -188,9 +188,21 @@ class RefreshTokenRegistrationEngine:
         else:
             logger.info(log_message)
 
-    def _create_email(self) -> bool:
+    def _existing_account_login_only(self) -> bool:
+        value = self.extra_config.get("chatgpt_existing_account_login_only", False)
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _create_email(self, *, existing_account_login_only: bool = False) -> bool:
+        action = "加载" if existing_account_login_only else "创建"
         try:
-            self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
+            if existing_account_login_only:
+                self._log(
+                    f"正在加载 {self.email_service.service_type.value} 邮箱凭据..."
+                )
+            else:
+                self._log(f"正在创建 {self.email_service.service_type.value} 邮箱...")
             self.email_info = self.email_service.create_email()
 
             email_value = str(
@@ -200,7 +212,7 @@ class RefreshTokenRegistrationEngine:
             ).strip()
             if not email_value:
                 self._log(
-                    f"创建邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
+                    f"{action}邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
                     "error",
                 )
                 return False
@@ -209,10 +221,13 @@ class RefreshTokenRegistrationEngine:
                 self.email_info = {}
             self.email_info["email"] = email_value
             self.email = email_value
-            self._log(f"成功创建邮箱: {self.email}")
+            if existing_account_login_only:
+                self._log(f"邮箱凭据加载成功: {self.email}")
+            else:
+                self._log(f"成功创建邮箱: {self.email}")
             return True
         except Exception as e:
-            self._log(f"创建邮箱失败: {e}", "error")
+            self._log(f"{action}邮箱失败: {e}", "error")
             return False
 
     def _read_int_config(
@@ -421,7 +436,11 @@ class RefreshTokenRegistrationEngine:
             "proxy_used": self.proxy_url,
             "registered_at": datetime.now().isoformat(),
             "registration_message": registration_message,
-            "registration_flow": "chatgpt_client.register_complete_flow",
+            "registration_flow": (
+                "skipped_existing_account_login"
+                if registration_message == "existing_account_login_only"
+                else "chatgpt_client.register_complete_flow"
+            ),
             "token_flow": "oauth_client.login_and_get_tokens",
             "token_login_mode": "passwordless",
             "browser_mode": self.browser_mode,
@@ -431,6 +450,71 @@ class RefreshTokenRegistrationEngine:
             "workspace_id": workspace_id,
             "account_claims_email": account_info.get("email", ""),
         }
+
+    def _login_existing_account(
+        self,
+        *,
+        result: RegistrationResult,
+        email_adapter: EmailServiceAdapter,
+        otp_wait_seconds: int,
+        otp_resend_wait_seconds: int,
+    ) -> RegistrationResult:
+        self._log("2. 登录已有 ChatGPT 账号并提取 Access Token + Refresh Token...")
+        oauth_client = self._build_oauth_client()
+        oauth_client.config.setdefault(
+            "chatgpt_oauth_otp_wait_seconds",
+            otp_wait_seconds,
+        )
+        oauth_client.config.setdefault(
+            "chatgpt_oauth_otp_resend_wait_seconds",
+            otp_resend_wait_seconds,
+        )
+        tokens = oauth_client.login_and_get_tokens(
+            result.email,
+            self.password or "",
+            device_id="",
+            user_agent=None,
+            sec_ch_ua=None,
+            impersonate=None,
+            skymail_client=email_adapter,
+            prefer_passwordless_login=True,
+            allow_phone_verification=False,
+            force_new_browser=True,
+            force_chatgpt_entry=False,
+            screen_hint="login",
+            force_password_login=False,
+            complete_about_you_if_needed=False,
+            login_source="existing_account_login_only",
+        )
+        if not tokens:
+            result.error_message = (
+                oauth_client.last_error or "已有 ChatGPT 账号 OAuth 登录失败"
+            )
+            return result
+
+        access_token = str(tokens.get("access_token") or "").strip()
+        refresh_token = str(tokens.get("refresh_token") or "").strip()
+        missing_tokens = []
+        if not access_token:
+            missing_tokens.append("Access Token")
+        if not refresh_token:
+            missing_tokens.append("Refresh Token")
+        if missing_tokens:
+            result.error_message = (
+                "已有账号登录未同时获取 " + " 和 ".join(missing_tokens)
+            )
+            return result
+
+        self._populate_result_from_tokens(
+            result=result,
+            tokens=tokens,
+            oauth_client=oauth_client,
+            registration_message="existing_account_login_only",
+            source="login",
+            register_client=None,
+        )
+        self._log("已有账号登录完成，Access Token 与 Refresh Token 均已获取")
+        return result
 
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
@@ -452,27 +536,57 @@ class RefreshTokenRegistrationEngine:
         )
 
         try:
+            existing_account_login_only = self._existing_account_login_only()
             registration_message = ""
             source = "register"
 
             self._log("=" * 60)
-            self._log("ChatGPT RT 全新主链路启动")
+            if existing_account_login_only:
+                self._log("ChatGPT 已有账号登录链路启动")
+            else:
+                self._log("ChatGPT RT 全新主链路启动")
             self._log(f"请求模式: {self.browser_mode}")
-            self._log("实现策略: 注册状态机 + OAuth 接续流程")
+            if existing_account_login_only:
+                self._log("实现策略: passwordless OAuth 登录 + AT/RT 提取")
+            else:
+                self._log("实现策略: 注册状态机 + OAuth 接续流程")
             self._log("=" * 60)
 
             if not fixed_email:
                 self.email = None
 
-            self._log("1. 创建邮箱...")
-            if not self._create_email():
-                last_error = "创建邮箱失败"
+            if existing_account_login_only:
+                self._log("1. 加载邮箱凭据...")
+            else:
+                self._log("1. 创建邮箱...")
+            if not self._create_email(
+                existing_account_login_only=existing_account_login_only
+            ):
+                last_error = (
+                    "加载邮箱失败" if existing_account_login_only else "创建邮箱失败"
+                )
                 result.error_message = last_error
                 return result
 
             result.email = self.email or ""
-            self.password = self.password or generate_random_password(16)
+            if existing_account_login_only:
+                self.password = self.password or ""
+            else:
+                self.password = self.password or generate_random_password(16)
             result.password = self.password
+
+            email_adapter = EmailServiceAdapter(
+                self.email_service,
+                result.email,
+                self._log,
+            )
+            if existing_account_login_only:
+                return self._login_existing_account(
+                    result=result,
+                    email_adapter=email_adapter,
+                    otp_wait_seconds=register_otp_wait_seconds,
+                    otp_resend_wait_seconds=register_otp_resend_wait_seconds,
+                )
 
             first_name, last_name = generate_random_name()
             birthdate = generate_random_birthday()
@@ -485,12 +599,6 @@ class RefreshTokenRegistrationEngine:
                 f"register_wait={register_otp_wait_seconds}s, "
                 f"register_resend_wait={register_otp_resend_wait_seconds}s, "
                 "oauth_wait=读取 OAuthClient 配置（默认600s）"
-            )
-
-            email_adapter = EmailServiceAdapter(
-                self.email_service,
-                result.email,
-                self._log,
             )
 
             _REG_RETRY_MARKERS = ("访问首页失败", "预授权被拦截")
