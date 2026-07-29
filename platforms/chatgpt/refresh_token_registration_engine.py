@@ -194,6 +194,15 @@ class RefreshTokenRegistrationEngine:
             return value
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _existing_account_phone_verification_enabled(self) -> bool:
+        value = self.extra_config.get(
+            "chatgpt_existing_account_allow_phone_verification",
+            False,
+        )
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
     def _create_email(self, *, existing_account_login_only: bool = False) -> bool:
         action = "加载" if existing_account_login_only else "创建"
         try:
@@ -469,6 +478,9 @@ class RefreshTokenRegistrationEngine:
             "chatgpt_oauth_otp_resend_wait_seconds",
             otp_resend_wait_seconds,
         )
+        allow_phone_verification = (
+            self._existing_account_phone_verification_enabled()
+        )
         tokens = oauth_client.login_and_get_tokens(
             result.email,
             self.password or "",
@@ -478,7 +490,7 @@ class RefreshTokenRegistrationEngine:
             impersonate=None,
             skymail_client=email_adapter,
             prefer_passwordless_login=True,
-            allow_phone_verification=False,
+            allow_phone_verification=allow_phone_verification,
             force_new_browser=True,
             force_chatgpt_entry=False,
             screen_hint="login",

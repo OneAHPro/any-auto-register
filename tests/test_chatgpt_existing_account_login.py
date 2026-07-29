@@ -17,7 +17,7 @@ class DummyEmailService:
 
 
 class ExistingAccountLoginTests(unittest.TestCase):
-    def _make_engine(self, *, login_only=True):
+    def _make_engine(self, *, login_only=True, allow_phone_verification=False):
         return RefreshTokenRegistrationEngine(
             email_service=DummyEmailService(),
             proxy_url="http://127.0.0.1:7890",
@@ -25,6 +25,9 @@ class ExistingAccountLoginTests(unittest.TestCase):
             max_retries=1,
             extra_config={
                 "chatgpt_existing_account_login_only": login_only,
+                "chatgpt_existing_account_allow_phone_verification": (
+                    allow_phone_verification
+                ),
             },
         )
 
@@ -63,6 +66,20 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(login_kwargs["login_source"], "existing_account_login_only")
         self.assertTrue(any("加载邮箱凭据" in line for line in result.logs))
         self.assertFalse(any("成功创建邮箱" in line for line in result.logs))
+
+    def test_login_only_can_enable_existing_phone_verification_service(self):
+        engine = self._make_engine(allow_phone_verification=True)
+        oauth_client = self._successful_oauth_client()
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
+        self.assertTrue(login_kwargs["allow_phone_verification"])
 
     def test_login_only_rejects_result_without_refresh_token(self):
         engine = self._make_engine()

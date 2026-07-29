@@ -169,6 +169,8 @@ tokens = oauth_client.login_and_get_tokens(
 
 If the call returns no token dictionary, use `oauth_client.last_error`. If `access_token` or `refresh_token` is empty, return an error naming the missing token. Otherwise call `_populate_result_from_tokens()` with `registration_message="existing_account_login_only"`, `source="login"`, and `register_client=None`.
 
+The helper reads `chatgpt_existing_account_allow_phone_verification` as an explicit boolean/string flag and passes it to `allow_phone_verification`. It remains disabled by default; the current batch enables it only after a working local SMSToMe pool is present.
+
 - [ ] **Step 3: Branch before registration profile generation**
 
 In `run()`, resolve the flag before logging. After mailbox loading and `EmailServiceAdapter` construction, call `_login_existing_account()` and return its result. Do not generate random profile data and do not build `ChatGPTClient` in this branch.
@@ -203,7 +205,7 @@ Expected: all target tests pass.
 
 - [ ] **Step 3: Run one existing mailbox**
 
-POST `/api/tasks/register` with `count=1`, `concurrency=1`, `executor_type=protocol`, and `extra.chatgpt_existing_account_login_only=true`.
+POST `/api/tasks/register` with `count=1`, `concurrency=1`, `executor_type=protocol`, `extra.chatgpt_existing_account_login_only=true`, and `extra.chatgpt_existing_account_allow_phone_verification=true` when the local phone pool is configured.
 
 Expected: logs contain the existing-account login source, no registration-state-machine entry, OTP succeeds, both tokens are persisted, and the account count increases by one.
 

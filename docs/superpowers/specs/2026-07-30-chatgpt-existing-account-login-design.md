@@ -7,6 +7,7 @@
 ## 范围
 
 - 新增任务配置 `chatgpt_existing_account_login_only`，默认关闭。
+- 新增任务配置 `chatgpt_existing_account_allow_phone_verification`，默认关闭；仅在已有账号被 OpenAI 导向 `add_phone` 且本地已配置接码能力时开启。
 - 配置开启时跳过 ChatGPT 注册状态机、随机注册资料和 `about_you` 提交。
 - 直接调用现有 `OAuthClient.login_and_get_tokens()`，使用 `screen_hint=login` 和 passwordless OTP。
 - 登录专用模式不改变默认的新账号注册流程。
@@ -18,8 +19,9 @@
 2. 创建邮箱验证码适配器。
 3. 以已有账号登录模式启动 OAuth 会话。
 4. 轮询新邮件并提交 OTP。
-5. 获取 OAuth Token 后校验 Access Token 和 Refresh Token 均为非空。
-6. 校验通过后复用现有账号持久化逻辑写入本地账号库；缺少任一 Token 时返回失败，不保存半成品。
+5. 若 OpenAI 要求 `add_phone` 且任务开启手机验证，则复用现有固定手机号或 SMSToMe 接码服务完成验证。
+6. 获取 OAuth Token 后校验 Access Token 和 Refresh Token 均为非空。
+7. 校验通过后复用现有账号持久化逻辑写入本地账号库；缺少任一 Token 时返回失败，不保存半成品。
 
 ## 日志与错误处理
 
@@ -31,6 +33,7 @@
 
 - 回归测试证明登录专用模式不调用注册状态机。
 - 验证 OAuth 调用使用 `screen_hint=login`、passwordless OTP，并关闭 `about_you` 补全。
+- 验证手机验证默认关闭，但可通过任务配置显式开启。
 - 验证 AT 与 RT 同时存在时成功，任一缺失时失败。
 - 验证默认注册模式行为保持不变。
 - 容器内目标测试通过后重建服务，先实跑一条，再处理其余邮箱。
