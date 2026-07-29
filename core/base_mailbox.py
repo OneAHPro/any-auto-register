@@ -3121,21 +3121,27 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
             imap_conn = self.mailbox._open_imap(account)
             seen: set[str] = set()
             for folder in self.mailbox._imap_folder_names:
-                status, _ = imap_conn.select(folder, readonly=True)
-                if status != "OK":
-                    continue
-                status, data = imap_conn.uid("search", None, "ALL")
-                if status != "OK":
-                    continue
-                ids = data[0].split() if data and data[0] else []
-                for uid in ids[-100:]:
-                    uid_str = (
-                        uid.decode("utf-8", errors="ignore")
-                        if isinstance(uid, bytes)
-                        else str(uid)
+                try:
+                    status, _ = imap_conn.select(folder, readonly=True)
+                    if status != "OK":
+                        continue
+                    status, data = imap_conn.uid("search", None, "ALL")
+                    if status != "OK":
+                        continue
+                    ids = data[0].split() if data and data[0] else []
+                    for uid in ids[-100:]:
+                        uid_str = (
+                            uid.decode("utf-8", errors="ignore")
+                            if isinstance(uid, bytes)
+                            else str(uid)
+                        )
+                        if uid_str:
+                            seen.add(f"{folder}:{uid_str}")
+                except Exception as exc:
+                    self.mailbox._log(
+                        f"[微软邮箱][IMAP] folder={folder} 获取当前邮件 ID 失败: {exc}"
                     )
-                    if uid_str:
-                        seen.add(f"{folder}:{uid_str}")
+                    continue
             return seen
         finally:
             try:

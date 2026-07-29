@@ -1,3 +1,4 @@
+import imaplib
 import unittest
 from unittest import mock
 
@@ -24,6 +25,31 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
 
         self.assertIsInstance(mailbox, OutlookMailbox)
         self.assertEqual(mailbox._backend_name, "graph")
+
+    def test_get_current_ids_keeps_inbox_ids_when_junk_folder_is_unsupported(self):
+        mailbox = OutlookMailbox(backend="imap")
+        account = MailboxAccount(email="demo@outlook.com")
+        imap_conn = mock.Mock()
+
+        def select_folder(folder, readonly=False):
+            self.assertTrue(readonly)
+            if folder == "Junk":
+                raise imaplib.IMAP4.error("EXAMINE command error: BAD")
+            if folder == "Trash":
+                return "NO", [b""]
+            return "OK", [b""]
+
+        imap_conn.select.side_effect = select_folder
+        imap_conn.uid.side_effect = [
+            ("OK", [b"7 8"]),
+            ("OK", [b"9"]),
+        ]
+
+        with mock.patch.object(mailbox, "_open_imap", return_value=imap_conn):
+            ids = mailbox.get_current_ids(account)
+
+        self.assertEqual(ids, {"INBOX:7", "INBOX:8", "Deleted Items:9"})
+        imap_conn.logout.assert_called_once_with()
 
     @mock.patch("requests.post")
     def test_fetch_oauth_token_graph_backend_prefers_graph_scope(self, mock_post):
