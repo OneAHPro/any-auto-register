@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi import requests as cffi_requests
 
@@ -34,6 +35,21 @@ def _redact(value: Any, secrets: list[str]) -> str:
 
 def _bounded_redact(value: Any, secrets: list[str]) -> str:
     return _redact(value, secrets)[:MAX_ERROR_DETAIL_LENGTH]
+
+
+def _sanitized_target_url(value: Any, secrets: list[str]) -> str:
+    try:
+        parsed = urlsplit(_text(value))
+        hostname = parsed.hostname
+        if not parsed.scheme or not hostname:
+            raise ValueError("invalid target URL")
+        host = f"[{hostname}]" if ":" in hostname else hostname
+        if parsed.port is not None:
+            host = f"{host}:{parsed.port}"
+        target = urlunsplit((parsed.scheme, host, parsed.path, "", ""))
+    except (TypeError, ValueError):
+        target = "已配置地址（格式无效）"
+    return _bounded_redact(target, secrets)
 
 
 def _response_detail(response, secrets: list[str]) -> str:
@@ -116,7 +132,8 @@ def upload_to_codex2api(account) -> tuple[bool, str]:
         if response.status_code in (401, 403):
             return False, "Codex2API Admin Key 无效或无权限"
         if response.status_code == 404:
-            return False, f"Codex2API 管理接口不存在: {api_url}"
+            safe_url = _sanitized_target_url(api_url, secrets)
+            return False, f"Codex2API 管理接口不存在: {safe_url}"
         suffix = f": {detail}" if detail else ""
         return False, f"Codex2API 上传失败: HTTP {response.status_code}{suffix}"
 

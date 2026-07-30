@@ -188,6 +188,28 @@ class Codex2APIUploadTests(unittest.TestCase):
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_missing_endpoint_has_bounded_redacted_target(self, post, get_config):
+        get_config.side_effect = lambda key, default="": {
+            "codex2api_api_url": (
+                "http://admin-secret@codex2api.local:8080/base"
+                f"?key=admin-secret&padding={'x' * 1000}#private"
+            ),
+            "codex2api_admin_key": "admin-secret",
+        }.get(key, default)
+        post.return_value = _Response({"error": "not found"}, status_code=404)
+
+        ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertIn("codex2api.local", message)
+        self.assertNotIn("admin-secret", message)
+        self.assertNotIn("@", message)
+        self.assertNotIn("?", message)
+        self.assertNotIn("#", message)
+        self.assertLessEqual(len(message), 260)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
     def test_error_response_redacts_all_secrets(self, post, get_config):
         get_config.side_effect = self._configured
         post.return_value = _Response(

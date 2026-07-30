@@ -254,13 +254,24 @@ class ChatGPTPlatform(BasePlatform):
         proxy = self.config.proxy if self.config else None
         extra = account.extra or {}
 
+        def _first_nonblank(*values) -> str:
+            for value in values:
+                text = str(value or "").strip()
+                if text:
+                    return text
+            return ""
+
         class _A:
             pass
 
         a = _A()
         a.email = account.email
-        a.access_token = extra.get("access_token") or extra.get("accessToken") or account.token
-        a.refresh_token = extra.get("refresh_token") or extra.get("refreshToken") or ""
+        a.access_token = _first_nonblank(
+            extra.get("access_token"), extra.get("accessToken"), account.token
+        )
+        a.refresh_token = _first_nonblank(
+            extra.get("refresh_token"), extra.get("refreshToken")
+        )
         a.id_token = extra.get("id_token", "")
         a.session_token = extra.get("session_token", "")
         a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")
