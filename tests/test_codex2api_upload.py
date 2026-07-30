@@ -160,6 +160,19 @@ class Codex2APIUploadTests(unittest.TestCase):
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_http_200_failure_detail_is_bounded(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 0, "failed": 1, "message": "x" * 1000}
+        )
+
+        ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertLessEqual(len(message), 200)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
     def test_authentication_failure_has_safe_message(self, post, get_config):
         get_config.side_effect = self._configured
         post.return_value = _Response(
@@ -188,6 +201,26 @@ class Codex2APIUploadTests(unittest.TestCase):
         self.assertNotIn("admin-secret", message)
         self.assertNotIn("rt-secret", message)
         self.assertNotIn("at-secret", message)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_non_json_error_redacts_long_secret_before_truncating(self, post, get_config):
+        long_admin_key = "secret-" + "x" * 500
+        get_config.side_effect = lambda key, default="": {
+            "codex2api_api_url": "http://codex2api.local:8080",
+            "codex2api_admin_key": long_admin_key,
+        }.get(key, default)
+        post.return_value = _Response(
+            ValueError("not json"),
+            status_code=500,
+            text=f"rejected {long_admin_key}",
+        )
+
+        ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertNotIn(long_admin_key[:200], message)
+        self.assertLessEqual(len(message), 260)
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
@@ -225,6 +258,22 @@ class Codex2APIUploadTests(unittest.TestCase):
         self.assertNotIn("admin-secret", log_output)
         self.assertNotIn("rt-secret", log_output)
         self.assertNotIn("at-secret", log_output)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_transport_error_detail_is_bounded(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.side_effect = RuntimeError("x" * 1000)
+
+        with self.assertLogs(
+            "platforms.chatgpt.codex2api_upload",
+            level="ERROR",
+        ) as captured:
+            ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertLessEqual(len(message), 260)
+        self.assertLessEqual(len("\n".join(captured.output)), 320)
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")

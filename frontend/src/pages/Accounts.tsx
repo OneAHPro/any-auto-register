@@ -1099,6 +1099,8 @@ export default function Accounts() {
       body.all_filtered = true
       if (search) body.email = search
       if (filterStatus) body.status = filterStatus
+      if (createdAtStart) body.created_at_start = createdAtStart
+      if (createdAtEnd) body.created_at_end = createdAtEnd
     }
 
     setCodex2APIUploadLoading(scope)

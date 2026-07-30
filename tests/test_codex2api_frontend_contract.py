@@ -42,6 +42,14 @@ class Codex2APIFrontendContractTests(unittest.TestCase):
         self.assertIn("codex2apiUploadLoading", accounts_source)
         self.assertIn("/upload_codex2api/batch", accounts_source)
         self.assertIn("导入 Codex2API", accounts_source)
+        self.assertIn(
+            "if (createdAtStart) body.created_at_start = createdAtStart",
+            accounts_source,
+        )
+        self.assertIn(
+            "if (createdAtEnd) body.created_at_end = createdAtEnd",
+            accounts_source,
+        )
 
 
 if __name__ == "__main__":

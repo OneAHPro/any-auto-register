@@ -68,7 +68,7 @@ def sync_account(account) -> list[dict[str, Any]]:
             persist_codex2api_sync_result(account, ok, msg)
             results.append({"name": "Codex2API", "ok": ok, "msg": msg})
 
-        # 贡献模式优先级最高：开启后仅上传到贡献服务器，避免重复上报到其它平台。
+        # Codex2API 已按独立配置处理；贡献模式继续覆盖其余旧上传目标，避免重复上报。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))
         if contribution_enabled:
             contribution_mode = str(config_store.get("contribution_mode", "codex") or "codex").strip().lower()

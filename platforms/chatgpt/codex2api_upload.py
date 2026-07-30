@@ -8,6 +8,7 @@ from typing import Any
 from curl_cffi import requests as cffi_requests
 
 logger = logging.getLogger(__name__)
+MAX_ERROR_DETAIL_LENGTH = 200
 
 
 def _get_config_value(key: str) -> str:
@@ -31,21 +32,25 @@ def _redact(value: Any, secrets: list[str]) -> str:
     return text
 
 
+def _bounded_redact(value: Any, secrets: list[str]) -> str:
+    return _redact(value, secrets)[:MAX_ERROR_DETAIL_LENGTH]
+
+
 def _response_detail(response, secrets: list[str]) -> str:
     try:
         payload = response.json()
     except Exception:
-        return _redact(getattr(response, "text", ""), secrets)[:200]
+        return _bounded_redact(getattr(response, "text", ""), secrets)
 
     if isinstance(payload, dict):
-        return _redact(
+        return _bounded_redact(
             payload.get("message")
             or payload.get("msg")
             or payload.get("error")
             or "",
             secrets,
-        )[:200]
-    return _redact(payload, secrets)[:200]
+        )
+    return _bounded_redact(payload, secrets)
 
 
 def _response_count(payload: dict[str, Any], key: str) -> int:
@@ -102,7 +107,7 @@ def upload_to_codex2api(account) -> tuple[bool, str]:
             impersonate="chrome110",
         )
     except Exception as exc:
-        detail = _redact(exc, secrets)
+        detail = _bounded_redact(exc, secrets)
         logger.error("Codex2API upload failed: %s", detail)
         return False, f"Codex2API 上传异常: {detail}"
 
@@ -134,7 +139,7 @@ def upload_to_codex2api(account) -> tuple[bool, str]:
     if duplicate > 0:
         return True, f"远端账号已存在（{credential_label}）"
 
-    detail = _redact(
+    detail = _bounded_redact(
         data.get("message") or data.get("msg") or data.get("error") or "",
         secrets,
     )
