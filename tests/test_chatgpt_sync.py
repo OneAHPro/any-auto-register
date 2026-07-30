@@ -2,7 +2,12 @@ import unittest
 from unittest import mock
 
 from core.db import AccountModel
-from services.chatgpt_sync import backfill_chatgpt_account_to_cpa, build_chatgpt_sync_account
+from services.chatgpt_sync import (
+    backfill_chatgpt_account_to_cpa,
+    build_chatgpt_sync_account,
+    get_codex2api_sync_state,
+    record_codex2api_sync_result,
+)
 
 
 class ChatGPTBackfillTests(unittest.TestCase):
@@ -30,6 +35,18 @@ class ChatGPTBackfillTests(unittest.TestCase):
         sync_account = build_chatgpt_sync_account(account)
 
         self.assertEqual(sync_account.user_id, "acct-123")
+
+    def test_codex2api_state_preserves_success_after_failed_retry(self):
+        extra = {}
+
+        record_codex2api_sync_result(extra, True, "uploaded")
+        state = record_codex2api_sync_result(extra, False, "timeout")
+
+        self.assertTrue(state["uploaded"])
+        self.assertIn("uploaded_at", state)
+        self.assertFalse(state["last_attempt_ok"])
+        self.assertEqual(state["last_message"], "timeout")
+        self.assertEqual(get_codex2api_sync_state(extra), state)
 
     def test_backfill_skips_when_remote_auth_exists(self):
         account = self._make_account()
