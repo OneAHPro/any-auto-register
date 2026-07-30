@@ -1121,8 +1121,9 @@ export default function Accounts() {
 
       showBatchActionResult(`${scopeLabel}导入 Codex2API 结果`, result)
       await load()
-    } catch (e: any) {
-      message.error({ content: `导入 Codex2API 失败: ${e.message}`, key: toastKey })
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      message.error({ content: `导入 Codex2API 失败: ${detail}`, key: toastKey })
     } finally {
       setCodex2APIUploadLoading('')
     }
