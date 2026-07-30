@@ -184,6 +184,95 @@ class ExternalSyncContributionModeTests(unittest.TestCase):
         upload_mock.assert_not_called()
         persist_mock.assert_not_called()
 
+    def test_codex2api_enabled_uploads_and_persists_sync_status(self):
+        account = DummyAccount(extra={"refresh_token": "rt-local"})
+        cfg = {
+            "contribution_enabled": "0",
+            "codex2api_enabled": "1",
+            "codex2api_api_url": "http://codex2api.local:8080",
+            "codex2api_admin_key": "admin-key",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ):
+            with mock.patch(
+                "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+                return_value=(True, "ok"),
+            ) as upload_mock:
+                with mock.patch(
+                    "services.external_sync.persist_codex2api_sync_result"
+                ) as persist_mock:
+                    result = sync_account(account)
+
+        self.assertEqual(
+            result,
+            [{"name": "Codex2API", "ok": True, "msg": "ok"}],
+        )
+        upload_mock.assert_called_once()
+        uploaded_account = upload_mock.call_args.args[0]
+        self.assertEqual(uploaded_account.email, account.email)
+        self.assertEqual(uploaded_account.refresh_token, "rt-local")
+        persist_mock.assert_called_once_with(account, True, "ok")
+
+    def test_codex2api_disabled_keeps_configuration_without_upload(self):
+        account = DummyAccount()
+        cfg = {
+            "contribution_enabled": "0",
+            "codex2api_enabled": "0",
+            "codex2api_api_url": "http://codex2api.local:8080",
+            "codex2api_admin_key": "admin-key",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ):
+            with mock.patch(
+                "platforms.chatgpt.codex2api_upload.upload_to_codex2api"
+            ) as upload_mock:
+                result = sync_account(account)
+
+        self.assertEqual(result, [])
+        upload_mock.assert_not_called()
+
+    def test_codex2api_runs_before_contribution_mode_early_return(self):
+        account = DummyAccount(extra={"refresh_token": "rt-local"})
+        cfg = {
+            "contribution_enabled": "1",
+            "contribution_server_url": "http://contribution.local:7317",
+            "contribution_key": "public-key",
+            "codex2api_enabled": "1",
+            "codex2api_api_url": "http://codex2api.local:8080",
+            "codex2api_admin_key": "admin-key",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ):
+            with mock.patch(
+                "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+                return_value=(True, "codex-ok"),
+            ):
+                with mock.patch(
+                    "services.external_sync.persist_codex2api_sync_result"
+                ):
+                    with mock.patch(
+                        "services.external_sync.upload_chatgpt_account_to_cpa",
+                        return_value=(True, "contribution-ok"),
+                    ):
+                        with mock.patch(
+                            "services.external_sync.persist_cpa_sync_result"
+                        ):
+                            result = sync_account(account)
+
+        self.assertEqual(
+            [item["name"] for item in result],
+            ["Codex2API", "Contribution"],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ from typing import Any
 
 from services.chatgpt_sync import (
     _get_account_extra,
+    persist_codex2api_sync_result,
     persist_cpa_sync_result,
     persist_sub2api_sync_result,
     upload_chatgpt_account_to_cpa,
@@ -55,6 +56,17 @@ def sync_account(account) -> list[dict[str, Any]]:
 
     if platform == "chatgpt":
         upload_account = _build_chatgpt_upload_account()
+
+        codex2api_enabled = _is_config_enabled(
+            config_store.get("codex2api_enabled", "0"),
+            default=False,
+        )
+        if codex2api_enabled:
+            from platforms.chatgpt.codex2api_upload import upload_to_codex2api
+
+            ok, msg = upload_to_codex2api(upload_account)
+            persist_codex2api_sync_result(account, ok, msg)
+            results.append({"name": "Codex2API", "ok": ok, "msg": msg})
 
         # 贡献模式优先级最高：开启后仅上传到贡献服务器，避免重复上报到其它平台。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))
