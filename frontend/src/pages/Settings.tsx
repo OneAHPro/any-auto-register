@@ -322,6 +322,22 @@ const TAB_ITEMS = [
     ],
   },
   {
+    key: 'codex2api',
+    label: 'Codex2API',
+    icon: <ApiOutlined />,
+    sections: [
+      {
+        title: '管理面板',
+        desc: '注册完成后自动上传到配置的 Codex2API 管理后台',
+        fields: [
+          { key: 'codex2api_enabled', label: '启用自动上传', type: 'boolean' },
+          { key: 'codex2api_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:8080' },
+          { key: 'codex2api_admin_key', label: 'Admin Key', secret: true },
+        ],
+      },
+    ],
+  },
+  {
     key: 'cliproxyapi',
     label: 'CLIProxyAPI',
     icon: <ApiOutlined />,
@@ -1818,6 +1834,7 @@ export default function Settings() {
         data.sub2api_enabled,
         Boolean(String(data.sub2api_api_url ?? '').trim() && String(data.sub2api_api_key ?? '').trim()),
       )
+      data.codex2api_enabled = parseBooleanConfigValue(data.codex2api_enabled)
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -1888,6 +1905,7 @@ export default function Settings() {
       }
       values.cpa_enabled = parseBooleanConfigValue(values.cpa_enabled)
       values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
+      values.codex2api_enabled = parseBooleanConfigValue(values.codex2api_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -1911,6 +1929,7 @@ export default function Settings() {
         mail_import_source: values.mail_provider === 'applemail' ? 'applemail' : 'microsoft',
         cpa_enabled: values.cpa_enabled,
         sub2api_enabled: values.sub2api_enabled,
+        codex2api_enabled: values.codex2api_enabled,
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
