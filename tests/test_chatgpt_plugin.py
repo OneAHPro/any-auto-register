@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from core.base_mailbox import MailboxAccount
@@ -73,6 +74,47 @@ class _FailingAdapter:
 
 
 class ChatGPTPluginTests(unittest.TestCase):
+    def test_actions_include_parameterless_codex2api_upload(self):
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+
+        action = next(
+            item
+            for item in platform.get_platform_actions()
+            if item["id"] == "upload_codex2api"
+        )
+
+        self.assertEqual(action["label"], "上传 Codex2API")
+        self.assertEqual(action["params"], [])
+
+    def test_codex2api_action_ignores_request_target_overrides(self):
+        platform = ChatGPTPlatform(config=RegisterConfig(extra={}))
+        account = SimpleNamespace(
+            email="demo@example.com",
+            token="at-local",
+            extra={"refresh_token": "rt-local"},
+            user_id="account-id",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+            return_value=(True, "uploaded"),
+        ) as upload_mock:
+            result = platform.execute_action(
+                "upload_codex2api",
+                account,
+                {
+                    "api_url": "http://forbidden.example",
+                    "api_key": "forbidden-key",
+                },
+            )
+
+        self.assertEqual(result, {"ok": True, "data": "uploaded"})
+        upload_mock.assert_called_once()
+        uploaded_account = upload_mock.call_args.args[0]
+        self.assertEqual(uploaded_account.email, account.email)
+        self.assertEqual(uploaded_account.refresh_token, "rt-local")
+        self.assertEqual(uploaded_account.access_token, "at-local")
+
     def test_custom_provider_rejects_blank_email(self):
         platform = ChatGPTPlatform(
             config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),

@@ -228,6 +228,11 @@ class ChatGPTPlatform(BasePlatform):
                 ],
             },
             {
+                "id": "upload_codex2api",
+                "label": "上传 Codex2API",
+                "params": [],
+            },
+            {
                 "id": "upload_tm",
                 "label": "上传 Team Manager",
                 "params": [
@@ -357,6 +362,12 @@ class ChatGPTPlatform(BasePlatform):
                 api_url=params.get("api_url"),
                 api_key=params.get("api_key"),
             )
+            return {"ok": ok, "data": msg}
+
+        if action_id == "upload_codex2api":
+            from platforms.chatgpt.codex2api_upload import upload_to_codex2api
+
+            ok, msg = upload_to_codex2api(a)
             return {"ok": ok, "data": msg}
 
         if action_id == "upload_tm":
