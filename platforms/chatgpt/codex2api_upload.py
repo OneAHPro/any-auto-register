@@ -35,7 +35,7 @@ def _response_detail(response, secrets: list[str]) -> str:
     try:
         payload = response.json()
     except Exception:
-        return _redact(_text(getattr(response, "text", ""))[:200], secrets)
+        return _redact(getattr(response, "text", ""), secrets)[:200]
 
     if isinstance(payload, dict):
         return _redact(
@@ -44,8 +44,8 @@ def _response_detail(response, secrets: list[str]) -> str:
             or payload.get("error")
             or "",
             secrets,
-        )
-    return _redact(payload, secrets)
+        )[:200]
+    return _redact(payload, secrets)[:200]
 
 
 def _response_count(payload: dict[str, Any], key: str) -> int:
@@ -96,7 +96,8 @@ def upload_to_codex2api(account) -> tuple[bool, str]:
             },
             json=payload,
             proxies=None,
-            verify=False,
+            verify=True,
+            allow_redirects=False,
             timeout=30,
             impersonate="chrome110",
         )

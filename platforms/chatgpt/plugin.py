@@ -259,8 +259,8 @@ class ChatGPTPlatform(BasePlatform):
 
         a = _A()
         a.email = account.email
-        a.access_token = extra.get("access_token") or account.token
-        a.refresh_token = extra.get("refresh_token", "")
+        a.access_token = extra.get("access_token") or extra.get("accessToken") or account.token
+        a.refresh_token = extra.get("refresh_token") or extra.get("refreshToken") or ""
         a.id_token = extra.get("id_token", "")
         a.session_token = extra.get("session_token", "")
         a.client_id = extra.get("client_id", "app_EMoamEEZ73f0CkXaXp7hrann")

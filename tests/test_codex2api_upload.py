@@ -57,6 +57,18 @@ class Codex2APIUploadTests(unittest.TestCase):
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_request_verifies_tls_and_rejects_redirects(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response({"success": 1, "failed": 0})
+
+        ok, _message = upload_to_codex2api(self._account())
+
+        self.assertTrue(ok)
+        self.assertIs(post.call_args.kwargs["verify"], True)
+        self.assertIs(post.call_args.kwargs["allow_redirects"], False)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
     def test_access_token_is_used_when_refresh_token_is_missing(self, post, get_config):
         get_config.side_effect = self._configured
         post.return_value = _Response({"updated": 1, "failed": 0})
@@ -176,6 +188,20 @@ class Codex2APIUploadTests(unittest.TestCase):
         self.assertNotIn("admin-secret", message)
         self.assertNotIn("rt-secret", message)
         self.assertNotIn("at-secret", message)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_error_response_detail_is_bounded(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"error": "x" * 1000},
+            status_code=500,
+        )
+
+        ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertLessEqual(len(message), 260)
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
