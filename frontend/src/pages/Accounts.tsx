@@ -63,9 +63,10 @@ function normalizeAccount(account: any) {
   const syncStatuses = extra.sync_statuses && typeof extra.sync_statuses === 'object' ? extra.sync_statuses : {}
   const cpaSync = syncStatuses.cpa && typeof syncStatuses.cpa === 'object' ? syncStatuses.cpa : {}
   const sub2apiSync = syncStatuses.sub2api && typeof syncStatuses.sub2api === 'object' ? syncStatuses.sub2api : {}
+  const codex2apiSync = syncStatuses.codex2api && typeof syncStatuses.codex2api === 'object' ? syncStatuses.codex2api : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  return { ...account, extra, cpaSync, sub2apiSync, cliproxySync, chatgptLocal }
+  return { ...account, extra, cpaSync, sub2apiSync, codex2apiSync, cliproxySync, chatgptLocal }
 }
 
 function formatSyncTime(value?: string) {
@@ -564,6 +565,7 @@ export default function Accounts() {
   const [registerLoading, setRegisterLoading] = useState(false)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
+  const [codex2apiUploadLoading, setCodex2APIUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
   useEffect(() => {
@@ -1075,11 +1077,64 @@ export default function Accounts() {
     }
   }
 
+  const handleBatchUploadCodex2API = async (scope: 'selected' | 'all') => {
+    const toastKey = `batch-upload-codex2api:${scope}`
+    const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
+
+    const body: Record<string, unknown> = {
+      params: {},
+    }
+
+    if (scope === 'selected') {
+      const accountIds = Array.from(selectedRowKeys)
+        .map((value) => Number(value))
+        .filter((value) => Number.isInteger(value) && value > 0)
+
+      if (accountIds.length === 0) {
+        message.warning('请先选择要导入 Codex2API 的账号')
+        return
+      }
+      body.account_ids = accountIds
+    } else {
+      body.all_filtered = true
+      if (search) body.email = search
+      if (filterStatus) body.status = filterStatus
+    }
+
+    setCodex2APIUploadLoading(scope)
+    message.loading({ content: `${scopeLabel}导入 Codex2API 进行中...`, key: toastKey, duration: 0 })
+    try {
+      const result = await apiFetch(`/actions/${currentPlatform}/upload_codex2api/batch`, {
+        method: 'POST',
+        body: JSON.stringify(body),
+      })
+
+      if (!result.total) {
+        message.info({ content: '没有可处理的账号', key: toastKey })
+      } else if (!result.failed) {
+        message.success({ content: `${scopeLabel}导入 Codex2API 完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else if (!result.success) {
+        message.error({ content: `${scopeLabel}导入 Codex2API 失败：成功 ${result.success} / ${result.total}`, key: toastKey })
+      } else {
+        message.warning({ content: `${scopeLabel}导入 Codex2API 部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
+      }
+
+      showBatchActionResult(`${scopeLabel}导入 Codex2API 结果`, result)
+      await load()
+    } catch (e: any) {
+      message.error({ content: `导入 Codex2API 失败: ${e.message}`, key: toastKey })
+    } finally {
+      setCodex2APIUploadLoading('')
+    }
+  }
+
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
   const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
 
   const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
+
+  const getUploadCodex2APIScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
   const backfillButtonLabel = () => {
     const scope = getBackfillScope()
@@ -1093,8 +1148,15 @@ export default function Accounts() {
     return scope === 'selected' ? `导入所选 CPA (${count})` : `导入筛选 CPA (${count})`
   }
 
+  const uploadCodex2APIButtonLabel = () => {
+    const scope = getUploadCodex2APIScope()
+    const count = scope === 'selected' ? selectedRowKeys.length : total
+    return scope === 'selected' ? `导入所选 Codex2API (${count})` : `导入筛选 Codex2API (${count})`
+  }
+
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const hasUploadCpaAction = platformActions.some((item) => item?.id === 'upload_cpa')
+  const hasUploadCodex2APIAction = platformActions.some((item) => item?.id === 'upload_codex2api')
   const monospaceStyle: React.CSSProperties = {
     fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
     fontSize: 12,
@@ -1200,11 +1262,13 @@ export default function Accounts() {
           const codex = record.chatgptLocal?.codex || {}
           const cpaSync = record.cpaSync || {}
           const sub2apiSync = record.sub2apiSync || {}
+          const codex2apiSync = record.codex2apiSync || {}
           const authMeta = authStateMeta(auth.state)
           const planTag = planMeta(subscription.plan)
           const codexMeta = codexStateMeta(codex.state)
           const cpaMeta = uploadSyncMeta(cpaSync)
           const sub2apiMeta = uploadSyncMeta(sub2apiSync)
+          const codex2apiMeta = uploadSyncMeta(codex2apiSync)
 
           return (
             <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
@@ -1219,6 +1283,9 @@ export default function Accounts() {
                 </Tag>
                 <Tag color={sub2apiMeta.color} title={uploadSyncTitle('Sub2API', sub2apiSync)}>
                   Sub2API {sub2apiMeta.label}
+                </Tag>
+                <Tag color={codex2apiMeta.color} title={uploadSyncTitle('Codex2API', codex2apiSync)}>
+                  Codex2API {codex2apiMeta.label}
                 </Tag>
               </div>
             </div>
@@ -1424,6 +1491,26 @@ export default function Accounts() {
                 disabled={getBackfillScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
               >
                 {backfillButtonLabel()}
+              </Button>
+            </Popconfirm>
+          )}
+          {currentPlatform === 'chatgpt' && hasUploadCodex2APIAction && (
+            <Popconfirm
+              title={
+                getUploadCodex2APIScope() === 'selected'
+                  ? `确认导入所选 ${selectedRowKeys.length} 个账号到 Codex2API？`
+                  : `确认导入当前筛选范围内 ${total} 个账号到 Codex2API？`
+              }
+              onConfirm={() => handleBatchUploadCodex2API(getUploadCodex2APIScope())}
+              okText="确认"
+              cancelText="取消"
+            >
+              <Button
+                loading={codex2apiUploadLoading === 'selected' || codex2apiUploadLoading === 'all'}
+                icon={<UploadOutlined />}
+                disabled={getUploadCodex2APIScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
+              >
+                {uploadCodex2APIButtonLabel()}
               </Button>
             </Popconfirm>
           )}

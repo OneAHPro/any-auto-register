@@ -32,6 +32,17 @@ class Codex2APIFrontendContractTests(unittest.TestCase):
             settings_source,
         )
 
+    def test_accounts_expose_codex2api_status_and_batch_upload(self):
+        accounts_source = (ROOT / "frontend/src/pages/Accounts.tsx").read_text()
+
+        self.assertIn("syncStatuses.codex2api", accounts_source)
+        self.assertIn("codex2apiSync", accounts_source)
+        self.assertIn("uploadSyncTitle('Codex2API'", accounts_source)
+        self.assertIn("handleBatchUploadCodex2API", accounts_source)
+        self.assertIn("codex2apiUploadLoading", accounts_source)
+        self.assertIn("/upload_codex2api/batch", accounts_source)
+        self.assertIn("导入 Codex2API", accounts_source)
+
 
 if __name__ == "__main__":
     unittest.main()
