@@ -172,6 +172,8 @@ def infer_page_type_from_url(url):
         return "about_you"
     if "log-in/password" in path:
         return "login_password"
+    if "mfa-challenge" in path:
+        return "mfa_challenge"
     if "sign-in-with-chatgpt" in path and "consent" in path:
         return "consent"
     if "workspace" in path and "select" in path:

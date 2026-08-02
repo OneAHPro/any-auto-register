@@ -80,6 +80,31 @@ class RegisterTaskStoreTests(unittest.TestCase):
             1,
         )
 
+    def test_optional_snapshots_return_none_after_cleanup_or_missing_task(self):
+        store = RegisterTaskStore()
+
+        self.assertIsNone(store.snapshot_if_present("missing"))
+        self.assertIsNone(store.log_snapshot_if_present("missing"))
+
+    def test_log_snapshot_is_copied_atomically(self):
+        store = RegisterTaskStore()
+        task_id = "task-runtime-log-snapshot"
+        store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="manual",
+        )
+        store.append_log(task_id, "first")
+        store.mark_running(task_id)
+
+        logs, status, snapshot = store.log_snapshot_if_present(task_id)
+        logs.append("mutated")
+
+        self.assertEqual(status, "running")
+        self.assertEqual(snapshot["logs"], ["first"])
+        self.assertEqual(store.snapshot(task_id)["logs"], ["first"])
+
 
 if __name__ == "__main__":
     unittest.main()

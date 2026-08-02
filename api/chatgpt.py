@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import apply_chatgpt_status_policy
+from services.chatgpt_phone_verification import phone_verification_manager
 import json, sys
 
 
@@ -56,6 +57,93 @@ def _persist_local_probe(acc: AccountModel, probe: dict, session: Session) -> No
     acc.updated_at = datetime.utcnow()
     session.add(acc)
     session.commit()
+
+
+class PhoneVerificationStartRequest(BaseModel):
+    phone: Optional[str] = None
+    leadbee_code: Optional[str] = None
+
+
+class PhoneVerificationCodeRequest(BaseModel):
+    code: str
+
+
+def _phone_error(exc: Exception) -> HTTPException:
+    return HTTPException(status_code=400, detail=str(exc) or "手机验证请求失败")
+
+
+@router.post("/{account_id}/phone-verification/start")
+def start_phone_verification(
+    account_id: int,
+    body: PhoneVerificationStartRequest,
+    session: Session = Depends(get_session),
+):
+    acc = _get_account(account_id, session)
+    email = str(acc.email or "").strip()
+    extra = acc.get_extra()
+    access_token = str(extra.get("access_token") or acc.token or "").strip()
+    refresh_token = str(extra.get("refresh_token") or "").strip()
+    if not email:
+        raise HTTPException(400, "账号邮箱未填写")
+    if not access_token:
+        raise HTTPException(400, "账号缺少 Access Token，请先执行邮箱登录")
+    if refresh_token:
+        raise HTTPException(400, "账号已有 Refresh Token，无需再次接码")
+    phone = str(body.phone or "").strip()
+    leadbee_code = str(body.leadbee_code or "").strip()
+    if phone and leadbee_code:
+        raise HTTPException(400, "手机号和 LeadBee 兑换码只能选择一种接码方式")
+    try:
+        if leadbee_code:
+            return phone_verification_manager.start(
+                account_id,
+                leadbee_code=leadbee_code,
+            )
+        if phone:
+            return phone_verification_manager.start(account_id, phone)
+        raise ValueError("请输入手机号码或 LeadBee 兑换码")
+    except ValueError as exc:
+        raise _phone_error(exc) from exc
+
+
+@router.get("/{account_id}/phone-verification/{session_id}")
+def get_phone_verification_status(
+    account_id: int,
+    session_id: str,
+    session: Session = Depends(get_session),
+):
+    _get_account(account_id, session)
+    try:
+        return phone_verification_manager.status(account_id, session_id)
+    except ValueError as exc:
+        raise _phone_error(exc) from exc
+
+
+@router.post("/{account_id}/phone-verification/{session_id}/submit")
+def submit_phone_verification_code(
+    account_id: int,
+    session_id: str,
+    body: PhoneVerificationCodeRequest,
+    session: Session = Depends(get_session),
+):
+    _get_account(account_id, session)
+    try:
+        return phone_verification_manager.submit_code(account_id, session_id, body.code)
+    except ValueError as exc:
+        raise _phone_error(exc) from exc
+
+
+@router.post("/{account_id}/phone-verification/{session_id}/resend")
+def resend_phone_verification_code(
+    account_id: int,
+    session_id: str,
+    session: Session = Depends(get_session),
+):
+    _get_account(account_id, session)
+    try:
+        return phone_verification_manager.resend(account_id, session_id)
+    except ValueError as exc:
+        raise _phone_error(exc) from exc
 
 
 # ── Token 刷新 ──────────────────────────────────────────────

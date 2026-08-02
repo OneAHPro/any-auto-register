@@ -11,6 +11,7 @@ import {
   MoonOutlined,
   LogoutOutlined,
   PlayCircleOutlined,
+  MobileOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import Dashboard from '@/pages/Dashboard'
@@ -21,6 +22,7 @@ import Settings from '@/pages/Settings'
 import TaskHistory from '@/pages/TaskHistory'
 import RunningTasks from '@/pages/RunningTasks'
 import Login from '@/pages/Login'
+import SmsPool from '@/pages/SmsPool'
 import { darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
 
@@ -95,6 +97,7 @@ function AppContent() {
     if (path.startsWith('/accounts')) return [path]
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
+    if (path === '/sms-pool') return ['/sms-pool']
     if (path === '/settings') return ['/settings']
     if (path === '/running-tasks') return ['/running-tasks']
     return ['/']
@@ -131,6 +134,11 @@ function AppContent() {
       key: '/proxies',
       icon: <GlobalOutlined />,
       label: '代理管理',
+    },
+    {
+      key: '/sms-pool',
+      icon: <MobileOutlined />,
+      label: 'SMS接码池',
     },
     {
       key: '/settings',
@@ -243,6 +251,7 @@ function AppContent() {
             <Route path="/running-tasks" element={<RunningTasks />} />
             <Route path="/history" element={<TaskHistory />} />
             <Route path="/proxies" element={<Proxies />} />
+            <Route path="/sms-pool" element={<SmsPool />} />
             <Route path="/settings" element={<Settings />} />
           </Routes>
         </Content>

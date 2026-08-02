@@ -2,6 +2,8 @@
 
 import random
 import string
+import threading
+import time
 
 from core.base_mailbox import BaseMailbox
 from core.base_platform import Account, BasePlatform, RegisterConfig
@@ -39,12 +41,24 @@ class ChatGPTPlatform(BasePlatform):
             return False
 
     def register(self, email: str = None, password: str = None) -> Account:
-        if not password:
-            password = "".join(random.choices(string.ascii_letters + string.digits + "!@#$", k=16))
-
         proxy = self.config.proxy if self.config else None
         browser_mode = (self.config.executor_type if self.config else None) or "protocol"
         extra_config = (self.config.extra or {}) if self.config and getattr(self.config, "extra", None) else {}
+        login_only = str(
+            extra_config.get("chatgpt_existing_account_login_only", "") or ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not password:
+            password = (
+                ""
+                if login_only
+                else "".join(
+                    random.choices(
+                        string.ascii_letters + string.digits + "!@#$",
+                        k=16,
+                    )
+                )
+            )
+
         log_fn = getattr(self, "_log_fn", print)
         max_retries = 3
         try:
@@ -87,22 +101,120 @@ class ChatGPTPlatform(BasePlatform):
                     self._acct = None
                     self._email = _fixed_email
                     self._before_ids = set()
+                    self._baseline_ready = threading.Event()
+                    self._baseline_error = ""
+
+                def _build_result(self):
+                    account_extra = dict(
+                        getattr(self._acct, "extra", None) or {}
+                    )
+                    result = {
+                        "email": self._email,
+                        "service_id": self._acct.account_id,
+                        "token": "",
+                    }
+                    if (
+                        str(account_extra.get("account_type") or "").strip()
+                        == "chatgpt_password_totp"
+                    ):
+                        result.update(
+                            {
+                                "account_type": "chatgpt_password_totp",
+                                "password": str(
+                                    account_extra.get("password") or ""
+                                ),
+                                "totp_secret": str(
+                                    account_extra.get("totp_secret") or ""
+                                ),
+                            }
+                        )
+                    elif str(account_extra.get("account_type") or "").strip() in {
+                        "chatgpt_password_url_otp",
+                        "chatgpt_password_reset_url_mail",
+                    }:
+                        account_type = str(account_extra.get("account_type") or "").strip()
+                        result.update(
+                            {
+                                "account_type": account_type,
+                                "password": str(account_extra.get("password") or ""),
+                                "mail_api_url": str(account_extra.get("mail_api_url") or ""),
+                                "totp_url": str(account_extra.get("totp_url") or ""),
+                                "password_reset_required": bool(
+                                    account_extra.get("password_reset_required", False)
+                                ),
+                                "new_password": str(account_extra.get("new_password") or ""),
+                            }
+                        )
+                    return result
+
+                def _load_baseline(self, get_current_ids):
+                    try:
+                        self._before_ids = set(
+                            get_current_ids(self._acct) or []
+                        )
+                    except Exception as exc:
+                        self._before_ids = set()
+                        self._baseline_error = str(exc).strip()
+                        log_fn(
+                            "邮箱旧邮件基线读取失败，将继续等待新验证码: "
+                            f"{self._baseline_error}"
+                        )
+                    finally:
+                        self._baseline_ready.set()
 
                 def create_email(self, config=None):
-                    if self._email and self._acct and _fixed_email:
-                        return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
-                    self._acct = _mailbox.get_email()
-                    get_current_ids = getattr(_mailbox, "get_current_ids", None)
-                    if callable(get_current_ids):
-                        self._before_ids = set(get_current_ids(self._acct) or [])
+                    if self._email and self._acct and (_fixed_email or login_only):
+                        return self._build_result()
+                    exact_selector = getattr(
+                        _mailbox,
+                        "get_email_by_address",
+                        None,
+                    )
+                    if _fixed_email and callable(exact_selector):
+                        self._acct = exact_selector(_fixed_email)
                     else:
-                        self._before_ids = set()
+                        self._acct = _mailbox.get_email()
+                    account_extra = dict(
+                        getattr(self._acct, "extra", None) or {}
+                    )
+                    is_chatgpt_credentials = (
+                        str(account_extra.get("account_type") or "").strip()
+                        == "chatgpt_password_totp"
+                    )
                     generated_email = getattr(self._acct, "email", "")
                     if not self._email:
                         self._email = _resolve_email(generated_email)
                     elif not _fixed_email:
                         self._email = _resolve_email(generated_email)
-                    return {"email": self._email, "service_id": self._acct.account_id, "token": ""}
+                    elif str(generated_email or "").strip().lower() != str(
+                        _fixed_email or ""
+                    ).strip().lower():
+                        raise RuntimeError(
+                            "重试绑定邮箱与邮箱池实际取出的账号不一致"
+                        )
+                    binding_callback = extra_config.get(
+                        "_chatgpt_attempt_binding_callback"
+                    )
+                    if callable(binding_callback):
+                        try:
+                            binding_callback(self._email, self._acct)
+                        except Exception as exc:
+                            log_fn(f"保存邮箱与接码卡密绑定失败: {exc}")
+                    get_current_ids = getattr(_mailbox, "get_current_ids", None)
+                    if is_chatgpt_credentials:
+                        self._before_ids = set()
+                        self._baseline_ready.set()
+                    elif callable(get_current_ids):
+                        threading.Thread(
+                            target=self._load_baseline,
+                            args=(get_current_ids,),
+                            name="chatgpt-mailbox-baseline",
+                            daemon=True,
+                        ).start()
+                    else:
+                        self._before_ids = set()
+                        self._baseline_ready.set()
+                    return self._build_result()
 
                 def get_verification_code(
                     self,
@@ -115,14 +227,80 @@ class ChatGPTPlatform(BasePlatform):
                 ):
                     if not self._acct:
                         raise RuntimeError("邮箱账户尚未创建，无法获取验证码")
+                    resolved_timeout = _resolve_mailbox_timeout(timeout)
+                    baseline_started_at = time.monotonic()
+                    baseline_wait = min(max(int(resolved_timeout), 1), 30)
+                    if not self._baseline_ready.wait(timeout=baseline_wait):
+                        log_fn(
+                            "邮箱旧邮件基线仍未返回，先开始轮询新验证码"
+                        )
+                    baseline_elapsed = int(
+                        max(0.0, time.monotonic() - baseline_started_at)
+                    )
+                    remaining_timeout = max(
+                        1,
+                        int(resolved_timeout) - baseline_elapsed,
+                    )
                     return _mailbox.wait_for_code(
                         self._acct,
                         keyword="",
-                        timeout=_resolve_mailbox_timeout(timeout),
-                        before_ids=self._before_ids,
+                        timeout=remaining_timeout,
+                        before_ids=set(self._before_ids),
                         otp_sent_at=otp_sent_at,
                         exclude_codes=exclude_codes,
                     )
+
+                def get_totp_code(self):
+                    if not self._acct:
+                        raise RuntimeError("邮箱账户尚未创建，无法获取 2FA 验证码")
+                    getter = getattr(_mailbox, "get_totp_code", None)
+                    if not callable(getter):
+                        raise RuntimeError("当前邮箱后端不支持远程 2FA")
+                    return getter(self._acct)
+
+                def supports_totp_code(self):
+                    if not self._acct:
+                        return False
+                    account_extra = dict(
+                        getattr(self._acct, "extra", None) or {}
+                    )
+                    return bool(str(account_extra.get("totp_url") or "").strip())
+
+                def commit_password_reset(self, new_password=""):
+                    if not self._acct:
+                        raise RuntimeError("邮箱账户尚未创建，无法保存新密码")
+                    commit = getattr(_mailbox, "commit_password_reset", None)
+                    if not callable(commit):
+                        raise RuntimeError("当前邮箱后端不支持保存重置密码")
+                    return commit(self._acct, new_password)
+
+                def get_mailbox_metadata(self):
+                    account = self._acct
+                    account_extra = dict(getattr(account, "extra", None) or {})
+                    provider = str(
+                        account_extra.get("provider")
+                        or extra_config.get("mail_provider")
+                        or "custom_provider"
+                    ).strip()
+                    account_type = str(account_extra.get("account_type") or "").strip()
+                    if account_type in {
+                        "chatgpt_password_totp",
+                        "chatgpt_password_url_otp",
+                        "chatgpt_password_reset_url_mail",
+                    }:
+                        account_extra = {
+                            "provider": "chatgpt_credentials",
+                            "account_type": account_type,
+                            "pool_file": str(
+                                account_extra.get("pool_file") or ""
+                            ),
+                        }
+                    return {
+                        "provider": provider,
+                        "email": str(self._email or getattr(account, "email", "") or "").strip(),
+                        "account_id": str(getattr(account, "account_id", "") or "").strip(),
+                        "extra": account_extra,
+                    }
 
                 def update_status(self, success, error=None):
                     pass
@@ -192,11 +370,84 @@ class ChatGPTPlatform(BasePlatform):
             max_retries=max_retries,
             extra_config=extra_config,
         )
-        result = adapter.run(context)
-        if not result or not result.success:
-            raise RuntimeError(result.error_message if result else "注册失败")
+        def _is_permanent_login_credential_error(error, error_code="") -> bool:
+            if str(error_code or "").strip() == "missing_totp_credentials":
+                return True
+            normalized = str(error or "").strip().lower()
+            return any(
+                marker in normalized
+                for marker in (
+                    "缺少 mfa 秘钥",
+                    "missing mfa secret",
+                    "missing totp secret",
+                    "密码已在认证服务重置，但本地凭据保存失败",
+                )
+            )
 
-        return adapter.build_account(result, password)
+        def _requeue_failed_login_mailbox(error="", error_code=""):
+            if not login_only:
+                return
+            if _is_permanent_login_credential_error(error, error_code):
+                log_fn(
+                    "当前 ChatGPT 账号仅支持 TOTP MFA，但导入记录缺少秘钥；"
+                    "已从自动重试池隔离，请补齐秘钥后重新导入"
+                )
+                return
+            mailbox_account = getattr(email_service, "_acct", None)
+            requeue = getattr(self.mailbox, "requeue_account", None)
+            if mailbox_account is not None and callable(requeue):
+                requeue(mailbox_account)
+
+        try:
+            result = adapter.run(context)
+        except Exception as exc:
+            _requeue_failed_login_mailbox(
+                exc,
+                getattr(exc, "error_code", ""),
+            )
+            raise
+        if not result or not result.success:
+            result_error = result.error_message if result else "注册失败"
+            result_error_code = getattr(result, "error_code", "") if result else ""
+            if not isinstance(result_error_code, str):
+                result_error_code = ""
+            _requeue_failed_login_mailbox(result_error, result_error_code)
+            raise RuntimeError(result_error)
+
+        account = adapter.build_account(result, password)
+        metadata_getter = getattr(email_service, "get_mailbox_metadata", None)
+        if callable(metadata_getter) and isinstance(getattr(account, "extra", None), dict):
+            mailbox_context = metadata_getter() or {}
+            if isinstance(mailbox_context, dict) and mailbox_context:
+                account.extra["mailbox_login_context"] = mailbox_context
+        account_extra = (
+            dict(account.extra)
+            if isinstance(getattr(account, "extra", None), dict)
+            else {}
+        )
+        refresh_token = str(
+            account_extra.get("refresh_token")
+            or account_extra.get("refreshToken")
+            or ""
+        ).strip()
+        mark_mailbox_used = getattr(self.mailbox, "mark_account_used", None)
+        mailbox_account = getattr(email_service, "_acct", None)
+        if login_only and refresh_token and callable(mark_mailbox_used):
+            try:
+                marked = mark_mailbox_used(mailbox_account)
+            except Exception as exc:
+                log_fn(
+                    "[WARN] Refresh Token 已获取，但邮箱池消费状态保存失败；"
+                    "当前领取保持不可用，避免重复登录"
+                    f"（{type(exc).__name__}）"
+                )
+            else:
+                if marked is False:
+                    log_fn(
+                        "[WARN] Refresh Token 已获取，但邮箱池消费状态保存失败；"
+                        "当前领取保持不可用，避免重复登录"
+                    )
+        return account
 
     def get_platform_actions(self) -> list:
         return [

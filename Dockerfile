@@ -48,7 +48,7 @@ RUN pip install --upgrade pip \
     && pip install -r requirements.txt \
     && installed=0 \
     && for attempt in 1 2 3; do \
-         if python -m playwright install --with-deps chromium firefox; then \
+         if python -m playwright install --with-deps chromium; then \
            installed=1; \
            break; \
          fi; \
@@ -60,6 +60,7 @@ RUN pip install --upgrade pip \
     && CAMOUFOX_VERSION="$CAMOUFOX_VERSION" CAMOUFOX_RELEASE="$CAMOUFOX_RELEASE" python /tmp/install_camoufox.py
 
 COPY . .
+RUN python /app/scripts/normalize_camoufox_install.py
 COPY --from=frontend-builder /app/static /app/static
 
 RUN apt-get update && apt-get install -y --no-install-recommends dos2unix git iproute2 procps \

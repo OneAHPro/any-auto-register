@@ -1,7 +1,7 @@
 import unittest
 from unittest import mock
 
-from services.external_sync import sync_account
+from services.external_sync import sync_account, sync_codex2api_account
 
 
 class DummyAccount:
@@ -24,6 +24,24 @@ def _config_getter(values: dict[str, str]):
 
 
 class ExternalSyncContributionModeTests(unittest.TestCase):
+    def test_codex2api_sync_reports_status_persistence_failure(self):
+        account = DummyAccount()
+        cfg = {"codex2api_enabled": "1"}
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+            return_value=(True, "远端已更新"),
+        ), mock.patch(
+            "services.external_sync.persist_codex2api_sync_result",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            result = sync_codex2api_account(account)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("同步状态保存失败", result["msg"])
+
     def test_contribution_enabled_uploads_only_to_contribution_server(self):
         account = DummyAccount()
         cfg = {

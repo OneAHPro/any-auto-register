@@ -1,0 +1,1573 @@
+import threading
+import time
+import unittest
+from types import SimpleNamespace
+from unittest import mock
+
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine
+
+from core.base_mailbox import MailboxAccount
+from core.db import AccountModel, OutlookAccountModel
+from core.task_runtime import RegisterTaskControl, StopTaskRequested
+from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
+from services.chatgpt_relogin import (
+    _build_email_service,
+    is_saved_chatgpt_account_relogin_eligible,
+    list_relogin_eligible_account_ids,
+    relogin_chatgpt_account,
+)
+
+
+class ChatGPTReloginTests(unittest.TestCase):
+    def setUp(self):
+        self.engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(self.engine)
+        self.account_id = self._add_account()
+
+    def _add_account(self, *, extra=None, password="chatgpt-password") -> int:
+        account = AccountModel(
+            platform="chatgpt",
+            email="demo@example.com",
+            password=password,
+            user_id="old-user",
+            token="old-at",
+            status="invalid",
+        )
+        account.set_extra(
+            extra
+            or {
+                "access_token": "old-at",
+                "refresh_token": "old-rt",
+                "id_token": "old-id",
+                "chatgpt_local": {"auth": {"state": "access_token_invalidated"}},
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "demo@example.com",
+                    "account_id": "mailbox-1",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                },
+                "sync_statuses": {"cpa": {"uploaded": True}},
+                "keep_me": "preserved",
+            }
+        )
+        with Session(self.engine) as session:
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            return int(account.id)
+
+    def _add_eligibility_account(
+        self,
+        email: str,
+        *,
+        password: str = "",
+        extra: dict | None = None,
+        platform: str = "chatgpt",
+        status: str = "registered",
+        account_refresh_token: str | None = "saved-chatgpt-rt",
+    ) -> int:
+        account = AccountModel(
+            platform=platform,
+            email=email,
+            password=password,
+            status=status,
+        )
+        account_extra = dict(extra or {})
+        if platform == "chatgpt" and account_refresh_token is not None:
+            account_extra.setdefault("refresh_token", account_refresh_token)
+        account.set_extra(account_extra)
+        with Session(self.engine) as session:
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            return int(account.id)
+
+    def test_password_only_account_without_mailbox_context_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "password@example.com",
+            password="saved-password",
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_password_totp_context_is_eligible(self):
+        account_id = self._add_eligibility_account(
+            "mfa@example.com",
+            password="saved-password",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "mfa@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "totp_secret": "MFA-SECRET",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_password_totp_pool_context_uses_recovery_rules(self):
+        account_id = self._add_eligibility_account(
+            "pool-mfa@example.com",
+            password="saved-password",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "pool-mfa@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "pool_file": "mfa.json",
+                    },
+                }
+            },
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.load_applemail_pool_records",
+            return_value=(
+                SimpleNamespace(name="mfa.json"),
+                [
+                    {
+                        "email": "pool-mfa@example.com",
+                        "password": "saved-password",
+                        "totp_secret": "MFA-SECRET",
+                        "account_type": "chatgpt_password_totp",
+                    }
+                ],
+            ),
+        ):
+            self.assertTrue(
+                is_saved_chatgpt_account_relogin_eligible(
+                    account_id,
+                    database_engine=self.engine,
+                    config={"applemail_pool_dir": "mail"},
+                )
+            )
+
+    def test_saved_mailbox_and_mailapi_contexts_are_eligible(self):
+        mailbox_id = self._add_eligibility_account(
+            "mailbox@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "mailbox@example.com",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                }
+            },
+        )
+        mailapi_id = self._add_eligibility_account(
+            "mailapi@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "mailapi@example.com",
+                    "extra": {
+                        "account_type": "mailapi_url",
+                        "mailapi_url": "https://mail.example.test/messages",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                mailbox_id,
+                database_engine=self.engine,
+            )
+        )
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                mailapi_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_saved_mailbox_credentials_without_account_refresh_token_are_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "incomplete@example.com",
+            account_refresh_token=None,
+            extra={
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "incomplete@example.com",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_legacy_camel_case_account_refresh_token_is_eligible(self):
+        account_id = self._add_eligibility_account(
+            "legacy-rt@example.com",
+            account_refresh_token=None,
+            extra={
+                "refresh_token": "   ",
+                "refreshToken": "saved-legacy-rt",
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "legacy-rt@example.com",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                },
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_generic_provider_context_uses_saved_identity_and_global_config(self):
+        skymail_id = self._add_eligibility_account(
+            "saved-skymail@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "skymail",
+                    "email": "saved-skymail@example.com",
+                    "account_id": "saved-skymail@example.com",
+                    "extra": {},
+                }
+            },
+        )
+        laoudo_id = self._add_eligibility_account(
+            "saved-laoudo@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "laoudo",
+                    "email": "saved-laoudo@example.com",
+                    "account_id": "mailbox-account-id",
+                    "extra": {},
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                skymail_id,
+                database_engine=self.engine,
+                config={
+                    "skymail_api_base": "https://mail.example.test",
+                    "skymail_token": "mail-token",
+                    "skymail_domain": "example.test",
+                },
+            )
+        )
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                laoudo_id,
+                database_engine=self.engine,
+                config={"laoudo_auth": "mail-token"},
+            )
+        )
+
+    def test_skymail_saved_identity_without_token_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "missing-skymail-token@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "skymail",
+                    "email": "missing-skymail-token@example.com",
+                    "account_id": "missing-skymail-token@example.com",
+                    "extra": {},
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+                config={
+                    "skymail_api_base": "https://mail.example.test",
+                    "skymail_domain": "example.test",
+                },
+            )
+        )
+
+    def test_configured_generic_providers_require_receive_configuration(self):
+        cases = [
+            (
+                "cloudmail",
+                {"cloudmail_api_base": "https://mail.example.test"},
+                {
+                    "cloudmail_api_base": "https://mail.example.test",
+                    "cloudmail_admin_password": "mail-password",
+                },
+            ),
+            ("laoudo", {}, {"laoudo_auth": "mail-token"}),
+            ("luckmail", {}, {"luckmail_api_key": "mail-token"}),
+            ("maliapi", {}, {"maliapi_api_key": "mail-token"}),
+            (
+                "opentrashmail",
+                {},
+                {"opentrashmail_api_url": "https://mail.example.test"},
+            ),
+            (
+                "cfworker",
+                {},
+                {"cfworker_api_url": "https://mail.example.test"},
+            ),
+        ]
+
+        for index, (provider, incomplete, complete) in enumerate(cases):
+            with self.subTest(provider=provider):
+                account_id = self._add_eligibility_account(
+                    f"configured-{index}@example.com",
+                    extra={
+                        "mailbox_login_context": {
+                            "provider": provider,
+                            "email": f"configured-{index}@example.com",
+                            "account_id": f"mailbox-{index}",
+                            "extra": {},
+                        }
+                    },
+                )
+                self.assertFalse(
+                    is_saved_chatgpt_account_relogin_eligible(
+                        account_id,
+                        database_engine=self.engine,
+                        config=incomplete,
+                    )
+                )
+                self.assertTrue(
+                    is_saved_chatgpt_account_relogin_eligible(
+                        account_id,
+                        database_engine=self.engine,
+                        config=complete,
+                    )
+                )
+
+    def test_public_generic_providers_need_only_persisted_identity(self):
+        for index, provider in enumerate(
+            ("tempmail_lol", "duckmail", "gptmail")
+        ):
+            with self.subTest(provider=provider):
+                account_id = self._add_eligibility_account(
+                    f"public-{index}@example.com",
+                    extra={
+                        "mailbox_login_context": {
+                            "provider": provider,
+                            "email": f"public-{index}@example.com",
+                            "account_id": f"mailbox-{index}",
+                            "extra": {},
+                        }
+                    },
+                )
+                self.assertTrue(
+                    is_saved_chatgpt_account_relogin_eligible(
+                        account_id,
+                        database_engine=self.engine,
+                        config={},
+                    )
+                )
+
+    def test_session_bound_generic_providers_are_not_reconstructable(self):
+        cases = [
+            (
+                "freemail",
+                {
+                    "freemail_api_url": "https://mail.example.test",
+                    "freemail_admin_token": "mail-token",
+                },
+            ),
+            ("moemail", {"moemail_api_key": "mail-token"}),
+        ]
+
+        for index, (provider, config) in enumerate(cases):
+            with self.subTest(provider=provider):
+                account_id = self._add_eligibility_account(
+                    f"session-bound-{index}@example.com",
+                    extra={
+                        "mailbox_login_context": {
+                            "provider": provider,
+                            "email": f"session-bound-{index}@example.com",
+                            "account_id": f"mailbox-{index}",
+                            "extra": {},
+                        }
+                    },
+                )
+                self.assertFalse(
+                    is_saved_chatgpt_account_relogin_eligible(
+                        account_id,
+                        database_engine=self.engine,
+                        config=config,
+                    )
+                )
+
+    def test_generic_provider_context_with_only_unrelated_password_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "generic-password@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "skymail",
+                    "extra": {"password": "unrelated-password"},
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+                config={
+                    "skymail_api_base": "https://mail.example.test",
+                    "skymail_token": "mail-token",
+                    "skymail_domain": "example.test",
+                },
+            )
+        )
+
+    def test_applemail_password_only_context_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "apple-password@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "applemail",
+                    "email": "apple-password@example.com",
+                    "extra": {"password": "mail-password"},
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_applemail_oauth_context_is_eligible(self):
+        account_id = self._add_eligibility_account(
+            "apple-oauth@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "applemail",
+                    "email": "apple-oauth@example.com",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_icloud_password_only_context_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "icloud-password@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "icloud",
+                    "email": "icloud-password@example.com",
+                    "extra": {
+                        "account_type": "icloud_web",
+                        "password": "mail-password",
+                    },
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_icloud_password_mfa_context_is_eligible(self):
+        account_id = self._add_eligibility_account(
+            "icloud-mfa@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "icloud",
+                    "email": "icloud-mfa@example.com",
+                    "extra": {
+                        "account_type": "icloud_web",
+                        "password": "mail-password",
+                        "mfa_secret": "MFA-SECRET",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_mailbox_context_without_provider_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "providerless@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "email": "providerless@example.com",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_password_only_chatgpt_credentials_context_is_not_eligible(self):
+        account_id = self._add_eligibility_account(
+            "password-no-mfa@example.com",
+            password="saved-password",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "password-no-mfa@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                    },
+                }
+            },
+        )
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_enabled_outlook_fallback_is_eligible_without_mutating_account(self):
+        account_id = self._add_eligibility_account("fallback@example.com")
+        with Session(self.engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="fallback@example.com",
+                    password="mail-password",
+                    client_id="mail-client",
+                    refresh_token="mail-refresh",
+                    enabled=True,
+                )
+            )
+            session.commit()
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, account_id)
+            self.assertNotIn("mailbox_login_context", saved.get_extra())
+
+    def test_missing_account_and_missing_credentials_are_not_eligible(self):
+        account_id = self._add_eligibility_account("empty@example.com")
+
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+        self.assertFalse(
+            is_saved_chatgpt_account_relogin_eligible(
+                999_999,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_invalid_status_remains_relogin_eligible(self):
+        account_id = self._add_eligibility_account(
+            "invalid@example.com",
+            password="saved-password",
+            status="invalid",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "invalid@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "totp_secret": "MFA-SECRET",
+                    },
+                }
+            },
+        )
+
+        self.assertTrue(
+            is_saved_chatgpt_account_relogin_eligible(
+                account_id,
+                database_engine=self.engine,
+            )
+        )
+
+    def test_eligible_account_ids_are_filtered_and_deterministic(self):
+        password_mfa_id = self._add_eligibility_account(
+            "z-password@example.com",
+            password="saved-password",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "z-password@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "totp_secret": "MFA-SECRET",
+                    },
+                }
+            },
+        )
+        self._add_eligibility_account("missing@example.com")
+        mailbox_id = self._add_eligibility_account(
+            "a-mailbox@example.com",
+            extra={
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "extra": {
+                        "client_id": "mail-client",
+                        "refresh_token": "mail-refresh",
+                    },
+                }
+            },
+        )
+        self._add_eligibility_account(
+            "other@example.com",
+            password="saved-password",
+            platform="other",
+        )
+
+        self.assertEqual(
+            list_relogin_eligible_account_ids(database_engine=self.engine),
+            [self.account_id, password_mfa_id, mailbox_id],
+        )
+
+    def test_build_email_service_discards_persisted_oauth_access_token_cache(self):
+        saved = {
+            "email": "demo@example.com",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "microsoft",
+                "email": "demo@example.com",
+                "account_id": "mailbox-1",
+                "extra": {
+                    "client_id": "mail-client",
+                    "refresh_token": "mail-refresh",
+                    "_oauth_token_cache": {
+                        "imap": {
+                            "access_token": "stale-access-token",
+                            "expires_at": 9_999_999_999,
+                        }
+                    },
+                },
+            },
+        }
+        mailbox = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ):
+            service = _build_email_service(
+                saved,
+                {},
+                log_fn=None,
+            )
+
+        self.assertNotIn("_oauth_token_cache", service._account.extra)
+        self.assertNotIn(
+            "_oauth_token_cache",
+            service.get_mailbox_metadata()["extra"],
+        )
+
+    def test_persisted_reset_url_service_prefers_email_mfa_without_totp_url(self):
+        from services.chatgpt_relogin import _PersistedEmailService
+
+        service = _PersistedEmailService(
+            mailbox=mock.Mock(),
+            mailbox_account=MailboxAccount(
+                email="reset@example.com",
+                account_id="reset@example.com",
+                extra={
+                    "account_type": "chatgpt_password_reset_url_mail",
+                    "mail_api_url": "https://mail.example.test/mail",
+                },
+            ),
+            mailbox_context={},
+            provider="chatgpt_credentials",
+            log_fn=None,
+        )
+
+        self.assertFalse(service.supports_totp_code())
+
+    @staticmethod
+    def _fresh_tokens():
+        return {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "id_token": "new-id",
+            "session_token": "new-session",
+            "workspace_id": "workspace-1",
+            "account_id": "new-user",
+        }
+
+    def test_full_relogin_persists_new_tokens_before_forced_codex2api_sync(self):
+        observed = {}
+
+        def sync(account, *, force=False, replace_existing=False):
+            with Session(self.engine) as session:
+                saved = session.get(AccountModel, self.account_id)
+                observed["saved_rt"] = saved.get_extra()["refresh_token"]
+                observed["saved_at"] = saved.token
+            observed["force"] = force
+            observed["replace_existing"] = replace_existing
+            observed["upload_rt"] = account.get_extra()["refresh_token"]
+            return {"name": "Codex2API", "ok": True, "msg": "远端账号已更新"}
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=self._fresh_tokens(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            side_effect=sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stage"], "completed")
+        self.assertEqual(observed["saved_rt"], "new-rt")
+        self.assertEqual(observed["saved_at"], "new-at")
+        self.assertEqual(observed["upload_rt"], "new-rt")
+        self.assertTrue(observed["force"])
+        self.assertTrue(observed["replace_existing"])
+
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            extra = saved.get_extra()
+            self.assertEqual(saved.token, "new-at")
+            self.assertEqual(saved.user_id, "new-user")
+            self.assertEqual(saved.status, "registered")
+            self.assertEqual(extra["refresh_token"], "new-rt")
+            self.assertEqual(extra["id_token"], "new-id")
+            self.assertEqual(extra["keep_me"], "preserved")
+            self.assertEqual(extra["sync_statuses"]["cpa"], {"uploaded": True})
+            self.assertNotIn("chatgpt_local", extra)
+
+    def test_login_failure_keeps_old_tokens_and_does_not_sync(self):
+        sync = mock.Mock()
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=RuntimeError("邮箱验证码校验失败"),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["relogin_ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertIn("邮箱验证码校验失败", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.token, "old-at")
+            self.assertEqual(saved.get_extra()["refresh_token"], "old-rt")
+
+    def test_deactivated_signal_from_login_log_interrupts_and_deletes_account(self):
+        logs = []
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            kwargs["log_fn"](
+                '[22:01:53] [登录链路] OTP 无效: {"错误":{"消息":'
+                '"你没有账号，因为它已被删除或停用。如果您认为这是错误，'
+                '请通过电话联系我们"}}'
+            )
+            raise ChatGPTAccountDeactivatedError()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id, log_fn=logs.append)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["relogin_ok"])
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        self.assertIn("已被删除或停用", result["message"])
+        self.assertTrue(any("OTP 无效" in line for line in logs))
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_ordinary_invalid_otp_log_does_not_delete_account(self):
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            kwargs["log_fn"]("[登录链路] OTP 无效: 验证码错误")
+            raise RuntimeError("邮箱验证码校验失败")
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertNotIn("account_removed", result)
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
+
+    def test_diagnostic_log_and_exception_text_do_not_delete_account(self):
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            kwargs["log_fn"](
+                "diagnostic: expected account_deleted but received timeout"
+            )
+            raise RuntimeError(
+                "diagnostic: upstream did not say account has been deleted or deactivated"
+            )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertEqual(result["stage"], "relogin")
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
+
+    def test_typed_deactivated_error_deletes_account_without_log_callback(self):
+        sync = mock.Mock()
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=ChatGPTAccountDeactivatedError(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_database_delete_failure_is_reported_without_claiming_account_removed(self):
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            kwargs["log_fn"]("账号已被删除或停用")
+            raise ChatGPTAccountDeactivatedError()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch.object(
+            Session,
+            "commit",
+            side_effect=RuntimeError("数据库写入失败"),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["account_removed"])
+        self.assertEqual(result["stage"], "account_remove_failed")
+        self.assertIn("本地记录删除失败", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
+
+    def test_reused_account_id_does_not_delete_a_replacement_account(self):
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            with Session(self.engine) as session:
+                original = session.get(AccountModel, self.account_id)
+                session.delete(original)
+                session.commit()
+                replacement = AccountModel(
+                    platform="chatgpt",
+                    email="replacement@example.com",
+                    password="replacement-password",
+                    status="registered",
+                )
+                session.add(replacement)
+                session.commit()
+                session.refresh(replacement)
+                self.assertEqual(replacement.id, self.account_id)
+            kwargs["log_fn"]("账号已被删除或停用")
+            raise ChatGPTAccountDeactivatedError()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["account_removed"])
+        self.assertEqual(result["stage"], "account_remove_failed")
+        self.assertIn("记录已发生变化", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            replacement = session.get(AccountModel, self.account_id)
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.email, "replacement@example.com")
+
+    def test_reused_account_id_does_not_receive_fresh_tokens_or_sync(self):
+        sync = mock.Mock(
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"}
+        )
+
+        def login(saved, **kwargs):
+            del saved, kwargs
+            with Session(self.engine) as session:
+                original = session.get(AccountModel, self.account_id)
+                session.delete(original)
+                session.commit()
+                replacement = AccountModel(
+                    platform="chatgpt",
+                    email="replacement@example.com",
+                    password="replacement-password",
+                    token="replacement-at",
+                    user_id="replacement-user",
+                    status="registered",
+                )
+                replacement.set_extra({"refresh_token": "replacement-rt"})
+                session.add(replacement)
+                session.commit()
+                session.refresh(replacement)
+                self.assertEqual(replacement.id, self.account_id)
+            return self._fresh_tokens()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertIn("记录已发生变化", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            replacement = session.get(AccountModel, self.account_id)
+            self.assertIsNotNone(replacement)
+            self.assertEqual(replacement.email, "replacement@example.com")
+            self.assertEqual(replacement.token, "replacement-at")
+            self.assertEqual(replacement.user_id, "replacement-user")
+            self.assertEqual(replacement.get_extra()["refresh_token"], "replacement-rt")
+
+    def test_log_observer_failure_does_not_hide_completed_account_removal(self):
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=ChatGPTAccountDeactivatedError(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+        ) as sync:
+            result = relogin_chatgpt_account(
+                self.account_id,
+                log_fn=mock.Mock(side_effect=RuntimeError("日志观察器失败")),
+            )
+
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_parallel_relogins_serialize_codex2api_replacement(self):
+        login_barrier = threading.Barrier(2)
+        sync_state_lock = threading.Lock()
+        sync_active = 0
+        sync_max_active = 0
+        results = []
+
+        def load(account_id):
+            return {
+                "id": int(account_id),
+                "email": f"account-{account_id}@example.com",
+                "created_at": None,
+                "password": "password",
+                "extra": {},
+                "mailbox_context": {"provider": "microsoft"},
+            }
+
+        def login(saved, **kwargs):
+            login_barrier.wait(timeout=1)
+            return self._fresh_tokens()
+
+        def persist(account_id, tokens, **kwargs):
+            del tokens, kwargs
+            return SimpleNamespace(
+                id=account_id,
+                email=f"account-{account_id}@example.com",
+            )
+
+        def sync(account, **kwargs):
+            del account, kwargs
+            nonlocal sync_active, sync_max_active
+            with sync_state_lock:
+                sync_active += 1
+                sync_max_active = max(sync_max_active, sync_active)
+            time.sleep(0.05)
+            with sync_state_lock:
+                sync_active -= 1
+            return {"name": "Codex2API", "ok": True, "msg": "ok"}
+
+        with mock.patch(
+            "services.chatgpt_relogin._load_saved_account",
+            side_effect=load,
+        ), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin._persist_fresh_tokens",
+            side_effect=persist,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            side_effect=sync,
+        ) as sync_mock:
+            workers = [
+                threading.Thread(
+                    target=lambda account_id=account_id: results.append(
+                        relogin_chatgpt_account(account_id)
+                    )
+                )
+                for account_id in (101, 102)
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2)
+
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["ok"] for result in results))
+        self.assertEqual(sync_mock.call_count, 2)
+        self.assertEqual(sync_max_active, 1)
+
+    def test_sync_failure_reports_partial_failure_but_keeps_fresh_tokens(self):
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=self._fresh_tokens(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": False, "msg": "远端更新超时"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["relogin_ok"])
+        self.assertEqual(result["stage"], "codex2api_sync")
+        self.assertIn("远端更新超时", result["message"])
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.get_extra()["refresh_token"], "new-rt")
+
+    def test_sync_exception_still_reports_relogin_as_successful(self):
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=self._fresh_tokens(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            side_effect=RuntimeError("同步状态落库失败"),
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["relogin_ok"])
+        self.assertEqual(result["stage"], "codex2api_sync")
+        self.assertIn("同步状态落库失败", result["message"])
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.get_extra()["refresh_token"], "new-rt")
+
+    def test_fresh_login_clears_stale_optional_identity_tokens(self):
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            extra = saved.get_extra()
+            extra.update(
+                {
+                    "session_token": "old-session",
+                    "workspace_id": "old-workspace",
+                    "account_id": "old-account",
+                    "idToken": "old-id-camel",
+                    "workspaceId": "old-workspace-camel",
+                    "accountId": "old-account-camel",
+                }
+            )
+            saved.set_extra(extra)
+            session.add(saved)
+            session.commit()
+
+        fresh_tokens = {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+            "id_token": "",
+            "session_token": "",
+            "workspace_id": "",
+            "account_id": "",
+        }
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=fresh_tokens,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            extra = saved.get_extra()
+            self.assertEqual(saved.user_id, "")
+            for key in (
+                "id_token",
+                "idToken",
+                "session_token",
+                "workspace_id",
+                "workspaceId",
+                "account_id",
+                "accountId",
+            ):
+                self.assertNotIn(key, extra)
+
+    def test_same_account_cannot_run_two_relogins_concurrently(self):
+        first_login_started = threading.Event()
+        release_first_login = threading.Event()
+        first_result = []
+
+        def login(saved, **kwargs):
+            first_login_started.set()
+            release_first_login.wait(timeout=2)
+            return self._fresh_tokens()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ) as login_mock, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ) as sync:
+            worker = threading.Thread(
+                target=lambda: first_result.append(
+                    relogin_chatgpt_account(self.account_id)
+                )
+            )
+            worker.start()
+            self.assertTrue(first_login_started.wait(timeout=1))
+            overlapping = relogin_chatgpt_account(self.account_id)
+            release_first_login.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(overlapping["ok"])
+        self.assertIn("正在重登", overlapping["message"])
+        self.assertTrue(first_result[0]["ok"])
+        self.assertEqual(login_mock.call_count, 1)
+        sync.assert_called_once()
+
+    def test_task_interruption_is_propagated_instead_of_reported_as_login_failure(self):
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=StopTaskRequested(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+        ) as sync:
+            with self.assertRaises(StopTaskRequested):
+                relogin_chatgpt_account(self.account_id)
+
+        sync.assert_not_called()
+
+    def test_stop_after_login_does_not_persist_fresh_tokens(self):
+        control = RegisterTaskControl()
+        sync = mock.Mock()
+
+        def login(saved, **kwargs):
+            del saved, kwargs
+            control.request_stop()
+            return self._fresh_tokens()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            with self.assertRaises(StopTaskRequested):
+                relogin_chatgpt_account(
+                    self.account_id,
+                    task_control=control,
+                    attempt_id=control.start_attempt(),
+                )
+
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.token, "old-at")
+            self.assertEqual(saved.get_extra()["refresh_token"], "old-rt")
+
+    def test_stop_after_token_persist_still_completes_codex2api_sync(self):
+        control = RegisterTaskControl()
+        sync = mock.Mock(
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"}
+        )
+
+        def persist(account_id, tokens, **kwargs):
+            del tokens, kwargs
+            control.request_stop()
+            return SimpleNamespace(
+                id=account_id,
+                email="demo@example.com",
+            )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=self._fresh_tokens(),
+        ), mock.patch(
+            "services.chatgpt_relogin._persist_fresh_tokens",
+            side_effect=persist,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(
+                self.account_id,
+                task_control=control,
+                attempt_id=control.start_attempt(),
+            )
+
+        self.assertTrue(result["ok"])
+        sync.assert_called_once()
+
+    def test_missing_mailbox_context_fails_with_account_specific_message(self):
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            saved.set_extra({"access_token": "old-at", "refresh_token": "old-rt"})
+            session.add(saved)
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+        ) as sync:
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertIn("demo@example.com", result["message"])
+        self.assertIn("邮箱登录凭据", result["message"])
+        sync.assert_not_called()
+
+    def test_password_totp_context_recovers_secret_from_original_pool_record(self):
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            saved.set_extra(
+                {
+                    "access_token": "old-at",
+                    "refresh_token": "old-rt",
+                    "mailbox_login_context": {
+                        "provider": "chatgpt_credentials",
+                        "email": "demo@example.com",
+                        "extra": {
+                            "account_type": "chatgpt_password_totp",
+                            "pool_file": "mfa.json",
+                        },
+                    },
+                }
+            )
+            session.add(saved)
+            session.commit()
+
+        captured = {}
+
+        class Adapter:
+            def run(self, context):
+                captured["email_info"] = context.email_service.create_email()
+                captured["extra"] = context.extra_config
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.load_applemail_pool_records",
+            return_value=(
+                SimpleNamespace(name="mfa.json"),
+                [
+                    {
+                        "email": "demo@example.com",
+                        "password": "chatgpt-password",
+                        "totp_secret": "JBSWY3DPEHPK3PXP",
+                        "account_type": "chatgpt_password_totp",
+                    }
+                ],
+            ),
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=Adapter(),
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"applemail_pool_dir": "mail", "default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(captured["email_info"]["password"], "chatgpt-password")
+        self.assertEqual(
+            captured["email_info"]["totp_secret"],
+            "JBSWY3DPEHPK3PXP",
+        )
+        self.assertTrue(captured["extra"]["chatgpt_existing_account_login_only"])
+        self.assertEqual(
+            captured["extra"]["chatgpt_existing_account_login_stage"],
+            "refresh_token",
+        )
+
+    def test_totp_recovery_rejects_same_email_with_wrong_pool_record_type(self):
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            saved.set_extra(
+                {
+                    "access_token": "old-at",
+                    "refresh_token": "old-rt",
+                    "mailbox_login_context": {
+                        "provider": "chatgpt_credentials",
+                        "email": "demo@example.com",
+                        "extra": {
+                            "account_type": "chatgpt_password_totp",
+                            "pool_file": "mfa.json",
+                        },
+                    },
+                }
+            )
+            session.add(saved)
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.load_applemail_pool_records",
+            return_value=(
+                SimpleNamespace(name="mfa.json"),
+                [
+                    {
+                        "email": "demo@example.com",
+                        "password": "apple-password",
+                        "mfa_secret": "JBSWY3DPEHPK3PXP",
+                        "account_type": "icloud_web",
+                    }
+                ],
+            ),
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"applemail_pool_dir": "mail"},
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+        ) as adapter, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+        ) as sync:
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("凭据类型", result["message"])
+        adapter.assert_not_called()
+        sync.assert_not_called()
+
+    def test_relogin_persists_mailbox_context_updated_during_otp_login(self):
+        updated_context = {
+            "provider": "microsoft",
+            "email": "demo@example.com",
+            "account_id": "mailbox-1",
+            "extra": {
+                "client_id": "mail-client",
+                "refresh_token": "mail-refresh-rotated",
+            },
+        }
+
+        class EmailService:
+            service_type = SimpleNamespace(value="microsoft")
+
+            def get_mailbox_metadata(self):
+                return updated_context
+
+        class Adapter:
+            def run(self, context):
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                    metadata={},
+                )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=EmailService(),
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=Adapter(),
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(
+                saved.get_extra()["mailbox_login_context"],
+                updated_context,
+            )
+
+    def test_relogin_reuses_global_mailbox_endpoint_configuration(self):
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            extra = saved.get_extra()
+            extra["mailbox_login_context"] = {
+                "provider": "applemail",
+                "email": "demo@example.com",
+                "account_id": "demo@example.com",
+                "extra": {
+                    "client_id": "mail-client",
+                    "refresh_token": "mail-refresh",
+                },
+            }
+            saved.set_extra(extra)
+            session.add(saved)
+            session.commit()
+
+        class Mailbox:
+            def get_current_ids(self, account):
+                return set()
+
+            def wait_for_code(self, account, **kwargs):
+                return "123456"
+
+        class Adapter:
+            def run(self, context):
+                context.email_service.create_email()
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                    metadata={},
+                )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=Mailbox(),
+        ) as create_mailbox_mock, mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=Adapter(),
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={
+                "default_executor": "headless",
+                "applemail_base_url": "https://mail.example.test",
+            },
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        mailbox_config = create_mailbox_mock.call_args.kwargs["extra"]
+        self.assertEqual(
+            mailbox_config["applemail_base_url"],
+            "https://mail.example.test",
+        )
+        self.assertEqual(mailbox_config["client_id"], "mail-client")
+
+
+if __name__ == "__main__":
+    unittest.main()

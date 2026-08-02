@@ -1,0 +1,1080 @@
+"""Re-login saved ChatGPT accounts and replace their Codex2API credentials."""
+
+from __future__ import annotations
+
+import threading
+import time
+from datetime import datetime, timezone
+from typing import Any, Callable, Mapping
+
+from sqlalchemy import delete, func, update
+from sqlmodel import Session, select
+
+from core.applemail_pool import load_applemail_pool_records
+from core.base_mailbox import MailboxAccount, create_mailbox
+from core.config_store import config_store
+from core.db import AccountModel, OutlookAccountModel, engine
+from core.task_runtime import TaskInterruption
+from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+    ChatGPTRegistrationContext,
+    build_chatgpt_registration_mode_adapter,
+)
+from services.chatgpt_account_state import (
+    ChatGPTAccountDeactivatedError,
+    account_is_visible_in_default_list,
+)
+from services.external_sync import sync_codex2api_account
+
+
+LogFn = Callable[[str], None]
+_ACCOUNT_RELOGIN_LOCKS_GUARD = threading.Lock()
+_ACCOUNT_RELOGIN_LOCKS: dict[int | str, threading.Lock] = {}
+_CODEX2API_RELOGIN_SYNC_LOCK = threading.Lock()
+
+
+def _text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _emit(log_fn: LogFn | None, message: str) -> None:
+    if callable(log_fn):
+        log_fn(str(message))
+
+
+def _emit_observer(log_fn: LogFn | None, message: str) -> None:
+    """A logging observer must never change a completed business operation."""
+    try:
+        _emit(log_fn, message)
+    except Exception:
+        return
+
+
+def _checkpoint_task(task_control, attempt_id: int | None) -> None:
+    if task_control is not None:
+        task_control.checkpoint(attempt_id=attempt_id)
+
+
+def _mailbox_context_from_outlook(
+    session: Session,
+    email: str,
+) -> dict[str, Any] | None:
+    imported = session.exec(
+        select(OutlookAccountModel)
+        .where(func.lower(OutlookAccountModel.email) == email.lower())
+        .where(OutlookAccountModel.enabled == True)  # noqa: E712
+    ).first()
+    if imported is None:
+        return None
+    return {
+        "provider": "microsoft",
+        "email": _text(imported.email) or email,
+        "account_id": _text(imported.id),
+        "extra": {
+            "provider": "microsoft",
+            "password": str(imported.password or ""),
+            "client_id": _text(imported.client_id),
+            "refresh_token": _text(imported.refresh_token),
+            "account_type": _text(imported.account_type) or "microsoft_oauth",
+            "mailapi_url": _text(imported.mailapi_url),
+        },
+    }
+
+
+def _resolve_saved_mailbox_provider(
+    mailbox_context: Mapping[str, Any],
+    context_extra: Mapping[str, Any],
+) -> tuple[str, str]:
+    provider = _text(mailbox_context.get("provider")).lower()
+    if provider == "custom_provider":
+        provider = _text(context_extra.get("provider")).lower()
+    account_type = _text(context_extra.get("account_type")).lower()
+    return provider, account_type
+
+
+_PUBLIC_RECEIVE_PROVIDERS = frozenset(
+    {"tempmail_lol", "duckmail", "gptmail"}
+)
+_SESSION_BOUND_RECEIVE_PROVIDERS = frozenset({"freemail", "moemail"})
+
+
+def _merged_saved_mailbox_config(
+    config: Mapping[str, Any] | None,
+    context_extra: Mapping[str, Any],
+) -> dict[str, Any] | None:
+    if config is None:
+        try:
+            merged = dict(config_store.get_all() or {})
+        except Exception:
+            return None
+    else:
+        merged = dict(config)
+    merged.update(context_extra)
+    return merged
+
+
+def _provider_receive_config_is_usable(
+    provider: str,
+    mailbox_config: Mapping[str, Any],
+) -> bool:
+    """Validate receive-time configuration without constructing a mailbox."""
+
+    if provider in _SESSION_BOUND_RECEIVE_PROVIDERS:
+        return False
+    if provider in _PUBLIC_RECEIVE_PROVIDERS:
+        return True
+    if provider == "skymail":
+        return bool(_text(mailbox_config.get("skymail_token")))
+    if provider == "cloudmail":
+        api_base = _text(
+            mailbox_config.get("cloudmail_api_base")
+            or mailbox_config.get("base_url")
+        )
+        admin_password = _text(
+            mailbox_config.get("cloudmail_admin_password")
+            or mailbox_config.get("admin_password")
+            or mailbox_config.get("api_key")
+        )
+        return bool(api_base and admin_password)
+    if provider == "maliapi":
+        return bool(_text(mailbox_config.get("maliapi_api_key")))
+    if provider == "opentrashmail":
+        return bool(_text(mailbox_config.get("opentrashmail_api_url")))
+    if provider == "cfworker":
+        return bool(_text(mailbox_config.get("cfworker_api_url")))
+    if provider == "luckmail":
+        return bool(_text(mailbox_config.get("luckmail_api_key")))
+    return bool(_text(mailbox_config.get("laoudo_auth")))
+
+
+def _mailbox_context_has_usable_credentials(
+    saved: dict[str, Any],
+    mailbox_context: object,
+    config: Mapping[str, Any] | None,
+) -> bool:
+    if not isinstance(mailbox_context, dict) or not mailbox_context:
+        return False
+    context_extra = mailbox_context.get("extra")
+    if not isinstance(context_extra, dict):
+        return False
+    provider, account_type = _resolve_saved_mailbox_provider(
+        mailbox_context,
+        context_extra,
+    )
+    if account_type in {
+        "chatgpt_password_url_otp",
+        "chatgpt_password_reset_url_mail",
+    }:
+        recovery_config = dict(config or {})
+        if config is None:
+            try:
+                recovery_config = dict(config_store.get_all() or {})
+            except Exception:
+                return False
+        try:
+            credentials = _recover_url_login_credentials(
+                saved,
+                mailbox_context,
+                recovery_config,
+            )
+        except Exception:
+            return False
+        return bool(
+            credentials.get("mail_api_url")
+            and credentials.get("password")
+            and not credentials.get("password_reset_required")
+        )
+    if provider == "chatgpt_credentials" or account_type == "chatgpt_password_totp":
+        recovery_config = dict(config or {})
+        if config is None and not _text(
+            context_extra.get("totp_secret")
+            or context_extra.get("mfa_secret")
+            or context_extra.get("totp")
+        ) and _text(context_extra.get("pool_file")):
+            try:
+                recovery_config = dict(config_store.get_all() or {})
+            except Exception:
+                return False
+        try:
+            _recover_password_totp_credentials(
+                saved,
+                mailbox_context,
+                recovery_config,
+            )
+        except Exception:
+            return False
+        return True
+    if provider == "icloud" or account_type == "icloud_web":
+        return bool(
+            _text(context_extra.get("password"))
+            and _text(context_extra.get("mfa_secret"))
+        )
+    if provider == "applemail":
+        return bool(
+            _text(context_extra.get("client_id"))
+            and _text(context_extra.get("refresh_token"))
+        )
+    if provider in {"outlook", "microsoft"}:
+        return bool(
+            _text(context_extra.get("password"))
+            or (
+                _text(context_extra.get("client_id"))
+                and _text(context_extra.get("refresh_token"))
+            )
+            or _text(context_extra.get("mailapi_url"))
+        )
+    if not provider:
+        return False
+    has_persisted_identity = bool(
+        _text(mailbox_context.get("email"))
+        or _text(mailbox_context.get("account_id"))
+    )
+    if not has_persisted_identity:
+        return False
+    mailbox_config = _merged_saved_mailbox_config(config, context_extra)
+    return bool(
+        mailbox_config is not None
+        and _provider_receive_config_is_usable(provider, mailbox_config)
+    )
+
+
+def _outlook_account_has_usable_credentials(account: OutlookAccountModel) -> bool:
+    return bool(
+        _text(account.password)
+        or (_text(account.client_id) and _text(account.refresh_token))
+        or _text(account.mailapi_url)
+    )
+
+
+def _is_saved_chatgpt_account_relogin_eligible_in_session(
+    session: Session,
+    account: AccountModel | None,
+    config: Mapping[str, Any] | None,
+) -> bool:
+    if (
+        account is None
+        or account.platform != "chatgpt"
+        or not _text(account.email)
+        or not account_is_visible_in_default_list(account)
+    ):
+        return False
+    try:
+        extra = dict(account.get_extra() or {})
+    except Exception:
+        return False
+    mailbox_context = extra.get("mailbox_login_context")
+    if isinstance(mailbox_context, dict) and mailbox_context:
+        return _mailbox_context_has_usable_credentials(
+            {
+                "email": _text(account.email),
+                "password": str(account.password or ""),
+                "extra": extra,
+            },
+            mailbox_context,
+            config,
+        )
+    imported = session.exec(
+        select(OutlookAccountModel)
+        .where(func.lower(OutlookAccountModel.email) == _text(account.email).lower())
+        .where(OutlookAccountModel.enabled == True)  # noqa: E712
+    ).first()
+    return bool(
+        imported is not None
+        and _outlook_account_has_usable_credentials(imported)
+    )
+
+
+def is_saved_chatgpt_account_relogin_eligible(
+    account_id: int,
+    *,
+    session: Session | None = None,
+    database_engine=None,
+    config: Mapping[str, Any] | None = None,
+) -> bool:
+    """Return whether a saved account has a usable re-login path.
+
+    The result contains no credential material and performs no writes.
+    """
+
+    try:
+        normalized_id = int(account_id)
+    except (TypeError, ValueError):
+        return False
+    if session is not None:
+        return _is_saved_chatgpt_account_relogin_eligible_in_session(
+            session,
+            session.get(AccountModel, normalized_id),
+            config,
+        )
+    resolved_engine = engine if database_engine is None else database_engine
+    with Session(resolved_engine) as owned_session:
+        return _is_saved_chatgpt_account_relogin_eligible_in_session(
+            owned_session,
+            owned_session.get(AccountModel, normalized_id),
+            config,
+        )
+
+
+def list_relogin_eligible_account_ids(
+    *,
+    session: Session | None = None,
+    database_engine=None,
+    config: Mapping[str, Any] | None = None,
+) -> list[int]:
+    """List eligible local ChatGPT account IDs in deterministic ID order."""
+
+    def _list(active_session: Session) -> list[int]:
+        accounts = active_session.exec(
+            select(AccountModel)
+            .where(AccountModel.platform == "chatgpt")
+            .order_by(AccountModel.id)
+        ).all()
+        return [
+            int(account.id)
+            for account in accounts
+            if account.id is not None
+            and _is_saved_chatgpt_account_relogin_eligible_in_session(
+                active_session,
+                account,
+                config,
+            )
+        ]
+
+    if session is not None:
+        return _list(session)
+    resolved_engine = engine if database_engine is None else database_engine
+    with Session(resolved_engine) as owned_session:
+        return _list(owned_session)
+
+
+def _load_saved_account(account_id: int) -> dict[str, Any]:
+    try:
+        normalized_id = int(account_id)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("ChatGPT 账号 ID 无效") from exc
+
+    with Session(engine) as session:
+        account = session.get(AccountModel, normalized_id)
+        if account is None or account.platform != "chatgpt":
+            raise RuntimeError("ChatGPT 账号不存在")
+        email = _text(account.email)
+        if not email:
+            raise RuntimeError("ChatGPT 账号邮箱未填写")
+        extra = dict(account.get_extra() or {})
+        mailbox_context = extra.get("mailbox_login_context")
+        if not isinstance(mailbox_context, dict) or not mailbox_context:
+            mailbox_context = _mailbox_context_from_outlook(session, email)
+            if mailbox_context:
+                extra["mailbox_login_context"] = mailbox_context
+                account.set_extra(extra)
+                account.updated_at = datetime.now(timezone.utc)
+                session.add(account)
+                session.commit()
+        return {
+            "id": normalized_id,
+            "email": email,
+            "created_at": account.created_at,
+            "password": str(account.password or ""),
+            "extra": extra,
+            "mailbox_context": mailbox_context,
+        }
+
+
+def _recover_password_totp_credentials(
+    saved: dict[str, Any],
+    mailbox_context: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, str]:
+    email = _text(mailbox_context.get("email")) or saved["email"]
+    context_extra = dict(mailbox_context.get("extra") or {})
+    password = str(context_extra.get("password") or saved.get("password") or "")
+    totp_secret = _text(
+        context_extra.get("totp_secret")
+        or context_extra.get("mfa_secret")
+        or context_extra.get("totp")
+    )
+
+    if not totp_secret:
+        pool_file = _text(context_extra.get("pool_file"))
+        if not pool_file:
+            raise RuntimeError(
+                f"账号 {email} 缺少邮箱登录凭据：未保存 MFA 秘钥来源"
+            )
+        try:
+            _path, records = load_applemail_pool_records(
+                pool_file=pool_file,
+                pool_dir=_text(config.get("applemail_pool_dir")) or "mail",
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"账号 {email} 的邮箱登录凭据读取失败: {exc}"
+            ) from exc
+        email_records = [
+            item
+            for item in records
+            if _text(item.get("email")).lower() == email.lower()
+        ]
+        if not email_records:
+            raise RuntimeError(
+                f"账号 {email} 在邮箱凭据池 {pool_file} 中不存在"
+            )
+        record = next(
+            (
+                item
+                for item in email_records
+                if _text(item.get("account_type")).lower()
+                == "chatgpt_password_totp"
+            ),
+            None,
+        )
+        if record is None:
+            raise RuntimeError(
+                f"账号 {email} 的凭据类型不是 ChatGPT 密码 + MFA"
+            )
+        password = str(record.get("password") or password)
+        totp_secret = _text(
+            record.get("totp_secret")
+            or record.get("mfa_secret")
+            or record.get("totp")
+        )
+
+    if not password or not totp_secret:
+        raise RuntimeError(f"账号 {email} 缺少邮箱登录凭据：密码或 MFA 秘钥为空")
+    return {
+        "email": email,
+        "password": password,
+        "totp_secret": totp_secret,
+    }
+
+
+def _recover_url_login_credentials(
+    saved: dict[str, Any],
+    mailbox_context: dict[str, Any],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    email = _text(mailbox_context.get("email")) or saved["email"]
+    context_extra = dict(mailbox_context.get("extra") or {})
+    pool_file = _text(context_extra.get("pool_file"))
+    if not pool_file:
+        raise RuntimeError(f"账号 {email} 缺少 URL 邮箱凭据来源")
+    _path, records = load_applemail_pool_records(
+        pool_file=pool_file,
+        pool_dir=_text(config.get("applemail_pool_dir")) or "mail",
+    )
+    record = next((
+        item
+        for item in records
+        if _text(item.get("email")).lower() == email.lower()
+        and _text(item.get("account_type")).lower() in {
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+        }
+    ), None)
+    if record is None:
+        raise RuntimeError(f"账号 {email} 在 URL 邮箱凭据池中不存在")
+    return {
+        "email": email,
+        "password": str(record.get("password") or ""),
+        "mail_api_url": _text(record.get("mail_api_url")),
+        "totp_url": _text(record.get("totp_url")),
+        "account_type": _text(record.get("account_type")),
+        "password_reset_required": bool(record.get("password_reset_required", False)),
+        "pool_file": pool_file,
+    }
+
+
+class _PasswordTotpEmailService:
+    service_type = type("ServiceType", (), {"value": "chatgpt_credentials"})()
+
+    def __init__(
+        self,
+        credentials: dict[str, str],
+        mailbox_context: dict[str, Any],
+    ) -> None:
+        self._credentials = credentials
+        self._mailbox_context = mailbox_context
+
+    def create_email(self, config=None):
+        del config
+        return {
+            "email": self._credentials["email"],
+            "service_id": self._credentials["email"],
+            "token": "",
+            "account_type": "chatgpt_password_totp",
+            "password": self._credentials["password"],
+            "totp_secret": self._credentials["totp_secret"],
+        }
+
+    def get_verification_code(self, **kwargs):
+        del kwargs
+        raise RuntimeError("当前账号使用密码 + MFA 重登，不读取邮箱验证码")
+
+    def get_mailbox_metadata(self):
+        return dict(self._mailbox_context)
+
+
+class _PersistedEmailService:
+    def __init__(
+        self,
+        *,
+        mailbox,
+        mailbox_account: MailboxAccount,
+        mailbox_context: dict[str, Any],
+        provider: str,
+        log_fn: LogFn | None,
+    ) -> None:
+        self.service_type = type("ServiceType", (), {"value": provider})()
+        self._mailbox = mailbox
+        self._account = mailbox_account
+        self._mailbox_context = mailbox_context
+        self._log_fn = log_fn
+        self._before_ids: set[Any] = set()
+        self._baseline_ready = threading.Event()
+        self._baseline_started = False
+
+    def _load_baseline(self) -> None:
+        try:
+            self._before_ids = set(
+                self._mailbox.get_current_ids(self._account) or []
+            )
+        except Exception as exc:
+            self._before_ids = set()
+            _emit(
+                self._log_fn,
+                f"邮箱旧邮件基线读取失败，将继续等待新验证码: {exc}",
+            )
+        finally:
+            self._baseline_ready.set()
+
+    def create_email(self, config=None):
+        del config
+        if not self._baseline_started:
+            self._baseline_started = True
+            threading.Thread(
+                target=self._load_baseline,
+                name="chatgpt-relogin-mailbox-baseline",
+                daemon=True,
+            ).start()
+        result = {
+            "email": self._account.email,
+            "service_id": self._account.account_id,
+            "token": "",
+        }
+        account_extra = dict(self._account.extra or {})
+        account_type = _text(account_extra.get("account_type"))
+        if account_type in {
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+        }:
+            result.update({
+                "account_type": account_type,
+                "password": str(account_extra.get("password") or ""),
+                "mail_api_url": _text(account_extra.get("mail_api_url")),
+                "totp_url": _text(account_extra.get("totp_url")),
+                "password_reset_required": bool(
+                    account_extra.get("password_reset_required", False)
+                ),
+            })
+        return result
+
+    def get_verification_code(
+        self,
+        email=None,
+        email_id=None,
+        timeout=120,
+        pattern=None,
+        otp_sent_at=None,
+        exclude_codes=None,
+    ):
+        del email, email_id
+        requested_timeout = max(int(timeout or 120), 1)
+        started_at = time.monotonic()
+        self._baseline_ready.wait(timeout=min(requested_timeout, 30))
+        elapsed = int(max(time.monotonic() - started_at, 0))
+        return self._mailbox.wait_for_code(
+            self._account,
+            keyword="",
+            timeout=max(requested_timeout - elapsed, 1),
+            before_ids=set(self._before_ids),
+            code_pattern=pattern,
+            otp_sent_at=otp_sent_at,
+            exclude_codes=exclude_codes,
+        )
+
+    def get_mailbox_metadata(self):
+        context = dict(self._mailbox_context)
+        context["email"] = self._account.email
+        context["account_id"] = self._account.account_id
+        context_extra = dict(self._account.extra or {})
+        context_extra.pop("_oauth_token_cache", None)
+        context["extra"] = context_extra
+        return context
+
+    def get_totp_code(self):
+        getter = getattr(self._mailbox, "get_totp_code", None)
+        if not callable(getter):
+            raise RuntimeError("当前邮箱后端不支持远程 2FA")
+        return getter(self._account)
+
+    def supports_totp_code(self) -> bool:
+        account_extra = dict(self._account.extra or {})
+        return bool(_text(account_extra.get("totp_url")))
+
+
+def _build_email_service(
+    saved: dict[str, Any],
+    config: dict[str, Any],
+    *,
+    log_fn: LogFn | None,
+    task_control=None,
+    attempt_id: int | None = None,
+):
+    mailbox_context = saved.get("mailbox_context")
+    if not isinstance(mailbox_context, dict) or not mailbox_context:
+        raise RuntimeError(
+            f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
+        )
+    context_extra = dict(mailbox_context.get("extra") or {})
+    provider, account_type = _resolve_saved_mailbox_provider(
+        mailbox_context,
+        context_extra,
+    )
+    if account_type in {
+        "chatgpt_password_url_otp",
+        "chatgpt_password_reset_url_mail",
+    }:
+        credentials = _recover_url_login_credentials(
+            saved,
+            mailbox_context,
+            config,
+        )
+        mailbox_config = dict(config)
+        mailbox_config.update({
+            "applemail_pool_file": credentials["pool_file"],
+            "applemail_pool_dir": _text(config.get("applemail_pool_dir")) or "mail",
+        })
+        proxy = _text(saved["extra"].get("proxy_used")) or None
+        mailbox = create_mailbox("applemail", extra=mailbox_config, proxy=proxy)
+        setattr(mailbox, "_log_fn", log_fn)
+        mailbox_account = mailbox.get_email_by_address(credentials["email"])
+        return _PersistedEmailService(
+            mailbox=mailbox,
+            mailbox_account=mailbox_account,
+            mailbox_context=mailbox_context,
+            provider="chatgpt_credentials",
+            log_fn=log_fn,
+        )
+    if provider == "chatgpt_credentials" or account_type == "chatgpt_password_totp":
+        credentials = _recover_password_totp_credentials(
+            saved,
+            mailbox_context,
+            config,
+        )
+        return _PasswordTotpEmailService(credentials, mailbox_context)
+
+    if provider in {"outlook", "microsoft"}:
+        provider = "microsoft"
+        context_extra.pop("_oauth_token_cache", None)
+    elif provider == "icloud":
+        provider = "applemail"
+        context_extra.setdefault("account_type", "icloud_web")
+    if not provider:
+        raise RuntimeError(f"账号 {saved['email']} 的邮箱登录凭据来源为空")
+
+    proxy = _text(saved["extra"].get("proxy_used")) or None
+    mailbox_config = dict(config)
+    mailbox_config.update(context_extra)
+    mailbox = create_mailbox(provider, extra=mailbox_config, proxy=proxy)
+    setattr(mailbox, "_log_fn", log_fn)
+    if task_control is not None:
+        setattr(mailbox, "_task_control", task_control)
+        setattr(mailbox, "_task_attempt_token", attempt_id)
+    mailbox_account = MailboxAccount(
+        email=_text(mailbox_context.get("email")) or saved["email"],
+        account_id=_text(mailbox_context.get("account_id")),
+        extra=context_extra,
+    )
+    return _PersistedEmailService(
+        mailbox=mailbox,
+        mailbox_account=mailbox_account,
+        mailbox_context=mailbox_context,
+        provider=provider,
+        log_fn=log_fn,
+    )
+
+
+def _login_with_saved_credentials(
+    saved: dict[str, Any],
+    *,
+    log_fn: LogFn | None = None,
+    task_control=None,
+    attempt_id: int | None = None,
+) -> dict[str, Any]:
+    mailbox_context = saved.get("mailbox_context")
+    if not isinstance(mailbox_context, dict) or not mailbox_context:
+        raise RuntimeError(
+            f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
+        )
+    config = dict(config_store.get_all() or {})
+    email_service = _build_email_service(
+        saved,
+        config,
+        log_fn=log_fn,
+        task_control=task_control,
+        attempt_id=attempt_id,
+    )
+    extra_config = dict(config)
+    extra_config.update(
+        {
+            "chatgpt_registration_mode": "refresh_token",
+            "chatgpt_has_refresh_token_solution": True,
+            "chatgpt_existing_account_login_only": True,
+            "chatgpt_existing_account_login_stage": "refresh_token",
+            "chatgpt_existing_account_allow_phone_verification": False,
+        }
+    )
+    try:
+        max_retries = max(int(config.get("register_max_retries") or 3), 1)
+    except (TypeError, ValueError):
+        max_retries = 3
+
+    adapter = build_chatgpt_registration_mode_adapter(extra_config)
+    result = adapter.run(
+        ChatGPTRegistrationContext(
+            email_service=email_service,
+            proxy_url=_text(saved["extra"].get("proxy_used")) or None,
+            callback_logger=log_fn or (lambda _message: None),
+            email=saved["email"],
+            password=str(saved.get("password") or ""),
+            browser_mode=_text(config.get("default_executor")) or "headless",
+            max_retries=max_retries,
+            extra_config=extra_config,
+        )
+    )
+    if not bool(getattr(result, "success", False)):
+        detail = _text(getattr(result, "error_message", "")) or "认证服务未返回成功状态"
+        raise RuntimeError(detail)
+
+    tokens = {
+        "access_token": _text(getattr(result, "access_token", "")),
+        "refresh_token": _text(getattr(result, "refresh_token", "")),
+        "id_token": _text(getattr(result, "id_token", "")),
+        "session_token": _text(getattr(result, "session_token", "")),
+        "workspace_id": _text(getattr(result, "workspace_id", "")),
+        "account_id": _text(getattr(result, "account_id", "")),
+        "source": _text(getattr(result, "source", "")) or "existing_account_web_login",
+    }
+    if not tokens["access_token"] or not tokens["refresh_token"]:
+        raise RuntimeError("重登完成，但认证服务未返回完整的 Access Token 和 Refresh Token")
+    result_metadata = getattr(result, "metadata", None)
+    metadata = dict(result_metadata) if isinstance(result_metadata, dict) else {}
+    metadata_getter = getattr(email_service, "get_mailbox_metadata", None)
+    if callable(metadata_getter):
+        try:
+            mailbox_context = metadata_getter() or {}
+            if isinstance(mailbox_context, dict) and mailbox_context:
+                metadata["mailbox_login_context"] = mailbox_context
+        except Exception as exc:
+            _emit(log_fn, f"保存最新邮箱登录凭据失败，将保留原凭据: {exc}")
+    if metadata:
+        tokens["metadata"] = metadata
+    return tokens
+
+
+def _persist_fresh_tokens(
+    account_id: int,
+    tokens: dict[str, Any],
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+) -> AccountModel:
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id))
+        if account is None or account.platform != "chatgpt":
+            raise RuntimeError("ChatGPT 账号不存在")
+        if (
+            _text(account.email).lower() != _text(expected_email).lower()
+            or account.created_at != expected_created_at
+        ):
+            raise RuntimeError("本地账号记录已发生变化，已停止保存新令牌")
+
+        # Build a detached snapshot. Mutating the attached ORM object here would
+        # let an autoflush issue an ID-only UPDATE before the identity guard below.
+        snapshot = AccountModel(**account.model_dump())
+        extra = dict(account.get_extra() or {})
+        for stale_key in (
+            "access_token",
+            "accessToken",
+            "refresh_token",
+            "refreshToken",
+            "id_token",
+            "idToken",
+            "session_token",
+            "sessionToken",
+            "workspace_id",
+            "workspaceId",
+            "account_id",
+            "accountId",
+            "chatgpt_account_id",
+            "chatgptAccountId",
+            "chatgpt_user_id",
+            "chatgptUserId",
+            "user_id",
+            "userId",
+        ):
+            extra.pop(stale_key, None)
+        for key in (
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "session_token",
+            "workspace_id",
+            "account_id",
+        ):
+            value = _text(tokens.get(key))
+            if value:
+                extra[key] = value
+        extra["chatgpt_registration_mode"] = "refresh_token"
+        extra["chatgpt_has_refresh_token_solution"] = True
+        extra["chatgpt_token_source"] = _text(tokens.get("source")) or "relogin"
+        extra.pop("chatgpt_local", None)
+        metadata = tokens.get("metadata")
+        if isinstance(metadata, dict):
+            mailbox_context = metadata.get("mailbox_login_context")
+            if isinstance(mailbox_context, dict) and mailbox_context:
+                extra["mailbox_login_context"] = mailbox_context
+
+        snapshot.token = _text(tokens.get("access_token"))
+        snapshot.user_id = _text(tokens.get("account_id"))
+        snapshot.status = "registered"
+        snapshot.updated_at = datetime.now(timezone.utc)
+        snapshot.set_extra(extra)
+
+        try:
+            result = session.exec(
+                update(AccountModel)
+                .where(AccountModel.id == int(account_id))
+                .where(AccountModel.platform == "chatgpt")
+                .where(func.lower(AccountModel.email) == _text(expected_email).lower())
+                .where(AccountModel.created_at == expected_created_at)
+                .values(
+                    token=snapshot.token,
+                    user_id=snapshot.user_id,
+                    status=snapshot.status,
+                    updated_at=snapshot.updated_at,
+                    extra_json=snapshot.extra_json,
+                )
+            )
+            updated_count = int(getattr(result, "rowcount", 0) or 0)
+            if updated_count != 1:
+                session.rollback()
+                raise RuntimeError("本地账号记录已发生变化，已停止保存新令牌")
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        return snapshot
+
+
+def _delete_local_chatgpt_account(
+    account_id: int,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+) -> bool:
+    """Delete exactly one local ChatGPT account; missing is an idempotent success."""
+    with Session(engine) as session:
+        try:
+            result = session.exec(
+                delete(AccountModel)
+                .where(AccountModel.id == int(account_id))
+                .where(AccountModel.platform == "chatgpt")
+                .where(func.lower(AccountModel.email) == _text(expected_email).lower())
+                .where(AccountModel.created_at == expected_created_at)
+            )
+            deleted_count = int(getattr(result, "rowcount", 0) or 0)
+            if deleted_count == 1:
+                session.commit()
+                return True
+            session.rollback()
+        except Exception:
+            session.rollback()
+            raise
+
+        current = session.get(AccountModel, int(account_id))
+        if current is None:
+            return False
+        raise RuntimeError("本地账号记录已发生变化，已停止自动删除")
+
+
+def _remove_deactivated_local_account(
+    account_id: int,
+    *,
+    email: str,
+    created_at: datetime,
+    log_fn: LogFn | None,
+) -> dict[str, Any]:
+    try:
+        deleted = _delete_local_chatgpt_account(
+            account_id,
+            expected_email=email,
+            expected_created_at=created_at,
+        )
+    except Exception as exc:
+        detail = _text(exc) or type(exc).__name__
+        message = f"检测到账号已被删除或停用，但本地记录删除失败: {detail}"
+        _emit_observer(log_fn, message)
+        return {
+            "ok": False,
+            "relogin_ok": False,
+            "account_removed": False,
+            "stage": "account_remove_failed",
+            "account_id": int(account_id),
+            "email": email,
+            "message": message,
+        }
+
+    message = (
+        "账号已被删除或停用，本地记录已自动删除"
+        if deleted
+        else "账号已被删除或停用，本地记录已不存在"
+    )
+    _emit_observer(log_fn, message)
+    return {
+        "ok": False,
+        "relogin_ok": False,
+        "account_removed": True,
+        "stage": "account_removed",
+        "account_id": int(account_id),
+        "email": email,
+        "message": message,
+    }
+
+
+def _relogin_chatgpt_account_locked(
+    account_id: int,
+    *,
+    log_fn: LogFn | None = None,
+    task_control=None,
+    attempt_id: int | None = None,
+) -> dict[str, Any]:
+    """Perform a real credential login, persist fresh tokens, then replace Codex2API."""
+    email = ""
+    saved: dict[str, Any] | None = None
+    try:
+        saved = _load_saved_account(account_id)
+        email = saved["email"]
+        _emit_observer(log_fn, f"开始使用已保存的邮箱凭据重新登录 {email}")
+
+        def _login_log(message: str) -> None:
+            _emit_observer(log_fn, message)
+
+        tokens = _login_with_saved_credentials(
+            saved,
+            log_fn=_login_log,
+            task_control=task_control,
+            attempt_id=attempt_id,
+        )
+        _checkpoint_task(task_control, attempt_id)
+        account = _persist_fresh_tokens(
+            saved["id"],
+            tokens,
+            expected_email=saved["email"],
+            expected_created_at=saved["created_at"],
+        )
+        _emit_observer(log_fn, "已获取并保存全新的 Access Token / Refresh Token")
+    except ChatGPTAccountDeactivatedError:
+        if saved is None:
+            raise RuntimeError("停用信号缺少对应的本地账号快照")
+        return _remove_deactivated_local_account(
+            saved["id"],
+            email=email,
+            created_at=saved["created_at"],
+            log_fn=log_fn,
+        )
+    except TaskInterruption:
+        raise
+    except Exception as exc:
+        message = _text(exc) or type(exc).__name__
+        return {
+            "ok": False,
+            "relogin_ok": False,
+            "stage": "relogin",
+            "account_id": int(account_id) if str(account_id).isdigit() else account_id,
+            "email": email,
+            "message": f"重登失败: {message}",
+        }
+
+    _emit_observer(log_fn, "正在按账号身份覆盖 Codex2API 旧凭据")
+    try:
+        with _CODEX2API_RELOGIN_SYNC_LOCK:
+            sync_result = sync_codex2api_account(
+                account,
+                force=True,
+                replace_existing=True,
+            )
+    except TaskInterruption:
+        raise
+    except Exception as exc:
+        sync_result = {
+            "name": "Codex2API",
+            "ok": False,
+            "msg": _text(exc)[:300] or "Codex2API 同步异常",
+        }
+    if not sync_result or not bool(sync_result.get("ok")):
+        detail = _text((sync_result or {}).get("msg")) or "Codex2API 未确认更新"
+        return {
+            "ok": False,
+            "relogin_ok": True,
+            "stage": "codex2api_sync",
+            "account_id": int(account.id or account_id),
+            "email": _text(account.email) or email,
+            "message": f"重登成功，但 Codex2API 覆盖更新失败: {detail}",
+            "sync": sync_result,
+        }
+
+    return {
+        "ok": True,
+        "relogin_ok": True,
+        "stage": "completed",
+        "account_id": int(account.id or account_id),
+        "email": _text(account.email) or email,
+        "message": "重登并同步 Codex2API 成功",
+        "sync": sync_result,
+    }
+
+
+def relogin_chatgpt_account(
+    account_id: int,
+    *,
+    log_fn: LogFn | None = None,
+    task_control=None,
+    attempt_id: int | None = None,
+) -> dict[str, Any]:
+    """Run one account at a time so local and remote credentials cannot cross."""
+    try:
+        lock_key: int | str = int(account_id)
+    except (TypeError, ValueError):
+        lock_key = _text(account_id)
+    with _ACCOUNT_RELOGIN_LOCKS_GUARD:
+        account_lock = _ACCOUNT_RELOGIN_LOCKS.setdefault(
+            lock_key,
+            threading.Lock(),
+        )
+    if not account_lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "relogin_ok": False,
+            "stage": "relogin",
+            "account_id": account_id,
+            "email": "",
+            "message": "重登失败: 该账号正在重登并同步，请等待当前任务完成",
+        }
+    try:
+        return _relogin_chatgpt_account_locked(
+            account_id,
+            log_fn=log_fn,
+            task_control=task_control,
+            attempt_id=attempt_id,
+        )
+    finally:
+        account_lock.release()

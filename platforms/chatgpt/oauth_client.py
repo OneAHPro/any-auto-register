@@ -2,21 +2,30 @@
 OAuth 客户端模块 - 处理 Codex OAuth 登录流程
 """
 
+import html
+import re
 import time
 import secrets
 import uuid
 import json
 import random
 from urllib.parse import urlparse, parse_qs
+from core.base_mailbox import MailboxAuthenticationError
+from core.icloud_mail import generate_totp
 from core.proxy_utils import build_requests_proxy_config
 from core.task_runtime import TaskInterruption
+from services.chatgpt_account_state import (
+    ChatGPTAccountDeactivatedError,
+    is_account_deactivated_message,
+)
 
 try:
     from curl_cffi import requests as curl_requests
 except ImportError:
     import requests as curl_requests
 
-from .phone_service import SMSToMePhoneService
+from .phone_service import create_phone_service
+from .log_sanitizer import sanitize_chatgpt_log_message
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -64,6 +73,7 @@ class OAuthClient:
         self.ua = ""
         self.sec_ch_ua = ""
         self.impersonate = ""
+        self.last_prepared_oauth_context = None
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -116,7 +126,7 @@ class OAuthClient:
     def _log(self, msg):
         """输出日志"""
         if self.verbose:
-            print(f"  [OAuth] {msg}")
+            print(f"  [OAuth] {sanitize_chatgpt_log_message(msg)}")
 
     def _enter_stage(self, stage: str, detail: str = ""):
         self.last_stage = str(stage or "").strip()
@@ -251,6 +261,30 @@ class OAuthClient:
         if not combined:
             return False
 
+        blacklist_markers = (
+            "phone number is invalid",
+            "invalid phone number",
+            "invalid phone",
+            "phone number invalid",
+            "sms verification failed",
+            "send sms verification failed",
+            "unable to send sms",
+            "not a valid mobile number",
+            "unsupported phone number",
+            "phone number not supported",
+            "carrier not supported",
+            "phone number already in use",
+            "phone numbers similar to yours",
+            "电话号码无效",
+            "手机号无效",
+            "发送短信验证失败",
+            "号码无效",
+            "号码不支持",
+            "手机号不支持",
+        )
+        if any(marker in combined for marker in blacklist_markers):
+            return True
+
         non_blacklist_markers = (
             "whatsapp",
             "未收到短信验证码",
@@ -277,36 +311,37 @@ class OAuthClient:
         )
         if any(marker in combined for marker in non_blacklist_markers):
             return False
+        return False
 
-        blacklist_markers = (
-            "phone number is invalid",
-            "invalid phone number",
-            "invalid phone",
-            "phone number invalid",
-            "sms verification failed",
-            "send sms verification failed",
-            "unable to send sms",
-            "not a valid mobile number",
-            "unsupported phone number",
-            "phone number not supported",
-            "carrier not supported",
-            "电话号码无效",
-            "手机号无效",
-            "发送短信验证失败",
-            "号码无效",
-            "号码不支持",
-            "手机号不支持",
+    @staticmethod
+    def _is_transient_oauth_entry_error(detail=""):
+        text = str(detail or "").strip().lower()
+        return any(
+            marker in text
+            for marker in (
+                "403",
+                "<!doctype",
+                "just a moment",
+                "please wait",
+                "请稍等",
+                "sign-in session is no longer valid",
+                "invalid_auth_step",
+            )
         )
-        return any(marker in combined for marker in blacklist_markers)
 
     def _blacklist_phone_if_needed(
         self, phone_service, entry, detail="", state: FlowState | None = None
     ):
         if not entry or not self._should_blacklist_phone_failure(detail, state):
             return False
+        if not bool(getattr(phone_service, "supports_blacklist", True)):
+            return False
         try:
             phone_service.mark_blacklisted(entry.phone)
-            self._log(f"已将手机号加入黑名单: {entry.phone}")
+            provider_name = str(
+                getattr(phone_service, "provider_name", "手机号服务") or "手机号服务"
+            )
+            self._log(f"{provider_name} 已处理被拒绝手机号: {entry.phone}")
             return True
         except Exception as e:
             self._log(f"写入手机号黑名单失败: {e}")
@@ -370,8 +405,20 @@ class OAuthClient:
 
     def _get_cookie_value(self, name, domain_hint=None):
         """读取当前会话中的 Cookie。"""
+        cookies = getattr(self.session, "cookies", None)
+        if cookies is None:
+            return ""
+        if not domain_hint:
+            getter = getattr(cookies, "get", None)
+            if callable(getter):
+                try:
+                    value = getter(name)
+                    if value:
+                        return str(value)
+                except Exception:
+                    pass
         try:
-            for cookie in self.session.cookies:
+            for cookie in cookies:
                 cookie_name = cookie.name if hasattr(cookie, "name") else str(cookie)
                 if cookie_name != name:
                     continue
@@ -405,6 +452,20 @@ class OAuthClient:
     def _state_is_login_password(self, state: FlowState):
         return state.page_type == "login_password"
 
+    def _state_is_password_reset_new_password(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "reset_password_new_password"
+            or "reset-password/new-password" in target
+        )
+
+    def _state_is_password_reset_success(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return (
+            state.page_type == "reset_password_success"
+            or "reset-password/success" in target
+        )
+
     def _state_is_create_account_password(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "create_account_password" or "create-account/password" in target
@@ -417,6 +478,90 @@ class OAuthClient:
             or "email-otp" in target
         )
 
+    def _state_is_mfa_challenge(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        page_type = str(state.page_type or "").strip().lower()
+        return (
+            page_type == "mfa_challenge"
+            or page_type.startswith("mfa_challenge_")
+            or "mfa-challenge" in target
+        )
+
+    @staticmethod
+    def _extract_mfa_factors(state: FlowState) -> list[dict[str, str]]:
+        factors: list[dict[str, str]] = []
+        known_types = {
+            "totp",
+            "email",
+            "email_otp",
+            "email_code",
+            "sms",
+            "phone",
+            "webauthn",
+            "passkey",
+            "recovery_code",
+        }
+
+        def visit(value):
+            if isinstance(value, dict):
+                factor_type = str(
+                    value.get("factor_type") or value.get("type") or ""
+                ).strip().lower()
+                factor_id = str(
+                    value.get("id") or value.get("factor_id") or ""
+                ).strip()
+                if factor_id and factor_type in known_types:
+                    factors.append({"id": factor_id, "type": factor_type})
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    visit(nested)
+
+        visit(state.payload or {})
+        visit(state.raw or {})
+        deduplicated: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for factor in factors:
+            signature = (factor["id"], factor["type"])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            deduplicated.append(factor)
+        return deduplicated
+
+    @staticmethod
+    def _extract_totp_factor_id(state: FlowState) -> str:
+        payloads = [state.payload or {}]
+        raw_page = (state.raw or {}).get("page") or {}
+        if isinstance(raw_page, dict):
+            payloads.append(raw_page.get("payload") or {})
+
+        for payload in payloads:
+            if not isinstance(payload, dict):
+                continue
+            factors = payload.get("factors") or []
+            for factor in factors:
+                if not isinstance(factor, dict):
+                    continue
+                factor_type = str(
+                    factor.get("factor_type") or factor.get("type") or ""
+                ).strip().lower()
+                if factor_type != "totp":
+                    continue
+                factor_id = str(
+                    factor.get("id") or payload.get("factor_id") or ""
+                ).strip()
+                if factor_id:
+                    return factor_id
+
+        target = str(state.continue_url or state.current_url or "").strip()
+        parts = [part for part in urlparse(target).path.split("/") if part]
+        for index, part in enumerate(parts):
+            if part.lower() == "mfa-challenge" and index + 1 < len(parts):
+                return str(parts[index + 1] or "").strip()
+        return ""
+
     def _state_is_add_phone(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "add_phone" or "add-phone" in target
@@ -424,6 +569,155 @@ class OAuthClient:
     def _state_is_about_you(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
         return state.page_type == "about_you" or "about-you" in target
+
+    def _state_is_choose_an_account(self, state: FlowState) -> bool:
+        target = f"{state.continue_url} {state.current_url}".lower()
+        return state.page_type == "choose_an_account" or "choose-an-account" in target
+
+    @staticmethod
+    def _extract_choose_account_session_id(page_html: str, email: str = "") -> str:
+        body = str(page_html or "")
+        matches: list[tuple[int, str]] = []
+        for match in re.finditer(
+            r"<(?:input|button)\b[^>]*\bname=[\"']session_id[\"'][^>]*>",
+            body,
+            flags=re.IGNORECASE,
+        ):
+            value_match = re.search(
+                r"\bvalue=[\"']([^\"']+)[\"']",
+                match.group(0),
+                flags=re.IGNORECASE,
+            )
+            if value_match:
+                matches.append((match.start(), html.unescape(value_match.group(1)).strip()))
+        matches = [(position, value) for position, value in matches if value]
+        if not matches:
+            return ""
+
+        target_email = str(email or "").strip().lower()
+        if target_email:
+            for index, (position, value) in enumerate(matches):
+                end = matches[index + 1][0] if index + 1 < len(matches) else len(body)
+                account_fragment = html.unescape(body[position:end]).lower()
+                if target_email in account_fragment:
+                    return value
+        if len(matches) == 1:
+            return matches[0][1]
+        return ""
+
+    def _submit_choose_account_session(
+        self,
+        state: FlowState,
+        *,
+        email: str,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """Select the authenticated OpenAI session before continuing Codex OAuth."""
+        self._enter_stage("choose_account", "select")
+        choose_url = normalize_flow_url(
+            state.continue_url or state.current_url,
+            auth_base=self.oauth_issuer,
+        )
+        if not choose_url:
+            self._set_error("账号选择页面缺少有效地址")
+            return None
+
+        try:
+            page_kwargs = {
+                "headers": self._headers(
+                    choose_url,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept="text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    referer=f"{self.oauth_issuer}/",
+                    navigation=True,
+                ),
+                "allow_redirects": False,
+                "timeout": 30,
+            }
+            if impersonate:
+                page_kwargs["impersonate"] = impersonate
+            page_response = self.session.get(choose_url, **page_kwargs)
+            if page_response.status_code != 200:
+                self._set_error(
+                    f"加载账号选择页面失败: HTTP {page_response.status_code}"
+                )
+                return None
+
+            session_id = self._extract_choose_account_session_id(
+                page_response.text,
+                email=email,
+            )
+            if not session_id:
+                self._set_error("账号选择页面未找到当前登录账号")
+                return None
+
+            sentinel_token = get_sentinel_token_via_browser(
+                flow="authorize_continue",
+                proxy=self.proxy,
+                page_url=choose_url,
+                headless=self.browser_mode != "headed",
+                device_id=device_id,
+                log_fn=lambda message: self._log(
+                    f"choose_account: {message}"
+                ),
+            )
+            if not sentinel_token:
+                sentinel_token = build_sentinel_token(
+                    self.session,
+                    device_id,
+                    flow="authorize_continue",
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+            if not sentinel_token:
+                self._set_error("无法获取 sentinel token (choose_account)")
+                return None
+
+            request_url = f"{self.oauth_issuer}/api/accounts/session/select"
+            headers = self._headers(
+                request_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=choose_url,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers={
+                    "oai-device-id": device_id,
+                    "openai-sentinel-token": sentinel_token,
+                },
+            )
+            headers.update(generate_datadog_trace())
+            post_kwargs = {
+                "json": {"session_id": session_id},
+                "headers": headers,
+                "allow_redirects": False,
+                "timeout": 30,
+            }
+            if impersonate:
+                post_kwargs["impersonate"] = impersonate
+            response = self.session.post(request_url, **post_kwargs)
+            self._log(f"/session/select -> {response.status_code}")
+            if response.status_code != 200:
+                self._set_error(
+                    f"选择当前登录账号失败: HTTP {response.status_code}"
+                )
+                return None
+            next_state = self._state_from_payload(
+                response.json(),
+                current_url=str(response.url) or request_url,
+            )
+            self._log(f"账号选择完成 {describe_flow_state(next_state)}")
+            return next_state
+        except Exception as exc:
+            self._set_error(f"选择当前登录账号异常: {exc}")
+            return None
 
     def _state_requires_navigation(self, state: FlowState):
         method = (state.method or "GET").upper()
@@ -461,6 +755,18 @@ class OAuthClient:
             return True
         session_data = self._decode_oauth_session_cookie() or {}
         return bool(session_data.get("workspaces"))
+
+    def _state_can_resume_authenticated_flow(self, state: FlowState) -> bool:
+        if self._extract_code_from_state(state):
+            return True
+        if self._state_is_add_phone(state):
+            return True
+        if self._state_supports_workspace_resolution(state):
+            return True
+        return state.page_type in {
+            "oauth_callback",
+            "callback",
+        }
 
     def _follow_flow_state(
         self,
@@ -559,6 +865,7 @@ class OAuthClient:
 
         has_login_session = False
         authorize_final_url = ""
+        authorize_status = 0
 
         try:
             headers = self._headers(
@@ -580,6 +887,7 @@ class OAuthClient:
 
             self._browser_pause()
             r = self.session.get(authorize_url, **kwargs)
+            authorize_status = int(r.status_code or 0)
             authorize_final_url = str(r.url)
             redirects = len(getattr(r, "history", []) or [])
             self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
@@ -593,10 +901,11 @@ class OAuthClient:
         except Exception as e:
             self._log(f"/oauth/authorize 异常: {e}")
 
-        if has_login_session:
+        if 200 <= authorize_status < 400 and has_login_session:
             return authorize_final_url
 
         self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
+        oauth2_status = 0
         try:
             oauth2_url = f"{self.oauth_issuer}/api/oauth/oauth2/auth"
             kwargs = {
@@ -617,6 +926,7 @@ class OAuthClient:
 
             self._browser_pause()
             r2 = self.session.get(oauth2_url, **kwargs)
+            oauth2_status = int(r2.status_code or 0)
             authorize_final_url = str(r2.url)
             redirects2 = len(getattr(r2, "history", []) or [])
             self._log(
@@ -634,7 +944,125 @@ class OAuthClient:
         except Exception as e:
             self._log(f"/api/oauth/oauth2/auth 异常: {e}")
 
-        return authorize_final_url
+        if 200 <= oauth2_status < 400 and has_login_session:
+            return authorize_final_url
+        return ""
+
+    def prepare_phone_verification_transaction(
+        self,
+        *,
+        email: str = "",
+        device_id: str,
+        user_agent: str,
+        sec_ch_ua: str,
+        accept_language: str = "",
+        impersonate: str = "",
+    ):
+        """Clone the post-email-OTP auth context and start the phone OAuth transaction.
+
+        The clone is intentional: the original session still has to consume the
+        ChatGPT callback to obtain the web Access Token.  The cloned session is
+        parked on the Codex OAuth state and is resumed later by the phone flow.
+        """
+        from .oauth_resume_cache import (
+            OAuthResumeContext,
+            restore_oauth_resume_context,
+            serialize_oauth_resume_context,
+        )
+
+        browser_snapshot = serialize_oauth_resume_context(
+            self.session,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept_language=accept_language,
+            impersonate=impersonate,
+            ttl_seconds=1800,
+        )
+        cloned_context = restore_oauth_resume_context(browser_snapshot)
+        if cloned_context is None:
+            self._set_error("邮箱登录已通过，但复制手机授权浏览器上下文失败")
+            return None
+
+        self.adopt_browser_context(
+            cloned_context.session,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept_language=accept_language,
+        )
+        code_verifier, code_challenge = generate_pkce()
+        oauth_state = secrets.token_urlsafe(32)
+        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
+        authorize_params = {
+            "response_type": "code",
+            "client_id": self.oauth_client_id,
+            "redirect_uri": self.oauth_redirect_uri,
+            "scope": "openid profile email offline_access",
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+            "state": oauth_state,
+        }
+        self._log("邮箱 OTP 已通过，预建手机验证 OAuth 事务...")
+        authorize_final_url = self._bootstrap_oauth_session(
+            authorize_url,
+            authorize_params,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not authorize_final_url:
+            self._set_error("邮箱登录已通过，但预建手机验证 OAuth 事务失败")
+            return None
+
+        state = self._state_from_url(authorize_final_url)
+        if self._state_is_choose_an_account(state):
+            self._log("预建手机验证 OAuth 命中账号选择页，选择当前登录账号...")
+            state = self._submit_choose_account_session(
+                state,
+                email=email,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            if state is None:
+                if not self.last_error:
+                    self._set_error("邮箱登录已通过，但选择当前登录账号失败")
+                return None
+        if not self._state_can_resume_authenticated_flow(state):
+            self._set_error(
+                "邮箱登录已通过，但手机验证 OAuth 未进入可续接状态: "
+                f"{describe_flow_state(state)}"
+            )
+            return None
+
+        referer = (
+            authorize_final_url
+            if authorize_final_url.startswith(self.oauth_issuer)
+            else f"{self.oauth_issuer}/log-in"
+        )
+        self.last_state = state
+        self._log(
+            "手机验证 OAuth 事务已预建并暂停: "
+            f"{describe_flow_state(state)}"
+        )
+        return OAuthResumeContext(
+            session=self.session,
+            device_id=str(device_id or "").strip(),
+            user_agent=str(user_agent or "").strip(),
+            sec_ch_ua=str(sec_ch_ua or "").strip(),
+            accept_language=str(accept_language or "").strip(),
+            impersonate=str(impersonate or "").strip(),
+            code_verifier=code_verifier,
+            oauth_state=oauth_state,
+            authorize_url=authorize_url,
+            authorize_params=authorize_params,
+            flow_state=state,
+            referer=referer,
+            expires_at=time.monotonic() + 1800,
+        )
 
     def _bootstrap_chatgpt_entry(
         self,
@@ -982,6 +1410,576 @@ class OAuthClient:
         except Exception as e:
             self._set_error(f"密码验证异常: {e}")
             return None
+
+    def _request_password_reset_otp(
+        self,
+        state: FlowState,
+        *,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """Start OpenAI's password-reset flow for the current auth session."""
+        self._enter_stage("password_reset", "send_otp")
+        request_url = f"{self.oauth_issuer}/api/accounts/password/send-otp"
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=(
+                state.current_url
+                or state.continue_url
+                or f"{self.oauth_issuer}/reset-password"
+            ),
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={"oai-device-id": device_id},
+        )
+        headers.update(generate_datadog_trace())
+        try:
+            kwargs = {
+                "headers": headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            self._browser_pause()
+            response = self.session.post(request_url, **kwargs)
+            self._log(f"/password/send-otp -> {response.status_code}")
+            if response.status_code != 200:
+                self._set_error(
+                    "密码重置验证码发送失败: "
+                    f"HTTP {response.status_code}"
+                )
+                return None
+            next_state = self._state_from_payload(
+                response.json(),
+                current_url=str(response.url) or request_url,
+            )
+            self._log(f"password reset {describe_flow_state(next_state)}")
+            return next_state
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(f"密码重置验证码发送异常: {exc}")
+            return None
+
+    def _submit_password_reset_new_password(
+        self,
+        state: FlowState,
+        *,
+        new_password: str,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """Persist the new password after the reset email OTP was verified."""
+        password = str(new_password or "")
+        if len(password) < 12:
+            self._set_error("新密码长度不足 12 个字符")
+            return None
+
+        self._enter_stage("password_reset", "new_password")
+        page_url = (
+            state.current_url
+            or state.continue_url
+            or f"{self.oauth_issuer}/reset-password/new-password"
+        )
+        sentinel_token = get_sentinel_token_via_browser(
+            flow="password_reset",
+            proxy=self.proxy,
+            page_url=page_url,
+            headless=self.browser_mode != "headed",
+            device_id=device_id,
+            log_fn=lambda msg: self._log(f"password_reset: {msg}"),
+        )
+        if not sentinel_token:
+            sentinel_token = build_sentinel_token(
+                self.session,
+                device_id,
+                flow="password_reset",
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+        if not sentinel_token:
+            self._set_error("无法获取 sentinel token (password_reset)")
+            return None
+
+        request_url = f"{self.oauth_issuer}/api/accounts/password/reset"
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=page_url,
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={
+                "oai-device-id": device_id,
+                "openai-sentinel-token": sentinel_token,
+            },
+        )
+        headers.update(generate_datadog_trace())
+        try:
+            kwargs = {
+                "json": {"password": password},
+                "headers": headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                kwargs["impersonate"] = impersonate
+            self._browser_pause()
+            response = self.session.post(request_url, **kwargs)
+            self._log(f"/password/reset -> {response.status_code}")
+            if response.status_code != 200:
+                self._set_error(
+                    f"新密码保存失败: HTTP {response.status_code}"
+                )
+                return None
+            next_state = self._state_from_payload(
+                response.json(),
+                current_url=str(response.url) or request_url,
+            )
+            self._log(f"password reset {describe_flow_state(next_state)}")
+            return next_state
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(f"新密码保存异常: {exc}")
+            return None
+
+    def _complete_password_reset(
+        self,
+        state: FlowState,
+        *,
+        email: str,
+        new_password: str,
+        skymail_client,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        on_password_reset=None,
+    ):
+        """Complete reset OTP + new-password submission in the active session."""
+        if skymail_client is None:
+            self._set_error("密码重置需要邮箱验证码接口，但当前记录未配置")
+            return None
+        otp_state = self._request_password_reset_otp(
+            state,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not otp_state or not self._state_is_email_otp(otp_state):
+            if not self.last_error:
+                self._set_error("密码重置未进入邮箱验证码步骤")
+            return None
+        new_password_state = self._handle_otp_verification(
+            email,
+            device_id,
+            user_agent,
+            sec_ch_ua,
+            impersonate,
+            skymail_client,
+            otp_state,
+            prefer_passwordless_login=False,
+        )
+        if not new_password_state:
+            if not self.last_error:
+                self._set_error("密码重置邮箱验证码校验失败")
+            return None
+        if not self._state_is_password_reset_new_password(new_password_state):
+            self._set_error(
+                "密码重置验证码通过，但认证服务未进入设置新密码步骤"
+            )
+            return None
+        success_state = self._submit_password_reset_new_password(
+            new_password_state,
+            new_password=new_password,
+            device_id=device_id,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
+        )
+        if not success_state or not self._state_is_password_reset_success(
+            success_state
+        ):
+            if not self.last_error:
+                self._set_error("新密码提交后未收到成功状态")
+            return None
+        if callable(on_password_reset):
+            try:
+                committed = on_password_reset(str(new_password or ""))
+                if committed is False:
+                    self._set_error(
+                        "密码已在认证服务重置，但本地凭据保存失败"
+                    )
+                    return None
+            except Exception as exc:
+                self._set_error(
+                    "密码已在认证服务重置，但本地凭据保存失败"
+                    f"（{type(exc).__name__}）"
+                )
+                return None
+        self._log("密码重置完成，新密码已安全保存；重新开始登录")
+        return success_state
+
+    def _submit_totp_mfa_challenge(
+        self,
+        state: FlowState,
+        *,
+        totp_secret: str,
+        totp_code_provider=None,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """初始化并提交 ChatGPT TOTP MFA，不向第三方发送 MFA 秘钥。"""
+        self._enter_stage("mfa", "totp")
+        factor_id = self._extract_totp_factor_id(state)
+        if not factor_id:
+            self._set_error("ChatGPT MFA 页面未返回 TOTP 因子")
+            return None
+        if not str(totp_secret or "").strip() and not callable(totp_code_provider):
+            self._set_error("ChatGPT 账号需要 MFA，但导入记录缺少 MFA 秘钥")
+            return None
+
+        referer = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/mfa-challenge/{factor_id}"
+        )
+        common_headers = {
+            "oai-device-id": device_id,
+        }
+
+        issue_url = f"{self.oauth_issuer}/api/accounts/mfa/issue_challenge"
+        issue_headers = self._headers(
+            issue_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="*/*",
+            referer=referer,
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers=common_headers,
+        )
+        issue_headers.update(generate_datadog_trace())
+        issue_kwargs = {
+            "json": {
+                "id": factor_id,
+                "type": "totp",
+                "force_fresh_challenge": False,
+            },
+            "headers": issue_headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            issue_kwargs["impersonate"] = impersonate
+
+        try:
+            self._browser_pause()
+            issue_response = self.session.post(issue_url, **issue_kwargs)
+            self._log(f"/mfa/issue_challenge -> {issue_response.status_code}")
+            if issue_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT MFA challenge 初始化失败: "
+                    f"{issue_response.status_code} - {issue_response.text[:180]}"
+                )
+                return None
+
+            if str(totp_secret or "").strip():
+                code = generate_totp(str(totp_secret or ""))
+            else:
+                code = str(totp_code_provider() or "").strip()
+                if not re.fullmatch(r"\d{6}", code):
+                    self._set_error("远程 MFA 接口未返回有效的六位验证码")
+                    return None
+            verify_url = f"{self.oauth_issuer}/api/accounts/mfa/verify"
+            verify_headers = self._headers(
+                verify_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=referer,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers=common_headers,
+            )
+            verify_headers.update(generate_datadog_trace())
+            verify_kwargs = {
+                "json": {
+                    "id": factor_id,
+                    "type": "totp",
+                    "code": code,
+                },
+                "headers": verify_headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                verify_kwargs["impersonate"] = impersonate
+
+            self._browser_pause()
+            verify_response = self.session.post(verify_url, **verify_kwargs)
+            self._log(f"/mfa/verify -> {verify_response.status_code}")
+            if verify_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT MFA 验证失败: "
+                    f"{verify_response.status_code} - {verify_response.text[:180]}"
+                )
+                return None
+
+            next_state = self._state_from_payload(
+                verify_response.json(),
+                current_url=str(verify_response.url) or verify_url,
+            )
+            self._log(f"MFA 通过 {describe_flow_state(next_state)}")
+            return next_state
+        except Exception as exc:
+            self._set_error(f"ChatGPT MFA 验证异常: {exc}")
+            return None
+
+    def _submit_email_mfa_challenge(
+        self,
+        state: FlowState,
+        *,
+        factor: dict[str, str],
+        email: str,
+        skymail_client,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """通过当前邮箱后端完成 ChatGPT 邮箱型 MFA。"""
+        self._enter_stage("mfa", "email")
+        factor_id = str(factor.get("id") or "").strip()
+        factor_type = str(factor.get("type") or "email").strip().lower()
+        if not factor_id:
+            self._set_error("ChatGPT 邮箱 MFA 页面未返回验证因子")
+            return None
+        wait_for_code = getattr(skymail_client, "wait_for_verification_code", None)
+        if not callable(wait_for_code):
+            self._set_error("ChatGPT 要求邮箱 MFA，但当前邮箱后端无法读取验证码")
+            return None
+
+        referer = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/mfa-challenge/{factor_id}"
+        )
+        common_headers = {"oai-device-id": device_id}
+        issue_url = f"{self.oauth_issuer}/api/accounts/mfa/issue_challenge"
+        issue_headers = self._headers(
+            issue_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="*/*",
+            referer=referer,
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers=common_headers,
+        )
+        issue_headers.update(generate_datadog_trace())
+        issue_kwargs = {
+            "json": {
+                "id": factor_id,
+                "type": factor_type,
+                "force_fresh_challenge": False,
+            },
+            "headers": issue_headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            issue_kwargs["impersonate"] = impersonate
+
+        try:
+            otp_sent_at = time.time()
+            self._browser_pause()
+            issue_response = self.session.post(issue_url, **issue_kwargs)
+            self._log(f"/mfa/issue_challenge({factor_type}) -> {issue_response.status_code}")
+            if issue_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT 邮箱 MFA challenge 初始化失败: "
+                    f"{issue_response.status_code} - {issue_response.text[:180]}"
+                )
+                return None
+
+            try:
+                wait_seconds = int(
+                    self.config.get("chatgpt_oauth_mfa_otp_wait_seconds", 120)
+                    or 120
+                )
+            except (TypeError, ValueError):
+                wait_seconds = 120
+            wait_seconds = max(30, min(wait_seconds, 600))
+            code = str(
+                wait_for_code(
+                    email,
+                    timeout=wait_seconds,
+                    otp_sent_at=otp_sent_at,
+                )
+                or ""
+            ).strip()
+            if not code:
+                self._set_error("等待 ChatGPT 邮箱 MFA 验证码超时")
+                return None
+
+            verify_url = f"{self.oauth_issuer}/api/accounts/mfa/verify"
+            verify_headers = self._headers(
+                verify_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=referer,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers=common_headers,
+            )
+            verify_headers.update(generate_datadog_trace())
+            verify_kwargs = {
+                "json": {
+                    "id": factor_id,
+                    "type": factor_type,
+                    "code": code,
+                },
+                "headers": verify_headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                verify_kwargs["impersonate"] = impersonate
+
+            self._browser_pause()
+            verify_response = self.session.post(verify_url, **verify_kwargs)
+            self._log(f"/mfa/verify({factor_type}) -> {verify_response.status_code}")
+            if verify_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT 邮箱 MFA 验证失败: "
+                    f"{verify_response.status_code} - {verify_response.text[:180]}"
+                )
+                return None
+
+            next_state = self._state_from_payload(
+                verify_response.json(),
+                current_url=str(verify_response.url) or verify_url,
+            )
+            self._log(f"邮箱 MFA 通过 {describe_flow_state(next_state)}")
+            return next_state
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(f"ChatGPT 邮箱 MFA 验证异常: {exc}")
+            return None
+
+    def _submit_mfa_challenge(
+        self,
+        state: FlowState,
+        *,
+        email: str,
+        skymail_client,
+        totp_secret: str,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        factors = self._extract_mfa_factors(state)
+        factor_types = [factor["type"] for factor in factors]
+        self._log(
+            "ChatGPT MFA 可用方式: "
+            + (", ".join(factor_types) if factor_types else "未返回")
+        )
+        email_factor = next(
+            (factor for factor in factors if "email" in factor["type"]),
+            None,
+        )
+        totp_factor = next(
+            (factor for factor in factors if factor["type"] == "totp"),
+            None,
+        )
+        totp_code_provider = getattr(skymail_client, "get_totp_code", None)
+        supports_totp_code = getattr(
+            skymail_client,
+            "supports_totp_code",
+            None,
+        )
+        if callable(supports_totp_code):
+            try:
+                if not supports_totp_code():
+                    totp_code_provider = None
+            except Exception:
+                totp_code_provider = None
+        has_totp_source = bool(
+            str(totp_secret or "").strip()
+            or callable(totp_code_provider)
+        )
+        if totp_factor is not None and has_totp_source:
+            return self._submit_totp_mfa_challenge(
+                state,
+                totp_secret=totp_secret,
+                totp_code_provider=(
+                    totp_code_provider
+                    if callable(totp_code_provider)
+                    else None
+                ),
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+        if email_factor is not None and skymail_client is not None:
+            return self._submit_email_mfa_challenge(
+                state,
+                factor=email_factor,
+                email=email,
+                skymail_client=skymail_client,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+
+        if totp_factor is not None or (not factors and has_totp_source):
+            return self._submit_totp_mfa_challenge(
+                state,
+                totp_secret=totp_secret,
+                totp_code_provider=(
+                    totp_code_provider
+                    if callable(totp_code_provider)
+                    else None
+                ),
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+
+        if factors:
+            self._set_error(
+                "ChatGPT 要求不受支持的 MFA 方式: " + ", ".join(factor_types)
+            )
+        else:
+            self._set_error("ChatGPT MFA 页面未返回可识别的验证方式")
+        return None
 
     def _send_passwordless_login_otp(
         self,
@@ -1640,6 +2638,55 @@ class OAuthClient:
         if self.proxy:
             self.session.proxies = build_requests_proxy_config(self.proxy)
 
+    def _capture_prepared_oauth_context(
+        self,
+        state: FlowState,
+        *,
+        code_verifier: str,
+        oauth_state: str,
+        authorize_url: str,
+        authorize_params: dict,
+        referer: str,
+        user_agent: str,
+        sec_ch_ua: str,
+        impersonate: str,
+    ):
+        """保存当前独立 OAuth 登录事务，供后续手机验证直接续接。"""
+        if not self._state_can_resume_authenticated_flow(state):
+            return None
+
+        from .oauth_resume_cache import OAuthResumeContext
+
+        try:
+            accept_language = str(
+                self.session.headers.get("Accept-Language") or ""
+            ).strip()
+        except Exception:
+            accept_language = ""
+
+        context = OAuthResumeContext(
+            session=self.session,
+            device_id=str(self.device_id or "").strip(),
+            user_agent=str(user_agent or "").strip(),
+            sec_ch_ua=str(sec_ch_ua or "").strip(),
+            accept_language=accept_language,
+            impersonate=str(impersonate or "").strip(),
+            code_verifier=str(code_verifier or "").strip(),
+            oauth_state=str(oauth_state or "").strip(),
+            authorize_url=str(authorize_url or "").strip(),
+            authorize_params=dict(authorize_params or {}),
+            flow_state=state,
+            referer=str(
+                state.current_url
+                or state.continue_url
+                or referer
+                or f"{self.oauth_issuer}/log-in"
+            ).strip(),
+            expires_at=time.monotonic() + 1800,
+        )
+        self.last_prepared_oauth_context = context
+        return context
+
     def login_and_get_tokens(
         self,
         email,
@@ -1652,7 +2699,11 @@ class OAuthClient:
         prefer_passwordless_login=False,
         allow_phone_verification=True,
         force_new_browser=False,
+        resume_authenticated_session=False,
         force_password_login=False,
+        totp_secret="",
+        password_reset_required=False,
+        on_password_reset=None,
         force_chatgpt_entry=False,
         screen_hint="login",
         complete_about_you_if_needed=False,
@@ -1661,7 +2712,9 @@ class OAuthClient:
         birthdate="",
         login_source="",
         stop_after_login=False,
+        prepared_oauth_context=None,
         _continue_depth=0,
+        _password_reset_depth=0,
     ):
         """
         完整的 OAuth 登录流程，获取 tokens
@@ -1676,7 +2729,9 @@ class OAuthClient:
             skymail_client: Skymail 客户端（用于获取 OTP，如果需要）
             prefer_passwordless_login: 是否强制走 passwordless OTP 链路
             allow_phone_verification: add_phone 后是否允许进入手机号验证码分支
+            resume_authenticated_session: 已进入认证后状态时跳过再次提交邮箱
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
+            totp_secret: ChatGPT TOTP MFA 秘钥；仅在服务端要求 MFA 时使用
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
@@ -1691,6 +2746,7 @@ class OAuthClient:
         self.last_error = ""
         self.last_workspace_id = ""
         self.last_state = FlowState()
+        self.last_prepared_oauth_context = None
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -1702,6 +2758,7 @@ class OAuthClient:
             f"complete_about_you_if_needed={'on' if complete_about_you_if_needed else 'off'}, "
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
+            f"totp_mfa={'on' if str(totp_secret or '').strip() else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
             f"stop_after_login={'on' if stop_after_login else 'off'}"
@@ -1722,65 +2779,149 @@ class OAuthClient:
             user_agent, sec_ch_ua, impersonate
         )
 
-        code_verifier, code_challenge = generate_pkce()
-        oauth_state = secrets.token_urlsafe(32)
-        authorize_params = {
-            "response_type": "code",
-            "client_id": self.oauth_client_id,
-            "redirect_uri": self.oauth_redirect_uri,
-            "scope": "openid profile email offline_access",
-            "code_challenge": code_challenge,
-            "code_challenge_method": "S256",
-            "state": oauth_state,
-        }
-        authorize_url = f"{self.oauth_issuer}/oauth/authorize"
-
-        seed_oai_device_cookie(self.session, device_id)
-
-        if force_chatgpt_entry:
-            self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
-            _ = self._bootstrap_chatgpt_entry(
-                email,
-                device_id,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
+        state = None
+        continue_referer = ""
+        if prepared_oauth_context is not None:
+            code_verifier = str(
+                getattr(prepared_oauth_context, "code_verifier", "") or ""
+            ).strip()
+            oauth_state = str(
+                getattr(prepared_oauth_context, "oauth_state", "") or ""
+            ).strip()
+            authorize_url = str(
+                getattr(prepared_oauth_context, "authorize_url", "") or ""
+            ).strip() or f"{self.oauth_issuer}/oauth/authorize"
+            authorize_params = dict(
+                getattr(prepared_oauth_context, "authorize_params", {}) or {}
             )
+            state = getattr(prepared_oauth_context, "flow_state", None)
+            continue_referer = str(
+                getattr(prepared_oauth_context, "referer", "") or ""
+            ).strip()
+            if not code_verifier or not oauth_state or not isinstance(state, FlowState):
+                self._set_error(
+                    "手机验证授权事务不完整，请重新执行一次邮箱登录；"
+                    "本次未获取手机号、未发送短信"
+                )
+                return None
+            if not self._state_can_resume_authenticated_flow(state):
+                self._set_error(
+                    "手机验证授权事务已失效，请重新执行一次邮箱登录；"
+                    "本次未获取手机号、未发送短信"
+                )
+                return None
+            self._log(
+                "步骤1: 直接续接邮箱登录时预建的手机 OAuth 事务，"
+                "不重新访问 /oauth/authorize，不重新提交邮箱"
+            )
+        else:
+            code_verifier, code_challenge = generate_pkce()
+            oauth_state = secrets.token_urlsafe(32)
+            authorize_params = {
+                "response_type": "code",
+                "client_id": self.oauth_client_id,
+                "redirect_uri": self.oauth_redirect_uri,
+                "scope": "openid profile email offline_access",
+                "code_challenge": code_challenge,
+                "code_challenge_method": "S256",
+                "state": oauth_state,
+            }
+            authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
-        self._log("步骤1: Bootstrap OAuth session...")
-        authorize_final_url = self._bootstrap_oauth_session(
-            authorize_url,
-            authorize_params,
-            device_id=device_id,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-        )
-        if not authorize_final_url:
-            self._set_error("Bootstrap 失败")
-            return None
+            seed_oai_device_cookie(self.session, device_id)
 
-        continue_referer = (
-            authorize_final_url
-            if authorize_final_url.startswith(self.oauth_issuer)
-            else f"{self.oauth_issuer}/log-in"
-        )
+            max_entry_attempts = 6
+            entry_error = ""
+            for entry_attempt in range(max_entry_attempts):
+                if entry_attempt > 0:
+                    self._log(
+                        f"OAuth 登录入口重试 {entry_attempt + 1}/{max_entry_attempts}："
+                        "新 Session + 新设备指纹"
+                    )
+                    self._recreate_session()
+                    device_id = str(uuid.uuid4())
+                    self.device_id = device_id
+                    user_agent, sec_ch_ua, impersonate = self._ensure_oauth_fingerprint(
+                        None,
+                        None,
+                        None,
+                    )
 
-        state = self._submit_authorize_continue(
-            email,
-            device_id,
-            continue_referer,
-            user_agent=user_agent,
-            sec_ch_ua=sec_ch_ua,
-            impersonate=impersonate,
-            authorize_url=authorize_url,
-            authorize_params=authorize_params,
-            screen_hint=str(screen_hint or "login"),
-        )
-        if not state:
-            if not self.last_error:
-                self._set_error("提交邮箱后未进入有效的 OAuth 状态")
-            return None
+                if force_chatgpt_entry:
+                    self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
+                    _ = self._bootstrap_chatgpt_entry(
+                        email,
+                        device_id,
+                        user_agent=user_agent,
+                        sec_ch_ua=sec_ch_ua,
+                        impersonate=impersonate,
+                    )
+
+                self.last_error = ""
+                self._log("步骤1: Bootstrap OAuth session...")
+                authorize_final_url = self._bootstrap_oauth_session(
+                    authorize_url,
+                    authorize_params,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                if not authorize_final_url:
+                    if resume_authenticated_session:
+                        self._set_error(
+                            "OpenAI 登录会话已失效，请先重新执行邮箱登录；"
+                            "本次未获取手机号、未发送短信"
+                        )
+                        return None
+                    entry_error = "OpenAI OAuth bootstrap 未建立有效 login_session"
+                    continue
+
+                continue_referer = (
+                    authorize_final_url
+                    if authorize_final_url.startswith(self.oauth_issuer)
+                    else f"{self.oauth_issuer}/log-in"
+                )
+                resumed_state = self._state_from_url(authorize_final_url)
+                if resume_authenticated_session:
+                    if self._state_can_resume_authenticated_flow(resumed_state):
+                        self._log(
+                            "已复用前序认证会话，跳过再次提交邮箱: "
+                            f"{describe_flow_state(resumed_state)}"
+                        )
+                        state = resumed_state
+                        break
+                    self._set_error(
+                        "OpenAI 登录会话已失效，请先重新执行邮箱登录；"
+                        "本次未获取手机号、未发送短信"
+                    )
+                    return None
+                state = self._submit_authorize_continue(
+                    email,
+                    device_id,
+                    continue_referer,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    authorize_url=authorize_url,
+                    authorize_params=authorize_params,
+                    screen_hint=str(screen_hint or "login"),
+                )
+                if state:
+                    break
+
+                entry_error = str(self.last_error or "").strip()
+                if not self._is_transient_oauth_entry_error(entry_error):
+                    if not self.last_error:
+                        self._set_error("提交邮箱后未进入有效的 OAuth 状态")
+                    return None
+                self._log("OAuth 登录入口被验证页拦截，准备更换会话重试")
+
+            if not state:
+                self._set_error(
+                    "OpenAI 登录入口触发 403 验证页，自动重试后仍未建立有效会话"
+                )
+                return None
 
         self._log(f"OAuth 状态起点: {describe_flow_state(state)}")
         seen_states = {}
@@ -1793,9 +2934,22 @@ class OAuthClient:
                 return False
             if self._state_is_email_otp(state_to_check):
                 return False
+            if self._state_is_mfa_challenge(state_to_check):
+                return False
             if self._state_is_create_account_password(state_to_check):
                 return False
-            return True
+            prepared_context = self._capture_prepared_oauth_context(
+                state_to_check,
+                code_verifier=code_verifier,
+                oauth_state=oauth_state,
+                authorize_url=authorize_url,
+                authorize_params=authorize_params,
+                referer=referer,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+            return prepared_context is not None
 
         for step in range(20):
             self.last_state = state
@@ -1818,6 +2972,52 @@ class OAuthClient:
                 else:
                     self._log("换取 tokens 失败")
                 return tokens
+
+            if password_reset_required and self._state_is_login_password(state):
+                if int(_password_reset_depth or 0) >= 1:
+                    self._set_error("密码重置后仍返回重置入口，已停止循环")
+                    return None
+                reset_state = self._complete_password_reset(
+                    state,
+                    email=email,
+                    new_password=password,
+                    skymail_client=skymail_client,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    on_password_reset=on_password_reset,
+                )
+                if not reset_state:
+                    return None
+                return self.login_and_get_tokens(
+                    email,
+                    password,
+                    device_id="",
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    skymail_client=skymail_client,
+                    prefer_passwordless_login=False,
+                    allow_phone_verification=allow_phone_verification,
+                    force_new_browser=True,
+                    resume_authenticated_session=False,
+                    force_password_login=True,
+                    totp_secret=totp_secret,
+                    password_reset_required=False,
+                    on_password_reset=on_password_reset,
+                    force_chatgpt_entry=force_chatgpt_entry,
+                    screen_hint=screen_hint,
+                    complete_about_you_if_needed=complete_about_you_if_needed,
+                    first_name=first_name,
+                    last_name=last_name,
+                    birthdate=birthdate,
+                    login_source=login_source,
+                    stop_after_login=stop_after_login,
+                    prepared_oauth_context=None,
+                    _continue_depth=0,
+                    _password_reset_depth=int(_password_reset_depth or 0) + 1,
+                )
 
             if prefer_passwordless_login and (not force_password_login) and self._state_is_login_password(state):
                 next_state = self._send_passwordless_login_otp(
@@ -1882,6 +3082,32 @@ class OAuthClient:
                     self._set_error("登录链路已完成，按要求停止")
                     return None
                 referer = state.current_url or referer
+                state = next_state
+                continue
+
+            if self._state_is_mfa_challenge(state):
+                next_state = self._submit_mfa_challenge(
+                    state,
+                    email=email,
+                    skymail_client=skymail_client,
+                    totp_secret=str(totp_secret or ""),
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                if not next_state:
+                    if not self.last_error:
+                        self._set_error("ChatGPT MFA 验证后未进入下一步 OAuth 状态")
+                    return None
+                if _should_stop_after_login(next_state):
+                    self._log(
+                        "登录链路已完成（MFA 验证后进入下一状态），按要求停止"
+                    )
+                    self.last_state = next_state
+                    self._set_error("登录链路已完成，按要求停止")
+                    return None
+                referer = state.current_url or state.continue_url or referer
                 state = next_state
                 continue
 
@@ -2002,44 +3228,12 @@ class OAuthClient:
                         continue
 
                     workspace_error = str(self.last_error or "").strip()
-                    if prefer_passwordless_login and _continue_depth < 1:
-                        self._log(
-                            "步骤5: canonical consent 仍未拿到 workspace/callback"
-                            + (
-                                f" ({workspace_error})"
-                                if workspace_error
-                                else ""
-                            )
-                            + "，重启一次全新 OAuth session + 新 PKCE"
-                        )
-                        self._recreate_session()
-                        return self.login_and_get_tokens(
-                            email,
-                            password,
-                            device_id,
-                            user_agent=user_agent,
-                            sec_ch_ua=sec_ch_ua,
-                            impersonate=impersonate,
-                            skymail_client=skymail_client,
-                            prefer_passwordless_login=prefer_passwordless_login,
-                            allow_phone_verification=allow_phone_verification,
-                            complete_about_you_if_needed=complete_about_you_if_needed,
-                            first_name=first_name,
-                            last_name=last_name,
-                            birthdate=birthdate,
-                            login_source=(
-                                f"{login_source}:add_phone_continue"
-                                if login_source
-                                else "add_phone_continue"
-                            ),
-                            _continue_depth=_continue_depth + 1,
-                        )
-                    else:
-                        self._set_error(
-                            "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback"
-                            + (f" ({workspace_error})" if workspace_error else "")
-                        )
-                        return None
+                    self._set_error(
+                        "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback；"
+                        "为避免重复发送邮箱验证码，本次不重启登录"
+                        + (f" ({workspace_error})" if workspace_error else "")
+                    )
+                    return None
                 else:
                     next_state = self._handle_add_phone_verification(
                         device_id,
@@ -2599,20 +3793,41 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
 
-        try:
-            kwargs = {
-                "json": {"phone_number": phone},
-                "headers": headers,
-                "timeout": 30,
-                "allow_redirects": False,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
+        kwargs = {
+            "json": {"phone_number": phone},
+            "headers": headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            kwargs["impersonate"] = impersonate
 
-            self._browser_pause(0.12, 0.25)
-            resp = self.session.post(request_url, **kwargs)
-        except Exception as e:
-            return False, None, f"add-phone/send 异常: {e}"
+        max_tls_attempts = 3
+        for attempt in range(max_tls_attempts):
+            try:
+                self._browser_pause(0.12, 0.25)
+                resp = self.session.post(request_url, **kwargs)
+                break
+            except Exception as e:
+                ssl_error_type = getattr(
+                    getattr(curl_requests, "exceptions", None),
+                    "SSLError",
+                    (),
+                )
+                retryable_tls_error = bool(
+                    ssl_error_type
+                    and isinstance(e, ssl_error_type)
+                    and type(e).__module__.startswith("curl_cffi.")
+                    and getattr(e, "code", None) == 35
+                )
+                if retryable_tls_error and attempt < max_tls_attempts - 1:
+                    self._log(
+                        "add-phone/send TLS 握手失败，"
+                        f"使用同一会话重试 {attempt + 2}/{max_tls_attempts}"
+                    )
+                    time.sleep(0.25 * (attempt + 1))
+                    continue
+                return False, None, f"add-phone/send 异常: {e}"
 
         self._log(f"/add-phone/send -> {resp.status_code}")
         if resp.status_code != 200:
@@ -2795,6 +4010,60 @@ class OAuthClient:
                 )
                 return None
 
+            interactive_broker = self.config.get("chatgpt_interactive_phone_broker")
+            if interactive_broker is not None:
+                interactive_broker.mark_code_sent(configured_phone)
+                while True:
+                    try:
+                        command = interactive_broker.wait_for_command()
+                    except Exception as exc:
+                        self._set_error(str(exc) or "手机验证会话已结束")
+                        return None
+
+                    if command.kind == "resend":
+                        resend_ok, resend_detail = self._resend_phone_otp(
+                            configured_phone,
+                            device_id,
+                            user_agent,
+                            sec_ch_ua,
+                            impersonate,
+                            next_state,
+                        )
+                        interactive_broker.resolve_command(
+                            command.id,
+                            ok=resend_ok,
+                            message=(
+                                "验证码已重新发送"
+                                if resend_ok
+                                else (resend_detail or "短信验证码重新发送失败")
+                            ),
+                        )
+                        continue
+
+                    valid, validated_state, detail = self._validate_phone_otp(
+                        command.payload,
+                        device_id,
+                        user_agent,
+                        sec_ch_ua,
+                        impersonate,
+                        next_state,
+                    )
+                    if not valid or not validated_state:
+                        interactive_broker.resolve_command(
+                            command.id,
+                            ok=False,
+                            message=detail or "手机号验证码错误或已过期",
+                        )
+                        continue
+
+                    interactive_broker.mark_phone_verified()
+                    interactive_broker.resolve_command(
+                        command.id,
+                        ok=True,
+                        message="手机号验证通过",
+                    )
+                    return validated_state
+
             if configured_codes:
                 for idx, code in enumerate(configured_codes, start=1):
                     self._log(
@@ -2820,117 +4089,255 @@ class OAuthClient:
             )
             return None
 
-        phone_service = SMSToMePhoneService(self.config, log_fn=self._log)
+        progress_broker = self.config.get("chatgpt_phone_progress_broker")
+        leadbee_codes = tuple(
+            code
+            for code in (
+                str(self.config.get("leadbee_code") or "").strip(),
+                str(self.config.get("chatgpt_leadbee_code") or "").strip(),
+            )
+            if code
+        )
+
+        def _phone_service_log(message):
+            safe_message = str(message or "")
+            for leadbee_code in leadbee_codes:
+                safe_message = safe_message.replace(
+                    leadbee_code,
+                    "[LeadBee兑换码已脱敏]",
+                )
+            self._log(safe_message)
+            if progress_broker is not None:
+                progress_broker.mark_progress(safe_message.strip())
+
+        phone_service = create_phone_service(
+            self.config,
+            log_fn=_phone_service_log,
+        )
+        provider_name = str(
+            getattr(phone_service, "provider_name", "手机号服务") or "手机号服务"
+        )
         if not phone_service.enabled:
             self._set_error(
-                "当前链路需要手机号验证，但未配置可用的手机号能力（SMSToMe 或固定手机号验证码）"
+                f"当前链路需要手机号验证，但未配置可用的{provider_name}能力或固定手机号验证码"
             )
             return None
 
+        requires_explicit_replacement = (
+            getattr(phone_service, "requires_explicit_replacement", False) is True
+        )
+
+        def _log_phone_failure(message):
+            safe_message = re.sub(r"\s+", " ", str(message or "")).strip()
+            exchange_code = str(getattr(phone_service, "code", "") or "").strip()
+            if exchange_code:
+                safe_message = safe_message.replace(exchange_code, "[LeadBee兑换码已脱敏]")
+            safe_message = re.sub(
+                r"(?i)(bearer\s+)[a-z0-9._~+/=-]+",
+                r"\1[凭据已脱敏]",
+                safe_message,
+            )[:500]
+            if safe_message:
+                _phone_service_log(safe_message)
+
         excluded_prefixes = set()
         last_failure = ""
+        phone_flow_succeeded = False
 
-        for attempt in range(phone_service.max_attempts):
-            try:
-                entry = phone_service.acquire_phone(exclude_prefixes=excluded_prefixes)
-            except Exception as e:
-                last_failure = f"获取手机号失败: {e}"
-                self._log(last_failure)
-                break
+        try:
+            for attempt in range(phone_service.max_attempts):
+                try:
+                    entry = phone_service.acquire_phone(
+                        exclude_prefixes=excluded_prefixes
+                    )
+                except Exception as e:
+                    last_failure = f"获取手机号失败: {e}"
+                    _log_phone_failure(last_failure)
+                    break
 
-            if not entry:
-                last_failure = last_failure or "SMSToMe 号码池中无可用手机号"
-                break
+                if not entry:
+                    last_failure = last_failure or f"{provider_name} 中无可用手机号"
+                    break
 
-            prefix = phone_service.prefix_hint(entry.phone)
-            self._log(
-                f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
-            )
-
-            sent, next_state, detail = self._send_phone_number(
-                entry.phone,
-                device_id,
-                user_agent,
-                sec_ch_ua,
-                impersonate,
-            )
-            if not sent or not next_state:
-                last_failure = detail or "add-phone/send 未返回有效状态"
-                self._log(last_failure)
-                self._blacklist_phone_if_needed(phone_service, entry, last_failure)
-                excluded_prefixes.add(prefix)
-                continue
-
-            if (
-                next_state.page_type != "phone_otp_verification"
-                and "phone-verification"
-                not in f"{next_state.continue_url} {next_state.current_url}".lower()
-            ):
-                last_failure = f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}"
-                self._log(last_failure)
-                self._blacklist_phone_if_needed(
-                    phone_service, entry, last_failure, next_state
+                prefix = phone_service.prefix_hint(entry.phone)
+                if progress_broker is not None:
+                    progress_broker.mark_phone_acquired(entry.phone)
+                self._log(
+                    f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
                 )
-                excluded_prefixes.add(prefix)
-                continue
 
-            session_data = self._decode_oauth_session_cookie() or {}
-            verification_channel = (
-                str(session_data.get("phone_verification_channel") or "sms")
-                .strip()
-                .lower()
-                or "sms"
-            )
-            bound_phone = (
-                str(session_data.get("phone_number") or entry.phone).strip()
-                or entry.phone
-            )
-            self._log(
-                f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
-            )
-
-            if verification_channel != "sms":
-                last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 SMSToMe 仅支持短信接码"
-                self._log(last_failure)
-                excluded_prefixes.add(prefix)
-                continue
-
-            code = phone_service.wait_for_code(entry)
-            if not code:
-                self._log("手机号验证码暂未收到，尝试重发一次...")
-                resend_ok, resend_detail = self._resend_phone_otp(
+                sent, next_state, detail = self._send_phone_number(
                     entry.phone,
+                    device_id,
+                    user_agent,
+                    sec_ch_ua,
+                    impersonate,
+                )
+                if not sent or not next_state:
+                    last_failure = detail or "add-phone/send 未返回有效状态"
+                    _log_phone_failure(last_failure)
+                    replacement_scheduled = self._blacklist_phone_if_needed(
+                        phone_service,
+                        entry,
+                        last_failure,
+                    )
+                    excluded_prefixes.add(prefix)
+                    if requires_explicit_replacement and not replacement_scheduled:
+                        break
+                    continue
+
+                if (
+                    next_state.page_type != "phone_otp_verification"
+                    and "phone-verification"
+                    not in f"{next_state.continue_url} {next_state.current_url}".lower()
+                ):
+                    last_failure = f"add-phone/send 未进入手机验证码页: {describe_flow_state(next_state)}"
+                    _log_phone_failure(last_failure)
+                    replacement_scheduled = self._blacklist_phone_if_needed(
+                        phone_service,
+                        entry,
+                        last_failure,
+                        next_state,
+                    )
+                    excluded_prefixes.add(prefix)
+                    if requires_explicit_replacement and not replacement_scheduled:
+                        break
+                    continue
+
+                session_data = self._decode_oauth_session_cookie() or {}
+                verification_channel = (
+                    str(session_data.get("phone_verification_channel") or "sms")
+                    .strip()
+                    .lower()
+                    or "sms"
+                )
+                bound_phone = (
+                    str(session_data.get("phone_number") or entry.phone).strip()
+                    or entry.phone
+                )
+                self._log(
+                    f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
+                )
+
+                if verification_channel != "sms":
+                    last_failure = f"add_phone 已切到 {verification_channel} 通道，当前 {provider_name} 仅支持短信接码"
+                    _log_phone_failure(last_failure)
+                    excluded_prefixes.add(prefix)
+                    if requires_explicit_replacement:
+                        break
+                    continue
+
+                if progress_broker is not None:
+                    progress_broker.mark_automatic_sms_sent(entry.phone)
+                code = phone_service.wait_for_code(entry)
+                if not code:
+                    resend_detail = ""
+                    if bool(getattr(phone_service, "supports_resend", True)):
+                        self._log("手机号验证码暂未收到，尝试重发一次...")
+                        resend_ok, resend_detail = self._resend_phone_otp(
+                            entry.phone,
+                            device_id,
+                            user_agent,
+                            sec_ch_ua,
+                            impersonate,
+                            next_state,
+                        )
+                        if resend_ok:
+                            code = phone_service.wait_for_code(entry)
+                    if not code:
+                        last_failure = (
+                            resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
+                        )
+                        _log_phone_failure(last_failure)
+                        excluded_prefixes.add(prefix)
+                        if requires_explicit_replacement:
+                            if attempt + 1 >= phone_service.max_attempts:
+                                break
+                            request_replacement = getattr(
+                                phone_service,
+                                "request_replacement",
+                                None,
+                            )
+                            if not callable(request_replacement):
+                                break
+                            try:
+                                replacement_scheduled = bool(
+                                    request_replacement(
+                                        entry.phone,
+                                        reason="sms_not_received",
+                                    )
+                                )
+                            except Exception as exc:
+                                replacement_failure = (
+                                    f"{provider_name} 换号失败: {exc}"
+                                )
+                                _log_phone_failure(replacement_failure)
+                                last_failure = (
+                                    f"{last_failure}; {replacement_failure}"
+                                )
+                                break
+                            if not replacement_scheduled:
+                                break
+                        continue
+
+                if progress_broker is not None:
+                    progress_broker.mark_automatic_code_received()
+                valid, validated_state, detail = self._validate_phone_otp(
+                    code,
                     device_id,
                     user_agent,
                     sec_ch_ua,
                     impersonate,
                     next_state,
                 )
-                if resend_ok:
-                    code = phone_service.wait_for_code(entry)
-                if not code:
-                    last_failure = (
-                        resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
-                    )
-                    self._log(last_failure)
+                if not valid or not validated_state:
+                    last_failure = detail or "手机号 OTP 验证失败"
+                    _log_phone_failure(last_failure)
                     excluded_prefixes.add(prefix)
+                    if requires_explicit_replacement:
+                        break
                     continue
 
-            valid, validated_state, detail = self._validate_phone_otp(
-                code,
-                device_id,
-                user_agent,
-                sec_ch_ua,
-                impersonate,
-                next_state,
-            )
-            if not valid or not validated_state:
-                last_failure = detail or "手机号 OTP 验证失败"
-                self._log(last_failure)
-                excluded_prefixes.add(prefix)
-                continue
-
-            return validated_state
+                phone_flow_succeeded = True
+                if progress_broker is not None:
+                    progress_broker.mark_phone_verified()
+                return validated_state
+        finally:
+            if (
+                not phone_flow_succeeded
+                and getattr(phone_service, "supports_cancellation", False) is True
+            ):
+                cancel_active = getattr(phone_service, "cancel_active", None)
+                if callable(cancel_active):
+                    cancelled = False
+                    cancellation_failure = ""
+                    try:
+                        cancelled = bool(cancel_active())
+                    except Exception as exc:
+                        cancellation_failure = str(exc or "").strip()
+                        _phone_service_log(
+                            f"{provider_name} 自动释放失败: {cancellation_failure}"
+                        )
+                    if (
+                        not cancelled
+                        and bool(getattr(phone_service, "card_at_risk", False))
+                    ):
+                        cancellation_failure = (
+                            cancellation_failure
+                            or str(
+                                getattr(phone_service, "last_cancel_error", "")
+                                or ""
+                            ).strip()
+                            or "服务端未确认恢复"
+                        )
+                        reuse_failure = (
+                            "LeadBee 任务不可取消，卡密不可复用: "
+                            f"{cancellation_failure}"
+                        )
+                        last_failure = "; ".join(
+                            part for part in (last_failure, reuse_failure) if part
+                        )
+                        _log_phone_failure(reuse_failure)
 
         self._set_error(f"add_phone 阶段失败: {last_failure or '未完成手机号验证'}")
         return None
@@ -3034,27 +4441,30 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/email-verification"
         )
-        sentinel_otp = get_sentinel_token_via_browser(
+        sentinel_otp = build_sentinel_token(
+            self.session,
+            device_id,
             flow="email_otp_validate",
-            proxy=self.proxy,
-            page_url=otp_referer,
-            headless=self.browser_mode != "headed",
-            device_id=device_id,
-            log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            impersonate=impersonate,
         )
         if sentinel_otp:
-            self._log("email_otp_validate: 已通过 Playwright SentinelSDK 获取 token")
+            self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
         else:
-            sentinel_otp = build_sentinel_token(
-                self.session,
-                device_id,
+            sentinel_otp = get_sentinel_token_via_browser(
                 flow="email_otp_validate",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
+                proxy=self.proxy,
+                page_url=otp_referer,
+                headless=self.browser_mode != "headed",
+                device_id=device_id,
+                log_fn=lambda msg: self._log(f"email_otp_validate: {msg}"),
             )
             if sentinel_otp:
-                self._log("email_otp_validate: 已通过 HTTP PoW 获取 token")
+                self._log(
+                    "email_otp_validate: HTTP PoW 失败，"
+                    "已通过 Playwright SentinelSDK 获取 token"
+                )
             else:
                 self._log("email_otp_validate: 未生成 sentinel token（继续尝试）")
 
@@ -3137,7 +4547,35 @@ class OAuthClient:
 
             self._log(f"/email-otp/validate -> {resp_otp.status_code}")
             if resp_otp.status_code != 200:
-                self._log(f"OTP 无效: {resp_otp.text[:160]}")
+                response_text = str(resp_otp.text or "")
+                self._log(f"OTP 无效: {response_text[:160]}")
+                error_code = ""
+                error_message = ""
+                try:
+                    error_payload = resp_otp.json()
+                except Exception:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    error_detail = error_payload.get("error") or error_payload.get("错误")
+                    if isinstance(error_detail, dict):
+                        error_code = str(
+                            error_detail.get("code")
+                            or error_detail.get("error_code")
+                            or error_detail.get("代码")
+                            or ""
+                        ).strip()
+                        error_message = str(
+                            error_detail.get("message")
+                            or error_detail.get("消息")
+                            or ""
+                        ).strip()
+                if is_account_deactivated_message(
+                    error_code,
+                    error_message or response_text,
+                ):
+                    terminal_message = error_message or "账号已被删除或停用"
+                    self._set_error(terminal_message)
+                    raise ChatGPTAccountDeactivatedError(terminal_message)
                 return None
 
             try:
@@ -3230,8 +4668,10 @@ class OAuthClient:
                         exclude_codes=tried_codes,
                     )
                 except TaskInterruption:
-                    self._set_error("任务已手动停止")
-                    return None
+                    raise
+                except MailboxAuthenticationError as e:
+                    self._set_error(str(e))
+                    break
                 except Exception as e:
                     if "手动停止" in str(e):
                         self._set_error("任务已手动停止")
@@ -3304,4 +4744,3 @@ class OAuthClient:
                 f"OAuth 阶段 OTP 验证失败，已尝试 {len(tried_codes)} 个验证码，等待窗口 {otp_wait_seconds}s"
             )
         return None
-

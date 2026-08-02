@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import {
   Table,
@@ -29,16 +29,25 @@ import {
   MoreOutlined,
   DeleteOutlined,
   SyncOutlined,
+  LoginOutlined,
+  RedoOutlined,
 } from '@ant-design/icons'
+import { ChatGPTExistingAccountLoginModal } from '@/components/ChatGPTExistingAccountLoginModal'
+import {
+  ChatGPTPhoneVerificationModal,
+  type ChatGPTPhoneVerificationAccount,
+} from '@/components/ChatGPTPhoneVerificationModal'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
+import { canStartChatGPTPhoneVerification } from '@/lib/chatgptStagedLogin'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { apiFetch } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 
 const { Text } = Typography
+const CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
@@ -553,6 +562,9 @@ export default function Accounts() {
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
+  const [existingAccountLoginModalOpen, setExistingAccountLoginModalOpen] = useState(false)
+  const [phoneVerificationAccount, setPhoneVerificationAccount] =
+    useState<ChatGPTPhoneVerificationAccount | null>(null)
 
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
@@ -563,13 +575,24 @@ export default function Accounts() {
   const [importLoading, setImportLoading] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
+  const [reloginTaskId, setReloginTaskId] = useState<string | null>(null)
+  const [reloginLoading, setReloginLoading] = useState(false)
+  const [reloginStartError, setReloginStartError] = useState('')
+  const [reloginConcurrency, setReloginConcurrency] = useState(1)
+  const reloginRequestEpochRef = useRef(0)
   const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [codex2apiUploadLoading, setCodex2APIUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
 
   useEffect(() => {
-    if (platform) setCurrentPlatform(platform)
+    reloginRequestEpochRef.current += 1
+    setCurrentPlatform(platform || 'chatgpt')
+    setSelectedRowKeys([])
+    setReloginStartError('')
+    setReloginTaskId(null)
+    setReloginLoading(false)
+    setReloginConcurrency(1)
   }, [platform])
 
   useEffect(() => {
@@ -711,6 +734,52 @@ export default function Accounts() {
     message.success('批量删除成功')
     setSelectedRowKeys([])
     load()
+  }
+
+  const handleChatgptRelogin = async () => {
+    const accountIds = Array.from(selectedRowKeys)
+      .map((value) => Number(value))
+      .filter((value) => Number.isInteger(value) && value > 0)
+
+    if (currentPlatform !== 'chatgpt' || accountIds.length === 0) return
+    const effectiveConcurrency = Math.min(
+      Math.max(Math.trunc(Number(reloginConcurrency) || 1), 1),
+      CHATGPT_RELOGIN_MAX_CONCURRENCY,
+      accountIds.length,
+    )
+
+    const requestEpoch = ++reloginRequestEpochRef.current
+    setReloginLoading(true)
+    setReloginStartError('')
+    try {
+      const result = await apiFetch('/tasks/chatgpt-relogin', {
+        method: 'POST',
+        body: JSON.stringify({
+          account_ids: accountIds,
+          concurrency: effectiveConcurrency,
+        }),
+      })
+      if (requestEpoch !== reloginRequestEpochRef.current) return
+      const nextTaskId = String(result.task_id || '').trim()
+      if (!nextTaskId) throw new Error('服务端未返回任务 ID')
+
+      setSelectedRowKeys([])
+      setReloginConcurrency(1)
+      setReloginTaskId(nextTaskId)
+      message.success(
+        `已启动 ${accountIds.length} 个账号重登（并发 ${effectiveConcurrency}）`,
+      )
+    } catch (error: unknown) {
+      if (requestEpoch !== reloginRequestEpochRef.current) return
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      const errorMessage = `启动重登失败: ${detail}`
+      setReloginStartError(errorMessage)
+      message.error(errorMessage)
+    } finally {
+      if (requestEpoch === reloginRequestEpochRef.current) {
+        setReloginLoading(false)
+      }
+    }
   }
 
   const handleAdd = async () => {
@@ -1176,6 +1245,7 @@ export default function Accounts() {
   }
   const secretPreviewStyle: React.CSSProperties = {
     ...monospaceStyle,
+    display: 'inline-block',
     filter: 'blur(4px)',
     whiteSpace: 'nowrap',
     overflow: 'hidden',
@@ -1196,6 +1266,7 @@ export default function Accounts() {
       dataIndex: 'email',
       key: 'email',
       width: 260,
+      fixed: isChatgptPlatform ? 'left' : undefined,
       render: (text: string, record: any) => (
         <div style={cellStackStyle}>
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
@@ -1377,6 +1448,11 @@ export default function Accounts() {
       fixed: isChatgptPlatform ? 'right' : undefined,
       render: (_: any, record: any) => (
         <Space size={4} wrap>
+          {isChatgptPlatform && canStartChatGPTPhoneVerification(record) ? (
+            <Button type="link" size="small" onClick={() => setPhoneVerificationAccount(record)}>
+              接码
+            </Button>
+          ) : null}
           <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
             详情
           </Button>
@@ -1458,6 +1534,11 @@ export default function Accounts() {
         </Space>
         <Space>
           {currentPlatform === 'chatgpt' && (
+            <Button icon={<LoginOutlined />} onClick={() => setExistingAccountLoginModalOpen(true)}>
+              登录
+            </Button>
+          )}
+          {currentPlatform === 'chatgpt' && (
             <Dropdown
               trigger={['click']}
               menu={{
@@ -1537,6 +1618,64 @@ export default function Accounts() {
               </Button>
             </Popconfirm>
           )}
+          {currentPlatform === 'chatgpt' && (
+            <Popconfirm
+              title={`确认重新登录所选 ${selectedRowKeys.length} 个账号、获取新令牌并覆盖同步到 Codex2API？`}
+              description={(
+                <Space size={8}>
+                  <Text type="secondary">
+                    并发数（最多 {Math.min(selectedRowKeys.length, CHATGPT_RELOGIN_MAX_CONCURRENCY)}）
+                  </Text>
+                  <InputNumber
+                    aria-label="重登并发数"
+                    min={1}
+                    max={Math.max(
+                      1,
+                      Math.min(selectedRowKeys.length, CHATGPT_RELOGIN_MAX_CONCURRENCY),
+                    )}
+                    precision={0}
+                    size="small"
+                    value={reloginConcurrency}
+                    onChange={(value) => {
+                      const maxConcurrency = Math.max(
+                        1,
+                        Math.min(selectedRowKeys.length, CHATGPT_RELOGIN_MAX_CONCURRENCY),
+                      )
+                      setReloginConcurrency(
+                        Math.min(Math.max(Math.trunc(Number(value) || 1), 1), maxConcurrency),
+                      )
+                    }}
+                    style={{ width: 72 }}
+                  />
+                </Space>
+              )}
+              onConfirm={handleChatgptRelogin}
+              disabled={selectedRowKeys.length === 0}
+              okText="确认"
+              cancelText="取消"
+              okButtonProps={{ autoInsertSpace: false }}
+              onOpenChange={(open) => {
+                if (open) {
+                  setReloginStartError('')
+                  setReloginConcurrency((current) => Math.min(
+                    Math.max(Math.trunc(Number(current) || 1), 1),
+                    Math.max(
+                      1,
+                      Math.min(selectedRowKeys.length, CHATGPT_RELOGIN_MAX_CONCURRENCY),
+                    ),
+                  ))
+                }
+              }}
+            >
+              <Button
+                icon={<RedoOutlined />}
+                loading={reloginLoading}
+                disabled={selectedRowKeys.length === 0}
+              >
+                重登所选 ({selectedRowKeys.length})
+              </Button>
+            </Popconfirm>
+          )}
           {selectedRowKeys.length > 0 && (
             <Popconfirm
               title={`确认删除选中的 ${selectedRowKeys.length} 个账号？`}
@@ -1555,6 +1694,17 @@ export default function Accounts() {
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
         </Space>
       </div>
+
+      {reloginStartError ? (
+        <Alert
+          type="error"
+          showIcon
+          closable
+          message={reloginStartError}
+          onClose={() => setReloginStartError('')}
+          style={{ marginBottom: 16 }}
+        />
+      ) : null}
 
       <Table
         rowKey="id"
@@ -1575,6 +1725,41 @@ export default function Accounts() {
           },
         })}
       />
+
+      <ChatGPTExistingAccountLoginModal
+        open={existingAccountLoginModalOpen && currentPlatform === 'chatgpt'}
+        onClose={() => setExistingAccountLoginModalOpen(false)}
+        onDone={() => {
+          load()
+        }}
+      />
+
+      <ChatGPTPhoneVerificationModal
+        open={Boolean(phoneVerificationAccount) && currentPlatform === 'chatgpt'}
+        account={phoneVerificationAccount}
+        onClose={() => setPhoneVerificationAccount(null)}
+        onSuccess={() => {
+          load()
+        }}
+      />
+
+      {reloginTaskId && currentPlatform === 'chatgpt' ? (
+        <Modal
+          title="重登并同步 Codex2API"
+          open
+          onCancel={() => setReloginTaskId(null)}
+          footer={null}
+          width={600}
+          maskClosable={false}
+          destroyOnHidden
+        >
+          <TaskLogPanel
+            taskId={reloginTaskId}
+            mode="relogin"
+            onDone={() => { load() }}
+          />
+        </Modal>
+      ) : null}
 
       <Modal
         title={`注册 ${currentPlatform}`}

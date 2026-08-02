@@ -106,7 +106,7 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         )
 
     def _build_account_extra(self, result) -> dict:
-        return {
+        extra = {
             "access_token": getattr(result, "access_token", ""),
             "refresh_token": getattr(result, "refresh_token", ""),
             "id_token": getattr(result, "id_token", ""),
@@ -116,6 +116,30 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
             "chatgpt_has_refresh_token_solution": self.mode == CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
             "chatgpt_token_source": getattr(result, "source", "register"),
         }
+        metadata = getattr(result, "metadata", None)
+        if isinstance(metadata, dict):
+            proxy_used = str(metadata.get("proxy_used") or "").strip()
+            if proxy_used:
+                extra["proxy_used"] = proxy_used
+            mailbox_login_context = metadata.get("mailbox_login_context")
+            if isinstance(mailbox_login_context, dict):
+                extra["mailbox_login_context"] = mailbox_login_context
+            oauth_resume_context = metadata.get("oauth_resume_context")
+            if (
+                metadata.get("phone_oauth_ready") is not False
+                and isinstance(oauth_resume_context, dict)
+                and oauth_resume_context
+            ):
+                extra["oauth_resume_context"] = oauth_resume_context
+            if "phone_oauth_ready" in metadata:
+                extra["phone_oauth_ready"] = bool(metadata.get("phone_oauth_ready"))
+            if "phone_oauth_prepare_error" in metadata:
+                extra["phone_oauth_prepare_error"] = str(
+                    metadata.get("phone_oauth_prepare_error") or ""
+                ).strip()[:500]
+            if metadata.get("phone_verification_required"):
+                extra["chatgpt_phone_verification_required"] = True
+        return extra
 
 
 class RefreshTokenChatGPTRegistrationAdapter(BaseChatGPTRegistrationModeAdapter):

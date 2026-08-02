@@ -1,6 +1,10 @@
+import base64
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+from curl_cffi import requests as cffi_requests
 
 from platforms.chatgpt.codex2api_upload import upload_to_codex2api
 
@@ -32,6 +36,13 @@ class Codex2APIUploadTests(unittest.TestCase):
             "codex2api_admin_key": "admin-secret",
         }.get(key, default)
 
+    @staticmethod
+    def _jwt(payload):
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"header.{encoded}.signature"
+
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
     def test_refresh_token_takes_precedence(self, post, get_config):
@@ -54,6 +65,640 @@ class Codex2APIUploadTests(unittest.TestCase):
             post.call_args.kwargs["headers"]["X-Admin-Key"],
             "admin-secret",
         )
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_uses_identity_import_with_both_fresh_tokens(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            ValueError("SSE response"),
+            text=(
+                'data: {"type":"progress","current":1,"total":1}\n\n'
+                'data: {"type":"complete","success":0,"updated":1,'
+                '"duplicate":0,"failed":0,"total":1}\n\n'
+            ),
+        )
+        list_before = _Response(
+            {
+                "accounts": [
+                    {
+                        "id": 7,
+                        "name": "demo@example.com",
+                        "email": "demo@example.com",
+                        "chatgpt_account_id": "workspace-1",
+                        "status": "error",
+                    }
+                ]
+            }
+        )
+        list_after = _Response(
+            {
+                "accounts": [
+                    {
+                        "id": 7,
+                        "name": "demo@example.com",
+                        "email": "demo@example.com",
+                        "chatgpt_account_id": "workspace-1",
+                        "status": "active",
+                    },
+                    {
+                        "id": 9,
+                        "name": "demo@example.com",
+                        "email": "demo@example.com",
+                        "chatgpt_account_id": "account-object-1",
+                        "status": "active",
+                    },
+                ]
+            }
+        )
+        test_response = _Response(
+            ValueError("SSE response"),
+            text='data: {"type":"test_complete","success":true}\n\n',
+        )
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            id_token="fresh-id",
+            session_token="fresh-session",
+            user_id="user-1",
+            account_id="account-object-1",
+            workspace_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.CurlMime",
+            create=True,
+        ) as curl_mime:
+            get.side_effect = [list_before, list_after, test_response]
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertTrue(ok)
+        self.assertIn("已覆盖更新", message)
+        self.assertEqual(get.call_count, 3)
+        self.assertIn("/api/admin/accounts/7/test", get.call_args_list[2].args[0])
+        self.assertEqual(
+            post.call_args.args[0],
+            "http://codex2api.local:8080/api/admin/accounts/import",
+        )
+        self.assertNotIn("data", post.call_args.kwargs)
+        self.assertNotIn("files", post.call_args.kwargs)
+        self.assertNotIn("Content-Type", post.call_args.kwargs["headers"])
+        mime = curl_mime.return_value
+        self.assertIs(post.call_args.kwargs["multipart"], mime)
+        self.assertEqual(mime.addpart.call_count, 2)
+        format_part, file_part = mime.addpart.call_args_list
+        self.assertEqual(format_part.kwargs, {"name": "format", "data": b"json"})
+        self.assertEqual(file_part.kwargs["name"], "file")
+        self.assertEqual(file_part.kwargs["filename"], "chatgpt-account.json")
+        self.assertEqual(file_part.kwargs["content_type"], "application/json")
+        payload = __import__("json").loads(file_part.kwargs["data"].decode("utf-8"))
+        self.assertEqual(payload["refresh_token"], "fresh-rt")
+        self.assertEqual(payload["access_token"], "fresh-at")
+        self.assertEqual(payload["id_token"], "fresh-id")
+        self.assertEqual(payload["email"], "demo@example.com")
+        self.assertEqual(payload["workspace_id"], "workspace-1")
+        self.assertEqual(payload["account_id"], "workspace-1")
+        mime.close.assert_called_once_with()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_verifies_new_row_and_removes_stale_remote_row(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            ValueError("SSE response"),
+            text=(
+                'data: {"type":"complete","success":1,"updated":0,'
+                '"duplicate":0,"failed":0,"total":1}\n\n'
+            ),
+        )
+        old_row = {
+            "id": 7,
+            "name": "demo@example.com",
+            "email": "",
+            "chatgpt_account_id": "",
+            "status": "error",
+            "error_message": "token_invalidated",
+        }
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+            "status": "active",
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            id_token="fresh-id",
+            session_token="fresh-session",
+            account_id="workspace-1",
+            workspace_id="workspace-1",
+            user_id="user-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": [old_row]}),
+                _Response({"accounts": [old_row, new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text='data: {"type":"test_complete","success":true}\n\n',
+                ),
+            ]
+            delete.return_value = _Response({"message": "账号已删除"})
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertTrue(ok)
+        self.assertIn("替换", message)
+        self.assertEqual(
+            delete.call_args.args[0],
+            "http://codex2api.local:8080/api/admin/accounts/7",
+        )
+        self.assertIn("/api/admin/accounts/8/test", get.call_args_list[2].args[0])
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_matches_remote_chatgpt_user_identity(
+        self,
+        post,
+        get_config,
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 0, "updated": 1, "duplicate": 0, "failed": 0}
+        )
+        before_row = {
+            "id": 7,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "user-1",
+            "status": "error",
+        }
+        after_row = {**before_row, "status": "active"}
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            id_token=self._jwt(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_account_id": "workspace-1",
+                        "chatgpt_user_id": "user-1",
+                    }
+                }
+            ),
+            workspace_id="workspace-1",
+            account_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get:
+            get.side_effect = [
+                _Response({"accounts": [before_row]}),
+                _Response({"accounts": [after_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text='data: {"type":"test_complete","success":true}\n\n',
+                ),
+            ]
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertTrue(ok)
+        self.assertIn("已覆盖更新", message)
+        self.assertIn("/api/admin/accounts/7/test", get.call_args_list[2].args[0])
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_keeps_authenticated_usage_limited_account(
+        self,
+        post,
+        get_config,
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 1, "updated": 0, "duplicate": 0, "failed": 0}
+        )
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+            "status": "rate_limited",
+        }
+        usage_event = {
+            "type": "error",
+            "error": (
+                "The usage limit has been reached\n\n"
+                '上游事件: {"response":{"error":'
+                '{"type":"usage_limit_reached"}}}'
+            ),
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            workspace_id="workspace-1",
+            account_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": []}),
+                _Response({"accounts": [new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text=f"data: {json.dumps(usage_event)}\n\n",
+                ),
+            ]
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertTrue(ok)
+        self.assertIn("用量已达上限", message)
+        delete.assert_not_called()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_prioritizes_invalid_token_over_usage_text(
+        self,
+        post,
+        get_config,
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 1, "updated": 0, "duplicate": 0, "failed": 0}
+        )
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            workspace_id="workspace-1",
+            account_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": []}),
+                _Response({"accounts": [new_row]}),
+                _Response(
+                    {
+                        "success": False,
+                        "error": {
+                            "code": "token_invalidated",
+                            "message": "The usage limit has been reached",
+                        },
+                    }
+                ),
+            ]
+            delete.return_value = _Response({"message": "账号已删除"})
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertFalse(ok)
+        self.assertIn("token_invalidated", message)
+        self.assertEqual(
+            delete.call_args.args[0],
+            "http://codex2api.local:8080/api/admin/accounts/8",
+        )
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_without_identity_rejects_ambiguous_updated_rows(
+        self, post, get_config
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 0, "updated": 1, "duplicate": 0, "failed": 0}
+        )
+        rows = [
+            {
+                "id": 7,
+                "name": "demo@example.com",
+                "email": "demo@example.com",
+                "chatgpt_account_id": "workspace-a",
+            },
+            {
+                "id": 9,
+                "name": "demo@example.com",
+                "email": "demo@example.com",
+                "chatgpt_account_id": "workspace-b",
+            },
+        ]
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": rows}),
+                _Response({"accounts": rows}),
+            ]
+            ok, message = upload_to_codex2api(
+                self._account(refresh_token="fresh-rt", access_token="fresh-at"),
+                replace_existing=True,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("身份", message)
+        self.assertEqual(get.call_count, 2)
+        delete.assert_not_called()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_rejects_ambiguous_same_workspace_updated_rows(
+        self, post, get_config
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 0, "updated": 1, "duplicate": 0, "failed": 0}
+        )
+        before_rows = [
+            {
+                "id": 7,
+                "name": "demo@example.com",
+                "email": "demo@example.com",
+                "chatgpt_account_id": "workspace-1",
+                "status": "error",
+            },
+            {
+                "id": 9,
+                "name": "demo@example.com",
+                "email": "demo@example.com",
+                "chatgpt_account_id": "workspace-1",
+                "status": "active",
+            },
+        ]
+        after_rows = [
+            {**before_rows[0], "status": "active"},
+            before_rows[1],
+        ]
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            workspace_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": before_rows}),
+                _Response({"accounts": after_rows}),
+            ]
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertFalse(ok)
+        self.assertIn("身份不唯一", message)
+        self.assertEqual(get.call_count, 2)
+        delete.assert_not_called()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_without_identity_verifies_one_new_row_without_cleanup(
+        self, post, get_config
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 1, "updated": 0, "duplicate": 0, "failed": 0}
+        )
+        old_row = {
+            "id": 7,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "",
+            "status": "error",
+            "error_message": "token_invalidated",
+        }
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "",
+            "status": "active",
+        }
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": [old_row]}),
+                _Response({"accounts": [old_row, new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text='data: {"type":"test_complete","success":true}\n\n',
+                ),
+            ]
+            ok, message = upload_to_codex2api(
+                self._account(refresh_token="fresh-rt", access_token="fresh-at"),
+                replace_existing=True,
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("已新增并验证", message)
+        self.assertIn("/api/admin/accounts/8/test", get.call_args_list[2].args[0])
+        delete.assert_not_called()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_preserves_identityless_row_without_invalid_token_evidence(
+        self, post, get_config
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 1, "updated": 0, "duplicate": 0, "failed": 0}
+        )
+        old_row = {
+            "id": 7,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "",
+            "status": "active",
+        }
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+            "status": "active",
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            account_id="account-object-1",
+            workspace_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": [old_row]}),
+                _Response({"accounts": [old_row, new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text='data: {"type":"test_complete","success":true}\n\n',
+                ),
+            ]
+            ok, _message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertTrue(ok)
+        delete.assert_not_called()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_rejects_unverified_new_row(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            ValueError("SSE response"),
+            text=(
+                'data: {"type":"complete","success":1,"updated":0,'
+                '"duplicate":0,"failed":0,"total":1}\n\n'
+            ),
+        )
+        old_row = {"id": 7, "name": "demo@example.com", "email": ""}
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            id_token="fresh-id",
+            account_id="workspace-1",
+            workspace_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": [old_row]}),
+                _Response({"accounts": [old_row, new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text=(
+                        'data: {"type":"error",'
+                        '"error":"token_invalidated"}\n\n'
+                    ),
+                ),
+            ]
+            delete.return_value = _Response({"message": "账号已删除"})
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertFalse(ok)
+        self.assertIn("token_invalidated", message)
+        self.assertEqual(
+            delete.call_args.args[0],
+            "http://codex2api.local:8080/api/admin/accounts/8",
+        )
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_reports_failed_cleanup_after_verification_failure(
+        self, post, get_config
+    ):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {"success": 1, "updated": 0, "duplicate": 0, "failed": 0}
+        )
+        new_row = {
+            "id": 8,
+            "name": "demo@example.com",
+            "email": "demo@example.com",
+            "chatgpt_account_id": "workspace-1",
+        }
+        account = SimpleNamespace(
+            email="demo@example.com",
+            refresh_token="fresh-rt",
+            access_token="fresh-at",
+            workspace_id="workspace-1",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as delete:
+            get.side_effect = [
+                _Response({"accounts": []}),
+                _Response({"accounts": [new_row]}),
+                _Response(
+                    ValueError("SSE response"),
+                    text=(
+                        'data: {"type":"error",'
+                        '"error":"token_invalidated"}\n\n'
+                    ),
+                ),
+            ]
+            delete.return_value = _Response(
+                {"message": "delete rejected"}, status_code=500
+            )
+            ok, message = upload_to_codex2api(account, replace_existing=True)
+
+        self.assertFalse(ok)
+        self.assertIn("token_invalidated", message)
+        self.assertIn("清理远端旧账号失败", message)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_does_not_treat_failed_import_as_success(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.return_value = _Response(
+            {
+                "success": 0,
+                "updated": 0,
+                "duplicate": 0,
+                "failed": 1,
+                "message": "identity update failed",
+            }
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get",
+            return_value=_Response({"accounts": []}),
+        ):
+            ok, message = upload_to_codex2api(
+                self._account(refresh_token="fresh-rt", access_token="fresh-at"),
+                replace_existing=True,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("identity update failed", message)
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
@@ -296,6 +941,87 @@ class Codex2APIUploadTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertLessEqual(len(message), 260)
         self.assertLessEqual(len("\n".join(captured.output)), 320)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_tls_handshake_error_is_retried_with_the_same_upload(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.side_effect = [
+            cffi_requests.exceptions.SSLError("TLS connect error", 35),
+            _Response({"success": 1, "failed": 0}),
+        ]
+
+        ok, message = upload_to_codex2api(self._account())
+
+        self.assertTrue(ok)
+        self.assertIn("上传成功", message)
+        self.assertEqual(post.call_count, 2)
+        first_call, second_call = post.call_args_list
+        self.assertEqual(first_call.args, second_call.args)
+        self.assertEqual(first_call.kwargs, second_call.kwargs)
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_replace_existing_tls_retry_rebuilds_and_closes_multipart(
+        self,
+        post,
+        get_config,
+    ):
+        get_config.side_effect = self._configured
+        post.side_effect = [
+            cffi_requests.exceptions.SSLError("TLS connect error", 35),
+            _Response(
+                {
+                    "success": 0,
+                    "updated": 0,
+                    "duplicate": 0,
+                    "failed": 1,
+                    "message": "stop after upload",
+                }
+            ),
+        ]
+        first_mime = mock.Mock()
+        second_mime = mock.Mock()
+
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get",
+            return_value=_Response({"accounts": []}),
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.CurlMime",
+            side_effect=[first_mime, second_mime],
+        ) as curl_mime:
+            ok, message = upload_to_codex2api(
+                self._account(refresh_token="fresh-rt", access_token="fresh-at"),
+                replace_existing=True,
+            )
+
+        self.assertFalse(ok)
+        self.assertIn("stop after upload", message)
+        self.assertEqual(post.call_count, 2)
+        self.assertIs(post.call_args_list[0].kwargs["multipart"], first_mime)
+        self.assertIs(post.call_args_list[1].kwargs["multipart"], second_mime)
+        self.assertEqual(curl_mime.call_count, 2)
+        first_mime.close.assert_called_once_with()
+        second_mime.close.assert_called_once_with()
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_non_handshake_ssl_error_is_not_retried(self, post, get_config):
+        get_config.side_effect = self._configured
+        post.side_effect = cffi_requests.exceptions.SSLError(
+            "certificate verify failed",
+            60,
+        )
+
+        with self.assertLogs(
+            "platforms.chatgpt.codex2api_upload",
+            level="ERROR",
+        ):
+            ok, message = upload_to_codex2api(self._account())
+
+        self.assertFalse(ok)
+        self.assertIn("上传异常", message)
+        post.assert_called_once()
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")

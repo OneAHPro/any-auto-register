@@ -1,4 +1,5 @@
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -152,6 +153,149 @@ class MailImportServiceTests(unittest.TestCase):
             self.assertEqual(response.snapshot.count, 1)
             self.assertEqual(response.snapshot.items[0].email, "demo@example.com")
 
+    def test_applemail_strategy_accepts_chatgpt_password_and_mfa_rows(self):
+        from services.mail_imports.providers import AppleMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        strategy = AppleMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            response = strategy.execute(
+                MailImportExecuteRequest(
+                    type="applemail",
+                    content=(
+                        "demo@icloud.com----chatgpt-password----"
+                        "JBSWY3DPEHPK3PXP"
+                    ),
+                    pool_dir=tmp_dir,
+                    filename="icloud_mfa.json",
+                    bind_to_config=False,
+                )
+            )
+
+            payload = json.loads(Path(tmp_dir, "icloud_mfa.json").read_text())
+
+        self.assertEqual(response.summary.success, 1)
+        self.assertEqual(payload[0]["account_type"], "chatgpt_password_totp")
+        self.assertEqual(payload[0]["password"], "chatgpt-password")
+        self.assertEqual(payload[0]["totp_secret"], "JBSWY3DPEHPK3PXP")
+
+    def test_applemail_strategy_imports_url_and_reset_credentials_after_header(self):
+        from services.mail_imports.providers import AppleMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        strategy = AppleMailImportStrategy()
+        mail_url = (
+            "https://oauth.example.test/mail?email=first%40example.com&token=MAIL_SECRET"
+        )
+        totp_url = (
+            "https://2fa.example.test/view?token=TOTP_SECRET&email=first%40example.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            response = strategy.execute(
+                MailImportExecuteRequest(
+                    type="applemail",
+                    content=(
+                        "购买后请按以下格式使用，本说明不属于卡密。\n"
+                        "=== 卡密内容 ===\n"
+                        f"first@example.com----password-1----{mail_url}----{totp_url}\n"
+                        "broken@example.com----登陆请点击忘记密码----"
+                        "https://oauth.example.test/mail?token=BROKEN_SECRET\n"
+                        "second@example.com----password-2----"
+                        "https://oauth.example.test/mail?token=MAIL_TWO----"
+                        "https://2fa.example.test/view?token=TOTP_TWO\n"
+                        "third@example.com----password-3----"
+                        "https://oauth.example.test/mail?token=MAIL_THREE----"
+                        "https://2fa.example.test/view?token=TOTP_THREE"
+                    ),
+                    pool_dir=tmp_dir,
+                    filename="url-credentials.json",
+                    bind_to_config=False,
+                )
+            )
+            payload = json.loads(
+                Path(tmp_dir, "url-credentials.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(response.summary.total, 4)
+        self.assertEqual(response.summary.success, 4)
+        self.assertEqual(response.summary.failed, 0)
+        self.assertEqual(response.errors, [])
+        self.assertEqual(len(payload), 4)
+        first = next(item for item in payload if item["email"] == "first@example.com")
+        self.assertEqual(first["account_type"], "chatgpt_password_url_otp")
+        self.assertEqual(first["password"], "password-1")
+        self.assertEqual(first["mail_api_url"], mail_url)
+        self.assertEqual(first["totp_url"], totp_url)
+        reset = next(item for item in payload if item["email"] == "broken@example.com")
+        self.assertEqual(reset["account_type"], "chatgpt_password_reset_url_mail")
+        self.assertEqual(reset["password"], "")
+        self.assertEqual(
+            reset["mail_api_url"],
+            "https://oauth.example.test/mail?token=BROKEN_SECRET",
+        )
+        self.assertNotIn("totp_url", reset)
+
+    def test_applemail_import_binding_activates_the_imported_pool(self):
+        from services.mail_imports.providers import AppleMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        strategy = AppleMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir, patch(
+            "services.mail_imports.providers.config_store.set_many"
+        ) as set_many:
+            strategy.execute(
+                MailImportExecuteRequest(
+                    type="applemail",
+                    content=(
+                        "demo@icloud.com----chatgpt-password----"
+                        "JBSWY3DPEHPK3PXP"
+                    ),
+                    pool_dir=tmp_dir,
+                    filename="active-applemail.json",
+                    bind_to_config=True,
+                )
+            )
+
+        set_many.assert_called_once_with(
+            {
+                "mail_provider": "applemail",
+                "applemail_pool_dir": tmp_dir,
+                "applemail_pool_file": "active-applemail.json",
+            }
+        )
+
+    def test_microsoft_import_binding_activates_the_microsoft_pool(self):
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'mail-import-bind.db'}"
+            )
+            SQLModel.metadata.create_all(test_engine)
+            try:
+                with patch(
+                    "services.mail_imports.providers.engine", test_engine
+                ), patch(
+                    "services.mail_imports.providers.config_store.set_many"
+                ) as set_many:
+                    response = strategy.execute(
+                        MailImportExecuteRequest(
+                            type="microsoft",
+                            content=(
+                                "demo@outlook.com----"
+                                "https://mailapi.example.test/inbox/demo"
+                            ),
+                            bind_to_config=True,
+                        )
+                    )
+            finally:
+                test_engine.dispose()
+
+        self.assertEqual(response.summary.success, 1)
+        set_many.assert_called_once_with({"mail_provider": "microsoft"})
+
     def test_microsoft_strategy_rejects_invalid_mailapi_url(self):
         from services.mail_imports.providers import MicrosoftMailImportStrategy
         from services.mail_imports.schemas import MailImportExecuteRequest
@@ -203,6 +347,7 @@ class MailImportServiceTests(unittest.TestCase):
                                 "first@outlook.com----password----client-a----refresh-a\n"
                                 "second@hotmail.com----password----client-b----refresh-b"
                             ),
+                            bind_to_config=False,
                         )
                     )
 
@@ -242,6 +387,7 @@ class MailImportServiceTests(unittest.TestCase):
                                 "oauth@outlook.com----password----client-a----refresh-a\n"
                                 "mailapi@hotmail.com----https://mailapi.icu/key?type=html&orderNo=abc123"
                             ),
+                            bind_to_config=False,
                         )
                     )
 
@@ -287,6 +433,7 @@ class MailImportServiceTests(unittest.TestCase):
                             alias_split_enabled=True,
                             alias_split_count=2,
                             alias_include_original=False,
+                            bind_to_config=False,
                         )
                     )
 

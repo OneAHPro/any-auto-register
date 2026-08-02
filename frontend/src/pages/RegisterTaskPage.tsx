@@ -333,7 +333,7 @@ export default function RegisterTaskPage() {
               <Select
                 options={[
                   { value: 'microsoft', label: '微软邮箱（Outlook / Hotmail）' },
-                  { value: 'applemail', label: 'AppleMail / 小苹果' },
+                  { value: 'applemail', label: 'iCloud MFA / AppleMail / 小苹果' },
                 ]}
               />
             </Form.Item>

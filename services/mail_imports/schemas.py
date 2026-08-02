@@ -6,7 +6,15 @@ from pydantic import BaseModel, Field
 
 
 MailImportProviderType = Literal["applemail", "microsoft"]
-MailImportAccountType = Literal["microsoft_oauth", "mailapi_url"]
+MailImportAccountType = Literal[
+    "microsoft_oauth",
+    "mailapi_url",
+    "applemail_oauth",
+    "icloud_web",
+    "chatgpt_password_totp",
+    "chatgpt_password_url_otp",
+    "chatgpt_password_reset_url_mail",
+]
 
 DEFAULT_PREVIEW_LIMIT = 100
 MAX_PREVIEW_LIMIT = 500

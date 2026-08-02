@@ -3,6 +3,7 @@ from fastapi.responses import StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, get_session
+from services.chatgpt_account_state import account_is_visible_in_default_list
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
@@ -10,6 +11,65 @@ import io, csv, json, logging
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
+
+
+def _safe_float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _sanitize_account_extra_for_api(raw_extra: str) -> str:
+    try:
+        extra = json.loads(raw_extra or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+
+    mailbox_context = extra.get("mailbox_login_context")
+    if isinstance(mailbox_context, dict):
+        extra["mailbox_login_context"] = {
+            "provider": str(mailbox_context.get("provider") or "").strip(),
+            "email": str(mailbox_context.get("email") or "").strip(),
+            "account_id": str(mailbox_context.get("account_id") or "").strip(),
+            "configured": True,
+        }
+
+    resume_context = extra.get("oauth_resume_context")
+    if isinstance(resume_context, dict):
+        flow_state = resume_context.get("flow_state")
+        page_type = (
+            str(flow_state.get("page_type") or "").strip()
+            if isinstance(flow_state, dict)
+            else ""
+        )
+        version = int(resume_context.get("version") or 0)
+        ready = bool(
+            version == 2
+            and str(resume_context.get("code_verifier") or "").strip()
+            and str(resume_context.get("oauth_state") or "").strip()
+            and page_type
+        )
+        extra["oauth_resume_context"] = {
+            "version": version,
+            "created_at": _safe_float(resume_context.get("created_at")),
+            "expires_at": _safe_float(resume_context.get("expires_at")),
+            "ready": ready,
+            "flow_state": {"page_type": page_type},
+        }
+
+    extra.pop("cookies", None)
+    return json.dumps(extra, ensure_ascii=False)
+
+
+def _account_for_response(account: AccountModel) -> dict:
+    payload = account.model_dump()
+    payload["extra_json"] = _sanitize_account_extra_for_api(
+        str(payload.get("extra_json") or "{}")
+    )
+    return payload
 
 
 class AccountCreate(BaseModel):
@@ -58,9 +118,19 @@ def list_accounts(
         q = q.where(AccountModel.created_at >= created_at_start)
     if created_at_end:
         q = q.where(AccountModel.created_at <= created_at_end)
-    total = len(session.exec(q).all())
-    items = session.exec(q.offset((page - 1) * page_size).limit(page_size)).all()
-    return {"total": total, "page": page, "items": items}
+    visible_accounts = [
+        account
+        for account in session.exec(q).all()
+        if account_is_visible_in_default_list(account)
+    ]
+    total = len(visible_accounts)
+    start = (page - 1) * page_size
+    items = visible_accounts[start:start + page_size]
+    return {
+        "total": total,
+        "page": page,
+        "items": [_account_for_response(item) for item in items],
+    }
 
 
 @router.post("")
@@ -76,7 +146,7 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
     session.add(acc)
     session.commit()
     session.refresh(acc)
-    return acc
+    return _account_for_response(acc)
 
 
 @router.get("/stats")
@@ -199,7 +269,7 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
     acc = session.get(AccountModel, account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    return acc
+    return _account_for_response(acc)
 
 
 @router.patch("/{account_id}")
@@ -218,7 +288,7 @@ def update_account(account_id: int, body: AccountUpdate,
     session.add(acc)
     session.commit()
     session.refresh(acc)
-    return acc
+    return _account_for_response(acc)
 
 
 @router.delete("/{account_id}")

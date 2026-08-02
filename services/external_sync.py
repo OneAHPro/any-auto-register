@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from services.chatgpt_sync import (
@@ -11,6 +12,9 @@ from services.chatgpt_sync import (
     persist_sub2api_sync_result,
     upload_chatgpt_account_to_cpa,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _is_config_enabled(value: Any, default: bool = False) -> bool:
@@ -33,6 +37,106 @@ def _pick_text(source: Any, *keys: str, default: str = "") -> str:
     return default
 
 
+def _build_chatgpt_upload_account(account):
+    class _A:
+        pass
+
+    upload_account = _A()
+    upload_account.email = account.email
+    extra = _get_account_extra(account)
+    upload_account.access_token = (
+        _pick_text(extra, "access_token", "accessToken") or account.token
+    )
+    upload_account.refresh_token = _pick_text(
+        extra,
+        "refresh_token",
+        "refreshToken",
+    )
+    upload_account.id_token = _pick_text(extra, "id_token", "idToken")
+    upload_account.session_token = _pick_text(
+        extra,
+        "session_token",
+        "sessionToken",
+    )
+    upload_account.client_id = _pick_text(
+        extra,
+        "client_id",
+        "clientId",
+        default="app_EMoamEEZ73f0CkXaXp7hrann",
+    )
+    stored_user_id = str(getattr(account, "user_id", "") or "").strip()
+    upload_account.workspace_id = _pick_text(
+        extra,
+        "workspace_id",
+        "workspaceId",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+        default=stored_user_id,
+    )
+    upload_account.account_id = _pick_text(
+        extra,
+        "account_id",
+        "accountId",
+        "chatgpt_account_id",
+        "chatgptAccountId",
+        default=upload_account.workspace_id,
+    )
+    upload_account.user_id = _pick_text(
+        extra,
+        "chatgpt_user_id",
+        "chatgptUserId",
+        "user_id",
+        "userId",
+        default=stored_user_id,
+    )
+    return upload_account
+
+
+def sync_codex2api_account(
+    account,
+    *,
+    force: bool = False,
+    replace_existing: bool = False,
+) -> dict[str, Any] | None:
+    """只同步 Codex2API，并独立记录该目标的结果。"""
+    from core.config_store import config_store
+
+    codex2api_enabled = _is_config_enabled(
+        config_store.get("codex2api_enabled", "0"),
+        default=False,
+    )
+    if not force and not codex2api_enabled:
+        return None
+
+    try:
+        from platforms.chatgpt.codex2api_upload import upload_to_codex2api
+
+        ok, msg = upload_to_codex2api(
+            _build_chatgpt_upload_account(account),
+            replace_existing=replace_existing,
+        )
+    except Exception as exc:
+        ok = False
+        msg = "Codex2API 自动同步异常"
+        logger.error("%s (%s)", msg, type(exc).__name__)
+
+    try:
+        persist_codex2api_sync_result(account, ok, msg)
+    except Exception as exc:
+        logger.error(
+            "Codex2API sync state persistence failed (%s)",
+            type(exc).__name__,
+        )
+        remote_message = str(msg or "").strip()
+        msg = (
+            f"{remote_message}，但同步状态保存失败"
+            if remote_message
+            else "Codex2API 同步状态保存失败"
+        )
+        ok = False
+    return {"name": "Codex2API", "ok": ok, "msg": msg}
+
+
 def sync_account(account) -> list[dict[str, Any]]:
     """根据平台将账号同步到外部系统。"""
     from core.config_store import config_store
@@ -40,33 +144,12 @@ def sync_account(account) -> list[dict[str, Any]]:
     platform = getattr(account, "platform", "")
     results: list[dict[str, Any]] = []
 
-    def _build_chatgpt_upload_account():
-        class _A:
-            pass
-
-        a = _A()
-        a.email = account.email
-        extra = _get_account_extra(account)
-        a.access_token = _pick_text(extra, "access_token", "accessToken") or account.token
-        a.refresh_token = _pick_text(extra, "refresh_token", "refreshToken")
-        a.id_token = _pick_text(extra, "id_token", "idToken")
-        a.session_token = _pick_text(extra, "session_token", "sessionToken")
-        a.client_id = _pick_text(extra, "client_id", "clientId", default="app_EMoamEEZ73f0CkXaXp7hrann")
-        return a
-
     if platform == "chatgpt":
-        upload_account = _build_chatgpt_upload_account()
+        upload_account = _build_chatgpt_upload_account(account)
 
-        codex2api_enabled = _is_config_enabled(
-            config_store.get("codex2api_enabled", "0"),
-            default=False,
-        )
-        if codex2api_enabled:
-            from platforms.chatgpt.codex2api_upload import upload_to_codex2api
-
-            ok, msg = upload_to_codex2api(upload_account)
-            persist_codex2api_sync_result(account, ok, msg)
-            results.append({"name": "Codex2API", "ok": ok, "msg": msg})
+        codex2api_result = sync_codex2api_account(account)
+        if codex2api_result is not None:
+            results.append(codex2api_result)
 
         # Codex2API 已按独立配置处理；贡献模式继续覆盖其余旧上传目标，避免重复上报。
         contribution_enabled = _is_config_enabled(config_store.get("contribution_enabled", "0"))

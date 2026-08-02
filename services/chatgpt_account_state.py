@@ -2,14 +2,63 @@
 
 from __future__ import annotations
 
+import re
+import json
 from typing import Any
+
+from core.task_runtime import TaskInterruption
 
 
 INVALID_ACCOUNT_STATUS = "invalid"
+_DEACTIVATION_CODE_PATTERN = re.compile(
+    r'''(?ix)
+    ["']?(?:error[._ -]?)?code["']?
+    \s*[:=]\s*["']?
+    (?:account_deactivated|account_deleted)\b
+    ''',
+)
+
+
+class ChatGPTAccountDeactivatedError(TaskInterruption):
+    """The authentication service explicitly says the account no longer exists."""
+
+    def __init__(self, message: str = "账号已被删除或停用") -> None:
+        super().__init__(str(message or "账号已被删除或停用").strip())
 
 
 def _lower_text(value: Any) -> str:
     return str(value or "").strip().lower()
+
+
+def chatgpt_account_refresh_token(account: Any) -> str:
+    """Return a saved ChatGPT refresh token without trusting stored JSON."""
+    extra: Any = getattr(account, "extra", None)
+    get_extra = getattr(account, "get_extra", None)
+    if not isinstance(extra, dict) and callable(get_extra):
+        try:
+            extra = get_extra()
+        except (TypeError, ValueError, json.JSONDecodeError):
+            extra = None
+    if not isinstance(extra, dict):
+        raw_extra = getattr(account, "extra_json", "")
+        try:
+            extra = json.loads(raw_extra or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            extra = {}
+    if not isinstance(extra, dict):
+        return ""
+    for key in ("refresh_token", "refreshToken"):
+        token = str(extra.get(key) or "").strip()
+        if token:
+            return token
+    return ""
+
+
+def account_is_visible_in_default_list(account: Any) -> bool:
+    """Hide incomplete ChatGPT rows while preserving every other platform."""
+    if _lower_text(getattr(account, "platform", "")) != "chatgpt":
+        return True
+    return bool(chatgpt_account_refresh_token(account))
 
 
 def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> bool:
@@ -17,10 +66,22 @@ def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> b
     text = _lower_text(message)
     if code in {"account_deactivated", "account_deleted"}:
         return True
+    if _DEACTIVATION_CODE_PATTERN.search(text):
+        return True
     markers = (
-        "deleted or deactivated",
         "account has been deleted or deactivated",
         "you do not have an account because it has been deleted or deactivated",
+        "your account was deleted or deactivated",
+        "你没有账号，因为它已被删除或停用",
+        "您没有账号，因为它已被删除或停用",
+        "账号已被删除或停用",
+        "账号已被停用或删除",
+        "帐号已被删除或停用",
+        "帐号已被停用或删除",
+        "账户已被删除或停用",
+        "账户已被停用或删除",
+        "帳號已被刪除或停用",
+        "帳戶已被刪除或停用",
     )
     return any(marker in text for marker in markers)
 

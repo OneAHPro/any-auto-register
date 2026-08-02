@@ -4,6 +4,7 @@ from services.chatgpt_account_state import (
     apply_chatgpt_status_policy,
     classify_local_probe_state,
     classify_remote_sync_state,
+    is_account_deactivated_message,
 )
 
 
@@ -78,6 +79,29 @@ class ChatGPTAccountStateTests(unittest.TestCase):
             ),
             "auth_deactivated",
         )
+
+    def test_chinese_deleted_or_deactivated_message_is_detected(self):
+        self.assertTrue(
+            is_account_deactivated_message(
+                message=(
+                    'OTP 无效: {"错误":{"消息":"你没有账号，'
+                    '因为它已被删除或停用。如果您认为这是错误，请通过电话联系我们"}}'
+                )
+            )
+        )
+
+    def test_ordinary_invalid_otp_is_not_treated_as_deactivated(self):
+        self.assertFalse(
+            is_account_deactivated_message(message="OTP 无效: 验证码错误")
+        )
+
+    def test_negated_or_diagnostic_phrases_are_not_deactivation_signals(self):
+        for message in (
+            "Response did not say deleted or deactivated.",
+            "Expected account_deleted but received timeout.",
+        ):
+            with self.subTest(message=message):
+                self.assertFalse(is_account_deactivated_message(message=message))
 
 
 if __name__ == "__main__":

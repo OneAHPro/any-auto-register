@@ -55,6 +55,88 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
         )
         self.assertFalse(account.extra["chatgpt_has_refresh_token_solution"])
 
+    def test_build_account_preserves_staged_login_metadata(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        resume_snapshot = {
+            "version": 1,
+            "expires_at": 1234567890,
+            "cookies": [{"name": "login_session", "value": "cookie"}],
+        }
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "existing@example.com",
+                "password": "",
+                "account_id": "acct-existing",
+                "access_token": "at-existing",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-existing",
+                "workspace_id": "ws-existing",
+                "source": "existing_account_web_login",
+                "metadata": {
+                    "proxy_used": "http://127.0.0.1:7890",
+                    "phone_verification_required": True,
+                    "mailbox_login_context": {
+                        "provider": "microsoft",
+                        "email": "existing@example.com",
+                        "extra": {"client_id": "mail-client"},
+                    },
+                    "oauth_resume_context": resume_snapshot,
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertEqual(account.token, "at-existing")
+        self.assertEqual(account.extra["refresh_token"], "")
+        self.assertTrue(account.extra["chatgpt_phone_verification_required"])
+        self.assertEqual(account.extra["proxy_used"], "http://127.0.0.1:7890")
+        self.assertEqual(
+            account.extra["mailbox_login_context"]["extra"]["client_id"],
+            "mail-client",
+        )
+        self.assertEqual(account.extra.get("oauth_resume_context"), resume_snapshot)
+
+    def test_build_account_preserves_phone_oauth_prepare_failure_marker(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "existing@example.com",
+                "password": "",
+                "account_id": "acct-existing",
+                "access_token": "at-existing",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-existing",
+                "workspace_id": "ws-existing",
+                "source": "existing_account_web_login",
+                "metadata": {
+                    "phone_verification_required": True,
+                    "phone_oauth_ready": False,
+                    "phone_oauth_prepare_error": "OAuth bootstrap failed",
+                    "oauth_resume_context": {},
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertFalse(account.extra["phone_oauth_ready"])
+        self.assertEqual(
+            account.extra["phone_oauth_prepare_error"],
+            "OAuth bootstrap failed",
+        )
+        self.assertNotIn("oauth_resume_context", account.extra)
+
     def test_access_token_only_adapter_passes_runtime_context_to_engine(self):
         created = {}
 

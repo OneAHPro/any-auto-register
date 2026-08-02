@@ -9,9 +9,11 @@ from sqlmodel import Session, select
 
 from core.base_mailbox import OutlookMailbox
 from core.applemail_pool import (
+    delete_applemail_pool_records,
     load_applemail_pool_records,
     load_applemail_pool_snapshot,
-    save_applemail_pool_json,
+    parse_applemail_pool_import_content,
+    save_applemail_pool_records,
 )
 from core.config_store import config_store
 from core.db import OutlookAccountModel, engine
@@ -83,16 +85,24 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
     def descriptor(self) -> MailImportProviderDescriptor:
         return MailImportProviderDescriptor(
             type="applemail",
-            label="AppleMail / 小苹果",
-            description="导入本地邮箱池文件，运行时按文件轮询邮箱并通过 AppleMail API 拉取邮件。",
+            label="ChatGPT 密码 + MFA / AppleMail",
+            description=(
+                "导入本地账号池；支持 ChatGPT 密码 + TOTP、URL 收件/2FA，"
+                "以及 AppleMail OAuth 凭据。"
+            ),
             helper_text=(
-                "支持数组/对象 JSON，也支持每行一条的 "
-                "`email----password----client_id----refresh_token` 文本。"
+                "支持数组/对象 JSON，也支持每行一条："
+                "ChatGPT 使用 `email----ChatGPT密码----MFA秘钥`；"
+                "URL 凭据使用 `email----密码----收件URL----2FA URL`；"
+                "忘记密码记录使用 `email----登陆请点击忘记密码----收件URL`；"
+                "AppleMail OAuth 使用 `email----password----client_id----refresh_token`。"
             ),
             content_placeholder=(
                 '[\n  {\n    "email": "demo@example.com",\n    "clientId": "xxxx",\n'
                 '    "refreshToken": "xxxx",\n    "folder": "INBOX"\n  }\n]\n\n'
-                "或粘贴 TXT:\ndemo@example.com----password----client_id----refresh_token"
+                "或粘贴 TXT:\n"
+                "demo@icloud.com----ChatGPT密码----BASE32_MFA_SECRET\n"
+                "demo@example.com----password----client_id----refresh_token"
             ),
             supports_filename=True,
             filename_label="邮箱池文件名",
@@ -127,6 +137,7 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
                 index=int(item.get("index") or 0),
                 email=str(item.get("email") or ""),
                 mailbox=str(item.get("mailbox") or "INBOX"),
+                account_type=str(item.get("account_type") or "applemail_oauth"),
             )
             for item in snapshot.get("items", [])
         ]
@@ -146,8 +157,11 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
         pool_dir = str(
             request.pool_dir or config_store.get("applemail_pool_dir", "mail")
         ).strip() or "mail"
-        result = save_applemail_pool_json(
-            request.content,
+        records, errors, total = parse_applemail_pool_import_content(request.content)
+        if not records:
+            raise RuntimeError(errors[0] if errors else "未找到可导入的小苹果邮箱记录")
+        result = save_applemail_pool_records(
+            records,
             pool_dir=pool_dir,
             filename=request.filename,
         )
@@ -155,6 +169,7 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
         if request.bind_to_config:
             config_store.set_many(
                 {
+                    "mail_provider": "applemail",
                     "applemail_pool_dir": pool_dir,
                     "applemail_pool_file": result["filename"],
                 }
@@ -171,11 +186,12 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
         return MailImportResponse(
             type="applemail",
             summary=MailImportSummary(
-                total=int(result["count"]),
-                success=int(result["count"]),
-                failed=0,
+                total=total,
+                success=len(records),
+                failed=len(errors),
             ),
             snapshot=snapshot,
+            errors=errors,
             meta={
                 "bound_to_config": request.bind_to_config,
                 "path": str(result["path"]),
@@ -189,31 +205,13 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
         pool_file = str(
             request.pool_file or config_store.get("applemail_pool_file", "")
         ).strip()
-        path, records = load_applemail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
-
-        target_email = str(request.email or "").strip().lower()
-        target_mailbox = str(request.mailbox or "").strip().lower()
-        removed = None
-        remaining: list[dict[str, str]] = []
-
-        for record in records:
-            record_email = str(record.get("email") or "").strip().lower()
-            record_mailbox = str(record.get("mailbox") or "INBOX").strip().lower()
-            is_match = record_email == target_email and (
-                not target_mailbox or record_mailbox == target_mailbox
-            )
-            if removed is None and is_match:
-                removed = record
-                continue
-            remaining.append(record)
-
-        if removed is None:
-            raise RuntimeError(f"未找到要删除的小苹果邮箱: {request.email}")
-
-        path.write_text(
-            json.dumps(remaining, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        path, deleted, errors = delete_applemail_pool_records(
+            pool_file=pool_file,
+            pool_dir=pool_dir,
+            items=[request],
         )
+        if errors:
+            raise RuntimeError(errors[0])
 
         snapshot = self.get_snapshot(
             MailImportSnapshotRequest(
@@ -241,12 +239,10 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
         pool_file = str(
             request.pool_file or config_store.get("applemail_pool_file", "")
         ).strip()
-        path, records = load_applemail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
-
-        remaining, deleted, errors = self._delete_records(records, request.items)
-        path.write_text(
-            json.dumps(remaining, ensure_ascii=False, indent=2),
-            encoding="utf-8",
+        path, deleted, errors = delete_applemail_pool_records(
+            pool_file=pool_file,
+            pool_dir=pool_dir,
+            items=request.items,
         )
 
         snapshot = self.get_snapshot(
@@ -561,6 +557,8 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                 preview_limit=request.preview_limit,
             )
         )
+        if request.bind_to_config and success > 0:
+            config_store.set_many({"mail_provider": "microsoft"})
         return MailImportResponse(
             type="microsoft",
             summary=MailImportSummary(

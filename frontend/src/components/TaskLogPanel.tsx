@@ -1,15 +1,16 @@
 import { useEffect, useRef, useState } from 'react'
 import { Button, message, Space, Tag } from 'antd'
-import { CopyOutlined, FastForwardOutlined, StopOutlined } from '@ant-design/icons'
+import { CopyOutlined, FastForwardOutlined, RedoOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
 
 interface TaskLogPanelProps {
   taskId: string
   onDone?: () => void
+  mode?: 'register' | 'login' | 'relogin'
 }
 
-type TaskTerminalStatus = 'idle' | 'done' | 'failed' | 'stopped'
+type TaskTerminalStatus = 'idle' | 'done' | 'partial' | 'failed' | 'stopped'
 
 interface RegisterSummary {
   success: number
@@ -38,19 +39,58 @@ function mergeSummary(previous: RegisterSummary, incoming: Partial<RegisterSumma
   })
 }
 
-export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
+function resolveTerminalStatus(
+  reportedStatus: string | undefined,
+  summary: RegisterSummary,
+): TaskTerminalStatus {
+  if (reportedStatus === 'failed') return 'failed'
+  if (reportedStatus === 'stopped') return 'stopped'
+  if (reportedStatus !== 'done') return 'idle'
+  if (summary.success === 0) return 'failed'
+  if (summary.total > 0 && summary.success < summary.total) return 'partial'
+  return 'done'
+}
+
+export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanelProps) {
+  const [activeTaskId, setActiveTaskId] = useState(taskId)
+  const [resolvedMode, setResolvedMode] = useState(mode)
   const [lines, setLines] = useState<string[]>([])
   const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
   const [error, setError] = useState('')
   const [terminalStatus, setTerminalStatus] = useState<TaskTerminalStatus>('idle')
   const [skipLoading, setSkipLoading] = useState(false)
   const [stopLoading, setStopLoading] = useState(false)
+  const [retryLoading, setRetryLoading] = useState(false)
+  const [retryableCount, setRetryableCount] = useState(0)
   const [stopRequested, setStopRequested] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
   const onDoneRef = useRef(onDone)
   const nextSinceRef = useRef(0)
 
   const isFinished = terminalStatus !== 'idle' || stopRequested
+  const wording = resolvedMode === 'relogin'
+    ? {
+        action: '重登并同步',
+        success: '重登并同步成功',
+        processed: '已处理',
+        total: '重登总数',
+        completed: '重登并同步完成',
+      }
+    : resolvedMode === 'login'
+      ? {
+          action: '登录',
+          success: '登录成功',
+          processed: '已处理',
+          total: '登录总数',
+          completed: '登录完成',
+        }
+      : {
+          action: '注册',
+          success: '注册成功',
+          processed: '已注册',
+          total: '总共注册',
+          completed: '注册完成',
+        }
 
   const handleCopyAll = async () => {
     try {
@@ -65,7 +105,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     if (isFinished) return
     setSkipLoading(true)
     try {
-      const response = await apiFetch(`/tasks/${taskId}/skip-current`, { method: 'POST' }) as {
+      const response = await apiFetch(`/tasks/${activeTaskId}/skip-current`, { method: 'POST' }) as {
         control?: { targeted_skip_attempts?: number }
       }
       const targeted = Number(response.control?.targeted_skip_attempts || 0)
@@ -86,7 +126,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
     if (isFinished) return
     setStopLoading(true)
     try {
-      await apiFetch(`/tasks/${taskId}/stop`, { method: 'POST' })
+      await apiFetch(`/tasks/${activeTaskId}/stop`, { method: 'POST' })
       setStopRequested(true)
       message.success('已发送停止任务请求，正在停止进行中的线程')
     } catch (error_: unknown) {
@@ -102,9 +142,57 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
   }, [onDone])
 
   useEffect(() => {
-    if (!taskId) return
+    setActiveTaskId(taskId)
+    setResolvedMode(mode)
+  }, [mode, taskId])
+
+  useEffect(() => {
+    let cancelled = false
+    if (terminalStatus === 'idle') {
+      setRetryableCount(0)
+      return
+    }
+    const loadRetryable = async () => {
+      try {
+        const result = await apiFetch(`/tasks/${activeTaskId}/retryable`) as {
+          count?: number
+        }
+        if (!cancelled) setRetryableCount(parseCounter(result.count))
+      } catch {
+        if (!cancelled) setRetryableCount(0)
+      }
+    }
+    void loadRetryable()
+    return () => {
+      cancelled = true
+    }
+  }, [activeTaskId, terminalStatus])
+
+  const handleRetryFailed = async () => {
+    if (retryableCount <= 0 || retryLoading) return
+    setRetryLoading(true)
+    try {
+      const result = await apiFetch(`/tasks/${activeTaskId}/retry-failed`, {
+        method: 'POST',
+      }) as { task_id?: string, retry_count?: number }
+      const nextTaskId = String(result.task_id || '').trim()
+      if (!nextTaskId) throw new Error('重试任务未返回任务 ID')
+      message.success(`已按原邮箱启动 ${parseCounter(result.retry_count)} 个失败账号重试；接码池任务会重新领取卡密`)
+      setRetryableCount(0)
+      setActiveTaskId(nextTaskId)
+    } catch (error_: unknown) {
+      const detail = error_ instanceof Error ? error_.message : '启动重试失败'
+      message.error(detail)
+    } finally {
+      setRetryLoading(false)
+    }
+  }
+
+  useEffect(() => {
+    if (!activeTaskId) return
     const controller = new AbortController()
     let cancelled = false
+    let latestSummary: RegisterSummary = { success: 0, registered: 0, total: 0 }
     const baseRetryMs = 1000
     const maxRetryMs = 8000
     nextSinceRef.current = 0
@@ -119,30 +207,33 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
     const initSnapshot = async (): Promise<boolean> => {
       try {
-        const snapshot = await apiFetch(`/tasks/${taskId}`) as {
+        const snapshot = await apiFetch(`/tasks/${activeTaskId}`) as {
           logs?: string[]
           status?: TaskTerminalStatus | string
           success?: number
           registered?: number
           total?: number
+          meta?: { mode?: string }
           control?: { stop_requested?: boolean }
         }
         if (cancelled) return true
 
         const snapshotLines = Array.isArray(snapshot.logs) ? snapshot.logs : []
         setLines(snapshotLines)
-        setSummary((previous) =>
-          mergeSummary(previous, {
-            success: snapshot.success,
-            registered: snapshot.registered,
-            total: snapshot.total,
-          }),
-        )
+        latestSummary = mergeSummary(latestSummary, {
+          success: snapshot.success,
+          registered: snapshot.registered,
+          total: snapshot.total,
+        })
+        setSummary(latestSummary)
+        if (snapshot.meta?.mode === 'login' || snapshot.meta?.mode === 'relogin') {
+          setResolvedMode(snapshot.meta.mode)
+        }
         nextSinceRef.current = snapshotLines.length
         setStopRequested(Boolean(snapshot.control?.stop_requested))
 
         if (snapshot.status === 'done' || snapshot.status === 'failed' || snapshot.status === 'stopped') {
-          setTerminalStatus(snapshot.status)
+          setTerminalStatus(resolveTerminalStatus(snapshot.status, latestSummary))
           onDoneRef.current?.()
           return true
         }
@@ -162,7 +253,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
         if (token) headers.Authorization = `Bearer ${token}`
 
         const since = nextSinceRef.current
-        const response = await fetch(`${API_BASE}/tasks/${taskId}/logs/stream?since=${since}`, {
+        const response = await fetch(`${API_BASE}/tasks/${activeTaskId}/logs/stream?since=${since}`, {
           headers,
           signal: controller.signal,
         })
@@ -202,19 +293,20 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
                 registered?: number
                 total?: number
               }
-              setSummary((previous) =>
-                mergeSummary(previous, {
-                  success: payload.success,
-                  registered: payload.registered,
-                  total: payload.total,
-                }),
-              )
+              latestSummary = mergeSummary(latestSummary, {
+                success: payload.success,
+                registered: payload.registered,
+                total: payload.total,
+              })
+              setSummary(latestSummary)
               if (payload.line) {
                 nextSinceRef.current += 1
                 setLines((previous) => [...previous, payload.line!])
               }
               if (payload.done) {
-                setTerminalStatus(payload.status || 'done')
+                setTerminalStatus(
+                  resolveTerminalStatus(payload.status || 'done', latestSummary),
+                )
                 onDoneRef.current?.()
                 return true
               }
@@ -255,7 +347,7 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
       cancelled = true
       controller.abort()
     }
-  }, [taskId])
+  }, [activeTaskId])
 
   useEffect(() => {
     if (!panelRef.current) return
@@ -264,23 +356,43 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
 
   const footerText =
     terminalStatus === 'done'
-      ? { text: '注册完成', color: '#10b981' }
+      ? { text: wording.completed, color: '#10b981' }
+      : terminalStatus === 'partial'
+        ? {
+            text: `${wording.action}部分完成（成功 ${summary.success} / ${summary.total}）`,
+            color: '#d97706',
+          }
       : terminalStatus === 'stopped'
         ? { text: '任务已停止', color: '#d97706' }
         : terminalStatus === 'failed'
-          ? { text: '任务失败', color: '#dc2626' }
+          ? {
+              text: `${wording.action}失败（成功 ${summary.success} / ${summary.total}）`,
+              color: '#dc2626',
+            }
           : null
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       <Space wrap style={{ marginBottom: 8 }}>
-        <Tag color="green">注册成功：{summary.success}</Tag>
-        <Tag color="blue">已注册：{summary.registered}</Tag>
-        <Tag color="default">总共注册：{summary.total}</Tag>
+        <Tag color="green">{wording.success}：{summary.success}</Tag>
+        <Tag color="blue">{wording.processed}：{summary.registered}</Tag>
+        <Tag color="default">{wording.total}：{summary.total}</Tag>
       </Space>
 
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <Space>
+          {terminalStatus !== 'idle' && retryableCount > 0 ? (
+            <Button
+              size="small"
+              type="primary"
+              aria-label={`重试失败账号（${retryableCount}）`}
+              icon={<RedoOutlined />}
+              onClick={handleRetryFailed}
+              loading={retryLoading}
+            >
+              重试失败账号（{retryableCount}）
+            </Button>
+          ) : null}
           <Button
             size="small"
             icon={<FastForwardOutlined />}
@@ -351,7 +463,12 @@ export function TaskLogPanel({ taskId, onDone }: TaskLogPanelProps) {
       </div>
 
       {footerText ? (
-        <div style={{ fontSize: 12, color: footerText.color, marginTop: 8 }}>
+        <div
+          role="status"
+          aria-live="polite"
+          aria-atomic="true"
+          style={{ fontSize: 12, color: footerText.color, marginTop: 8 }}
+        >
           {footerText.text}
         </div>
       ) : null}

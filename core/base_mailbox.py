@@ -20,6 +20,29 @@ class MailboxAccount:
     extra: dict = None  # 平台额外信息
 
 
+class MailboxClaimScope:
+    """Remember and serialize normal mailbox claims within one task."""
+
+    def __init__(self):
+        self._attempted_emails: set[str] = set()
+        self._lock = threading.Lock()
+
+    def claim(
+        self,
+        claim_fn: Callable[[set[str]], MailboxAccount],
+    ) -> MailboxAccount:
+        with self._lock:
+            account = claim_fn(set(self._attempted_emails))
+            email = str(getattr(account, "email", "") or "").strip().lower()
+            if email:
+                self._attempted_emails.add(email)
+            return account
+
+
+class MailboxAuthenticationError(RuntimeError):
+    """Terminal mailbox authentication failure after credential refresh."""
+
+
 class BaseMailbox(ABC):
     def _log(self, message: str) -> None:
         log_fn = getattr(self, "_log_fn", None)
@@ -363,10 +386,15 @@ class AppleMailMailbox(BaseMailbox):
         self.pool_file = str(pool_file or "").strip()
         self.pool_dir = str(pool_dir or "mail").strip() or "mail"
         self.mailboxes = self._normalize_mailboxes(mailboxes)
+        self.proxy_url = str(proxy or "").strip()
         self.proxy = build_requests_proxy_config(proxy)
+        self._proxy = self.proxy
         self._email = None
         self._selected_record = None
         self._selected_pool_path = None
+        self._icloud_clients = {}
+        self._mailapi_backend = None
+        self._claim_scope: MailboxClaimScope | None = None
 
     @staticmethod
     def _normalize_mailboxes(value: Any) -> list[str]:
@@ -561,7 +589,72 @@ class AppleMailMailbox(BaseMailbox):
             "mailbox": mailbox,
         }
 
+    @staticmethod
+    def _is_icloud_web_account(account: MailboxAccount) -> bool:
+        extra = account.extra or {}
+        return str(extra.get("account_type") or "").strip() == "icloud_web"
+
+    @staticmethod
+    def _is_chatgpt_password_totp_account(account: MailboxAccount) -> bool:
+        extra = account.extra or {}
+        return (
+            str(extra.get("account_type") or "").strip()
+            == "chatgpt_password_totp"
+        )
+
+    @staticmethod
+    def _is_chatgpt_url_mail_account(account: MailboxAccount) -> bool:
+        extra = account.extra or {}
+        return str(extra.get("account_type") or "").strip() in {
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+        }
+
+    def _get_mailapi_backend(self):
+        if self._mailapi_backend is None:
+            self._mailapi_backend = MailApiUrlOtpBackend(self)
+        return self._mailapi_backend
+
+    @staticmethod
+    def _generate_password_reset_password(length: int = 20) -> str:
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits + "!@#$%"
+        required = [
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.digits),
+            secrets.choice("!@#$%"),
+        ]
+        required.extend(secrets.choice(alphabet) for _ in range(max(length - 4, 8)))
+        secrets.SystemRandom().shuffle(required)
+        return "".join(required)
+
+    def _get_icloud_client(self, account: MailboxAccount):
+        key = str(account.email or "").strip().lower()
+        client = self._icloud_clients.get(key)
+        if client is not None:
+            return client
+        extra = account.extra or {}
+        from .icloud_mail import ICloudMailClient
+
+        client = ICloudMailClient(
+            email=account.email,
+            password=str(extra.get("password") or ""),
+            mfa_secret=str(extra.get("mfa_secret") or ""),
+            proxy_url=self.proxy_url,
+        )
+        self._icloud_clients[key] = client
+        return client
+
     def _list_messages(self, account: MailboxAccount, mailbox: str) -> list[dict[str, Any]]:
+        if self._is_chatgpt_password_totp_account(account):
+            raise RuntimeError(
+                "ChatGPT 密码 + MFA 凭据不包含邮箱收件能力"
+            )
+        if self._is_icloud_web_account(account):
+            return self._get_icloud_client(account).list_messages(mailbox)
         data = self._request_json(
             "GET",
             "/api/mail-all",
@@ -577,40 +670,248 @@ class AppleMailMailbox(BaseMailbox):
         return self._unwrap_message_payload(data)
 
     def get_email(self) -> MailboxAccount:
+        if self._claim_scope is not None:
+            return self._claim_scope.claim(
+                lambda exclude_emails: self._claim_email(
+                    exclude_emails=exclude_emails,
+                )
+            )
+        return self._claim_email()
+
+    def bind_claim_scope(self, scope: MailboxClaimScope | None) -> None:
+        self._claim_scope = scope
+
+    def get_email_by_address(self, email: str) -> MailboxAccount:
+        try:
+            return self._claim_email(email=email)
+        except RuntimeError as claim_error:
+            from .applemail_pool import load_used_applemail_record_by_email
+
+            try:
+                pool_path, record = load_used_applemail_record_by_email(
+                    email=email,
+                    pool_file=self.pool_file,
+                    pool_dir=self.pool_dir,
+                )
+            except RuntimeError:
+                raise claim_error
+            return self._build_pool_account(pool_path, record)
+
+    def _claim_email(
+        self,
+        email: str = "",
+        *,
+        exclude_emails=None,
+    ) -> MailboxAccount:
         from .applemail_pool import take_next_applemail_record
 
         pool_path, record = take_next_applemail_record(
             pool_file=self.pool_file,
             pool_dir=self.pool_dir,
+            email=email,
+            exclude_emails=exclude_emails,
         )
+        return self._build_pool_account(pool_path, record)
+
+    def _build_pool_account(
+        self,
+        pool_path,
+        record: dict[str, Any],
+    ) -> MailboxAccount:
         self._selected_pool_path = pool_path
         self._selected_record = record
         self._email = record["email"]
-        self._log(f"[AppleMail] 使用邮箱池: {pool_path.name}")
-        self._log(f"[AppleMail] 分配邮箱: {record['email']}")
-        return MailboxAccount(
-            email=record["email"],
-            account_id=record["email"],
-            extra={
+        account_type = str(record.get("account_type") or "").strip()
+        direct_icloud = account_type == "icloud_web"
+        chatgpt_credentials = account_type == "chatgpt_password_totp"
+        url_credentials = account_type in {
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+        }
+        provider_label = (
+            "ChatGPT MFA"
+            if chatgpt_credentials or url_credentials
+            else "iCloud"
+            if direct_icloud
+            else "AppleMail"
+        )
+        self._log(f"[{provider_label}] 使用邮箱池: {pool_path.name}")
+        self._log(f"[{provider_label}] 分配邮箱: {record['email']}")
+        if url_credentials:
+            extra = {
+                "provider": "chatgpt_credentials",
+                "account_type": account_type,
+                "password": str(record.get("password") or ""),
+                "mail_api_url": record["mail_api_url"],
+                "mailapi_url": record["mail_api_url"],
+                "mailbox": record.get("mailbox") or "INBOX",
+                "pool_file": pool_path.name,
+            }
+            if str(record.get("totp_url") or "").strip():
+                extra["totp_url"] = str(record["totp_url"])
+            if account_type == "chatgpt_password_url_otp":
+                if "totp_url" not in extra:
+                    raise RuntimeError("ChatGPT URL 登录记录缺少 2FA 地址")
+            elif bool(record.get("password_reset_required", True)):
+                extra["password_reset_required"] = True
+                extra["new_password"] = self._generate_password_reset_password()
+            else:
+                extra["password_reset_required"] = False
+        elif chatgpt_credentials:
+            extra = {
+                "provider": "chatgpt_credentials",
+                "account_type": "chatgpt_password_totp",
+                "password": record["password"],
+                "totp_secret": record["totp_secret"],
+                "pool_file": pool_path.name,
+            }
+        elif direct_icloud:
+            extra = {
+                "provider": "icloud",
+                "account_type": "icloud_web",
+                "password": record["password"],
+                "mfa_secret": record["mfa_secret"],
+                "mailbox": record.get("mailbox") or "INBOX",
+                "pool_file": pool_path.name,
+            }
+        else:
+            extra = {
                 "provider": "applemail",
                 "client_id": record["client_id"],
                 "refresh_token": record["refresh_token"],
                 "mailbox": record.get("mailbox") or "INBOX",
                 "pool_file": pool_path.name,
-            },
+            }
+        extra["_pool_claim_id"] = str(record.get("pool_claim_id") or "")
+        extra["_pool_state"] = str(record.get("pool_state") or "")
+        return MailboxAccount(
+            email=record["email"],
+            account_id=record["email"],
+            extra=extra,
         )
 
+    def requeue_account(self, account: MailboxAccount) -> bool:
+        from .applemail_pool import requeue_applemail_record
+
+        selected = dict(self._selected_record or {})
+        account_extra = dict(getattr(account, "extra", None) or {})
+        account_email = str(getattr(account, "email", "") or "").strip()
+        selected_email = str(selected.get("email") or "").strip()
+        if selected_email and account_email and selected_email.lower() != account_email.lower():
+            return False
+        claim_id = str(account_extra.get("_pool_claim_id") or "").strip()
+        if (
+            not claim_id
+            and str(selected.get("pool_state") or "").strip().lower() == "claimed"
+        ):
+            claim_id = str(selected.get("pool_claim_id") or "").strip()
+        if not claim_id:
+            return False
+        restored = requeue_applemail_record(
+            pool_file=str(self._selected_pool_path or self.pool_file),
+            pool_dir=self.pool_dir,
+            claim_id=claim_id,
+        )
+        if restored:
+            selected["enabled"] = True
+            selected["pool_state"] = "available"
+            selected.pop("pool_claim_id", None)
+            self._selected_record = selected
+        return restored
+
+    def mark_account_used(self, account: MailboxAccount) -> bool:
+        from .applemail_pool import mark_applemail_record_used
+
+        selected = dict(self._selected_record or {})
+        account_extra = dict(getattr(account, "extra", None) or {})
+        account_email = str(getattr(account, "email", "") or "").strip()
+        selected_email = str(selected.get("email") or "").strip()
+        if selected_email and account_email and selected_email.lower() != account_email.lower():
+            return False
+        if (
+            str(account_extra.get("_pool_state") or "").strip().lower() == "used"
+            or str(selected.get("pool_state") or "").strip().lower() == "used"
+        ):
+            return True
+        claim_id = str(account_extra.get("_pool_claim_id") or "").strip()
+        if (
+            not claim_id
+            and str(selected.get("pool_state") or "").strip().lower() == "claimed"
+        ):
+            claim_id = str(selected.get("pool_claim_id") or "").strip()
+        if not claim_id:
+            return False
+        marked = mark_applemail_record_used(
+            pool_file=str(self._selected_pool_path or self.pool_file),
+            pool_dir=self.pool_dir,
+            claim_id=claim_id,
+        )
+        if marked:
+            selected["enabled"] = False
+            selected["pool_state"] = "used"
+            selected.pop("pool_claim_id", None)
+            self._selected_record = selected
+            if isinstance(account.extra, dict):
+                account.extra["_pool_state"] = "used"
+        return marked
+
+    def commit_password_reset(
+        self,
+        account: MailboxAccount,
+        new_password: str = "",
+    ) -> bool:
+        from .applemail_pool import commit_applemail_password_reset
+
+        selected = dict(self._selected_record or {})
+        account_extra = dict(getattr(account, "extra", None) or {})
+        account_email = str(getattr(account, "email", "") or "").strip()
+        selected_email = str(selected.get("email") or "").strip()
+        if selected_email and account_email and selected_email.lower() != account_email.lower():
+            return False
+        claim_id = str(account_extra.get("_pool_claim_id") or "").strip()
+        if (
+            not claim_id
+            and str(selected.get("pool_state") or "").strip().lower() == "claimed"
+        ):
+            claim_id = str(selected.get("pool_claim_id") or "").strip()
+        if not claim_id:
+            return False
+        password = str(new_password or account_extra.get("new_password") or "")
+        committed = commit_applemail_password_reset(
+            pool_file=str(self._selected_pool_path or self.pool_file),
+            pool_dir=self.pool_dir,
+            claim_id=claim_id,
+            new_password=password,
+        )
+        if committed:
+            selected["password"] = password
+            selected["password_reset_required"] = False
+            self._selected_record = selected
+            if isinstance(account.extra, dict):
+                account.extra["password"] = password
+                account.extra["password_reset_required"] = False
+                account.extra.pop("new_password", None)
+        return committed
+
     def get_current_ids(self, account: MailboxAccount) -> set:
+        if self._is_chatgpt_url_mail_account(account):
+            return self._get_mailapi_backend().get_current_ids(account)
+        if self._is_chatgpt_password_totp_account(account):
+            return set()
         ids = set()
+        errors = []
         for mailbox in self._resolve_mailboxes_for_account(account):
             try:
                 messages = self._list_messages(account, mailbox)
-            except Exception:
+            except Exception as exc:
+                errors.append(exc)
                 continue
             ids.update(
                 self._resolve_message_id(message, mailbox)
                 for message in messages
             )
+        if errors and self._is_icloud_web_account(account):
+            raise RuntimeError(str(errors[0])) from errors[0]
         return ids
 
     def wait_for_code(
@@ -622,6 +923,19 @@ class AppleMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
+        if self._is_chatgpt_url_mail_account(account):
+            return self._get_mailapi_backend().wait_for_code(
+                account,
+                keyword=keyword,
+                timeout=timeout,
+                before_ids=before_ids,
+                code_pattern=code_pattern,
+                **kwargs,
+            )
+        if self._is_chatgpt_password_totp_account(account):
+            raise RuntimeError(
+                "当前记录是 ChatGPT 密码 + MFA 登录凭据，无法读取邮箱验证码"
+            )
         seen = {str(mid) for mid in (before_ids or set())}
         exclude_codes = {
             str(code).strip()
@@ -634,6 +948,8 @@ class AppleMailMailbox(BaseMailbox):
                 try:
                     messages = self._list_messages(account, mailbox)
                 except Exception:
+                    if self._is_icloud_web_account(account):
+                        raise
                     continue
 
                 for message in messages:
@@ -650,7 +966,12 @@ class AppleMailMailbox(BaseMailbox):
                     if code and code in exclude_codes:
                         continue
                     if code:
-                        self._log(f"[AppleMail] {mailbox} 收到验证码: {code}")
+                        provider_label = (
+                            "iCloud"
+                            if self._is_icloud_web_account(account)
+                            else "AppleMail"
+                        )
+                        self._log(f"[{provider_label}] {mailbox} 收到验证码: {code}")
                         return code
             return None
 
@@ -659,6 +980,68 @@ class AppleMailMailbox(BaseMailbox):
             poll_interval=3,
             poll_once=poll_once,
         )
+
+    def get_totp_code(self, account: MailboxAccount) -> str:
+        import re
+        import requests
+        from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+        extra = account.extra or {}
+        source_url = str(extra.get("totp_url") or "").strip()
+        if not source_url:
+            raise RuntimeError("远程 2FA 地址为空")
+        try:
+            parsed = urlsplit(source_url)
+            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                raise ValueError
+            path = parsed.path.rstrip("/")
+            if path.endswith("/view"):
+                path = f"{path[:-5]}/api/v1/2fa"
+            elif not path.endswith("/api/v1/2fa"):
+                path = "/api/v1/2fa"
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query.setdefault("email", str(account.email or "").strip())
+            api_url = urlunsplit(
+                (parsed.scheme, parsed.netloc, path, urlencode(query), "")
+            )
+        except Exception as exc:
+            raise RuntimeError("远程 2FA 地址格式无效") from exc
+
+        def fetch_once() -> tuple[str, float | None]:
+            try:
+                response = requests.get(
+                    api_url,
+                    headers={"accept": "application/json"},
+                    proxies=self.proxy,
+                    timeout=15,
+                )
+                if int(response.status_code or 0) >= 400:
+                    raise RuntimeError(f"HTTP {response.status_code}")
+                payload = response.json()
+                if not isinstance(payload, dict) or payload.get("ok") is False:
+                    raise RuntimeError("响应状态无效")
+                response_email = str(payload.get("email") or "").strip().lower()
+                if response_email and response_email != str(account.email or "").strip().lower():
+                    raise RuntimeError("响应邮箱不匹配")
+                code = str(payload.get("code") or "").strip()
+                if not re.fullmatch(r"\d{6}", code):
+                    raise RuntimeError("验证码格式无效")
+                try:
+                    remaining = float(payload.get("remaining"))
+                except (TypeError, ValueError):
+                    remaining = None
+                return code, remaining
+            except Exception as exc:
+                status_match = re.fullmatch(r"HTTP (\d{3})", str(exc))
+                suffix = f": {status_match.group(0)}" if status_match else ""
+                raise RuntimeError(f"远程 2FA 获取失败{suffix}") from exc
+
+        code, remaining = fetch_once()
+        if remaining is not None and 0 <= remaining <= 5:
+            self._sleep_with_checkpoint(remaining + 0.5)
+            code, _remaining = fetch_once()
+        self._log("[2FA] 已获取一次性验证码")
+        return code
 
 
 class LaoudoMailbox(BaseMailbox):
@@ -3169,14 +3552,42 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
             if str(code or "").strip()
         }
         keyword_lower = str(keyword or "").strip().lower()
+        imap_conn = None
+
+        def close_connection() -> None:
+            nonlocal imap_conn
+            if imap_conn is None:
+                return
+            try:
+                imap_conn.logout()
+            except Exception:
+                pass
+            imap_conn = None
 
         def poll_once() -> Optional[str]:
+            nonlocal imap_conn
+            import imaplib
+
+            if imap_conn is None:
+                try:
+                    imap_conn = self.mailbox._open_imap(account)
+                    self.mailbox._log(
+                        "[微软邮箱][IMAP] 登录成功，本轮复用同一连接查询全部文件夹"
+                    )
+                except MailboxAuthenticationError as exc:
+                    self.mailbox._log(
+                        f"[微软邮箱][IMAP] 鉴权失败，已停止 OTP 等待: {exc}"
+                    )
+                    raise
+                except Exception as exc:
+                    self.mailbox._log(
+                        f"[微软邮箱][IMAP] 连接失败，本轮稍后重试: {exc}"
+                    )
+                    return None
+
             for folder in self.mailbox._imap_folder_names:
-                imap_conn = None
                 try:
                     self.mailbox._log(f"[微软邮箱][IMAP] folder={folder} 开始轮询")
-                    imap_conn = self.mailbox._open_imap(account)
-                    self.mailbox._log(f"[微软邮箱][IMAP] folder={folder} IMAP 登录成功")
                     status, _ = imap_conn.select(folder, readonly=True)
                     if status != "OK":
                         self.mailbox._log(
@@ -3250,24 +3661,27 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
                             f"[微软邮箱][IMAP] folder={folder} 验证码提取成功: {code}"
                         )
                         return code
+                except imaplib.IMAP4.abort as exc:
+                    self.mailbox._log(
+                        f"[微软邮箱][IMAP] 连接中断，下轮自动重连: {exc}"
+                    )
+                    close_connection()
+                    break
                 except Exception as exc:
                     self.mailbox._log(
-                        f"[微软邮箱][IMAP] folder={folder} IMAP 查询异常: {exc}"
+                        f"[微软邮箱][IMAP] folder={folder} 不可用，已跳过: {exc}"
                     )
                     continue
-                finally:
-                    try:
-                        if imap_conn:
-                            imap_conn.logout()
-                    except Exception:
-                        pass
             return None
 
-        return self.mailbox._run_polling_wait(
-            timeout=timeout,
-            poll_interval=5,
-            poll_once=poll_once,
-        )
+        try:
+            return self.mailbox._run_polling_wait(
+                timeout=timeout,
+                poll_interval=5,
+                poll_once=poll_once,
+            )
+        finally:
+            close_connection()
 
 
 class OutlookGraphMailboxBackend(OutlookMailboxBackend):
@@ -3477,33 +3891,575 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
     def _code_key(code: str) -> str:
         return f"mailapi_code:{str(code or '').strip()}"
 
-    def _fetch_mailapi_text(self, account: MailboxAccount) -> str:
+    @staticmethod
+    def _parse_timestamp(value: Any) -> Optional[float]:
+        from datetime import datetime
+
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            numeric = float(value)
+            return numeric / 1000 if numeric > 10_000_000_000 else numeric
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            numeric = float(text)
+            return numeric / 1000 if numeric > 10_000_000_000 else numeric
+        except (TypeError, ValueError):
+            pass
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _decode_mailapi_data_uri(value: Any) -> str:
+        import base64
+        import binascii
+        import re
+        from urllib.parse import unquote_to_bytes
+
+        text = str(value or "")
+        match = re.match(r"^data:([^,]*?),(.*)$", text, re.IGNORECASE | re.DOTALL)
+        if not match:
+            return text
+
+        metadata, payload = match.groups()
+        try:
+            encoded_payload = unquote_to_bytes(payload)
+            if re.search(r"(?:^|;)base64(?:;|$)", metadata, re.IGNORECASE):
+                decoded = base64.b64decode(encoded_payload, validate=False)
+            else:
+                decoded = encoded_payload
+            charset_match = re.search(
+                r"(?:^|;)charset=([^;]+)",
+                metadata,
+                re.IGNORECASE,
+            )
+            charset = charset_match.group(1).strip() if charset_match else "utf-8"
+            return decoded.decode(charset, errors="replace")
+        except (binascii.Error, LookupError, UnicodeError, ValueError):
+            return text
+
+    @classmethod
+    def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
+        import json
+
+        raw_text = str(text or "")
+        try:
+            payload = json.loads(raw_text)
+        except (TypeError, ValueError):
+            payload = None
+
+        if not isinstance(payload, dict):
+            return {
+                "content": raw_text,
+                "received_at": None,
+                "message_id": "",
+                "status": None,
+            }
+
+        content_parts = []
+        for key in ("subject", "msg", "content", "text", "body", "html"):
+            value = payload.get(key)
+            if value is None or value is False or value == "":
+                continue
+            if key == "html" and isinstance(value, bool):
+                continue
+            content_parts.append(cls._decode_mailapi_data_uri(value))
+        content = " ".join(content_parts).strip()
+        received_value = next(
+            (
+                payload.get(key)
+                for key in (
+                    "received_at",
+                    "receivedAt",
+                    "created_at",
+                    "createdAt",
+                    "timestamp",
+                    "date",
+                )
+                if payload.get(key) not in (None, "")
+            ),
+            None,
+        )
+        identity_parts = [
+            str(payload.get("email") or "").strip(),
+            str(received_value or "").strip(),
+            str(payload.get("request_id") or payload.get("message_id") or "").strip(),
+        ]
+        identity = "|".join(part for part in identity_parts if part)
+        message_id = ""
+        if identity:
+            import hashlib
+
+            message_id = "mailapi_message:" + hashlib.sha256(
+                identity.encode("utf-8", errors="ignore")
+            ).hexdigest()
+        return {
+            "content": content or raw_text,
+            "received_at": cls._parse_timestamp(received_value),
+            "message_id": message_id,
+            "status": payload.get("status"),
+        }
+
+    @staticmethod
+    def _decode_mailapi_script_string(value: str) -> str:
+        """Decode the small subset of JS escaping used by MailAPI page URLs."""
+        import re
+        from html import unescape
+
+        text = unescape(str(value or ""))
+        return re.sub(r"\\([\\/'\"])", r"\1", text)
+
+    @classmethod
+    def _find_legacy_mailapi_detail_url(
+        cls,
+        page_text: str,
+        source_url: str,
+    ) -> Optional[str]:
+        """Resolve the newest message URL from a MailAPI HTML list page."""
+        import re
+        from html import unescape
+        from urllib.parse import quote, urljoin
+
+        raw = str(page_text or "")
+        list_marker_match = re.search(
+            r"\bid\s*=\s*(['\"])message-list\1",
+            raw,
+            re.IGNORECASE,
+        )
+        detail_base_match = re.search(
+            r"\bdetailBase\s*=\s*(['\"])(.*?)\1",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        detail_suffix_match = re.search(
+            r"\bdetailSuffix\s*=\s*(['\"])(.*?)\1",
+            raw,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if (
+            not list_marker_match
+            or not detail_base_match
+            or not detail_suffix_match
+            or detail_base_match.start() <= list_marker_match.end()
+        ):
+            return None
+
+        list_region = raw[list_marker_match.end() : detail_base_match.start()]
+        items: list[tuple[str, str]] = []
+        for anchor_match in re.finditer(
+            r"<a\b([^>]*)>(.*?)</a\s*>",
+            list_region,
+            flags=re.IGNORECASE | re.DOTALL,
+        ):
+            attrs = anchor_match.group(1)
+            class_match = re.search(
+                r"\bclass\s*=\s*(['\"])(.*?)\1",
+                attrs,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            data_id_match = re.search(
+                r"\bdata-id\s*=\s*(['\"])(.*?)\1",
+                attrs,
+                flags=re.IGNORECASE | re.DOTALL,
+            )
+            class_names = {
+                name.lower()
+                for name in re.split(
+                    r"\s+",
+                    unescape(class_match.group(2)).strip()
+                    if class_match
+                    else "",
+                )
+                if name
+            }
+            if "item" not in class_names or not data_id_match:
+                continue
+            items.append((data_id_match.group(2), anchor_match.group(2)))
+        if not items:
+            return None
+
+        verification_subject = re.compile(
+            r"(?is)\b(?:verification|login|security)\b.{0,32}\bcode\b|"
+            r"\b(?:temporary|one[-\s]*time)\b.{0,32}"
+            r"\b(?:code|password)\b|\botp\b|"
+            r"验证码|校验码|动态码|認証コード|認證碼|驗證碼"
+        )
+        selected_item = next(
+            (
+                item
+                for item in items
+                if verification_subject.search(
+                    unescape(re.sub(r"<[^>]+>", " ", item[1]))
+                )
+            ),
+            items[0],
+        )
+        message_id = unescape(str(selected_item[0] or "")).strip()
+        detail_base = cls._decode_mailapi_script_string(detail_base_match.group(2))
+        detail_suffix = cls._decode_mailapi_script_string(
+            detail_suffix_match.group(2)
+        )
+        if not message_id or not detail_base:
+            return None
+
+        detail_path = (
+            f"{detail_base.rstrip('/')}/{quote(message_id, safe='')}"
+            f"{detail_suffix}"
+        )
+        return urljoin(str(source_url or ""), detail_path)
+
+    @staticmethod
+    def _mailapi_visible_text(value: Any) -> str:
+        import re
+        from html import unescape
+
+        return " ".join(
+            unescape(re.sub(r"<[^>]+>", " ", str(value or ""))).split()
+        )
+
+    @classmethod
+    def _mailapi_same_origin_url(cls, value: Any, source_url: str) -> Optional[str]:
+        from html import unescape
+        from urllib.parse import urljoin, urlsplit
+
+        candidate = unescape(str(value or "")).strip()
+        if not candidate or candidate.startswith(("#", "javascript:", "mailto:")):
+            return None
+        resolved = urljoin(str(source_url or ""), candidate)
+        source = urlsplit(str(source_url or ""))
+        target = urlsplit(resolved)
+        if target.scheme not in {"http", "https"}:
+            return None
+        if source.netloc and target.netloc.lower() != source.netloc.lower():
+            return None
+        return resolved
+
+    @classmethod
+    def _mailapi_detail_score(cls, url: str, label: str = "") -> int:
+        import re
+
+        haystack = f"{url} {label}".lower()
+        score = 0
+        if re.search(r"verification|login|security|otp|验证码|校验码|动态码", haystack):
+            score += 50
+        if re.search(r"detail|message|messages|mail|inbox|read", haystack):
+            score += 20
+        if re.search(r"delete|logout|unsubscribe|settings", haystack):
+            score -= 100
+        return score
+
+    @classmethod
+    def _find_json_mailapi_detail_urls(
+        cls,
+        payload: Any,
+        source_url: str,
+    ) -> list[tuple[int, str]]:
+        """Find detail links in arbitrary nested MailAPI JSON responses."""
+        url_keys = {
+            "url",
+            "href",
+            "link",
+            "detail_url",
+            "detailurl",
+            "message_url",
+            "messageurl",
+            "read_url",
+            "readurl",
+            "detail",
+        }
+        found: list[tuple[int, str]] = []
+
+        def walk(node: Any, context: str = "") -> None:
+            if isinstance(node, dict):
+                labels = " ".join(
+                    str(node.get(key) or "")
+                    for key in ("subject", "title", "name", "snippet", "preview")
+                )
+                next_context = f"{context} {labels}".strip()
+                for key, value in node.items():
+                    normalized_key = str(key or "").lower().replace("-", "_")
+                    if normalized_key in url_keys and isinstance(value, str):
+                        if normalized_key == "detail":
+                            detail_value = value.strip()
+                            if not (
+                                "/" in detail_value
+                                or detail_value.startswith(("?", "http://", "https://"))
+                            ):
+                                walk(value, next_context)
+                                continue
+                        resolved = cls._mailapi_same_origin_url(value, source_url)
+                        if resolved:
+                            found.append(
+                                (
+                                    cls._mailapi_detail_score(resolved, next_context),
+                                    resolved,
+                                )
+                            )
+                    walk(value, next_context)
+            elif isinstance(node, list):
+                for item in node[:50]:
+                    walk(item, context)
+
+        walk(payload)
+        return found
+
+    @classmethod
+    def _find_mailapi_detail_urls(
+        cls,
+        page_text: str,
+        source_url: str,
+    ) -> list[str]:
+        """Discover same-origin message detail URLs without provider-specific markup.
+
+        MailAPI providers commonly return a list page first, but the list markup,
+        URL path, and JSON field names vary.  This bounded discoverer accepts
+        direct links, data-* attributes, nested JSON links, and simple endpoint
+        templates exposed in inline scripts.  It deliberately stays same-origin
+        and caps the candidate set so polling cannot fan out indefinitely.
+        """
+        import json
+        import re
+        from html import unescape
+        from urllib.parse import quote
+
+        raw = str(page_text or "")
+        ranked: list[tuple[int, int, str]] = []
+        sequence = 0
+
+        def add(value: Any, label: str = "", score: Optional[int] = None) -> None:
+            nonlocal sequence
+            resolved = cls._mailapi_same_origin_url(value, source_url)
+            if not resolved:
+                return
+            rank = (
+                int(score)
+                if score is not None
+                else cls._mailapi_detail_score(resolved, label)
+            )
+            ranked.append((rank, sequence, resolved))
+            sequence += 1
+
+        # Preserve the proven yangyang-style resolver as the highest-confidence
+        # candidate, while allowing all other providers to use generic links.
+        legacy_url = cls._find_legacy_mailapi_detail_url(raw, source_url)
+        if legacy_url:
+            add(legacy_url, score=1000)
+
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        if payload is not None:
+            for score, url in cls._find_json_mailapi_detail_urls(payload, source_url):
+                add(url, score=score + 100)
+
+        # Score direct controls by their own visible label before considering
+        # larger container elements.  This prevents a nearby verification row
+        # from accidentally boosting an older sibling link.
+        for match in re.finditer(
+            r"<(?:a|button)\b([^>]*)>(.*?)</(?:a|button)\s*>",
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            attrs, body = match.groups()
+            label = cls._mailapi_visible_text(body)
+            for attr_match in re.finditer(
+                r"\b(?:href|data-(?:href|url|detail-url|message-url|link))\s*=\s*(['\"])(.*?)\1",
+                attrs,
+                re.IGNORECASE | re.DOTALL,
+            ):
+                add(attr_match.group(2), label)
+
+        # Read every relevant opening tag independently, including nested rows.
+        # A short following-text window gives data-* controls useful context.
+        element_pattern = re.compile(
+            r"<(?:a|button|article|div|li|tr|section)\b([^>]*)>",
+            re.IGNORECASE | re.DOTALL,
+        )
+        attribute_pattern = re.compile(
+            r"\b(?:href|data-(?:href|url|detail-url|message-url|link))\s*=\s*(['\"])(.*?)\1",
+            re.IGNORECASE | re.DOTALL,
+        )
+        for match in element_pattern.finditer(raw):
+            attrs = match.group(1) or ""
+            label = cls._mailapi_visible_text(
+                raw[match.end() : match.end() + 320]
+            )
+            for attr_match in attribute_pattern.finditer(attrs):
+                add(attr_match.group(2), label)
+
+        # Some pages keep only data-id plus a fetch() endpoint template in a
+        # script.  Resolve the common placeholder forms without executing JS.
+        ids = [
+            unescape(item[1]).strip()
+            for item in re.findall(
+                r"\b(?:data-(?:message-)?id|messageId|message_id)\s*=\s*(['\"])(.*?)\1",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            if str(item[1] or "").strip()
+        ]
+        templates = []
+        for match in re.finditer(
+            r"(['\"])([^'\"]*(?:message|messages|mail|detail|read)[^'\"]*)\1",
+            raw,
+            re.IGNORECASE,
+        ):
+            value = unescape(match.group(2)).strip()
+            if "/" in value or "=" in value:
+                templates.append(value)
+        for template in templates[:20]:
+            for message_id in ids[:20]:
+                encoded_id = quote(message_id, safe="")
+                candidate = template
+                replaced = False
+                for marker in ("{id}", "{message_id}", ":id", "%s", "%ID%"):
+                    if marker in candidate:
+                        candidate = candidate.replace(marker, encoded_id)
+                        replaced = True
+                if replaced:
+                    add(candidate, "message detail template", 30)
+
+        if not ranked and ids:
+            # Last-resort bounded guesses for APIs that render only data-id.  They
+            # remain same-origin and are attempted only when no explicit link was
+            # discoverable.
+            for message_id in ids[:5]:
+                encoded_id = quote(message_id, safe="")
+                for suffix in (
+                    f"/message/{encoded_id}",
+                    f"/messages/{encoded_id}",
+                    f"/api/messages/{encoded_id}",
+                ):
+                    add(suffix, "message id fallback", 1)
+
+        result: list[str] = []
+        seen: set[str] = set()
+        for _score, _sequence, url in sorted(ranked, key=lambda item: (-item[0], item[1])):
+            if url in seen:
+                continue
+            seen.add(url)
+            result.append(url)
+            if len(result) >= 8:
+                break
+        return result
+
+    @classmethod
+    def _find_mailapi_detail_url(
+        cls,
+        page_text: str,
+        source_url: str,
+    ) -> Optional[str]:
+        return next(iter(cls._find_mailapi_detail_urls(page_text, source_url)), None)
+
+    def _request_mailapi(
+        self,
+        url: str,
+        *,
+        cookies: Any = None,
+        timeout: int = 15,
+    ):
         import requests
 
-        extra = account.extra or {}
-        url = str(extra.get("mailapi_url") or "").strip()
-        if not url:
-            raise RuntimeError("mailapi_url 为空，无法轮询取码")
-        response = requests.get(
-            url,
-            timeout=15,
-            proxies=getattr(self.mailbox, "_proxy", None),
-        )
+        request_kwargs = {
+            "timeout": max(1, int(timeout or 15)),
+            "proxies": getattr(self.mailbox, "_proxy", None),
+        }
+        if cookies:
+            request_kwargs["cookies"] = cookies
+        response = requests.get(url, **request_kwargs)
         if response.status_code >= 400:
             raise RuntimeError(
                 f"MailAPI 取码请求失败: HTTP {response.status_code}"
             )
-        return str(response.text or "")
+        return response
+
+    @staticmethod
+    def _collect_mailapi_cookies(response: Any):
+        import requests
+
+        cookie_jar = requests.cookies.RequestsCookieJar()
+        response_chain = [*(getattr(response, "history", None) or []), response]
+        for item in response_chain:
+            cookies = getattr(item, "cookies", None)
+            if cookies:
+                cookie_jar.update(cookies)
+        return cookie_jar
+
+    def _fetch_mailapi_text(self, account: MailboxAccount) -> str:
+        extra = account.extra or {}
+        url = str(extra.get("mailapi_url") or "").strip()
+        if not url:
+            raise RuntimeError("mailapi_url 为空，无法轮询取码")
+        response = self._request_mailapi(url)
+        text = str(response.text or "")
+        direct_message = self._parse_mailapi_message(text)
+        direct_content = str(direct_message.get("content") or "")
+        if (
+            direct_content
+            and direct_content != text
+            and self._extract_code(direct_content, None)
+        ):
+            return text
+        source_url = str(getattr(response, "url", "") or url)
+        detail_urls = self._find_mailapi_detail_urls(text, source_url)
+        if not detail_urls:
+            return text
+
+        self.mailbox._log("[MailAPI] 入口为邮件列表，自动发现并跟进邮件详情")
+        cookies = self._collect_mailapi_cookies(response)
+        first_detail_text = ""
+        # The newest/highest-confidence messages are ranked first.  Bound the
+        # detail fan-out so a slow stale message cannot add up to eight 15s
+        # waits to every OTP poll.
+        for detail_url in detail_urls[:3]:
+            try:
+                detail_response = self._request_mailapi(
+                    detail_url,
+                    cookies=cookies,
+                    timeout=5,
+                )
+                detail_text = str(detail_response.text or "")
+                if not detail_text:
+                    continue
+                if not first_detail_text:
+                    first_detail_text = detail_text
+                detail_message = self._parse_mailapi_message(detail_text)
+                if self._extract_message_code(detail_message, detail_text, None):
+                    return detail_text
+            except Exception:
+                continue
+        return first_detail_text or text
 
     def _extract_code(self, text: str, code_pattern: str | None) -> str:
         normalized_text = self.mailbox._decode_raw_content(text) or str(text or "")
         return str(self.mailbox._safe_extract(normalized_text, code_pattern) or "").strip()
 
+    def _extract_message_code(
+        self,
+        message: dict[str, Any],
+        raw_text: str,
+        code_pattern: str | None,
+    ) -> str:
+        content = str(message.get("content") or "")
+        code = self._extract_code(content, code_pattern)
+        if code or content == str(raw_text or ""):
+            return code
+        return self._extract_code(str(raw_text or ""), code_pattern)
+
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
             text = self._fetch_mailapi_text(account)
-            code = self._extract_code(text, None)
-            return {self._code_key(code)} if code else set()
+            message = self._parse_mailapi_message(text)
+            code = self._extract_message_code(message, text, None)
+            if not code:
+                return set()
+            message_id = str(message.get("message_id") or "").strip()
+            return {message_id or self._code_key(code)}
         except Exception:
             return set()
 
@@ -3523,26 +4479,59 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             if str(code or "").strip()
         }
         keyword_lower = str(keyword or "").strip().lower()
+        try:
+            otp_sent_at = float(kwargs.get("otp_sent_at") or 0)
+        except (TypeError, ValueError):
+            otp_sent_at = 0.0
 
         def poll_once() -> Optional[str]:
             try:
                 text = self._fetch_mailapi_text(account)
             except Exception as exc:
-                self.mailbox._log(f"[MailAPI] 拉取失败: {exc}")
+                self.mailbox._log(
+                    f"[MailAPI] 拉取失败: {type(exc).__name__ or 'Error'}"
+                )
                 return None
 
-            if keyword_lower and keyword_lower not in str(text).lower():
+            message = self._parse_mailapi_message(text)
+            if message.get("status") is False:
                 return None
-            code = self._extract_code(text, code_pattern)
+            content = str(message.get("content") or "")
+            searchable_content = (
+                content if content == str(text or "") else f"{content} {text}"
+            )
+            if keyword_lower and keyword_lower not in searchable_content.lower():
+                return None
+            code = self._extract_message_code(message, text, code_pattern)
             if not code:
                 return None
             if code in exclude_codes:
                 self.mailbox._log(f"[MailAPI] 跳过已尝试验证码: {code}")
                 return None
+            received_at = message.get("received_at")
+            if otp_sent_at and received_at and float(received_at) < otp_sent_at:
+                self.mailbox._log("[MailAPI] 跳过发送验证码之前收到的旧邮件")
+                return None
             code_key = self._code_key(code)
-            if code_key in seen:
+            message_id = str(message.get("message_id") or "").strip()
+            seen_before = code_key in seen or (message_id and message_id in seen)
+            baseline_raced_with_new_message = bool(
+                otp_sent_at
+                and received_at
+                and float(received_at) >= otp_sent_at
+            )
+            baseline_freshness_is_unverifiable = bool(
+                otp_sent_at and not received_at
+            )
+            if (
+                seen_before
+                and not baseline_raced_with_new_message
+                and not baseline_freshness_is_unverifiable
+            ):
                 return None
             seen.add(code_key)
+            if message_id:
+                seen.add(message_id)
             self.mailbox._log(f"[MailAPI] 收到验证码: {code}")
             return code
 
@@ -3626,21 +4615,24 @@ class OutlookMailbox(BaseMailbox):
             return True
         return bool(str(extra.get("mailapi_url") or "").strip())
 
-    def _pop_account(self) -> dict:
+    def _pop_account(self, email: str = "") -> dict:
         from sqlmodel import Session, select
         from core.db import engine, OutlookAccountModel
 
+        target_email = str(email or "").strip()
         with OutlookMailbox._pop_lock:
             with Session(engine) as session:
-                account = (
-                    session.exec(
-                        select(OutlookAccountModel)
-                        .where(OutlookAccountModel.enabled == True)
-                        .order_by(OutlookAccountModel.id)
-                    )
-                    .first()
+                query = select(OutlookAccountModel).where(
+                    OutlookAccountModel.enabled == True
                 )
+                if target_email:
+                    query = query.where(OutlookAccountModel.email == target_email)
+                account = session.exec(query.order_by(OutlookAccountModel.id)).first()
                 if not account:
+                    if target_email:
+                        raise RuntimeError(
+                            f"指定邮箱不在本地池中: {target_email}"
+                        )
                     raise RuntimeError("微软邮箱账号池为空，请先在设置页批量导入")
 
                 payload = {
@@ -3658,6 +4650,14 @@ class OutlookMailbox(BaseMailbox):
 
     def get_email(self) -> MailboxAccount:
         payload = self._pop_account()
+        return self._mailbox_account_from_payload(payload)
+
+    def get_email_by_address(self, email: str) -> MailboxAccount:
+        """Atomically pop the exact mailbox used by a persisted retry binding."""
+        payload = self._pop_account(email=email)
+        return self._mailbox_account_from_payload(payload)
+
+    def _mailbox_account_from_payload(self, payload: dict) -> MailboxAccount:
         email = str(payload.get("email") or "").strip()
         if not email:
             raise RuntimeError("微软邮箱账号邮箱为空")
@@ -3697,7 +4697,7 @@ class OutlookMailbox(BaseMailbox):
 
     def requeue_account(self, account: MailboxAccount) -> None:
         from sqlmodel import Session, select
-        from core.db import engine, OutlookAccountModel
+        from core.db import _utcnow, engine, OutlookAccountModel
 
         email = str(getattr(account, "email", "") or "").strip()
         extra = getattr(account, "extra", None) or {}
@@ -3955,6 +4955,7 @@ class OutlookMailbox(BaseMailbox):
         account: MailboxAccount,
         *,
         preferred_backend: str | None = None,
+        force_refresh: bool = False,
     ) -> str:
         extra = account.extra or {}
         client_id = str(extra.get("client_id") or "").strip()
@@ -3965,6 +4966,8 @@ class OutlookMailbox(BaseMailbox):
 
         cache = extra.setdefault("_oauth_token_cache", {})
         cache_key = self._normalize_backend_name(preferred_backend or self._backend_name)
+        if force_refresh and isinstance(cache, dict):
+            cache.pop(cache_key, None)
         cached = cache.get(cache_key) if isinstance(cache, dict) else None
         now = time.time()
         if isinstance(cached, dict):
@@ -4002,6 +5005,21 @@ class OutlookMailbox(BaseMailbox):
         auth_string = f"user={email}\x01auth=Bearer {access_token}\x01\x01"
         imap_conn.authenticate("XOAUTH2", lambda _: auth_string.encode("utf-8"))
 
+    @staticmethod
+    def _is_imap_authentication_error(exc: Exception) -> bool:
+        message = str(exc or "").strip().lower()
+        return any(
+            marker in message
+            for marker in (
+                "authenticate failed",
+                "authentication failed",
+                "login failed",
+                "invalid credentials",
+                "credentials rejected",
+                "auth failed",
+            )
+        )
+
     def _open_imap(self, account: MailboxAccount):
         import imaplib
 
@@ -4019,34 +5037,102 @@ class OutlookMailbox(BaseMailbox):
             )
 
         last_error = None
+        fresh_oauth_auth_rejected = False
+        password_auth_rejected = False
+        oauth_refresh_attempted = False
+
+        def connect_with_oauth(host: str, token: str):
+            connection = None
+            try:
+                connection = imaplib.IMAP4_SSL(
+                    host,
+                    self._imap_port,
+                    timeout=30,
+                )
+                self._imap_auth_oauth(
+                    connection,
+                    email=email_addr,
+                    access_token=token,
+                )
+                return connection
+            except Exception:
+                try:
+                    if connection is not None:
+                        connection.logout()
+                except Exception:
+                    pass
+                raise
+
         for host in self._imap_servers:
             if not host:
                 continue
             if access_token:
                 try:
-                    imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
-                    self._imap_auth_oauth(
-                        imap_conn, email=email_addr, access_token=access_token
-                    )
-                    return imap_conn
+                    return connect_with_oauth(host, access_token)
                 except Exception as exc:
                     last_error = exc
-                    try:
-                        imap_conn.logout()
-                    except Exception:
-                        pass
+                    is_auth_failure = self._is_imap_authentication_error(exc)
+                    if is_auth_failure and oauth_refresh_attempted:
+                        fresh_oauth_auth_rejected = True
+                    if is_auth_failure and not oauth_refresh_attempted:
+                        oauth_refresh_attempted = True
+                        self._log(
+                            "[微软邮箱][IMAP] "
+                            f"host={host} auth_mode=oauth 鉴权被拒绝，"
+                            "清除 access token 缓存并用 refresh token 重试一次"
+                        )
+                        try:
+                            access_token = self._get_oauth_access_token(
+                                account,
+                                preferred_backend="imap",
+                                force_refresh=True,
+                            )
+                        except Exception as refresh_exc:
+                            last_error = refresh_exc
+                            self._log(
+                                "[微软邮箱][IMAP] "
+                                f"host={host} auth_mode=oauth access token 刷新失败"
+                            )
+                        else:
+                            try:
+                                return connect_with_oauth(host, access_token)
+                            except Exception as refreshed_auth_exc:
+                                last_error = refreshed_auth_exc
+                                fresh_oauth_auth_rejected = (
+                                    fresh_oauth_auth_rejected
+                                    or self._is_imap_authentication_error(
+                                        refreshed_auth_exc
+                                    )
+                                )
+                                self._log(
+                                    "[微软邮箱][IMAP] "
+                                    f"host={host} auth_mode=oauth 刷新后重试失败"
+                                )
             if password:
+                imap_conn = None
                 try:
                     imap_conn = imaplib.IMAP4_SSL(host, self._imap_port, timeout=30)
                     imap_conn.login(email_addr, password)
                     return imap_conn
                 except Exception as exc:
                     last_error = exc
+                    password_auth_rejected = (
+                        password_auth_rejected
+                        or self._is_imap_authentication_error(exc)
+                    )
                     try:
-                        imap_conn.logout()
+                        if imap_conn is not None:
+                            imap_conn.logout()
                     except Exception:
                         pass
 
+        if fresh_oauth_auth_rejected or (
+            password_auth_rejected and not (client_id and refresh_token)
+        ):
+            raise MailboxAuthenticationError(
+                "微软邮箱 IMAP 鉴权失败：刷新令牌并重试后仍被服务端拒绝，"
+                "请检查邮箱凭据、IMAP 权限或稍后重试"
+            ) from last_error
         raise RuntimeError(f"微软邮箱 IMAP 登录失败: {last_error}")
 
     def _resolve_backend(self, account: MailboxAccount) -> OutlookMailboxBackend:

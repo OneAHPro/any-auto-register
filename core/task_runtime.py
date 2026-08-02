@@ -313,6 +313,24 @@ class RegisterTaskStore:
         with self._lock:
             return self._records[task_id].to_dict()
 
+    def snapshot_if_present(self, task_id: str) -> dict[str, Any] | None:
+        """Return a snapshot without an exists/snapshot TOCTOU window."""
+        with self._lock:
+            record = self._records.get(task_id)
+            return record.to_dict() if record is not None else None
+
+    def log_snapshot_if_present(
+        self,
+        task_id: str,
+    ) -> tuple[list[str], str, dict[str, Any]] | None:
+        """Copy log state and counters from the same locked record version."""
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return None
+            snapshot = record.to_dict()
+            return list(snapshot["logs"]), str(snapshot["status"]), snapshot
+
     def list_snapshots(self) -> list[dict[str, Any]]:
         with self._lock:
             return [record.to_dict() for record in self._records.values()]

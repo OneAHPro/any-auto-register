@@ -17,15 +17,22 @@ from typing import Any, Callable, Dict, Optional
 from core.task_runtime import TaskInterruption
 
 from .chatgpt_client import ChatGPTClient
+from .log_sanitizer import sanitize_chatgpt_log_message
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
+from .oauth_resume_cache import oauth_resume_cache, serialize_oauth_resume_context
 from .utils import (
+    FlowState,
     generate_random_birthday,
     generate_random_name,
     generate_random_password,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class MissingTotpCredentialsError(ValueError):
+    error_code = "missing_totp_credentials"
 
 
 @dataclass
@@ -42,6 +49,7 @@ class RegistrationResult:
     id_token: str = ""
     session_token: str = ""
     error_message: str = ""
+    error_code: str = ""
     logs: list | None = None
     metadata: dict | None = None
     source: str = "register"
@@ -58,6 +66,7 @@ class RegistrationResult:
             "id_token": self.id_token[:20] + "..." if self.id_token else "",
             "session_token": self.session_token[:20] + "..." if self.session_token else "",
             "error_message": self.error_message,
+            "error_code": self.error_code,
             "logs": self.logs or [],
             "metadata": self.metadata or {},
             "source": self.source,
@@ -145,6 +154,24 @@ class EmailServiceAdapter:
             self.log_fn(f"成功获取验证码: {code}")
         return code
 
+    def get_totp_code(self) -> str:
+        getter = getattr(self.email_service, "get_totp_code", None)
+        if not callable(getter):
+            raise RuntimeError("当前邮箱服务未提供远程 2FA 验证码")
+        return str(getter() or "").strip()
+
+    def supports_totp_code(self) -> bool:
+        supports = getattr(self.email_service, "supports_totp_code", None)
+        if callable(supports):
+            return bool(supports())
+        return callable(getattr(self.email_service, "get_totp_code", None))
+
+    def commit_password_reset(self, new_password: str) -> bool:
+        commit = getattr(self.email_service, "commit_password_reset", None)
+        if not callable(commit):
+            raise RuntimeError("当前邮箱服务不支持保存重置后的密码")
+        return commit(str(new_password or "")) is not False
+
 
 class RefreshTokenRegistrationEngine:
     """Refresh token 注册引擎。"""
@@ -170,12 +197,17 @@ class RefreshTokenRegistrationEngine:
 
         self.email: Optional[str] = None
         self.password: Optional[str] = None
+        self.totp_secret: Optional[str] = None
+        self.password_reset_required = False
         self.email_info: Optional[Dict[str, Any]] = None
+        self._email_error_message = ""
+        self._email_error_code = ""
         self.logs: list[str] = []
 
     def _log(self, message: str, level: str = "info"):
         timestamp = datetime.now().strftime("%H:%M:%S")
-        log_message = f"[{timestamp}] {message}"
+        safe_message = sanitize_chatgpt_log_message(message)
+        log_message = f"[{timestamp}] {safe_message}"
         self.logs.append(log_message)
 
         if self.callback_logger:
@@ -203,8 +235,22 @@ class RefreshTokenRegistrationEngine:
             return value
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _existing_account_login_stage(self) -> str:
+        value = str(
+            self.extra_config.get(
+                "chatgpt_existing_account_login_stage",
+                "refresh_token",
+            )
+            or "refresh_token"
+        ).strip().lower().replace("-", "_")
+        if value in {"access_token", "access_token_only", "at", "at_only"}:
+            return "access_token"
+        return "refresh_token"
+
     def _create_email(self, *, existing_account_login_only: bool = False) -> bool:
         action = "加载" if existing_account_login_only else "创建"
+        self._email_error_message = ""
+        self._email_error_code = ""
         try:
             if existing_account_login_only:
                 self._log(
@@ -220,8 +266,11 @@ class RefreshTokenRegistrationEngine:
                 or ""
             ).strip()
             if not email_value:
+                self._email_error_message = (
+                    f"{self.email_service.service_type.value} 返回空邮箱地址"
+                )
                 self._log(
-                    f"{action}邮箱失败: {self.email_service.service_type.value} 返回空邮箱地址",
+                    f"{action}邮箱失败: {self._email_error_message}",
                     "error",
                 )
                 return False
@@ -231,13 +280,75 @@ class RefreshTokenRegistrationEngine:
             self.email_info["email"] = email_value
             self.email = email_value
             if existing_account_login_only:
+                account_type = str(
+                    self.email_info.get("account_type") or ""
+                ).strip()
+                if account_type == "chatgpt_password_totp":
+                    password = str(self.email_info.get("password") or "")
+                    totp_secret = str(self.email_info.get("totp_secret") or "")
+                    if not password or not totp_secret:
+                        raise MissingTotpCredentialsError(
+                            "ChatGPT 密码 + MFA 登录记录缺少密码或 MFA 秘钥"
+                        )
+                    self.password = password
+                    self.totp_secret = totp_secret
+                    self.password_reset_required = False
+                    self._log(
+                        "已识别 ChatGPT 密码 + MFA 登录凭据；不会访问 Apple 邮箱"
+                    )
+                elif account_type == "chatgpt_password_url_otp":
+                    password = str(self.email_info.get("password") or "")
+                    if not password:
+                        raise ValueError("ChatGPT URL 验证记录缺少登录密码")
+                    self.password = password
+                    self.totp_secret = ""
+                    self.password_reset_required = False
+                    self._log("已识别 ChatGPT 密码 + URL 邮箱/2FA 凭据")
+                elif account_type == "chatgpt_password_reset_url_mail":
+                    reset_required = bool(
+                        self.email_info.get("password_reset_required", True)
+                    )
+                    password_key = "new_password" if reset_required else "password"
+                    password = str(self.email_info.get(password_key) or "")
+                    if len(password) < 12:
+                        raise ValueError(
+                            "ChatGPT 忘记密码记录缺少可用的新密码"
+                        )
+                    self.password = password
+                    self.totp_secret = ""
+                    self.password_reset_required = reset_required
+                    if reset_required:
+                        self._log(
+                            "已识别忘记密码记录；将自动邮箱取码、设置新密码并继续登录"
+                        )
+                    else:
+                        self._log("已加载此前重置并保存的 ChatGPT 登录密码")
+            if existing_account_login_only:
                 self._log(f"邮箱凭据加载成功: {self.email}")
             else:
                 self._log(f"成功创建邮箱: {self.email}")
             return True
         except Exception as e:
-            self._log(f"{action}邮箱失败: {e}", "error")
+            self._email_error_message = str(e).strip()
+            self._email_error_code = str(getattr(e, "error_code", "") or "").strip()
+            self._log(f"{action}邮箱失败: {self._email_error_message}", "error")
             return False
+
+    def _commit_password_reset(
+        self,
+        email_adapter: EmailServiceAdapter,
+        new_password: str,
+    ) -> bool:
+        committed = email_adapter.commit_password_reset(new_password)
+        if committed is False:
+            return False
+        self.password = str(new_password or "")
+        self.password_reset_required = False
+        if isinstance(self.email_info, dict):
+            self.email_info["password"] = self.password
+            self.email_info["password_reset_required"] = False
+            self.email_info.pop("new_password", None)
+        return True
 
     def _read_int_config(
         self,
@@ -278,7 +389,8 @@ class RefreshTokenRegistrationEngine:
             verbose=False,
             browser_mode=self.browser_mode,
         )
-        client._log = lambda msg: self._log(f"[注册链路] {msg}")
+        chain_label = "登录链路" if self._existing_account_login_only() else "注册链路"
+        client._log = lambda msg: self._log(f"[{chain_label}] {msg}")
         return client
 
     def _build_oauth_client(self) -> OAuthClient:
@@ -451,7 +563,9 @@ class RefreshTokenRegistrationEngine:
                 else "chatgpt_client.register_complete_flow"
             ),
             "token_flow": "oauth_client.login_and_get_tokens",
-            "token_login_mode": "passwordless",
+            "token_login_mode": (
+                "password_totp" if self.totp_secret else "passwordless"
+            ),
             "browser_mode": self.browser_mode,
             "device_id": getattr(register_client, "device_id", ""),
             "impersonate": getattr(register_client, "impersonate", ""),
@@ -481,6 +595,7 @@ class RefreshTokenRegistrationEngine:
         allow_phone_verification = (
             self._existing_account_phone_verification_enabled()
         )
+        password_login = bool(self.password)
         tokens = oauth_client.login_and_get_tokens(
             result.email,
             self.password or "",
@@ -489,12 +604,18 @@ class RefreshTokenRegistrationEngine:
             sec_ch_ua=None,
             impersonate=None,
             skymail_client=email_adapter,
-            prefer_passwordless_login=True,
+            prefer_passwordless_login=not password_login,
             allow_phone_verification=allow_phone_verification,
             force_new_browser=True,
             force_chatgpt_entry=False,
             screen_hint="login",
-            force_password_login=False,
+            force_password_login=password_login,
+            totp_secret=self.totp_secret or "",
+            password_reset_required=self.password_reset_required,
+            on_password_reset=lambda new_password: self._commit_password_reset(
+                email_adapter,
+                new_password,
+            ),
             complete_about_you_if_needed=False,
             login_source="existing_account_login_only",
         )
@@ -528,6 +649,123 @@ class RefreshTokenRegistrationEngine:
         self._log("已有账号登录完成，Access Token 与 Refresh Token 均已获取")
         return result
 
+    def _login_existing_account_access_token(
+        self,
+        *,
+        result: RegistrationResult,
+        email_adapter: EmailServiceAdapter,
+        otp_wait_seconds: int,
+        otp_resend_wait_seconds: int,
+    ) -> RegistrationResult:
+        self._log("2. 登录已有 ChatGPT 账号并提取 Access Token...")
+        chatgpt_client = self._build_chatgpt_client()
+        ok, session_result = chatgpt_client.login_existing_account_and_get_session(
+            result.email,
+            email_adapter,
+            password=self.password or "",
+            totp_secret=self.totp_secret or "",
+            password_reset_required=self.password_reset_required,
+            on_password_reset=lambda new_password: self._commit_password_reset(
+                email_adapter,
+                new_password,
+            ),
+            otp_wait_timeout=otp_wait_seconds,
+            otp_resend_wait_timeout=otp_resend_wait_seconds,
+        )
+        if not ok:
+            result.error_message = str(
+                session_result or "已有 ChatGPT 账号邮箱登录失败"
+            )
+            return result
+
+        session_data = session_result if isinstance(session_result, dict) else {}
+        access_token = str(session_data.get("access_token") or "").strip()
+        if not access_token:
+            result.error_message = "已有账号邮箱登录未获取 Access Token"
+            return result
+
+        prepared_context = getattr(
+            chatgpt_client, "phone_oauth_resume_context", None
+        )
+        prepared_ready = bool(
+            prepared_context is not None
+            and isinstance(getattr(prepared_context, "code_verifier", None), str)
+            and str(getattr(prepared_context, "code_verifier", "") or "").strip()
+            and isinstance(getattr(prepared_context, "oauth_state", None), str)
+            and str(getattr(prepared_context, "oauth_state", "") or "").strip()
+            and isinstance(getattr(prepared_context, "flow_state", None), FlowState)
+        )
+        oauth_resume_context = {}
+        if prepared_ready:
+            context_kwargs = {
+                "session": prepared_context.session,
+                "device_id": prepared_context.device_id,
+                "user_agent": prepared_context.user_agent,
+                "sec_ch_ua": prepared_context.sec_ch_ua,
+                "accept_language": prepared_context.accept_language,
+                "impersonate": prepared_context.impersonate,
+                "code_verifier": prepared_context.code_verifier,
+                "oauth_state": prepared_context.oauth_state,
+                "authorize_url": prepared_context.authorize_url,
+                "authorize_params": prepared_context.authorize_params,
+                "flow_state": prepared_context.flow_state,
+                "referer": prepared_context.referer,
+            }
+            oauth_resume_cache.remember(result.email, **context_kwargs)
+            oauth_resume_context = serialize_oauth_resume_context(
+                **context_kwargs,
+                ttl_seconds=1800,
+            )
+        else:
+            oauth_resume_cache.take(result.email)
+            self._log(
+                "Access Token 已获取，但本次未生成可续接的手机授权事务；"
+                "接码前需要重新执行邮箱登录",
+                "warning",
+            )
+
+        mailbox_context = {}
+        metadata_getter = getattr(self.email_service, "get_mailbox_metadata", None)
+        if callable(metadata_getter):
+            try:
+                mailbox_context = metadata_getter() or {}
+            except Exception as exc:
+                self._log(f"读取邮箱登录上下文失败: {exc}", "warning")
+
+        result.success = True
+        result.access_token = access_token
+        result.refresh_token = ""
+        result.session_token = str(session_data.get("session_token") or "").strip()
+        result.account_id = str(
+            session_data.get("account_id")
+            or session_data.get("user_id")
+            or ""
+        ).strip()
+        result.workspace_id = str(session_data.get("workspace_id") or "").strip()
+        result.source = "existing_account_web_login"
+        result.metadata = {
+            "email_service": self.email_service.service_type.value,
+            "proxy_used": self.proxy_url,
+            "registered_at": datetime.now().isoformat(),
+            "registration_message": "existing_account_access_token_login",
+            "registration_flow": "skipped_existing_account_web_login",
+            "token_flow": "chatgpt_client.login_existing_account_and_get_session",
+            "token_login_mode": (
+                "password_totp" if self.totp_secret else "passwordless"
+            ),
+            "browser_mode": self.browser_mode,
+            "workspace_id": result.workspace_id,
+            "phone_verification_required": True,
+            "phone_oauth_ready": prepared_ready,
+            "phone_oauth_prepare_error": str(
+                getattr(chatgpt_client, "phone_oauth_resume_error", "") or ""
+            ).strip(),
+            "mailbox_login_context": mailbox_context,
+            "oauth_resume_context": oauth_resume_context,
+        }
+        self._log("已有账号邮箱登录完成，Access Token 已获取；Refresh Token 等待手机验证")
+        return result
+
     def run(self) -> RegistrationResult:
         result = RegistrationResult(success=False, logs=self.logs)
         last_error = ""
@@ -559,7 +797,7 @@ class RefreshTokenRegistrationEngine:
                 self._log("ChatGPT RT 全新主链路启动")
             self._log(f"请求模式: {self.browser_mode}")
             if existing_account_login_only:
-                self._log("实现策略: passwordless OAuth 登录 + AT/RT 提取")
+                self._log("实现策略: 根据导入凭据选择密码/MFA或邮箱 OTP 登录")
             else:
                 self._log("实现策略: 注册状态机 + OAuth 接续流程")
             self._log("=" * 60)
@@ -574,10 +812,15 @@ class RefreshTokenRegistrationEngine:
             if not self._create_email(
                 existing_account_login_only=existing_account_login_only
             ):
-                last_error = (
-                    "加载邮箱失败" if existing_account_login_only else "创建邮箱失败"
+                generic_error = (
+                    "加载邮箱失败"
+                    if existing_account_login_only
+                    else "创建邮箱失败"
                 )
+                detail = self._email_error_message
+                last_error = f"{generic_error}: {detail}" if detail else generic_error
                 result.error_message = last_error
+                result.error_code = self._email_error_code
                 return result
 
             result.email = self.email or ""
@@ -593,6 +836,13 @@ class RefreshTokenRegistrationEngine:
                 self._log,
             )
             if existing_account_login_only:
+                if self._existing_account_login_stage() == "access_token":
+                    return self._login_existing_account_access_token(
+                        result=result,
+                        email_adapter=email_adapter,
+                        otp_wait_seconds=register_otp_wait_seconds,
+                        otp_resend_wait_seconds=register_otp_resend_wait_seconds,
+                    )
                 return self._login_existing_account(
                     result=result,
                     email_adapter=email_adapter,

@@ -3,9 +3,15 @@ from unittest import mock
 
 from core.base_mailbox import MailboxAccount
 from core.base_platform import Account, RegisterConfig
-from platforms.qwen.core import QwenRegister, wait_for_activation_link
-from platforms.qwen.cpa_upload import generate_token_json, upload_to_cpa
-from platforms.qwen.plugin import QwenPlatform
+
+try:
+    from platforms.qwen.core import QwenRegister, wait_for_activation_link
+    from platforms.qwen.cpa_upload import generate_token_json, upload_to_cpa
+    from platforms.qwen.plugin import QwenPlatform
+except ModuleNotFoundError as exc:
+    if exc.name == "platforms.qwen":
+        raise unittest.SkipTest("Qwen 平台已从当前版本移除") from exc
+    raise
 
 
 class _DummyExecutor:

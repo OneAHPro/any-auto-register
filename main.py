@@ -20,6 +20,9 @@ from api.auth import router as auth_router
 from api.mail_imports import router as mail_imports_router
 from api.outlook import router as outlook_router
 from api.contribution import router as contribution_router
+from api.chatgpt import router as chatgpt_router
+from api.sms_pool import router as sms_pool_router
+from api.automations import router as automations_router
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
 
@@ -114,6 +117,9 @@ app.include_router(auth_router, prefix="/api")
 app.include_router(mail_imports_router, prefix="/api")
 app.include_router(outlook_router, prefix="/api")
 app.include_router(contribution_router, prefix="/api")
+app.include_router(chatgpt_router, prefix="/api")
+app.include_router(sms_pool_router, prefix="/api")
+app.include_router(automations_router, prefix="/api")
 
 
 @app.get("/api/solver/status")

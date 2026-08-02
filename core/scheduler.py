@@ -8,51 +8,97 @@ import threading
 import time
 
 
+def tick_chatgpt_auto_relogin(*, now: datetime):
+    """Lazy import keeps scheduler module startup independent from API tasks."""
+
+    from services.chatgpt_auto_relogin import tick_chatgpt_auto_relogin as tick
+
+    return tick(now=now)
+
+
 class Scheduler:
     def __init__(self):
         self._running = False
-        self._thread: threading.Thread = None
+        self._thread: threading.Thread | None = None
+        self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
         self._loop_interval_seconds = 60
         self._trial_check_interval_seconds = 3600
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
 
     def start(self):
-        if self._running:
-            return
-        self._running = True
-        
-        now = time.time()
-        # 将上次执行时间设为当前时间，避免应用一启动就瞬间触发定时任务（如 CPA 自动注册）
-        self._last_trial_check_at = now
-        self._last_cpa_maintenance_at = now
+        with self._lifecycle_lock:
+            if self._running:
+                return
+            self._running = True
+            stop_event = threading.Event()
+            self._stop_event = stop_event
 
-        self._thread = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+            now = time.monotonic()
+            # 保持 trial/CPA 启动后先等完整周期；自动重登由首轮 tick 自行排期。
+            self._last_trial_check_at = now
+            self._last_cpa_maintenance_at = now
+
+            self._thread = threading.Thread(
+                target=self._loop,
+                args=(stop_event,),
+                daemon=True,
+            )
+            self._thread.start()
         print("[Scheduler] 已启动")
 
     def stop(self):
-        self._running = False
+        with self._lifecycle_lock:
+            self._running = False
+            self._stop_event.set()
 
-    def _loop(self):
-        while self._running:
-            now = time.time()
-            if now - self._last_trial_check_at >= self._trial_check_interval_seconds:
-                try:
-                    self.check_trial_expiry()
-                    self._last_trial_check_at = now
-                except Exception as e:
-                    print(f"[Scheduler] Trial 检查错误: {e}")
+    def run_once(
+        self,
+        wall_now: datetime,
+        monotonic_now: float,
+    ) -> None:
+        if wall_now.tzinfo is None:
+            wall_now = wall_now.replace(tzinfo=timezone.utc)
+        else:
+            wall_now = wall_now.astimezone(timezone.utc)
 
+        try:
+            tick_chatgpt_auto_relogin(now=wall_now)
+        except Exception as e:
+            print(f"[Scheduler] ChatGPT 自动重登错误: {e}")
+
+        if (
+            monotonic_now - self._last_trial_check_at
+            >= self._trial_check_interval_seconds
+        ):
+            try:
+                self.check_trial_expiry()
+            except Exception as e:
+                print(f"[Scheduler] Trial 检查错误: {e}")
+            else:
+                self._last_trial_check_at = monotonic_now
+
+        try:
             cpa_interval = self._get_cpa_maintenance_interval_seconds()
-            if cpa_interval and now - self._last_cpa_maintenance_at >= cpa_interval:
-                try:
-                    self.check_cpa_credentials()
-                    self._last_cpa_maintenance_at = now
-                except Exception as e:
-                    print(f"[Scheduler] CPA 维护错误: {e}")
+            if (
+                cpa_interval
+                and monotonic_now - self._last_cpa_maintenance_at >= cpa_interval
+            ):
+                self.check_cpa_credentials()
+                self._last_cpa_maintenance_at = monotonic_now
+        except Exception as e:
+            print(f"[Scheduler] CPA 维护错误: {e}")
 
-            time.sleep(self._loop_interval_seconds)
+    def _loop(self, stop_event: threading.Event | None = None):
+        stop_event = stop_event or self._stop_event
+        while not stop_event.is_set():
+            self.run_once(
+                wall_now=datetime.now(timezone.utc),
+                monotonic_now=time.monotonic(),
+            )
+            if stop_event.wait(self._loop_interval_seconds):
+                break
 
     def _get_cpa_maintenance_interval_seconds(self) -> int:
         from services.cpa_manager import get_cpa_maintenance_interval_seconds

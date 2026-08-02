@@ -35,7 +35,7 @@ interface MailImportSnapshotItem {
   mailbox: string
   enabled?: boolean | null
   has_oauth?: boolean | null
-  account_type?: 'microsoft_oauth' | 'mailapi_url' | null
+  account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_password_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
 }
 
 interface MailImportSnapshot {
@@ -124,7 +124,7 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
         ...provider,
         type: 'applemail',
         apiType: 'applemail',
-        label: 'AppleMail / 小苹果',
+        label: 'iCloud MFA / AppleMail / 小苹果',
       })
       continue
     }
@@ -535,13 +535,31 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     ]
 
     if (selectedType === 'applemail') {
-      baseColumns.push({
-        title: '邮箱文件夹',
-        dataIndex: 'mailbox',
-        key: 'mailbox',
-        width: 140,
-        render: (value: string) => <Tag>{value || 'INBOX'}</Tag>,
-      } as never)
+      baseColumns.push(
+        {
+          title: '类型',
+          dataIndex: 'account_type',
+          key: 'account_type',
+          width: 180,
+          render: (value: string) => {
+            const labels: Record<string, string> = {
+              chatgpt_password_url_otp: '密码 + URL 2FA',
+              chatgpt_password_reset_url_mail: '需重置密码',
+              chatgpt_password_totp: '密码 + TOTP',
+              icloud_web: 'iCloud Web',
+              applemail_oauth: 'AppleMail OAuth',
+            }
+            return <Tag>{labels[value] || value || 'AppleMail OAuth'}</Tag>
+          },
+        } as never,
+        {
+          title: '邮箱文件夹',
+          dataIndex: 'mailbox',
+          key: 'mailbox',
+          width: 140,
+          render: (value: string) => <Tag>{value || 'INBOX'}</Tag>,
+        } as never,
+      )
     } else {
       baseColumns.push(
         {

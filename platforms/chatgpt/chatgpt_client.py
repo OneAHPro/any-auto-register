@@ -6,7 +6,7 @@ ChatGPT 注册客户端模块
 import random
 import uuid
 import time
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlsplit
 from core.proxy_utils import build_requests_proxy_config
 
 try:
@@ -131,6 +131,9 @@ class ChatGPTClient:
         seed_oai_device_cookie(self.session, self.device_id)
         self.last_registration_state = FlowState()
         self.last_stage = ""
+        self.last_authorize_status = 0
+        self.phone_oauth_resume_context = None
+        self.phone_oauth_resume_error = ""
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
@@ -593,7 +596,7 @@ class ChatGPTClient:
 
         return None
 
-    def signin(self, email, csrf_token):
+    def signin(self, email, csrf_token, screen_hint="login_or_signup"):
         """
         提交邮箱，获取 authorize URL
 
@@ -607,7 +610,7 @@ class ChatGPTClient:
             "prompt": "login",
             "ext-oai-did": self.device_id,
             "auth_session_logging_id": str(uuid.uuid4()),
-            "screen_hint": "login_or_signup",
+            "screen_hint": str(screen_hint or "login_or_signup"),
             "login_hint": email,
         }
 
@@ -645,6 +648,445 @@ class ChatGPTClient:
 
         return None
 
+    def login_existing_account_and_get_session(
+        self,
+        email,
+        skymail_client,
+        *,
+        password="",
+        totp_secret="",
+        password_reset_required=False,
+        on_password_reset=None,
+        otp_wait_timeout=600,
+        otp_resend_wait_timeout=300,
+        _password_reset_depth=0,
+    ):
+        """通过 ChatGPT Web 登录获取 AT，不发起 offline_access token exchange。"""
+        from .oauth_client import OAuthClient
+
+        if not str(email or "").strip():
+            return False, "邮箱地址为空"
+        password_login = bool(str(password or "").strip())
+        if skymail_client is None and not password_login:
+            return False, "缺少邮箱验证码接收服务"
+
+        self.phone_oauth_resume_context = None
+        self.phone_oauth_resume_error = ""
+
+        try:
+            otp_wait_timeout = max(30, int(otp_wait_timeout or 600))
+        except Exception:
+            otp_wait_timeout = 600
+        try:
+            otp_resend_wait_timeout = max(30, int(otp_resend_wait_timeout or 300))
+        except Exception:
+            otp_resend_wait_timeout = 300
+
+        oauth_helper_config = {
+            "chatgpt_oauth_otp_wait_seconds": otp_wait_timeout,
+            "chatgpt_oauth_otp_resend_wait_seconds": otp_resend_wait_timeout,
+        }
+        helper = OAuthClient(
+            oauth_helper_config,
+            proxy=self.proxy,
+            verbose=False,
+            browser_mode=self.browser_mode,
+        )
+        helper._log = self._log
+
+        phone_prepare_attempts = 0
+        max_phone_prepare_attempts = 3
+
+        def prepare_phone_transaction(*, attempts: int = 2):
+            nonlocal phone_prepare_attempts
+            if self.phone_oauth_resume_context is not None:
+                return True
+
+            remaining = min(
+                max(1, int(attempts or 1)),
+                max_phone_prepare_attempts - phone_prepare_attempts,
+            )
+            for _ in range(max(0, remaining)):
+                phone_prepare_attempts += 1
+                phone_helper = OAuthClient(
+                    oauth_helper_config,
+                    proxy=self.proxy,
+                    verbose=False,
+                    browser_mode=self.browser_mode,
+                )
+                phone_helper._log = self._log
+                phone_helper.adopt_browser_context(
+                    self.session,
+                    device_id=self.device_id,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    accept_language=self.accept_language,
+                )
+                try:
+                    prepared_context = (
+                        phone_helper.prepare_phone_verification_transaction(
+                            email=email,
+                            device_id=self.device_id,
+                            user_agent=self.ua,
+                            sec_ch_ua=self.sec_ch_ua,
+                            accept_language=self.accept_language,
+                            impersonate=self.impersonate,
+                        )
+                    )
+                except Exception as exc:
+                    prepared_context = None
+                    self.phone_oauth_resume_error = str(exc).strip()[:500]
+
+                if prepared_context is not None:
+                    self.phone_oauth_resume_context = prepared_context
+                    self.phone_oauth_resume_error = ""
+                    self._log(
+                        "首轮登录验证已通过，手机验证 OAuth 事务已同步预建"
+                    )
+                    return True
+
+                self.phone_oauth_resume_error = str(
+                    self.phone_oauth_resume_error
+                    or phone_helper.last_error
+                    or "复制首轮登录会话失败"
+                ).strip()[:500]
+                if phone_prepare_attempts < max_phone_prepare_attempts:
+                    self._log(
+                        "手机验证 OAuth 事务预建失败，"
+                        f"使用原认证会话重试 {phone_prepare_attempts + 1}/"
+                        f"{max_phone_prepare_attempts}"
+                    )
+
+            if self.phone_oauth_resume_context is not None:
+                self._log(
+                    "首轮登录验证已通过，手机验证 OAuth 事务已同步预建"
+                )
+                return True
+            return False
+
+        final_url = ""
+        continue_referer = ""
+        session_ready = False
+        bootstrap_error = "打开 OpenAI 登录页失败"
+        max_bootstrap_attempts = 6
+        for bootstrap_attempt in range(max_bootstrap_attempts):
+            if bootstrap_attempt > 0:
+                self._log(
+                    f"登录入口重试 {bootstrap_attempt + 1}/{max_bootstrap_attempts}..."
+                )
+                self._reset_session()
+            if not self.visit_homepage():
+                bootstrap_error = "访问 ChatGPT 首页失败"
+                continue
+            csrf_token = self.get_csrf_token()
+            if not csrf_token:
+                bootstrap_error = "获取 ChatGPT CSRF Token 失败"
+                continue
+            authorize_url = self.signin(email, csrf_token, screen_hint="login")
+            if not authorize_url:
+                bootstrap_error = "提交登录邮箱失败"
+                continue
+            final_url = self.authorize(authorize_url) or ""
+            if not final_url:
+                bootstrap_error = "打开 OpenAI 登录页失败"
+                continue
+
+            helper.adopt_browser_context(
+                self.session,
+                device_id=self.device_id,
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                accept_language=self.accept_language,
+            )
+            final_parts = urlsplit(final_url)
+            is_openai_auth_page = final_parts.netloc.lower().endswith("openai.com")
+            has_login_session = bool(
+                self._get_cookie_value("login_session")
+            )
+            needs_oauth_bootstrap = is_openai_auth_page and (
+                self.last_authorize_status in {401, 403} or not has_login_session
+            )
+            if needs_oauth_bootstrap:
+                self._log(
+                    "OpenAI 登录会话尚未建立，切换 OAuth bootstrap/fallback..."
+                )
+                source_parts = urlsplit(authorize_url)
+                authorize_base = (
+                    f"{source_parts.scheme}://{source_parts.netloc}{source_parts.path}"
+                )
+                authorize_params = dict(
+                    parse_qsl(source_parts.query, keep_blank_values=True)
+                )
+                bootstrapped_url = helper._bootstrap_oauth_session(
+                    authorize_base,
+                    authorize_params,
+                    device_id=self.device_id,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                )
+                if bootstrapped_url and helper._get_cookie_value("login_session"):
+                    continue_referer = bootstrapped_url
+                    session_ready = True
+                    break
+                bootstrap_error = "OpenAI 登录会话未建立，请重新开始登录"
+                continue
+
+            continue_referer = final_url
+            session_ready = True
+            break
+        if not final_url or not session_ready:
+            return False, bootstrap_error
+
+        helper.adopt_browser_context(
+            self.session,
+            device_id=self.device_id,
+            user_agent=self.ua,
+            sec_ch_ua=self.sec_ch_ua,
+            accept_language=self.accept_language,
+        )
+
+        state = helper._state_from_url(final_url)
+        referer = continue_referer or final_url
+        seen_states = {}
+        for step in range(16):
+            signature = helper._state_signature(state)
+            seen_states[signature] = seen_states.get(signature, 0) + 1
+            self._log(
+                f"已有账号 Web 登录状态[{step + 1}/16]: "
+                f"{describe_flow_state(state)}"
+            )
+            if seen_states[signature] > 2:
+                return False, f"邮箱登录状态卡住: {describe_flow_state(state)}"
+
+            state_url = str(state.continue_url or state.current_url or "").lower()
+            if (
+                state.page_type == "api_accounts_authorize"
+                or (
+                    "/api/accounts/authorize" in state_url
+                    and "/api/accounts/authorize/continue" not in state_url
+                )
+            ):
+                next_state = helper._submit_authorize_continue(
+                    email,
+                    self.device_id,
+                    referer,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                    screen_hint="login",
+                )
+                if not next_state:
+                    return False, helper.last_error or "提交登录邮箱失败"
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                continue
+
+            if (
+                state.page_type == "external_url"
+                and self._state_requires_navigation(state)
+            ):
+                success, next_state = self._follow_flow_state(
+                    state,
+                    referer=state.current_url or referer,
+                )
+                if not success:
+                    return False, f"邮箱登录回调失败: {next_state}"
+                referer = state.current_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
+            if self._is_registration_complete_state(state):
+                self.last_registration_state = state
+                break
+
+            if helper._state_is_login_password(state):
+                if password_reset_required:
+                    if int(_password_reset_depth or 0) >= 1:
+                        return False, "密码重置后仍返回重置入口，已停止循环"
+                    reset_state = helper._complete_password_reset(
+                        state,
+                        email=email,
+                        new_password=str(password or ""),
+                        skymail_client=skymail_client,
+                        device_id=self.device_id,
+                        user_agent=self.ua,
+                        sec_ch_ua=self.sec_ch_ua,
+                        impersonate=self.impersonate,
+                        on_password_reset=on_password_reset,
+                    )
+                    if not reset_state:
+                        return False, helper.last_error or "ChatGPT 密码重置失败"
+                    return self.login_existing_account_and_get_session(
+                        email,
+                        skymail_client,
+                        password=str(password or ""),
+                        totp_secret=str(totp_secret or ""),
+                        password_reset_required=False,
+                        on_password_reset=on_password_reset,
+                        otp_wait_timeout=otp_wait_timeout,
+                        otp_resend_wait_timeout=otp_resend_wait_timeout,
+                        _password_reset_depth=int(_password_reset_depth or 0) + 1,
+                    )
+                if password_login:
+                    next_state = helper._submit_password_verify(
+                        str(password or ""),
+                        self.device_id,
+                        user_agent=self.ua,
+                        sec_ch_ua=self.sec_ch_ua,
+                        impersonate=self.impersonate,
+                        referer=state.current_url or state.continue_url or referer,
+                    )
+                else:
+                    next_state = helper._send_passwordless_login_otp(
+                        email,
+                        self.device_id,
+                        user_agent=self.ua,
+                        sec_ch_ua=self.sec_ch_ua,
+                        impersonate=self.impersonate,
+                        referer=state.current_url or state.continue_url or referer,
+                    )
+                if not next_state:
+                    return False, helper.last_error or "ChatGPT 密码登录失败"
+                referer = state.current_url or referer
+                state = next_state
+                continue
+
+            if helper._state_is_mfa_challenge(state):
+                next_state = helper._submit_mfa_challenge(
+                    state,
+                    email=email,
+                    skymail_client=skymail_client,
+                    totp_secret=str(totp_secret or ""),
+                    device_id=self.device_id,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                )
+                if not next_state:
+                    return False, helper.last_error or "ChatGPT MFA 验证失败"
+                prepare_phone_transaction()
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
+            if helper._state_is_email_otp(state):
+                next_state = helper._handle_otp_verification(
+                    email,
+                    self.device_id,
+                    self.ua,
+                    self.sec_ch_ua,
+                    self.impersonate,
+                    skymail_client,
+                    state,
+                    prefer_passwordless_login=True,
+                    allow_cached_code_retry=False,
+                )
+                if not next_state:
+                    return False, helper.last_error or "邮箱验证码校验失败"
+                if not helper._state_is_mfa_challenge(next_state):
+                    prepare_phone_transaction()
+                referer = state.current_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
+            if helper._state_is_add_phone(state):
+                self._log("Web 邮箱登录已进入 add_phone，开始读取当前 ChatGPT Session")
+                self.last_registration_state = state
+                break
+
+            if helper._state_is_about_you(state):
+                return False, "该邮箱尚未完成 ChatGPT 账号注册"
+
+            if self._state_requires_navigation(state):
+                success, next_state = self._follow_flow_state(
+                    state,
+                    referer=state.current_url or referer,
+                )
+                if not success:
+                    return False, f"邮箱登录跳转失败: {next_state}"
+                referer = state.current_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
+            return False, f"未支持的邮箱登录状态: {describe_flow_state(state)}"
+        else:
+            return False, "邮箱登录状态机超出最大步数"
+
+        session_ok, session_result = self.fetch_chatgpt_session()
+        if not session_ok:
+            try:
+                self.visit_homepage()
+            except Exception:
+                pass
+            session_ok, session_result = self.fetch_chatgpt_session()
+        if not session_ok:
+            return False, f"邮箱登录完成但未获取 Access Token: {session_result}"
+
+        session_data = session_result if isinstance(session_result, dict) else {}
+        access_token = str(session_data.get("accessToken") or "").strip()
+        if not access_token:
+            return False, "ChatGPT Session 未返回 Access Token"
+
+        if (
+            self.phone_oauth_resume_context is None
+            and phone_prepare_attempts < max_phone_prepare_attempts
+        ):
+            self._log(
+                "Access Token 已获取，使用同一认证会话最后重试手机验证 OAuth 预建"
+            )
+            prepare_phone_transaction(attempts=1)
+
+        if self.phone_oauth_resume_context is not None:
+            self._log(
+                "Access Token 已获取，手机验证 OAuth 事务可直接续接；"
+                "无需再次登录邮箱"
+            )
+        else:
+            prepare_detail = str(self.phone_oauth_resume_error or "").strip()
+            self.phone_oauth_resume_error = (
+                "首轮邮箱登录会话未能预建手机验证 OAuth 事务"
+                + (f": {prepare_detail}" if prepare_detail else "")
+            )[:500]
+            self._log(
+                "Access Token 已保留，但手机验证 OAuth 事务未就绪；"
+                "为避免重复发送邮箱验证码，不再启动第二轮登录: "
+                f"{self.phone_oauth_resume_error}"
+            )
+
+        session_cookie = self.get_next_auth_session_token()
+        user = session_data.get("user") or {}
+        account = session_data.get("account") or {}
+        jwt_payload = decode_jwt_payload(access_token)
+        auth_payload = jwt_payload.get("https://api.openai.com/auth") or {}
+        account_id = str(
+            account.get("id")
+            or auth_payload.get("chatgpt_account_id")
+            or ""
+        ).strip()
+        user_id = str(
+            user.get("id")
+            or auth_payload.get("chatgpt_user_id")
+            or auth_payload.get("user_id")
+            or ""
+        ).strip()
+        return True, {
+            "access_token": access_token,
+            "session_token": str(
+                session_data.get("sessionToken") or session_cookie or ""
+            ).strip(),
+            "account_id": account_id,
+            "workspace_id": account_id,
+            "user_id": user_id,
+            "user": user,
+            "account": account,
+            "expires": session_data.get("expires"),
+        }
+
     def authorize(self, url, max_retries=3):
         """
         访问 authorize URL，跟随重定向（带重试机制）
@@ -653,6 +1095,7 @@ class ChatGPTClient:
         Returns:
             str: 最终重定向的 URL
         """
+        self.last_authorize_status = 0
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
@@ -677,6 +1120,23 @@ class ChatGPTClient:
                 )
 
                 final_url = str(r.url)
+                self.last_authorize_status = int(r.status_code or 0)
+                redirects = len(getattr(r, "history", []) or [])
+                content_type = str(
+                    (getattr(r, "headers", {}) or {}).get("content-type", "") or ""
+                ).split(";", 1)[0].strip().lower()
+                final_page = urlparse(final_url).path or "/"
+                has_login_session = bool(
+                    self._get_cookie_value("login_session", "auth.openai.com")
+                )
+                self._log(
+                    "authorize 会话诊断: "
+                    f"status={r.status_code} "
+                    f"redirects={redirects} "
+                    f"login_session={'已获取' if has_login_session else '未获取'} "
+                    f"final_page={final_page} "
+                    f"content_type={content_type or 'unknown'}"
+                )
                 self._log(f"重定向到: {final_url}")
                 return final_url
 

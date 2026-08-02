@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
 import {
   SaveOutlined,
@@ -15,6 +15,7 @@ import {
 } from '@ant-design/icons'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import MailImportPanel from '@/components/settings/MailImportPanel'
+import ChatGPTAutoReloginSection from '@/components/settings/ChatGPTAutoReloginSection'
 import { apiFetch } from '@/lib/utils'
 
 function resolveEffectiveMailProvider(mailProvider: string, mailImportSource: string) {
@@ -170,8 +171,8 @@ const TAB_ITEMS = [
         ],
       },
       {
-        title: '邮箱导入（AppleMail / 小苹果）',
-        desc: '读取本地邮箱池文件，通过 refresh_token + client_id 调用小苹果取件接口；支持在本页直接导入 JSON',
+        title: '邮箱导入（iCloud MFA / AppleMail / 小苹果）',
+        desc: 'iCloud 支持“邮箱----密码----MFA 秘钥”直连取码；原 refresh_token + client_id 小苹果格式继续兼容',
         fields: [
           { key: 'applemail_base_url', label: 'API URL', placeholder: 'https://www.appleemail.top' },
           { key: 'applemail_pool_dir', label: '邮箱池目录', placeholder: 'mail' },
@@ -528,6 +529,23 @@ function resolveFeatureEnabledConfig(value: unknown, fallbackEnabled: boolean): 
   const normalized = String(value ?? '').trim()
   if (!normalized) return fallbackEnabled
   return parseBooleanConfigValue(normalized)
+}
+
+function normalizeBoundedInteger(value: unknown, fallback: number, min: number, max: number): number {
+  const normalized = String(value ?? '').trim()
+  if (!normalized) return fallback
+  const parsed = typeof value === 'number' ? value : Number(normalized)
+  if (!Number.isInteger(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function errorDetail(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim()
+  if (typeof error === 'object' && error !== null) {
+    const detail = (error as Record<string, unknown>).detail
+    if (typeof detail === 'string' && detail.trim()) return detail.trim()
+  }
+  return fallback
 }
 
 const CONTRIBUTION_REDEEM_OPTIONS = [10, 100, 1000]
@@ -1099,11 +1117,13 @@ function ContributionPanel({
   onSave,
   saving,
   saved,
+  saveDisabled,
 }: {
   form: any
   onSave: () => Promise<void>
   saving: boolean
   saved: boolean
+  saveDisabled: boolean
 }) {
   const [loadingStats, setLoadingStats] = useState(false)
   const [redeeming, setRedeeming] = useState(false)
@@ -1412,7 +1432,7 @@ function ContributionPanel({
           </>
         )}
 
-        <Button type="primary" icon={<SaveOutlined />} onClick={onSave} loading={saving} block>
+        <Button type="primary" icon={<SaveOutlined />} onClick={onSave} loading={saving} disabled={saveDisabled} block>
           {saved ? '已保存 ✓' : '保存配置'}
         </Button>
       </Card>
@@ -1775,16 +1795,27 @@ export default function Settings() {
   const [form] = Form.useForm()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [saveError, setSaveError] = useState('')
+  const [configLoadState, setConfigLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [configLoadError, setConfigLoadError] = useState('')
   const [activeTab, setActiveTab] = useState('register')
   const currentMailProviderRaw = String(Form.useWatch('mail_provider', form) || '')
   const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
   const currentMailProvider = resolveEffectiveMailProvider(currentMailProviderRaw, currentMailImportSource)
   const showFloatingSaveButton = activeTab === 'mailbox' || activeTab === 'chatgpt'
   const contentPaneRef = useRef<HTMLDivElement | null>(null)
+  const configLoadRequestIdRef = useRef(0)
   const [floatingSaveBounds, setFloatingSaveBounds] = useState<{ left: number; width: number } | null>(null)
 
-  useEffect(() => {
-    apiFetch('/config').then((data) => {
+  const loadConfig = useCallback(async () => {
+    const requestId = ++configLoadRequestIdRef.current
+    setConfigLoadState('loading')
+    setConfigLoadError('')
+    try {
+      const response = await apiFetch('/config')
+      if (requestId !== configLoadRequestIdRef.current) return
+      const data = asRecord(response)
+      if (!data) throw new Error('配置响应格式无效')
       const configMailProvider = String(data.mail_provider || 'luckmail')
       const isMailImportProvider = configMailProvider === 'microsoft' || configMailProvider === 'outlook' || configMailProvider === 'applemail'
       if (!data.mail_provider) {
@@ -1835,6 +1866,19 @@ export default function Settings() {
         Boolean(String(data.sub2api_api_url ?? '').trim() && String(data.sub2api_api_key ?? '').trim()),
       )
       data.codex2api_enabled = parseBooleanConfigValue(data.codex2api_enabled)
+      data.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(data.chatgpt_auto_relogin_enabled)
+      data.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
+        data.chatgpt_auto_relogin_interval_minutes,
+        30,
+        20,
+        1440,
+      )
+      data.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
+        data.chatgpt_auto_relogin_concurrency,
+        10,
+        1,
+        10,
+      )
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -1847,8 +1891,21 @@ export default function Settings() {
       data.mail_import_source = configMailProvider === 'applemail' ? 'applemail' : 'microsoft'
       data.mail_provider = isMailImportProvider ? 'mail_import' : configMailProvider
       form.setFieldsValue(data)
-    })
+      setConfigLoadState('ready')
+    } catch (error: unknown) {
+      if (requestId !== configLoadRequestIdRef.current) return
+      setConfigLoadError(errorDetail(error, '读取配置失败，请重试'))
+      setConfigLoadState('error')
+    }
   }, [form])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void loadConfig() }, 0)
+    return () => {
+      window.clearTimeout(timer)
+      configLoadRequestIdRef.current += 1
+    }
+  }, [loadConfig])
 
   useEffect(() => {
     if (!showFloatingSaveButton) {
@@ -1884,7 +1941,10 @@ export default function Settings() {
   }, [showFloatingSaveButton, activeTab])
 
   const save = async () => {
+    if (configLoadState !== 'ready') return
     setSaving(true)
+    setSaved(false)
+    setSaveError('')
     try {
       const values = form.getFieldsValue(true)
       values.mail_provider = resolveEffectiveMailProvider(values.mail_provider, values.mail_import_source)
@@ -1906,6 +1966,19 @@ export default function Settings() {
       values.cpa_enabled = parseBooleanConfigValue(values.cpa_enabled)
       values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
       values.codex2api_enabled = parseBooleanConfigValue(values.codex2api_enabled)
+      values.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(values.chatgpt_auto_relogin_enabled)
+      values.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
+        values.chatgpt_auto_relogin_interval_minutes,
+        30,
+        20,
+        1440,
+      )
+      values.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
+        values.chatgpt_auto_relogin_concurrency,
+        10,
+        1,
+        10,
+      )
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -1930,6 +2003,9 @@ export default function Settings() {
         cpa_enabled: values.cpa_enabled,
         sub2api_enabled: values.sub2api_enabled,
         codex2api_enabled: values.codex2api_enabled,
+        chatgpt_auto_relogin_enabled: values.chatgpt_auto_relogin_enabled,
+        chatgpt_auto_relogin_interval_minutes: values.chatgpt_auto_relogin_interval_minutes,
+        chatgpt_auto_relogin_concurrency: values.chatgpt_auto_relogin_concurrency,
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
@@ -1945,12 +2021,16 @@ export default function Settings() {
       message.success('保存成功')
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
+    } catch (error: unknown) {
+      setSaved(false)
+      setSaveError(errorDetail(error, '保存配置失败，请稍后重试'))
     } finally {
       setSaving(false)
     }
   }
 
   const currentTab = TAB_ITEMS.find((t) => t.key === activeTab) as TabConfig
+  const saveDisabled = configLoadState !== 'ready'
   const mailboxSections =
     activeTab === 'mailbox'
       ? splitMailboxSections(currentTab.sections, currentMailProvider)
@@ -1986,7 +2066,7 @@ export default function Settings() {
               pointerEvents: 'auto',
             }}
           >
-            <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
+            <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
               {saved ? '已保存 ✓' : '保存配置'}
             </Button>
           </div>
@@ -1996,6 +2076,40 @@ export default function Settings() {
         <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>全局配置</h1>
         <p style={{ color: '#7a8ba3', marginTop: 4 }}>配置将持久化保存，注册任务自动使用</p>
       </div>
+
+      {configLoadState === 'loading' ? (
+        <Typography.Text role="status" aria-live="polite">
+          正在加载配置…
+        </Typography.Text>
+      ) : null}
+      {configLoadState === 'error' ? (
+        <Alert
+          role="alert"
+          aria-live="assertive"
+          type="error"
+          showIcon
+          message="配置加载失败"
+          description={configLoadError}
+          action={<Button onClick={() => { void loadConfig() }}>重试加载</Button>}
+        />
+      ) : null}
+      {saveError ? (
+        <Alert
+          role="alert"
+          aria-live="assertive"
+          type="error"
+          showIcon
+          message="保存配置失败"
+          description={saveError}
+          closable
+          onClose={() => setSaveError('')}
+        />
+      ) : null}
+      {saved ? (
+        <Typography.Text role="status" aria-live="polite">
+          配置已保存。
+        </Typography.Text>
+      ) : null}
 
       <div style={{ display: 'flex', gap: 24 }}>
         <div style={{ width: 200 }}>
@@ -2023,7 +2137,7 @@ export default function Settings() {
           ) : (
             <Form form={form} layout="vertical">
               {activeTab === 'contribution' ? (
-                <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} />
+                <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} saveDisabled={saveDisabled} />
               ) : (
                 <>
                   {activeTab === 'captcha' ? <SolverStatus /> : null}
@@ -2043,13 +2157,16 @@ export default function Settings() {
                       {currentMailProviderRaw !== 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                     </>
                   ) : (
-                    currentTab.sections.map((section) => (
-                      <ConfigSection key={section.title} section={section} />
-                    ))
+                    <>
+                      {currentTab.sections.map((section) => (
+                        <ConfigSection key={section.title} section={section} />
+                      ))}
+                      {activeTab === 'codex2api' ? <ChatGPTAutoReloginSection /> : null}
+                    </>
                   )}
                   {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}
                   {!showFloatingSaveButton ? (
-                    <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} block>
+                    <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
                     {saved ? '已保存 ✓' : '保存配置'}
                     </Button>
                   ) : null}

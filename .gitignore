@@ -13,6 +13,9 @@ build/
 *.db
 *.sqlite
 *.sqlite3
+*.db-shm
+*.db-wal
+backups/
 
 # 日志
 logs/
@@ -45,6 +48,9 @@ static/
 
 # Docker 数据
 data/
+_ext_targets/
+services/external_logs/
+docker-compose.local.yml
 
 # 环境变量
 .env

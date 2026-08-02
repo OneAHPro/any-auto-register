@@ -1,9 +1,18 @@
+import logging
+
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 from core.config_store import config_store
 from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
 
 router = APIRouter(prefix="/config", tags=["config"])
+logger = logging.getLogger(__name__)
+
+_CHATGPT_AUTO_RELOGIN_CONFIG_KEYS = {
+    "chatgpt_auto_relogin_enabled",
+    "chatgpt_auto_relogin_interval_minutes",
+    "chatgpt_auto_relogin_concurrency",
+}
 
 CONFIG_KEYS = [
     "email_domain_rule_enabled",
@@ -93,6 +102,9 @@ CONFIG_KEYS = [
     "codex_proxy_url",
     "codex_proxy_key",
     "codex_proxy_upload_type",
+    "chatgpt_auto_relogin_enabled",
+    "chatgpt_auto_relogin_interval_minutes",
+    "chatgpt_auto_relogin_concurrency",
     "cliproxyapi_base_url",
     "cliproxyapi_management_key",
     "grok2api_url",
@@ -155,6 +167,12 @@ def get_config():
         all_cfg["email_domain_rule_enabled"] = "0"
     if not str(all_cfg.get("email_domain_level_count", "") or "").strip():
         all_cfg["email_domain_level_count"] = "2"
+    if not str(all_cfg.get("chatgpt_auto_relogin_enabled", "") or "").strip():
+        all_cfg["chatgpt_auto_relogin_enabled"] = "0"
+    if not str(all_cfg.get("chatgpt_auto_relogin_interval_minutes", "") or "").strip():
+        all_cfg["chatgpt_auto_relogin_interval_minutes"] = "30"
+    if not str(all_cfg.get("chatgpt_auto_relogin_concurrency", "") or "").strip():
+        all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -178,7 +196,37 @@ def update_config(body: ConfigUpdate):
         if level_count < 2:
             raise HTTPException(status_code=400, detail="域名级数不能小于 2")
         safe["email_domain_level_count"] = str(level_count)
+    if "chatgpt_auto_relogin_enabled" in safe:
+        enabled = str(safe.get("chatgpt_auto_relogin_enabled", "")).strip().lower()
+        safe["chatgpt_auto_relogin_enabled"] = (
+            "1" if enabled in {"1", "true", "yes", "on"} else "0"
+        )
+    for key, minimum, maximum, label in (
+        ("chatgpt_auto_relogin_interval_minutes", 20, 1440, "自动重登间隔"),
+        ("chatgpt_auto_relogin_concurrency", 1, 10, "自动重登并发数"),
+    ):
+        if key not in safe:
+            continue
+        try:
+            value = int(str(safe.get(key, "")).strip())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"{label}必须是整数") from exc
+        if not minimum <= value <= maximum:
+            raise HTTPException(
+                status_code=400,
+                detail=f"{label}必须在 {minimum} 到 {maximum} 之间",
+            )
+        safe[key] = str(value)
     config_store.set_many(safe)
+    if _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS.intersection(safe):
+        try:
+            from services.chatgpt_auto_relogin import tick_chatgpt_auto_relogin
+
+            # Apply stop/enable/interval changes immediately instead of waiting
+            # for the scheduler's next periodic tick.
+            tick_chatgpt_auto_relogin(store=config_store)
+        except Exception:
+            logger.exception("ChatGPT 自动重登配置即时协调失败，将由调度器重试")
     return {"ok": True, "updated": list(safe.keys())}
 
 

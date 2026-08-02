@@ -17,3 +17,4 @@ pyinstaller>=6.0.0
 httpx>=0.27.0
 selectolax>=0.3.21
 names>=0.3.0
+pyicloud==2.0.1
