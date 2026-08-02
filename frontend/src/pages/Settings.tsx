@@ -1869,8 +1869,8 @@ export default function Settings() {
       data.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(data.chatgpt_auto_relogin_enabled)
       data.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_interval_minutes,
-        30,
-        20,
+        10,
+        10,
         1440,
       )
       data.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
@@ -1879,6 +1879,16 @@ export default function Settings() {
         1,
         10,
       )
+      data.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
+        data.chatgpt_auto_relogin_alert_threshold,
+        5,
+        1,
+        10000,
+      )
+      data.smtp_port = normalizeBoundedInteger(data.smtp_port, 587, 1, 65535)
+      data.smtp_use_ssl = parseBooleanConfigValue(data.smtp_use_ssl)
+      data.smtp_force_auth_login = parseBooleanConfigValue(data.smtp_force_auth_login)
+      data.smtp_password = ''
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -1969,8 +1979,8 @@ export default function Settings() {
       values.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(values.chatgpt_auto_relogin_enabled)
       values.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_interval_minutes,
-        30,
-        20,
+        10,
+        10,
         1440,
       )
       values.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
@@ -1979,6 +1989,15 @@ export default function Settings() {
         1,
         10,
       )
+      values.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
+        values.chatgpt_auto_relogin_alert_threshold,
+        5,
+        1,
+        10000,
+      )
+      values.smtp_port = normalizeBoundedInteger(values.smtp_port, 587, 1, 65535)
+      values.smtp_use_ssl = parseBooleanConfigValue(values.smtp_use_ssl)
+      values.smtp_force_auth_login = parseBooleanConfigValue(values.smtp_force_auth_login)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -2006,6 +2025,11 @@ export default function Settings() {
         chatgpt_auto_relogin_enabled: values.chatgpt_auto_relogin_enabled,
         chatgpt_auto_relogin_interval_minutes: values.chatgpt_auto_relogin_interval_minutes,
         chatgpt_auto_relogin_concurrency: values.chatgpt_auto_relogin_concurrency,
+        chatgpt_auto_relogin_alert_threshold: values.chatgpt_auto_relogin_alert_threshold,
+        smtp_port: values.smtp_port,
+        smtp_use_ssl: values.smtp_use_ssl,
+        smtp_force_auth_login: values.smtp_force_auth_login,
+        smtp_password: '',
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,

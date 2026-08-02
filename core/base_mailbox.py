@@ -874,13 +874,14 @@ class AppleMailMailbox(BaseMailbox):
             and str(selected.get("pool_state") or "").strip().lower() == "claimed"
         ):
             claim_id = str(selected.get("pool_claim_id") or "").strip()
-        if not claim_id:
+        if not claim_id and not account_email:
             return False
         password = str(new_password or account_extra.get("new_password") or "")
         committed = commit_applemail_password_reset(
             pool_file=str(self._selected_pool_path or self.pool_file),
             pool_dir=self.pool_dir,
             claim_id=claim_id,
+            email=account_email,
             new_password=password,
         )
         if committed:

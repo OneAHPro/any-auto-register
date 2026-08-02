@@ -692,12 +692,74 @@ class ChatGPTPluginTests(unittest.TestCase):
             self.assertEqual(records[0]["pool_state"], "used")
             context_extra = account.extra["mailbox_login_context"]["extra"]
             self.assertEqual(context_extra["account_type"], "chatgpt_password_totp")
-            self.assertNotIn("password", context_extra)
-            self.assertNotIn("totp_secret", context_extra)
+            self.assertEqual(context_extra["password"], "chatgpt-password")
+            self.assertEqual(context_extra["totp_secret"], "JBSWY3DPEHPK3PXP")
             self.assertEqual(
                 Path(tmp_dir, "chatgpt_mfa.json").stat().st_mode & 0o777,
                 0o600,
             )
+
+    def test_password_reset_flow_persists_self_contained_login_credentials(self):
+        class ResetAdapter:
+            def run(self, context):
+                email_info = context.email_service.create_email()
+                self.new_password = "Reset-Password-2026"
+                self.assert_reset = email_info["password_reset_required"]
+                context.email_service.commit_password_reset(self.new_password)
+                return mock.Mock(success=True)
+
+            def build_account(self, result, fallback_password):
+                del result, fallback_password
+                return Account(
+                    platform="chatgpt",
+                    email="reset-user@icloud.com",
+                    password=self.new_password,
+                    token="access-token",
+                    extra={
+                        "access_token": "access-token",
+                        "refresh_token": "refresh-token",
+                    },
+                )
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "reset-user@icloud.com----登陆请点击忘记密码----"
+                "https://mail.example.test/mail?token=MAIL_SECRET",
+                pool_dir=tmp_dir,
+                filename="reset-user.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="reset-user.json",
+            )
+            adapter = ResetAdapter()
+            platform = ChatGPTPlatform(
+                config=RegisterConfig(
+                    extra={
+                        "chatgpt_registration_mode": "refresh_token",
+                        "chatgpt_existing_account_login_only": True,
+                    }
+                ),
+                mailbox=mailbox,
+            )
+
+            with mock.patch(
+                "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+                return_value=adapter,
+            ):
+                account = platform.register()
+
+            self.assertTrue(adapter.assert_reset)
+            context_extra = account.extra["mailbox_login_context"]["extra"]
+            self.assertEqual(
+                context_extra["account_type"],
+                "chatgpt_password_reset_url_mail",
+            )
+            self.assertEqual(context_extra["password"], "Reset-Password-2026")
+            self.assertIn("MAIL_SECRET", context_extra["mail_api_url"])
+            self.assertFalse(context_extra["password_reset_required"])
+            self.assertNotIn("new_password", context_extra)
+            self.assertNotIn("_pool_claim_id", context_extra)
 
 
 

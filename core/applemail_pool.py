@@ -768,7 +768,8 @@ def mark_applemail_record_used(
 
 def commit_applemail_password_reset(
     *,
-    claim_id: str,
+    claim_id: str = "",
+    email: str = "",
     new_password: str,
     pool_file: str | None = None,
     pool_dir: str | None = None,
@@ -781,6 +782,19 @@ def commit_applemail_password_reset(
         content = path.read_text(encoding="utf-8", errors="ignore")
         records = parse_applemail_pool_content(content, allow_empty=True)
         record = _find_claimed_record(records, claim_id=claim_id)
+        if record is None and str(email or "").strip():
+            target_email = str(email or "").strip().lower()
+            record = next(
+                (
+                    item
+                    for item in records
+                    if str(item.get("email") or "").strip().lower()
+                    == target_email
+                    and str(item.get("pool_state") or "").strip().lower()
+                    in {_POOL_STATE_CLAIMED, _POOL_STATE_USED}
+                ),
+                None,
+            )
         if record is None:
             return False
         if str(record.get("account_type") or "").strip() != "chatgpt_password_reset_url_mail":

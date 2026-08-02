@@ -105,6 +105,15 @@ CONFIG_KEYS = [
     "chatgpt_auto_relogin_enabled",
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
+    "chatgpt_auto_relogin_alert_threshold",
+    "smtp_host",
+    "smtp_port",
+    "smtp_username",
+    "smtp_password",
+    "smtp_sender_email",
+    "smtp_recipient_email",
+    "smtp_use_ssl",
+    "smtp_force_auth_login",
     "cliproxyapi_base_url",
     "cliproxyapi_management_key",
     "grok2api_url",
@@ -170,9 +179,19 @@ def get_config():
     if not str(all_cfg.get("chatgpt_auto_relogin_enabled", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_enabled"] = "0"
     if not str(all_cfg.get("chatgpt_auto_relogin_interval_minutes", "") or "").strip():
-        all_cfg["chatgpt_auto_relogin_interval_minutes"] = "30"
+        all_cfg["chatgpt_auto_relogin_interval_minutes"] = "10"
     if not str(all_cfg.get("chatgpt_auto_relogin_concurrency", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
+    if not str(all_cfg.get("chatgpt_auto_relogin_alert_threshold", "") or "").strip():
+        all_cfg["chatgpt_auto_relogin_alert_threshold"] = "5"
+    if not str(all_cfg.get("smtp_port", "") or "").strip():
+        all_cfg["smtp_port"] = "587"
+    if not str(all_cfg.get("smtp_use_ssl", "") or "").strip():
+        all_cfg["smtp_use_ssl"] = "1"
+    if not str(all_cfg.get("smtp_force_auth_login", "") or "").strip():
+        all_cfg["smtp_force_auth_login"] = "0"
+    # SMTP 凭证只允许写入，不回传到前端或 API 调用方。
+    all_cfg["smtp_password"] = ""
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -201,9 +220,18 @@ def update_config(body: ConfigUpdate):
         safe["chatgpt_auto_relogin_enabled"] = (
             "1" if enabled in {"1", "true", "yes", "on"} else "0"
         )
+    for bool_key in ("smtp_use_ssl", "smtp_force_auth_login"):
+        if bool_key in safe:
+            enabled = str(safe.get(bool_key, "")).strip().lower()
+            safe[bool_key] = "1" if enabled in {"1", "true", "yes", "on"} else "0"
+    if "smtp_password" in safe and not str(safe.get("smtp_password") or ""):
+        # 前端留空表示保留现有凭证，避免读取配置后误清空。
+        safe.pop("smtp_password", None)
     for key, minimum, maximum, label in (
-        ("chatgpt_auto_relogin_interval_minutes", 20, 1440, "自动重登间隔"),
+        ("chatgpt_auto_relogin_interval_minutes", 10, 1440, "自动重登间隔"),
         ("chatgpt_auto_relogin_concurrency", 1, 10, "自动重登并发数"),
+        ("chatgpt_auto_relogin_alert_threshold", 1, 10000, "邮件告警阈值"),
+        ("smtp_port", 1, 65535, "SMTP 端口"),
     ):
         if key not in safe:
             continue

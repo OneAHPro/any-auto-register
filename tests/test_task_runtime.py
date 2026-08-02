@@ -50,6 +50,35 @@ class RegisterTaskControlTests(unittest.TestCase):
 
 
 class RegisterTaskStoreTests(unittest.TestCase):
+    def test_update_meta_merges_cycle_results_without_dropping_task_identity(self):
+        store = RegisterTaskStore()
+        task_id = "task-runtime-meta"
+        store.create(
+            task_id,
+            platform="chatgpt",
+            total=3,
+            source="schedule",
+            meta={"automation": True, "concurrency": 2},
+        )
+
+        store.update_meta(
+            task_id,
+            invalid_rt_count=2,
+            relogin_failed_count=1,
+            alert_sent=False,
+        )
+
+        self.assertEqual(
+            store.snapshot(task_id)["meta"],
+            {
+                "automation": True,
+                "concurrency": 2,
+                "invalid_rt_count": 2,
+                "relogin_failed_count": 1,
+                "alert_sent": False,
+            },
+        )
+
     def test_snapshot_contains_control_and_skip_fields(self):
         store = RegisterTaskStore()
         task_id = "task-runtime-snapshot"

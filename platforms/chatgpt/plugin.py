@@ -288,13 +288,47 @@ class ChatGPTPlatform(BasePlatform):
                         "chatgpt_password_url_otp",
                         "chatgpt_password_reset_url_mail",
                     }:
-                        account_extra = {
+                        credential_snapshot = {
                             "provider": "chatgpt_credentials",
                             "account_type": account_type,
                             "pool_file": str(
                                 account_extra.get("pool_file") or ""
                             ),
                         }
+                        if account_type == "chatgpt_password_totp":
+                            credential_snapshot.update(
+                                {
+                                    "password": str(
+                                        account_extra.get("password") or ""
+                                    ),
+                                    "totp_secret": str(
+                                        account_extra.get("totp_secret") or ""
+                                    ),
+                                }
+                            )
+                        else:
+                            credential_snapshot.update(
+                                {
+                                    "password": str(
+                                        account_extra.get("password") or ""
+                                    ),
+                                    "mail_api_url": str(
+                                        account_extra.get("mail_api_url")
+                                        or account_extra.get("mailapi_url")
+                                        or ""
+                                    ),
+                                    "totp_url": str(
+                                        account_extra.get("totp_url") or ""
+                                    ),
+                                    "password_reset_required": bool(
+                                        account_extra.get(
+                                            "password_reset_required",
+                                            False,
+                                        )
+                                    ),
+                                }
+                            )
+                        account_extra = credential_snapshot
                     return {
                         "provider": provider,
                         "email": str(self._email or getattr(account, "email", "") or "").strip(),

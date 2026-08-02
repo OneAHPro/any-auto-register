@@ -45,6 +45,10 @@ import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { apiFetch } from '@/lib/utils'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
+import {
+  formatAutoReloginCountdown,
+  type ChatGPTAutoReloginStatus,
+} from '@/lib/chatgptAutoReloginStatus'
 
 const { Text } = Typography
 const CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
@@ -584,6 +588,9 @@ export default function Accounts() {
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [codex2apiUploadLoading, setCodex2APIUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
+  const [autoReloginStatus, setAutoReloginStatus] =
+    useState<ChatGPTAutoReloginStatus | null>(null)
+  const [autoReloginNow, setAutoReloginNow] = useState(() => Date.now())
 
   useEffect(() => {
     reloginRequestEpochRef.current += 1
@@ -634,6 +641,31 @@ export default function Accounts() {
     apiFetch(`/actions/${currentPlatform}`)
       .then((data) => setPlatformActions(data.actions || []))
       .catch(() => setPlatformActions([]))
+  }, [currentPlatform])
+
+  useEffect(() => {
+    if (currentPlatform !== 'chatgpt') {
+      return
+    }
+
+    let cancelled = false
+    const loadAutoReloginStatus = async () => {
+      try {
+        const status = await apiFetch('/automations/chatgpt-relogin')
+        if (!cancelled) setAutoReloginStatus(status as ChatGPTAutoReloginStatus)
+      } catch {
+        if (!cancelled) setAutoReloginStatus(null)
+      }
+    }
+
+    loadAutoReloginStatus()
+    const statusPoll = window.setInterval(loadAutoReloginStatus, 5000)
+    const countdownTick = window.setInterval(() => setAutoReloginNow(Date.now()), 1000)
+    return () => {
+      cancelled = true
+      window.clearInterval(statusPoll)
+      window.clearInterval(countdownTick)
+    }
   }, [currentPlatform])
 
   const copyText = (text: string) => {
@@ -1528,6 +1560,11 @@ export default function Accounts() {
             onChange={(value) => { setPage(1); setCreatedAtEnd(value ? value.toISOString() : '') }}
           />
           <Text type="secondary">{total} 个账号</Text>
+          {currentPlatform === 'chatgpt' && (
+            <Text type="secondary">
+              下次执行：{formatAutoReloginCountdown(autoReloginStatus, autoReloginNow)}
+            </Text>
+          )}
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
           )}

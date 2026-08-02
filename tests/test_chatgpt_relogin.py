@@ -1,5 +1,6 @@
 import threading
 import time
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -13,8 +14,12 @@ from core.task_runtime import RegisterTaskControl, StopTaskRequested
 from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
 from services.chatgpt_relogin import (
     _build_email_service,
+    _login_with_saved_credentials,
+    _recover_url_login_credentials,
     is_saved_chatgpt_account_relogin_eligible,
+    list_auto_maintenance_account_ids,
     list_relogin_eligible_account_ids,
+    refresh_or_relogin_chatgpt_account,
     relogin_chatgpt_account,
 )
 
@@ -743,6 +748,259 @@ class ChatGPTReloginTests(unittest.TestCase):
 
         self.assertFalse(service.supports_totp_code())
 
+    def test_legacy_reset_url_credentials_use_saved_account_password(self):
+        saved = {
+            "email": "legacy-reset@example.com",
+            "password": "Saved-ChatGPT-Password",
+            "extra": {},
+        }
+        mailbox_context = {
+            "provider": "chatgpt_credentials",
+            "email": "legacy-reset@example.com",
+            "extra": {
+                "account_type": "chatgpt_password_reset_url_mail",
+                "pool_file": "legacy-reset.json",
+            },
+        }
+        pool_record = {
+            "email": "legacy-reset@example.com",
+            "account_type": "chatgpt_password_reset_url_mail",
+            "password": "",
+            "password_reset_required": True,
+            "mail_api_url": "https://mail.example.test/mail?token=MAIL_SECRET",
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.load_applemail_pool_records",
+            return_value=(SimpleNamespace(name="legacy-reset.json"), [pool_record]),
+        ):
+            credentials = _recover_url_login_credentials(
+                saved,
+                mailbox_context,
+                {"applemail_pool_dir": "mail"},
+            )
+
+        self.assertEqual(credentials["password"], "Saved-ChatGPT-Password")
+        self.assertFalse(credentials["password_reset_required"])
+        self.assertIn("MAIL_SECRET", credentials["mail_api_url"])
+
+    def test_used_reset_url_record_can_generate_and_persist_a_new_password(self):
+        from core.applemail_pool import (
+            load_applemail_pool_records,
+            save_applemail_pool_json,
+        )
+        from core.base_mailbox import AppleMailMailbox
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "reset-again@example.com----登陆请点击忘记密码----"
+                "https://mail.example.test/mail?token=MAIL_SECRET",
+                pool_dir=tmp_dir,
+                filename="reset-again.json",
+            )
+            pool = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="reset-again.json",
+            )
+            claimed = pool.get_email()
+            self.assertTrue(pool.mark_account_used(claimed))
+            saved = {
+                "email": "reset-again@example.com",
+                "password": "",
+                "extra": {},
+                "mailbox_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "reset-again@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_reset_url_mail",
+                        "pool_file": "reset-again.json",
+                    },
+                },
+            }
+
+            service = _build_email_service(
+                saved,
+                {"applemail_pool_dir": tmp_dir},
+                log_fn=None,
+            )
+            service._mailbox.get_current_ids = mock.Mock(return_value=set())
+            email_info = service.create_email()
+            generated = email_info["new_password"]
+            self.assertGreaterEqual(len(generated), 12)
+            self.assertTrue(email_info["password_reset_required"])
+            self.assertTrue(service.commit_password_reset(generated))
+
+            metadata_extra = service.get_mailbox_metadata()["extra"]
+            self.assertEqual(metadata_extra["password"], generated)
+            self.assertFalse(metadata_extra["password_reset_required"])
+            self.assertNotIn("new_password", metadata_extra)
+            _path, records = load_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="reset-again.json",
+            )
+            self.assertEqual(records[0]["password"], generated)
+            self.assertEqual(records[0]["pool_state"], "used")
+
+    def test_force_password_reset_discards_rejected_saved_password(self):
+        from core.applemail_pool import save_applemail_pool_json
+        from core.base_mailbox import AppleMailMailbox
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "reset-rejected@example.com----登陆请点击忘记密码----"
+                "https://mail.example.test/mail?token=MAIL_SECRET",
+                pool_dir=tmp_dir,
+                filename="reset-rejected.json",
+            )
+            pool = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="reset-rejected.json",
+            )
+            claimed = pool.get_email()
+            self.assertTrue(pool.mark_account_used(claimed))
+            self.assertTrue(
+                pool.commit_password_reset(
+                    claimed,
+                    "Stale-Saved-Password",
+                )
+            )
+            saved = {
+                "email": "reset-rejected@example.com",
+                "password": "Stale-Saved-Password",
+                "extra": {},
+                "mailbox_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "reset-rejected@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_reset_url_mail",
+                        "pool_file": "reset-rejected.json",
+                    },
+                },
+            }
+
+            service = _build_email_service(
+                saved,
+                {"applemail_pool_dir": tmp_dir},
+                log_fn=None,
+                force_password_reset=True,
+            )
+            service._mailbox.get_current_ids = mock.Mock(return_value=set())
+            email_info = service.create_email()
+
+            self.assertEqual(email_info["password"], "")
+            self.assertTrue(email_info["password_reset_required"])
+            self.assertGreaterEqual(len(email_info["new_password"]), 12)
+            self.assertNotEqual(
+                email_info["new_password"],
+                "Stale-Saved-Password",
+            )
+
+    def test_explicit_saved_password_rejection_retries_with_forced_reset(self):
+        saved = {
+            "email": "reset-rejected@example.com",
+            "password": "Stale-Saved-Password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "reset-rejected@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_reset_url_mail",
+                    "pool_file": "reset-rejected.json",
+                },
+            },
+        }
+        normal_service = mock.Mock()
+        reset_service = mock.Mock()
+        reset_service.get_mailbox_metadata.return_value = saved["mailbox_context"]
+
+        class Adapter:
+            def __init__(self):
+                self.calls = 0
+
+            def run(self, _context):
+                self.calls += 1
+                if self.calls == 1:
+                    return SimpleNamespace(
+                        success=False,
+                        error_message=(
+                            "[stage=authorize_continue] 密码验证失败: HTTP 401 "
+                            "(invalid_credentials)"
+                        ),
+                    )
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                    metadata={},
+                )
+
+        adapter = Adapter()
+        logs = []
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            side_effect=[normal_service, reset_service],
+        ) as build_service, mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            tokens = _login_with_saved_credentials(saved, log_fn=logs.append)
+
+        self.assertEqual(tokens["refresh_token"], "new-rt")
+        self.assertEqual(adapter.calls, 2)
+        self.assertEqual(build_service.call_count, 2)
+        self.assertFalse(
+            build_service.call_args_list[0].kwargs.get(
+                "force_password_reset", False
+            )
+        )
+        self.assertTrue(
+            build_service.call_args_list[1].kwargs["force_password_reset"]
+        )
+        self.assertTrue(any("忘记密码" in message for message in logs))
+
+    def test_transient_login_failure_does_not_force_password_reset(self):
+        saved = {
+            "email": "reset-timeout@example.com",
+            "password": "Saved-Password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "reset-timeout@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_reset_url_mail",
+                    "pool_file": "reset-timeout.json",
+                },
+            },
+        }
+        adapter = mock.Mock()
+        adapter.run.return_value = SimpleNamespace(
+            success=False,
+            error_message="[stage=authorize_continue] ReadTimeout",
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=mock.Mock(),
+        ) as build_service, mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ReadTimeout"):
+                _login_with_saved_credentials(saved)
+
+        self.assertEqual(build_service.call_count, 1)
+
     @staticmethod
     def _fresh_tokens():
         return {
@@ -795,6 +1053,24 @@ class ChatGPTReloginTests(unittest.TestCase):
             self.assertEqual(extra["keep_me"], "preserved")
             self.assertEqual(extra["sync_statuses"]["cpa"], {"uploaded": True})
             self.assertNotIn("chatgpt_local", extra)
+
+    def test_full_relogin_persists_password_changed_by_reset_flow(self):
+        tokens = self._fresh_tokens()
+        tokens["password"] = "Replacement-ChatGPT-Password"
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.password, "Replacement-ChatGPT-Password")
 
     def test_login_failure_keeps_old_tokens_and_does_not_sync(self):
         sync = mock.Mock()
@@ -1567,6 +1843,181 @@ class ChatGPTReloginTests(unittest.TestCase):
             "https://mail.example.test",
         )
         self.assertEqual(mailbox_config["client_id"], "mail-client")
+
+    def test_auto_maintenance_includes_visible_account_with_rt_but_no_login_context(self):
+        account_id = self._add_eligibility_account(
+            "rt-only@example.com",
+            extra={"refresh_token": "rt-only-token"},
+        )
+
+        account_ids = list_auto_maintenance_account_ids(
+            database_engine=self.engine,
+        )
+
+        self.assertIn(account_id, account_ids)
+
+    def test_auto_maintenance_treats_missing_rt_as_full_login_candidate(self):
+        account_id = self._add_eligibility_account(
+            "missing-rt-login@example.com",
+            account_refresh_token=None,
+            extra={},
+        )
+        full_login_result = {
+            "ok": True,
+            "relogin_ok": True,
+            "stage": "completed",
+            "account_id": account_id,
+            "email": "missing-rt-login@example.com",
+            "message": "完整登录并同步成功",
+        }
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked",
+            return_value=full_login_result,
+        ) as full_login:
+            result = refresh_or_relogin_chatgpt_account(account_id)
+
+        full_login.assert_called_once()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "full_login")
+        self.assertEqual(result["refresh_state"], "invalid")
+        self.assertEqual(result["refresh_error_code"], "missing_refresh_token")
+
+    def test_auto_refresh_success_persists_rotated_tokens_and_syncs_without_login(self):
+        refresh_result = SimpleNamespace(
+            success=True,
+            state="valid",
+            access_token="refreshed-at",
+            refresh_token="rotated-rt",
+            expires_at=None,
+            http_status=200,
+            error_code="",
+            error_message="",
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.TokenRefreshManager"
+        ) as manager_class, mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked"
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ) as sync:
+            manager_class.return_value.refresh_by_oauth_token.return_value = refresh_result
+            result = refresh_or_relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["refresh_ok"])
+        self.assertEqual(result["mode"], "refresh_token")
+        full_login.assert_not_called()
+        sync.assert_called_once()
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.token, "refreshed-at")
+            extra = saved.get_extra()
+            self.assertEqual(extra["access_token"], "refreshed-at")
+            self.assertEqual(extra["refresh_token"], "rotated-rt")
+            self.assertEqual(extra["id_token"], "old-id")
+
+    def test_auto_refresh_explicit_invalid_falls_back_to_full_login(self):
+        refresh_result = SimpleNamespace(
+            success=False,
+            state="invalid",
+            access_token="",
+            refresh_token="",
+            expires_at=None,
+            http_status=400,
+            error_code="invalid_grant",
+            error_message="OAuth token 刷新失败: HTTP 400 (invalid_grant)",
+        )
+        full_result = {
+            "ok": True,
+            "relogin_ok": True,
+            "stage": "completed",
+            "account_id": self.account_id,
+            "email": "demo@example.com",
+            "message": "重登并同步 Codex2API 成功",
+        }
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.TokenRefreshManager"
+        ) as manager_class, mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked",
+            return_value=full_result,
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account"
+        ) as sync:
+            manager_class.return_value.refresh_by_oauth_token.return_value = refresh_result
+            result = refresh_or_relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "full_login")
+        self.assertEqual(result["refresh_state"], "invalid")
+        full_login.assert_called_once()
+        sync.assert_not_called()
+
+    def test_auto_refresh_transient_failure_preserves_tokens_and_does_not_login(self):
+        refresh_result = SimpleNamespace(
+            success=False,
+            state="transient_error",
+            access_token="",
+            refresh_token="",
+            expires_at=None,
+            http_status=503,
+            error_code="server_error",
+            error_message="OAuth token 刷新失败: HTTP 503 (server_error)",
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.TokenRefreshManager"
+        ) as manager_class, mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked"
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account"
+        ) as sync:
+            manager_class.return_value.refresh_by_oauth_token.return_value = refresh_result
+            result = refresh_or_relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "refresh_deferred")
+        self.assertEqual(result["refresh_state"], "transient_error")
+        full_login.assert_not_called()
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.token, "old-at")
+            self.assertEqual(saved.get_extra()["refresh_token"], "old-rt")
+
+    def test_auto_refresh_sync_failure_is_reported_after_local_tokens_are_saved(self):
+        refresh_result = SimpleNamespace(
+            success=True,
+            state="valid",
+            access_token="refreshed-at",
+            refresh_token="rotated-rt",
+            expires_at=None,
+            http_status=200,
+            error_code="",
+            error_message="",
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.TokenRefreshManager"
+        ) as manager_class, mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked"
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": False, "msg": "remote test failed"},
+        ):
+            manager_class.return_value.refresh_by_oauth_token.return_value = refresh_result
+            result = refresh_or_relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["refresh_ok"])
+        self.assertEqual(result["stage"], "codex2api_sync")
+        full_login.assert_not_called()
+        with Session(self.engine) as session:
+            saved = session.get(AccountModel, self.account_id)
+            self.assertEqual(saved.get_extra()["refresh_token"], "rotated-rt")
 
 
 if __name__ == "__main__":

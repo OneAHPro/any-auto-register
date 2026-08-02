@@ -12,8 +12,8 @@ ENABLED_CONFIG_KEY = "chatgpt_auto_relogin_enabled"
 INTERVAL_MINUTES_CONFIG_KEY = "chatgpt_auto_relogin_interval_minutes"
 CONCURRENCY_CONFIG_KEY = "chatgpt_auto_relogin_concurrency"
 
-DEFAULT_INTERVAL_MINUTES = 30
-MIN_INTERVAL_MINUTES = 20
+DEFAULT_INTERVAL_MINUTES = 10
+MIN_INTERVAL_MINUTES = 10
 MAX_INTERVAL_MINUTES = 1440
 DEFAULT_CONCURRENCY = 10
 MIN_CONCURRENCY = 1
@@ -307,9 +307,9 @@ def tick_chatgpt_auto_relogin(
             )
 
         if list_eligible is None:
-            from services.chatgpt_relogin import list_relogin_eligible_account_ids
+            from services.chatgpt_relogin import list_auto_maintenance_account_ids
 
-            list_eligible = list_relogin_eligible_account_ids
+            list_eligible = list_auto_maintenance_account_ids
         if try_enqueue is None or observe is None:
             from api.tasks import (
                 observe_chatgpt_task,
@@ -576,9 +576,9 @@ def _reconcile_chatgpt_auto_relogin_eligibility_locked(
         return get_chatgpt_auto_relogin_status(resolved_store)
 
     if eligible_account_ids is None:
-        from services.chatgpt_relogin import list_relogin_eligible_account_ids
+        from services.chatgpt_relogin import list_auto_maintenance_account_ids
 
-        eligible_account_ids = list_relogin_eligible_account_ids()
+        eligible_account_ids = list_auto_maintenance_account_ids()
     eligible_count = len(tuple(eligible_account_ids))
     current_state = _optional_text(
         snapshot.get(_STATUS_KEY_BY_FIELD["state"], "")

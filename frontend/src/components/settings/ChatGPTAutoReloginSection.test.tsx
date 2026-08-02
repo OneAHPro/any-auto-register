@@ -73,12 +73,17 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(screen.getByRole('switch', { name: '启用 ChatGPT 自动重登' }).getAttribute('aria-checked')).toBe('false')
     const interval = screen.getByRole('spinbutton', { name: '自动重登间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '自动重登并发数' }) as HTMLInputElement
-    expect(interval.value).toBe('30')
-    expect(interval.getAttribute('aria-valuemin')).toBe('20')
+    const threshold = screen.getByRole('spinbutton', { name: '邮件告警阈值（账号数）' }) as HTMLInputElement
+    expect(interval.value).toBe('10')
+    expect(interval.getAttribute('aria-valuemin')).toBe('10')
     expect(interval.getAttribute('aria-valuemax')).toBe('1440')
     expect(concurrency.value).toBe('10')
     expect(concurrency.getAttribute('aria-valuemin')).toBe('1')
     expect(concurrency.getAttribute('aria-valuemax')).toBe('10')
+    expect(threshold.value).toBe('5')
+    expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
+    expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
+    expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()
   })
 
   it('shows the explicit no-account paused status', async () => {

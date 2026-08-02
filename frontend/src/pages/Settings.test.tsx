@@ -47,6 +47,15 @@ describe('Settings ChatGPT automatic relogin config', () => {
       chatgpt_auto_relogin_enabled: '0',
       chatgpt_auto_relogin_interval_minutes: '45',
       chatgpt_auto_relogin_concurrency: '3',
+      chatgpt_auto_relogin_alert_threshold: '5',
+      smtp_host: 'smtp.example.com',
+      smtp_port: '587',
+      smtp_username: 'notify@example.com',
+      smtp_password: '',
+      smtp_sender_email: 'notify@example.com',
+      smtp_recipient_email: 'owner@example.com',
+      smtp_use_ssl: '1',
+      smtp_force_auth_login: '0',
     }
     vi.mocked(apiFetch).mockReset()
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
@@ -84,6 +93,9 @@ describe('Settings ChatGPT automatic relogin config', () => {
       chatgpt_auto_relogin_enabled: false,
       chatgpt_auto_relogin_interval_minutes: 45,
       chatgpt_auto_relogin_concurrency: 3,
+      chatgpt_auto_relogin_alert_threshold: 5,
+      smtp_host: 'smtp.example.com',
+      smtp_recipient_email: 'owner@example.com',
     })
   })
 
@@ -101,7 +113,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
     await user.click(screen.getByText('Codex2API'))
 
     await waitFor(() => {
-      expect((screen.getByRole('spinbutton', { name: '自动重登间隔（分钟）' }) as HTMLInputElement).value).toBe('30')
+      expect((screen.getByRole('spinbutton', { name: '自动重登间隔（分钟）' }) as HTMLInputElement).value).toBe('10')
       expect((screen.getByRole('spinbutton', { name: '自动重登并发数' }) as HTMLInputElement).value).toBe('10')
     })
   })

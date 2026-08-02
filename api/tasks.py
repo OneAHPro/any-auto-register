@@ -1050,17 +1050,27 @@ def _create_chatgpt_relogin_task_record(
         concurrency,
         account_count=len(normalized_ids),
     )
+    task_meta = {
+        "mode": "relogin",
+        "automation": automation,
+        "account_ids": normalized_ids,
+        "concurrency": effective_concurrency,
+    }
+    if automation:
+        task_meta.update(
+            {
+                "invalid_rt_count": 0,
+                "relogin_failed_count": 0,
+                "alert_sent": False,
+                "alert_reason": "pending",
+            }
+        )
     _task_store.create(
         task_id,
         platform="chatgpt",
         total=len(normalized_ids),
         source=source,
-        meta={
-            "mode": "relogin",
-            "automation": automation,
-            "account_ids": normalized_ids,
-            "concurrency": effective_concurrency,
-        },
+        meta=task_meta,
     )
     _persist_task_snapshot(task_id)
 
@@ -1268,9 +1278,20 @@ def _run_chatgpt_relogin_task_inner(
         ThreadPoolExecutor,
         wait,
     )
-    from services.chatgpt_relogin import relogin_chatgpt_account
+    from services.chatgpt_relogin import (
+        refresh_or_relogin_chatgpt_account,
+        relogin_chatgpt_account,
+    )
 
     control = _task_store.control_for(task_id)
+    task_snapshot = _task_store.snapshot(task_id)
+    automation = _is_truthy((task_snapshot.get("meta") or {}).get("automation"))
+    account_action = (
+        refresh_or_relogin_chatgpt_account
+        if automation
+        else relogin_chatgpt_account
+    )
+    task_label = "自动认证维护" if automation else "重登"
     total = len(account_ids)
     max_workers = min(
         max(int(concurrency or 1), 1),
@@ -1282,12 +1303,39 @@ def _run_chatgpt_relogin_task_inner(
     skipped = 0
     errors: list[str] = []
     stopped = False
+    cycle_counts_lock = threading.Lock()
+    invalid_rt_count = 0
+    relogin_failed_count = 0
+
+    def _record_automatic_result(result: dict) -> None:
+        nonlocal invalid_rt_count, relogin_failed_count
+        if not automation:
+            return
+        refresh_invalid = (
+            str(result.get("refresh_state") or "").strip().lower() == "invalid"
+        )
+        full_relogin_failed = (
+            str(result.get("mode") or "").strip().lower() == "full_login"
+            and not bool(result.get("relogin_ok"))
+            and not bool(result.get("account_removed"))
+            and str(result.get("stage") or "").strip() != "account_removed"
+        )
+        with cycle_counts_lock:
+            if refresh_invalid:
+                invalid_rt_count += 1
+            if full_relogin_failed:
+                relogin_failed_count += 1
+            _task_store.update_meta(
+                task_id,
+                invalid_rt_count=invalid_rt_count,
+                relogin_failed_count=relogin_failed_count,
+            )
 
     _task_store.mark_running(task_id)
     _persist_task_snapshot_best_effort(task_id)
     _log(
         task_id,
-        f"开始重登并同步 Codex2API，共 {total} 个账号，并发 {max_workers}",
+        f"开始{task_label}并同步 Codex2API，共 {total} 个账号，并发 {max_workers}",
     )
 
     def _do_one(index: int, account_id: int) -> AttemptResult:
@@ -1296,7 +1344,7 @@ def _run_chatgpt_relogin_task_inner(
             control.checkpoint()
             attempt_id = control.start_attempt()
             control.checkpoint(attempt_id=attempt_id)
-            _log(task_id, f"开始重登第 {index}/{total} 个账号（ID: {account_id}）")
+            _log(task_id, f"开始{task_label}第 {index}/{total} 个账号（ID: {account_id}）")
             control.checkpoint(attempt_id=attempt_id)
 
             def _service_log(message) -> None:
@@ -1304,7 +1352,7 @@ def _run_chatgpt_relogin_task_inner(
                 if text:
                     _log(task_id, f"  [账号 {account_id}] {text}")
 
-            result = relogin_chatgpt_account(
+            result = account_action(
                 account_id,
                 log_fn=_service_log,
                 task_control=control,
@@ -1317,18 +1365,29 @@ def _run_chatgpt_relogin_task_inner(
             account_label = email or f"账号 ID {account_id}"
             message = _redact_chatgpt_relogin_log(result.get("message"))
             stage = str(result.get("stage") or "").strip()
+            result_mode = str(result.get("mode") or "").strip() or (
+                "refresh_token" if automation else "relogin"
+            )
             relogin_ok = bool(result.get("relogin_ok"))
             account_removed = bool(result.get("account_removed")) or stage == "account_removed"
+            _record_automatic_result(result)
 
             if bool(result.get("ok")):
                 detail_message = message or "重登并同步成功"
-                _log(task_id, f"[OK] 重登并同步成功: {account_label}（{detail_message}）")
+                success_label = (
+                    "RT 刷新并同步成功"
+                    if result_mode == "refresh_token"
+                    else "完整登录并同步成功"
+                    if automation
+                    else "重登并同步成功"
+                )
+                _log(task_id, f"[OK] {success_label}: {account_label}（{detail_message}）")
                 _save_task_log(
                     "chatgpt",
                     email,
                     "success",
                     detail={
-                        "mode": "relogin",
+                        "mode": result_mode,
                         "account_id": account_id,
                         "stage": stage or "completed",
                     },
@@ -1345,9 +1404,15 @@ def _run_chatgpt_relogin_task_inner(
                     )
                     failure_label = ""
                 elif relogin_ok or stage == "codex2api_sync":
-                    failure_label = "重登成功，但 Codex2API 覆盖更新失败"
+                    failure_label = (
+                        "认证更新成功，但 Codex2API 覆盖更新失败"
+                        if automation
+                        else "重登成功，但 Codex2API 覆盖更新失败"
+                    )
+                elif stage == "refresh_deferred":
+                    failure_label = "RT 检测暂时失败，等待下轮重试"
                 else:
-                    failure_label = "重登失败"
+                    failure_label = f"{task_label}失败"
                 if failure_label:
                     _log(
                         task_id,
@@ -1359,7 +1424,7 @@ def _run_chatgpt_relogin_task_inner(
                     "failed",
                     error=detail_message,
                     detail={
-                        "mode": "relogin",
+                        "mode": result_mode,
                         "account_id": account_id,
                         "stage": stage or "relogin",
                         "relogin_ok": relogin_ok,
@@ -1454,15 +1519,69 @@ def _run_chatgpt_relogin_task_inner(
     final_status = "stopped" if stopped or control.is_stop_requested() else "done"
     if final_status == "stopped":
         summary = (
-            f"重登任务已停止: 完整成功 {success} 个，"
+            f"{task_label}任务已停止: 完整成功 {success} 个，"
             f"已处理 {processed} 个，失败 {len(errors)} 个"
         )
     else:
         summary = (
-            f"重登任务完成: 完整成功 {success} 个，"
+            f"{task_label}任务完成: 完整成功 {success} 个，"
             f"已处理 {processed} 个，失败 {len(errors)} 个"
         )
+    if automation:
+        summary += (
+            f"，RT 明确失效 {invalid_rt_count} 个，"
+            f"完整重登失败 {relogin_failed_count} 个"
+        )
     _log(task_id, summary)
+
+    if automation and final_status == "done":
+        try:
+            from services.chatgpt_auto_relogin_alerts import (
+                send_auto_relogin_alert,
+            )
+
+            alert_result = send_auto_relogin_alert(
+                task_id=task_id,
+                total_accounts=total,
+                invalid_rt_count=invalid_rt_count,
+                relogin_failed_count=relogin_failed_count,
+            )
+            if not isinstance(alert_result, dict):
+                raise RuntimeError("invalid alert result")
+        except Exception as exc:
+            alert_result = {
+                "sent": False,
+                "reason": "send_failed",
+                "error_type": type(exc).__name__,
+            }
+
+        alert_meta = {
+            "alert_sent": bool(alert_result.get("sent")),
+            "alert_reason": str(alert_result.get("reason") or "unknown"),
+        }
+        if alert_result.get("threshold") is not None:
+            alert_meta["alert_threshold"] = int(alert_result["threshold"])
+        if alert_result.get("error_type"):
+            alert_meta["alert_error_type"] = str(alert_result["error_type"])
+        _task_store.update_meta(task_id, **alert_meta)
+
+        alert_reason = alert_meta["alert_reason"]
+        if alert_meta["alert_sent"]:
+            _log(task_id, "[ALERT] 本轮阈值告警邮件已发送")
+        elif alert_reason == "below_threshold":
+            _log(task_id, "邮件告警未触发：本轮统计低于配置阈值")
+        elif alert_reason == "smtp_not_configured":
+            _log(task_id, "[ALERT] 已达到告警阈值，但 SMTP 配置不完整")
+        else:
+            error_type = str(alert_meta.get("alert_error_type") or "UnknownError")
+            _log(task_id, f"[ALERT] 告警邮件发送失败（{error_type}）")
+    elif automation:
+        _task_store.update_meta(
+            task_id,
+            alert_sent=False,
+            alert_reason="task_stopped",
+        )
+
     _task_store.finish(
         task_id,
         status=final_status,

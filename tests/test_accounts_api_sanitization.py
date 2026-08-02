@@ -24,6 +24,8 @@ class AccountApiSanitizationTests(unittest.TestCase):
                     "extra": {
                         "password": "mailbox-password-secret",
                         "mfa_secret": "MFASEEDSECRET2222",
+                        "mail_api_url": "https://mail.example.test/?token=MAILURLSECRET",
+                        "totp_url": "https://totp.example.test/?token=TOTPURLSECRET",
                     },
                 },
                 "oauth_resume_context": {
@@ -53,6 +55,8 @@ class AccountApiSanitizationTests(unittest.TestCase):
         self.assertNotIn("openai-cookie-secret", serialized)
         self.assertNotIn("oauth-code-verifier-secret", serialized)
         self.assertNotIn("oauth-state-secret", serialized)
+        self.assertNotIn("MAILURLSECRET", serialized)
+        self.assertNotIn("TOTPURLSECRET", serialized)
         self.assertEqual(
             extra["mailbox_login_context"],
             {

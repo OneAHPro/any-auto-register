@@ -285,6 +285,12 @@ class RegisterTaskStore:
                 record.registered = max(0, int(registered))
             record.updated_at = time.time()
 
+    def update_meta(self, task_id: str, **values: Any) -> None:
+        with self._lock:
+            record = self._records[task_id]
+            record.meta.update(values)
+            record.updated_at = time.time()
+
     def finish(
         self,
         task_id: str,

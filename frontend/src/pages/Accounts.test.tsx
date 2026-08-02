@@ -5,6 +5,7 @@ import { cleanup, render, screen, waitFor, within } from '@testing-library/react
 import userEvent from '@testing-library/user-event'
 
 import { apiFetch } from '@/lib/utils'
+import { formatAutoReloginCountdown } from '@/lib/chatgptAutoReloginStatus'
 import Accounts from './Accounts'
 
 const routeState = vi.hoisted(() => ({ platform: 'chatgpt' }))
@@ -131,6 +132,21 @@ describe('Accounts ChatGPT staged login integration', () => {
     cleanup()
   })
 
+  it('formats the next automatic authentication deadline as a live countdown', () => {
+    const now = Date.parse('2026-08-03T00:00:00Z')
+
+    expect(
+      formatAutoReloginCountdown(
+        {
+          enabled: true,
+          state: 'idle',
+          next_run_at: '2026-08-03T00:10:00Z',
+        },
+        now,
+      ),
+    ).toBe('10:00')
+  })
+
   it('opens staged login and phone verification from the ChatGPT account page and refreshes after completion', async () => {
     const user = userEvent.setup()
     render(<Accounts />)
@@ -177,6 +193,35 @@ describe('Accounts ChatGPT staged login integration', () => {
 
     expect(await screen.findByText('0 个账号')).toBeTruthy()
     expect(screen.getByRole('button', { name: /登录$/ })).toBeTruthy()
+  })
+
+  it('shows the current automatic authentication cycle after the account count', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return { items: [eligibleAccount, completedAccount], total: 64 }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/automations/chatgpt-relogin') {
+        return {
+          enabled: true,
+          state: 'running',
+          reason: 'task_running',
+          eligible_accounts: 64,
+          active_task_id: 'task-auto-running',
+          next_run_at: null,
+          interval_minutes: 10,
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    const accountCount = await screen.findByText('64 个账号')
+    const countdown = await screen.findByText('下次执行：当前轮运行中')
+    expect(
+      accountCount.compareDocumentPosition(countdown) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
   })
 
   it('does not show ChatGPT staged-login actions on another platform', async () => {

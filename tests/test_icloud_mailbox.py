@@ -967,6 +967,33 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertEqual(records[0]["pool_state"], "claimed")
             self.assertNotIn("new_password", records[0])
 
+    def test_used_reset_url_account_can_persist_a_replacement_password(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "legacy@example.com----登陆请点击忘记密码----"
+                "https://mail.example.test/mail?token=MAIL_SECRET",
+                pool_dir=tmp_dir,
+                filename="legacy-used-reset.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="legacy-used-reset.json",
+            )
+            account = mailbox.get_email()
+            self.assertTrue(mailbox.mark_account_used(account))
+
+            replacement = "Replacement-Password-2026"
+            self.assertTrue(mailbox.commit_password_reset(account, replacement))
+
+            _path, records = load_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="legacy-used-reset.json",
+            )
+            self.assertEqual(records[0]["password"], replacement)
+            self.assertFalse(records[0]["password_reset_required"])
+            self.assertEqual(records[0]["pool_state"], "used")
+            self.assertFalse(records[0]["enabled"])
+
     def test_four_field_reset_marker_is_not_misclassified_as_a_password(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(

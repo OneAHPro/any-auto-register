@@ -33,6 +33,16 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         save_log = mock.patch("api.tasks._save_task_log")
         save_log.start()
         self.addCleanup(save_log.stop)
+        alert_sender = mock.patch(
+            "services.chatgpt_auto_relogin_alerts.send_auto_relogin_alert",
+            return_value={
+                "sent": False,
+                "reason": "below_threshold",
+                "threshold": 5,
+            },
+        )
+        self.alert_sender = alert_sender.start()
+        self.addCleanup(alert_sender.stop)
 
     def tearDown(self):
         with _task_store._lock:
@@ -366,6 +376,171 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(snapshot["registered"], 2)
         self.assertEqual(snapshot["meta"]["concurrency"], 2)
+
+    def test_automatic_task_uses_refresh_first_account_action(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [17],
+            source="schedule",
+            automation=True,
+        )
+        result = {
+            "ok": True,
+            "relogin_ok": False,
+            "refresh_ok": True,
+            "mode": "refresh_token",
+            "stage": "completed",
+            "account_id": 17,
+            "email": "refresh@example.com",
+            "message": "RT 刷新并同步 Codex2API 成功",
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
+            return_value=result,
+        ) as refresh_first, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account"
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [17])
+
+        refresh_first.assert_called_once()
+        full_login.assert_not_called()
+        self.assertEqual(_task_store.snapshot(task_id)["success"], 1)
+
+    def test_manual_task_keeps_forced_full_login_action(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(task_id, [18])
+        result = {
+            "ok": True,
+            "relogin_ok": True,
+            "stage": "completed",
+            "account_id": 18,
+            "email": "manual@example.com",
+            "message": "重登并同步 Codex2API 成功",
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account"
+        ) as refresh_first, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value=result,
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [18])
+
+        full_login.assert_called_once()
+        refresh_first.assert_not_called()
+        self.alert_sender.assert_not_called()
+        self.assertEqual(_task_store.snapshot(task_id)["success"], 1)
+
+    def test_automatic_task_records_cycle_counts_and_sends_one_summary_alert(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        account_ids = [201, 202, 203, 204]
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            account_ids,
+            source="schedule",
+            automation=True,
+        )
+        results = [
+            {
+                "ok": False,
+                "relogin_ok": False,
+                "refresh_state": "invalid",
+                "mode": "full_login",
+                "stage": "relogin",
+                "account_id": 201,
+                "email": "failed@example.com",
+                "message": "验证码登录失败",
+            },
+            {
+                "ok": True,
+                "relogin_ok": True,
+                "refresh_state": "invalid",
+                "mode": "full_login",
+                "stage": "completed",
+                "account_id": 202,
+                "email": "recovered@example.com",
+                "message": "完整登录并同步成功",
+            },
+            {
+                "ok": False,
+                "relogin_ok": True,
+                "refresh_state": "invalid",
+                "mode": "full_login",
+                "stage": "codex2api_sync",
+                "account_id": 203,
+                "email": "sync-failed@example.com",
+                "message": "登录成功但同步失败",
+            },
+            {
+                "ok": False,
+                "relogin_ok": False,
+                "refresh_state": "transient_error",
+                "mode": "refresh_token",
+                "stage": "refresh_deferred",
+                "account_id": 204,
+                "email": "retry@example.com",
+                "message": "下轮重试",
+            },
+        ]
+        self.alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold": 2,
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
+            side_effect=results,
+        ):
+            _run_chatgpt_relogin_task(task_id, account_ids, concurrency=1)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["meta"]["invalid_rt_count"], 3)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 1)
+        self.assertTrue(snapshot["meta"]["alert_sent"])
+        self.assertEqual(snapshot["meta"]["alert_reason"], "sent")
+        self.assertEqual(snapshot["meta"]["alert_threshold"], 2)
+        self.alert_sender.assert_called_once_with(
+            task_id=task_id,
+            total_accounts=4,
+            invalid_rt_count=3,
+            relogin_failed_count=1,
+        )
+
+    def test_automatic_alert_exception_does_not_change_task_outcome(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [205],
+            source="schedule",
+            automation=True,
+        )
+        self.alert_sender.side_effect = RuntimeError("smtp secret detail")
+
+        with mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
+            return_value={
+                "ok": True,
+                "relogin_ok": False,
+                "refresh_state": "valid",
+                "mode": "refresh_token",
+                "stage": "completed",
+                "account_id": 205,
+                "email": "valid@example.com",
+                "message": "RT 刷新成功",
+            },
+        ):
+            _run_chatgpt_relogin_task(task_id, [205])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertFalse(snapshot["meta"]["alert_sent"])
+        self.assertEqual(snapshot["meta"]["alert_reason"], "send_failed")
+        self.assertNotIn("smtp secret detail", "\n".join(snapshot["logs"]))
 
     def test_task_reports_each_account_and_finishes_only_after_sync_results(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -835,6 +1010,9 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             gate,
         ), mock.patch(
             "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=relogin,
+        ), mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
             side_effect=relogin,
         ), mock.patch.object(
             auto_control,

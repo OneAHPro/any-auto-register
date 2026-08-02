@@ -30,6 +30,72 @@ class TokenRefreshResult:
     refresh_token: str = ""
     expires_at: Optional[datetime] = None
     error_message: str = ""
+    state: str = "transient_error"
+    http_status: int = 0
+    error_code: str = ""
+
+
+_INVALID_REFRESH_TOKEN_CODES = frozenset(
+    {
+        "invalid_grant",
+        "invalid_refresh_token",
+        "invalid_token",
+        "refresh_token_expired",
+        "refresh_token_invalid",
+        "refresh_token_invalidated",
+        "refresh_token_reused",
+        "refresh_token_revoked",
+        "token_invalidated",
+    }
+)
+
+
+def _oauth_error_details(payload: object) -> tuple[str, str]:
+    if not isinstance(payload, dict):
+        return "", ""
+    raw_error = payload.get("error")
+    if isinstance(raw_error, dict):
+        code = str(
+            raw_error.get("code")
+            or raw_error.get("type")
+            or raw_error.get("error")
+            or ""
+        ).strip().lower()
+        message = str(
+            raw_error.get("message")
+            or raw_error.get("error_description")
+            or ""
+        ).strip().lower()
+    else:
+        code = str(raw_error or payload.get("code") or "").strip().lower()
+        message = ""
+    message = str(
+        message
+        or payload.get("error_description")
+        or payload.get("message")
+        or ""
+    ).strip().lower()
+    return code, message
+
+
+def _is_explicit_invalid_refresh_token(code: str, message: str) -> bool:
+    normalized_code = str(code or "").strip().lower()
+    if normalized_code in _INVALID_REFRESH_TOKEN_CODES:
+        return True
+    normalized_message = str(message or "").strip().lower()
+    return any(
+        marker in normalized_message
+        for marker in (
+            "refresh token has expired",
+            "refresh token is expired",
+            "refresh token has been revoked",
+            "refresh token was revoked",
+            "refresh token is invalid",
+            "invalid refresh token",
+            "refresh token was already used",
+            "token_invalidated",
+        )
+    )
 
 
 class TokenRefreshManager:
@@ -120,6 +186,8 @@ class TokenRefreshManager:
             result.success = True
             result.access_token = access_token
             result.expires_at = expires_at
+            result.state = "valid"
+            result.http_status = 200
 
             logger.info(f"Session token 刷新成功，过期时间: {expires_at}")
             return result
@@ -170,12 +238,35 @@ class TokenRefreshManager:
                 timeout=30
             )
 
+            result.http_status = int(response.status_code or 0)
             if response.status_code != 200:
-                result.error_message = f"OAuth token 刷新失败: HTTP {response.status_code}"
-                logger.warning(f"{result.error_message}, 响应: {response.text[:200]}")
+                try:
+                    error_payload = response.json()
+                except Exception:
+                    error_payload = {}
+                error_code, error_message = _oauth_error_details(error_payload)
+                result.error_code = error_code or "http_error"
+                if _is_explicit_invalid_refresh_token(error_code, error_message):
+                    result.state = "invalid"
+                result.error_message = (
+                    f"OAuth token 刷新失败: HTTP {response.status_code}"
+                    f" ({result.error_code})"
+                )
+                logger.warning(result.error_message)
                 return result
 
-            data = response.json()
+            try:
+                data = response.json()
+            except Exception:
+                result.error_code = "invalid_response"
+                result.error_message = "OAuth token 刷新失败: 响应不是有效 JSON"
+                logger.warning(result.error_message)
+                return result
+            if not isinstance(data, dict):
+                result.error_code = "invalid_response"
+                result.error_message = "OAuth token 刷新失败: 响应格式无效"
+                logger.warning(result.error_message)
+                return result
 
             # 提取令牌
             access_token = data.get("access_token")
@@ -183,6 +274,7 @@ class TokenRefreshManager:
             expires_in = data.get("expires_in", 3600)
 
             if not access_token:
+                result.error_code = "missing_access_token"
                 result.error_message = "OAuth token 刷新失败: 未找到 access_token"
                 logger.warning(result.error_message)
                 return result
@@ -194,12 +286,14 @@ class TokenRefreshManager:
             result.access_token = access_token
             result.refresh_token = new_refresh_token
             result.expires_at = expires_at
+            result.state = "valid"
 
             logger.info(f"OAuth token 刷新成功，过期时间: {expires_at}")
             return result
 
         except Exception as e:
-            result.error_message = f"OAuth token 刷新异常: {str(e)}"
+            result.error_code = "network_error"
+            result.error_message = f"OAuth token 刷新异常: {type(e).__name__}"
             logger.error(result.error_message)
             return result
 

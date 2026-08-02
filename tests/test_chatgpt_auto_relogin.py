@@ -13,6 +13,15 @@ PUBLIC_KEYS = {
     "chatgpt_auto_relogin_enabled",
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
+    "chatgpt_auto_relogin_alert_threshold",
+    "smtp_host",
+    "smtp_port",
+    "smtp_username",
+    "smtp_password",
+    "smtp_sender_email",
+    "smtp_recipient_email",
+    "smtp_use_ssl",
+    "smtp_force_auth_login",
 }
 
 
@@ -68,9 +77,34 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
 
     assert PUBLIC_KEYS.issubset(config_api.CONFIG_KEYS)
     assert response["chatgpt_auto_relogin_enabled"] == "0"
-    assert response["chatgpt_auto_relogin_interval_minutes"] == "30"
+    assert response["chatgpt_auto_relogin_interval_minutes"] == "10"
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
+    assert response["chatgpt_auto_relogin_alert_threshold"] == "5"
+    assert response["smtp_port"] == "587"
+    assert response["smtp_use_ssl"] == "1"
     assert store.writes == []
+
+
+def test_public_config_never_returns_or_clears_saved_smtp_password(monkeypatch):
+    from api import config as config_api
+
+    store = FakeConfigStore({"smtp_password": "stored-smtp-credential"})
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    response = config_api.get_config()
+    result = config_api.update_config(
+        config_api.ConfigUpdate(
+            data={
+                "smtp_password": "",
+                "chatgpt_auto_relogin_alert_threshold": 5,
+            }
+        )
+    )
+
+    assert response["smtp_password"] == ""
+    assert store.values["smtp_password"] == "stored-smtp-credential"
+    assert store.writes == [{"chatgpt_auto_relogin_alert_threshold": "5"}]
+    assert result["updated"] == ["chatgpt_auto_relogin_alert_threshold"]
 
 
 @pytest.mark.parametrize(
@@ -120,12 +154,18 @@ def test_public_config_put_normalizes_enabled_to_zero_or_one(
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("chatgpt_auto_relogin_interval_minutes", 19),
+        ("chatgpt_auto_relogin_interval_minutes", 9),
         ("chatgpt_auto_relogin_interval_minutes", 1441),
         ("chatgpt_auto_relogin_interval_minutes", "not-an-integer"),
         ("chatgpt_auto_relogin_concurrency", 0),
         ("chatgpt_auto_relogin_concurrency", 11),
         ("chatgpt_auto_relogin_concurrency", "not-an-integer"),
+        ("chatgpt_auto_relogin_alert_threshold", 0),
+        ("chatgpt_auto_relogin_alert_threshold", 10001),
+        ("chatgpt_auto_relogin_alert_threshold", "not-an-integer"),
+        ("smtp_port", 0),
+        ("smtp_port", 65536),
+        ("smtp_port", "not-an-integer"),
     ],
 )
 def test_public_config_put_rejects_invalid_auto_relogin_numbers(
@@ -169,10 +209,10 @@ def test_service_normalizes_defaults_and_bounds_from_an_isolated_store():
     )
 
     assert defaults.enabled is False
-    assert defaults.interval_minutes == 30
+    assert defaults.interval_minutes == 10
     assert defaults.concurrency == 10
     assert bounded.enabled is True
-    assert bounded.interval_minutes == 20
+    assert bounded.interval_minutes == 10
     assert bounded.concurrency == 10
     assert invalid == defaults
 
@@ -257,7 +297,7 @@ def test_internal_status_can_receive_scheduler_state_without_becoming_public_con
         "last_task_id": "task-active",
         "last_started_at": "2026-08-02T12:00:00Z",
         "next_run_at": "2026-08-02T12:30:00Z",
-        "interval_minutes": 30,
+        "interval_minutes": 10,
         "concurrency": 10,
     }
     assert set(service.INTERNAL_STATUS_CONFIG_KEYS).isdisjoint(CONFIG_KEYS)
@@ -283,7 +323,7 @@ def test_status_endpoint_has_a_coherent_disabled_response(monkeypatch):
         "last_task_id": None,
         "last_started_at": None,
         "next_run_at": None,
-        "interval_minutes": 30,
+        "interval_minutes": 10,
         "concurrency": 10,
     }
 
@@ -358,6 +398,35 @@ def test_eligibility_reconcile_resumes_after_accounts_are_added():
     assert status["eligible_accounts"] == 1
     assert status["active_task_id"] is None
     assert status["next_run_at"] == "2026-08-02T12:30:00Z"
+
+
+def test_eligibility_reconcile_defaults_to_refresh_token_maintenance_accounts(
+    monkeypatch,
+):
+    service = _service_module()
+    store = FakeConfigStore(
+        {
+            "chatgpt_auto_relogin_enabled": "1",
+            "chatgpt_auto_relogin_interval_minutes": "10",
+            "chatgpt_auto_relogin_status_state": "paused_no_accounts",
+        }
+    )
+    monkeypatch.setattr(
+        "services.chatgpt_relogin.list_auto_maintenance_account_ids",
+        lambda: [71, 72],
+    )
+    monkeypatch.setattr(
+        "services.chatgpt_relogin.list_relogin_eligible_account_ids",
+        lambda: pytest.fail("reconcile used full-login eligibility"),
+    )
+
+    status = service.reconcile_chatgpt_auto_relogin_eligibility(
+        store=store,
+        now=datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
+    )
+
+    assert status["eligible_accounts"] == 2
+    assert status["next_run_at"] == "2026-08-02T12:10:00Z"
 
 
 def test_repeated_eligibility_reconcile_does_not_move_scheduled_deadline():
@@ -606,13 +675,13 @@ def test_enabling_after_disabled_waits_a_complete_interval():
     )
     service.tick_chatgpt_auto_relogin(
         store=store,
-        now=t0 + timedelta(minutes=29, seconds=59),
+        now=t0 + timedelta(minutes=9, seconds=59),
         list_eligible=lambda: [7],
         try_enqueue=lambda *args: enqueues.append(args) or _accepted(),
         observe=lambda _: None,
     )
 
-    assert enabled["next_run_at"] == "2026-08-02T12:30:00Z"
+    assert enabled["next_run_at"] == "2026-08-02T12:10:00Z"
     assert enqueues == []
 
 

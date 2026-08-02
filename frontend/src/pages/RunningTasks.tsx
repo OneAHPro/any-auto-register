@@ -39,6 +39,13 @@ interface TaskSnapshot {
   created_at: number | string | null
   updated_at: number | string | null
   control: { stop_requested: boolean }
+  meta?: {
+    automation?: boolean
+    invalid_rt_count?: number
+    relogin_failed_count?: number
+    alert_sent?: boolean
+    alert_reason?: string
+  }
 }
 
 const PLATFORM_LABELS: Record<string, string> = {
@@ -160,6 +167,9 @@ export default function RunningTasks() {
     const total = Number.isFinite(totalRaw) && totalRaw > 0 ? Math.floor(totalRaw) : 0
     const done = Number.isFinite(doneRaw) && doneRaw > 0 ? Math.floor(doneRaw) : 0
     const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((done / total) * 100))) : 0
+    const isAutomaticAuthentication = Boolean(task.meta?.automation)
+    const invalidRtCount = Math.max(0, Number(task.meta?.invalid_rt_count) || 0)
+    const reloginFailedCount = Math.max(0, Number(task.meta?.relogin_failed_count) || 0)
 
     const duration = isActive(task)
       ? formatDuration(task.created_at, now)
@@ -184,7 +194,9 @@ export default function RunningTasks() {
                   {PLATFORM_LABELS[task.platform] || task.platform}
                 </Tag>
                 <Text type="secondary" style={{ fontSize: 11 }}>
-                  {SOURCE_LABELS[task.source] || task.source || '-'}
+                  {isAutomaticAuthentication
+                    ? '自动认证'
+                    : SOURCE_LABELS[task.source] || task.source || '-'}
                 </Text>
               </Space>
             </Space>
@@ -232,6 +244,21 @@ export default function RunningTasks() {
                   <Text style={{ fontSize: 11, color: '#d97706' }}>
                     → 跳过 {skipped}
                   </Text>
+                )}
+                {isAutomaticAuthentication && (
+                  <>
+                    <Tag color={invalidRtCount > 0 ? 'warning' : 'default'} style={{ margin: 0 }}>
+                      RT失效 {invalidRtCount}
+                    </Tag>
+                    <Tag color={reloginFailedCount > 0 ? 'error' : 'default'} style={{ margin: 0 }}>
+                      重登失败 {reloginFailedCount}
+                    </Tag>
+                    {task.meta?.alert_sent ? (
+                      <Tag color="processing" style={{ margin: 0 }}>邮件已提醒</Tag>
+                    ) : task.meta?.alert_reason === 'below_threshold' ? (
+                      <Tag style={{ margin: 0 }}>未触发邮件</Tag>
+                    ) : null}
+                  </>
                 )}
               </Space>
             </Space>
