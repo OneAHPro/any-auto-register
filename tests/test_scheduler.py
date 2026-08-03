@@ -73,12 +73,50 @@ def test_run_once_keeps_trial_and_cpa_failures_independent(monkeypatch):
     assert scheduler._last_cpa_maintenance_at == 10.0
 
 
+def test_run_once_isolates_task_history_cleanup_failure(monkeypatch):
+    scheduler = scheduler_module.Scheduler()
+    scheduler._last_trial_check_at = 100.0
+    scheduler._last_cpa_maintenance_at = 100.0
+    scheduler._last_task_history_cleanup_at = 0.0
+    scheduler._task_history_cleanup_interval_seconds = 10
+    wall_now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    auto_tick = mock.Mock()
+    cleanup = mock.Mock(side_effect=RuntimeError("cleanup failed"))
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "tick_chatgpt_auto_relogin",
+        auto_tick,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "cleanup_task_history",
+        cleanup,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_cpa_maintenance_interval_seconds",
+        lambda: 0,
+    )
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=10.0)
+
+    auto_tick.assert_called_once_with(now=wall_now)
+    cleanup.assert_called_once_with()
+    assert scheduler._last_task_history_cleanup_at == 0.0
+
+
 def test_start_is_daemon_nonblocking_and_immediately_ticks_without_trial_or_cpa(
     monkeypatch,
 ):
     scheduler = scheduler_module.Scheduler()
     ticked = threading.Event()
     auto_tick = mock.Mock(side_effect=lambda **_: ticked.set())
+    history_cleanup = mock.Mock(
+        return_value={"task_runs": 0, "task_logs": 0}
+    )
     trial = mock.Mock()
     cpa = mock.Mock()
 
@@ -86,6 +124,12 @@ def test_start_is_daemon_nonblocking_and_immediately_ticks_without_trial_or_cpa(
         scheduler_module,
         "tick_chatgpt_auto_relogin",
         auto_tick,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "cleanup_task_history",
+        history_cleanup,
         raising=False,
     )
     monkeypatch.setattr(scheduler, "check_trial_expiry", trial)
@@ -107,6 +151,7 @@ def test_start_is_daemon_nonblocking_and_immediately_ticks_without_trial_or_cpa(
         assert called_now.utcoffset() == timezone.utc.utcoffset(called_now)
         trial.assert_not_called()
         cpa.assert_not_called()
+        history_cleanup.assert_called_once_with()
     finally:
         scheduler.stop()
         scheduler._thread.join(timeout=1)
@@ -120,6 +165,12 @@ def test_stop_wakes_the_scheduler_event_wait_immediately(monkeypatch):
         scheduler_module,
         "tick_chatgpt_auto_relogin",
         lambda **_: ticked.set(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "cleanup_task_history",
+        mock.Mock(return_value={"task_runs": 0, "task_logs": 0}),
         raising=False,
     )
     monkeypatch.setattr(

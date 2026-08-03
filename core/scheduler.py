@@ -1,9 +1,12 @@
 """定时任务调度 - 账号有效性检测、trial 到期提醒"""
+from __future__ import annotations
+
 from datetime import datetime, timezone
 from sqlmodel import Session, select
 from .db import engine, AccountModel
 from .registry import get, load_all
 from .base_platform import Account, AccountStatus, RegisterConfig
+from services.task_history_retention import cleanup_task_history
 import threading
 import time
 
@@ -24,8 +27,10 @@ class Scheduler:
         self._lifecycle_lock = threading.Lock()
         self._loop_interval_seconds = 60
         self._trial_check_interval_seconds = 3600
+        self._task_history_cleanup_interval_seconds = 86400
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
+        self._last_task_history_cleanup_at = 0.0
 
     def start(self):
         with self._lifecycle_lock:
@@ -39,6 +44,9 @@ class Scheduler:
             # 保持 trial/CPA 启动后先等完整周期；自动重登由首轮 tick 自行排期。
             self._last_trial_check_at = now
             self._last_cpa_maintenance_at = now
+            self._last_task_history_cleanup_at = (
+                now - self._task_history_cleanup_interval_seconds
+            )
 
             self._thread = threading.Thread(
                 target=self._loop,
@@ -67,6 +75,24 @@ class Scheduler:
             tick_chatgpt_auto_relogin(now=wall_now)
         except Exception as e:
             print(f"[Scheduler] ChatGPT 自动重登错误: {e}")
+
+        if (
+            monotonic_now - self._last_task_history_cleanup_at
+            >= self._task_history_cleanup_interval_seconds
+        ):
+            try:
+                deleted = cleanup_task_history()
+            except Exception as e:
+                print(f"[Scheduler] 任务历史清理错误: {type(e).__name__}")
+            else:
+                self._last_task_history_cleanup_at = monotonic_now
+                total_deleted = sum(int(value or 0) for value in deleted.values())
+                if total_deleted:
+                    print(
+                        "[Scheduler] 已清理过期任务历史: "
+                        f"任务 {deleted.get('task_runs', 0)} 条，"
+                        f"记录 {deleted.get('task_logs', 0)} 条"
+                    )
 
         if (
             monotonic_now - self._last_trial_check_at
