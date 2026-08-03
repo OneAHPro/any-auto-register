@@ -1,6 +1,7 @@
 /www/any-auto-register/shared/logs/app.log
 /www/any-auto-register/shared/logs/app-error.log
-/www/any-auto-register/shared/data/logs/solver.log {
+/www/any-auto-register/shared/data/logs/solver.log
+/www/any-auto-register/shared/data/logs/external_apps/*.log {
     size 20M
     rotate 5
     missingok
@@ -26,4 +27,3 @@
         test ! -f /run/nginx.pid || kill -USR1 $(cat /run/nginx.pid)
     endscript
 }
-

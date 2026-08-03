@@ -16,8 +16,13 @@ from typing import Any
 import requests
 
 _ROOT = Path(__file__).resolve().parents[2]
-_EXT_ROOT = _ROOT / "_ext_targets"
-_LOG_ROOT = Path(__file__).resolve().parent / "external_logs"
+_RUNTIME_DIR = str(os.getenv("APP_RUNTIME_DIR", "") or "").strip()
+if _RUNTIME_DIR:
+    _EXT_ROOT = Path(_RUNTIME_DIR) / "external_apps"
+    _LOG_ROOT = Path(_RUNTIME_DIR) / "logs" / "external_apps"
+else:
+    _EXT_ROOT = _ROOT / "_ext_targets"
+    _LOG_ROOT = Path(__file__).resolve().parent / "external_logs"
 _LOG_ROOT.mkdir(parents=True, exist_ok=True)
 
 _REMOTE_URLS = {
