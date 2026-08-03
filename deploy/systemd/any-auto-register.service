@@ -1,0 +1,28 @@
+[Unit]
+Description=Any Auto Register account manager
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=any-auto-register
+Group=any-auto-register
+WorkingDirectory=/www/any-auto-register/current
+EnvironmentFile=/www/any-auto-register/shared/app.env
+ExecStart=/usr/bin/xvfb-run -a "--server-args=-screen 0 1920x1080x24" /www/any-auto-register/venv/bin/python main.py
+Restart=on-failure
+RestartSec=5
+TimeoutStartSec=120
+TimeoutStopSec=90
+KillMode=mixed
+UMask=0077
+LimitNOFILE=65535
+TasksMax=2048
+CPUQuota=400%
+MemoryHigh=4G
+MemoryMax=6G
+StandardOutput=append:/www/any-auto-register/shared/logs/app.log
+StandardError=append:/www/any-auto-register/shared/logs/app-error.log
+
+[Install]
+WantedBy=multi-user.target
