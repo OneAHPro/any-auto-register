@@ -107,6 +107,60 @@ def test_public_config_never_returns_or_clears_saved_smtp_password(monkeypatch):
     assert result["updated"] == ["chatgpt_auto_relogin_alert_threshold"]
 
 
+def test_smtp_test_uses_unsaved_form_values_without_persisting_them(monkeypatch):
+    from api import config as config_api
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    store = FakeConfigStore(
+        {
+            "smtp_host": "smtp.saved.example",
+            "smtp_port": "587",
+            "smtp_username": "saved@example.com",
+            "smtp_password": "stored-smtp-credential",
+            "smtp_sender_email": "saved@example.com",
+            "smtp_recipient_email": "old@example.com",
+            "smtp_use_ssl": "1",
+            "smtp_force_auth_login": "0",
+        }
+    )
+    observed = {}
+
+    def send_test(*, config):
+        observed.update(config)
+        return {"sent": True, "reason": "sent", "recipient_count": 1}
+
+    monkeypatch.setattr(config_api, "config_store", store)
+    monkeypatch.setattr(alerts, "send_smtp_test_email", send_test)
+
+    result = config_api.test_smtp_config(
+        config_api.SMTPTestRequest(
+            data={
+                "smtp_host": "smtp.form.example",
+                "smtp_port": 465,
+                "smtp_password": "",
+                "smtp_recipient_email": "new@example.com",
+                "smtp_use_ssl": True,
+                "smtp_force_auth_login": False,
+                "chatgpt_auto_relogin_enabled": True,
+            }
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "message": "测试邮件已发送",
+        "recipient_count": 1,
+    }
+    assert observed["smtp_host"] == "smtp.form.example"
+    assert observed["smtp_port"] == "465"
+    assert observed["smtp_password"] == "stored-smtp-credential"
+    assert observed["smtp_recipient_email"] == "new@example.com"
+    assert observed["smtp_use_ssl"] == "1"
+    assert observed["smtp_force_auth_login"] == "0"
+    assert "chatgpt_auto_relogin_enabled" not in observed
+    assert store.writes == []
+
+
 @pytest.mark.parametrize(
     ("submitted", "expected"),
     [

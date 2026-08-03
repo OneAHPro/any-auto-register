@@ -96,6 +96,28 @@ def _build_message(
     return message
 
 
+def _build_test_message(
+    *,
+    sender: str,
+    recipients: list[str],
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = "[Any Auto Register] SMTP 测试成功"
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    occurred_at = (
+        datetime.now(timezone.utc)
+        .astimezone()
+        .isoformat(timespec="seconds")
+    )
+    message.set_content(
+        "这是一封 Any Auto Register SMTP 测试邮件。\n\n"
+        "SMTP 邮件配置可用，自动认证告警可以正常投递。\n"
+        f"测试时间：{occurred_at}\n"
+    )
+    return message
+
+
 def _authenticate(
     smtp: smtplib.SMTP,
     *,
@@ -120,56 +142,19 @@ def _authenticate(
     smtp.auth("LOGIN", _auth_login, initial_response_ok=False)
 
 
-def send_auto_relogin_alert(
+def _send_message(
     *,
-    task_id: str,
-    total_accounts: int,
-    invalid_rt_count: int,
-    relogin_failed_count: int,
-    config: Mapping[str, object] | None = None,
+    snapshot: Mapping[str, object],
+    message: EmailMessage,
+    sender: str,
+    recipients: list[str],
 ) -> dict[str, object]:
-    """Send one alert when either cycle counter reaches the configured threshold."""
-
-    snapshot = dict(config) if config is not None else _get_config()
-    threshold = _positive_int(
-        snapshot.get("chatgpt_auto_relogin_alert_threshold"),
-        DEFAULT_ALERT_THRESHOLD,
-    )
-    invalid_count = _non_negative_int(invalid_rt_count)
-    failed_count = _non_negative_int(relogin_failed_count)
-    if invalid_count < threshold and failed_count < threshold:
-        return {
-            "sent": False,
-            "reason": "below_threshold",
-            "threshold": threshold,
-        }
-
     host = _text(snapshot.get("smtp_host"))
     port = _positive_int(snapshot.get("smtp_port"), DEFAULT_SMTP_PORT)
     username = _text(snapshot.get("smtp_username"))
     password = str(snapshot.get("smtp_password") or "")
-    sender = _text(snapshot.get("smtp_sender_email")) or username
-    recipients = _mailboxes(snapshot.get("smtp_recipient_email"))
-    if not recipients:
-        recipients = _mailboxes(username or sender)
-    if not host or not sender or not recipients:
-        return {
-            "sent": False,
-            "reason": "smtp_not_configured",
-            "threshold": threshold,
-        }
-
     use_ssl = _to_bool(snapshot.get("smtp_use_ssl"), default=True)
     force_auth_login = _to_bool(snapshot.get("smtp_force_auth_login"))
-    message = _build_message(
-        sender=sender,
-        recipients=recipients,
-        task_id=_text(task_id),
-        total_accounts=_non_negative_int(total_accounts),
-        invalid_rt_count=invalid_count,
-        relogin_failed_count=failed_count,
-        threshold=threshold,
-    )
 
     try:
         tls_context = ssl.create_default_context()
@@ -206,17 +191,104 @@ def send_auto_relogin_alert(
     except Exception as exc:
         error_type = type(exc).__name__
         logger.warning(
-            "ChatGPT 自动认证告警邮件发送失败（%s）",
+            "ChatGPT 自动认证邮件发送失败（%s）",
             error_type,
         )
         return {
             "sent": False,
             "reason": "send_failed",
-            "threshold": threshold,
             "error_type": error_type,
         }
 
-    return {"sent": True, "reason": "sent", "threshold": threshold}
+    return {"sent": True, "reason": "sent"}
 
 
-__all__ = ["send_auto_relogin_alert"]
+def send_auto_relogin_alert(
+    *,
+    task_id: str,
+    total_accounts: int,
+    invalid_rt_count: int,
+    relogin_failed_count: int,
+    config: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Send one alert when either cycle counter reaches the configured threshold."""
+
+    snapshot = dict(config) if config is not None else _get_config()
+    threshold = _positive_int(
+        snapshot.get("chatgpt_auto_relogin_alert_threshold"),
+        DEFAULT_ALERT_THRESHOLD,
+    )
+    invalid_count = _non_negative_int(invalid_rt_count)
+    failed_count = _non_negative_int(relogin_failed_count)
+    if invalid_count < threshold and failed_count < threshold:
+        return {
+            "sent": False,
+            "reason": "below_threshold",
+            "threshold": threshold,
+        }
+
+    host = _text(snapshot.get("smtp_host"))
+    username = _text(snapshot.get("smtp_username"))
+    sender = _text(snapshot.get("smtp_sender_email")) or username
+    recipients = _mailboxes(snapshot.get("smtp_recipient_email"))
+    if not recipients:
+        recipients = _mailboxes(username or sender)
+    if not host or not sender or not recipients:
+        return {
+            "sent": False,
+            "reason": "smtp_not_configured",
+            "threshold": threshold,
+        }
+
+    message = _build_message(
+        sender=sender,
+        recipients=recipients,
+        task_id=_text(task_id),
+        total_accounts=_non_negative_int(total_accounts),
+        invalid_rt_count=invalid_count,
+        relogin_failed_count=failed_count,
+        threshold=threshold,
+    )
+
+    result = _send_message(
+        snapshot=snapshot,
+        message=message,
+        sender=sender,
+        recipients=recipients,
+    )
+    result["threshold"] = threshold
+    return result
+
+
+def send_smtp_test_email(
+    *,
+    config: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Send a dedicated test message without applying the alert threshold."""
+
+    snapshot = dict(config) if config is not None else _get_config()
+    host = _text(snapshot.get("smtp_host"))
+    username = _text(snapshot.get("smtp_username"))
+    sender = _text(snapshot.get("smtp_sender_email")) or username
+    recipients = _mailboxes(snapshot.get("smtp_recipient_email"))
+    if not recipients:
+        recipients = _mailboxes(username or sender)
+    if not host or not sender or not recipients:
+        return {"sent": False, "reason": "smtp_not_configured"}
+
+    message = _build_test_message(
+        sender=sender,
+        recipients=recipients,
+    )
+    result = _send_message(
+        snapshot=snapshot,
+        message=message,
+        sender=sender,
+        recipients=recipients,
+    )
+    if bool(result.get("sent")):
+        result["recipient_count"] = len(recipients)
+    return result
+
+
+__all__ = ["send_auto_relogin_alert", "send_smtp_test_email"]

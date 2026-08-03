@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Card, Descriptions, Divider, Form, Input, InputNumber, Switch, Tag, Typography } from 'antd'
+import { Button, Card, Descriptions, Divider, Form, Input, InputNumber, Switch, Tag, Typography } from 'antd'
 
 import { apiFetch } from '@/lib/utils'
 
@@ -9,6 +9,22 @@ interface ChatGPTAutoReloginStatus {
   last_task_id?: string | null
   last_started_at?: string | null
   next_run_at?: string | null
+}
+
+const SMTP_FORM_FIELDS = [
+  'smtp_host',
+  'smtp_port',
+  'smtp_username',
+  'smtp_password',
+  'smtp_sender_email',
+  'smtp_recipient_email',
+  'smtp_use_ssl',
+  'smtp_force_auth_login',
+] as const
+
+function requestError(error: unknown, fallback: string) {
+  if (error instanceof Error && error.message.trim()) return error.message.trim()
+  return fallback
 }
 
 function formatTime(value: string | null | undefined) {
@@ -37,8 +53,14 @@ function statusLabel(status: string | undefined) {
 }
 
 export default function ChatGPTAutoReloginSection() {
+  const form = Form.useFormInstance()
   const [status, setStatus] = useState<ChatGPTAutoReloginStatus | null>(null)
   const [statusError, setStatusError] = useState(false)
+  const [smtpTestSending, setSmtpTestSending] = useState(false)
+  const [smtpTestResult, setSmtpTestResult] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
 
   useEffect(() => {
     let mounted = true
@@ -66,6 +88,30 @@ export default function ChatGPTAutoReloginSection() {
       window.clearInterval(timer)
     }
   }, [])
+
+  const sendSmtpTest = async () => {
+    if (smtpTestSending) return
+    setSmtpTestSending(true)
+    setSmtpTestResult(null)
+    try {
+      const data = form.getFieldsValue([...SMTP_FORM_FIELDS])
+      const response = await apiFetch('/config/smtp/test', {
+        method: 'POST',
+        body: JSON.stringify({ data }),
+      }) as { message?: string }
+      setSmtpTestResult({
+        type: 'success',
+        message: response.message || '测试邮件已发送',
+      })
+    } catch (error: unknown) {
+      setSmtpTestResult({
+        type: 'error',
+        message: requestError(error, 'SMTP 测试邮件发送失败'),
+      })
+    } finally {
+      setSmtpTestSending(false)
+    }
+  }
 
   return (
     <Card
@@ -137,6 +183,19 @@ export default function ChatGPTAutoReloginSection() {
       <Form.Item name="smtp_force_auth_login" label="强制使用 AUTH LOGIN" valuePropName="checked" initialValue={false}>
         <Switch aria-label="强制使用 AUTH LOGIN" checkedChildren="开启" unCheckedChildren="关闭" />
       </Form.Item>
+      <Button onClick={() => void sendSmtpTest()} loading={smtpTestSending}>
+        发送测试邮件
+      </Button>
+      {smtpTestResult ? (
+        <Typography.Text
+          role={smtpTestResult.type === 'error' ? 'alert' : 'status'}
+          aria-live={smtpTestResult.type === 'error' ? 'assertive' : 'polite'}
+          type={smtpTestResult.type === 'error' ? 'danger' : 'success'}
+          style={{ display: 'block', marginTop: 10 }}
+        >
+          {smtpTestResult.message}
+        </Typography.Text>
+      ) : null}
 
       <div role="status" aria-live="polite" aria-atomic="true">
         <Descriptions size="small" column={1} bordered>

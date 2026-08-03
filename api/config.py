@@ -1,7 +1,7 @@
 import logging
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from core.config_store import config_store
 from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
 
@@ -12,6 +12,16 @@ _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS = {
     "chatgpt_auto_relogin_enabled",
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
+}
+_SMTP_CONFIG_KEYS = {
+    "smtp_host",
+    "smtp_port",
+    "smtp_username",
+    "smtp_password",
+    "smtp_sender_email",
+    "smtp_recipient_email",
+    "smtp_use_ssl",
+    "smtp_force_auth_login",
 }
 
 CONFIG_KEYS = [
@@ -136,6 +146,10 @@ class ConfigUpdate(BaseModel):
     data: dict
 
 
+class SMTPTestRequest(BaseModel):
+    data: dict = Field(default_factory=dict)
+
+
 class AppleMailImportRequest(BaseModel):
     content: str
     filename: str = ""
@@ -256,6 +270,60 @@ def update_config(body: ConfigUpdate):
         except Exception:
             logger.exception("ChatGPT 自动重登配置即时协调失败，将由调度器重试")
     return {"ok": True, "updated": list(safe.keys())}
+
+
+@router.post("/smtp/test")
+def test_smtp_config(body: SMTPTestRequest):
+    snapshot = {
+        key: value
+        for key, value in dict(config_store.get_all() or {}).items()
+        if key in _SMTP_CONFIG_KEYS
+    }
+    overrides = {
+        key: value
+        for key, value in dict(body.data or {}).items()
+        if key in _SMTP_CONFIG_KEYS
+    }
+    if not str(overrides.get("smtp_password") or ""):
+        overrides.pop("smtp_password", None)
+    for bool_key in ("smtp_use_ssl", "smtp_force_auth_login"):
+        if bool_key in overrides:
+            enabled = str(overrides.get(bool_key, "")).strip().lower()
+            overrides[bool_key] = (
+                "1" if enabled in {"1", "true", "yes", "on"} else "0"
+            )
+    if "smtp_port" in overrides:
+        try:
+            port = int(str(overrides.get("smtp_port", "")).strip())
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail="SMTP 端口必须是整数") from exc
+        if not 1 <= port <= 65535:
+            raise HTTPException(
+                status_code=400,
+                detail="SMTP 端口必须在 1 到 65535 之间",
+            )
+        overrides["smtp_port"] = str(port)
+    snapshot.update(overrides)
+
+    from services.chatgpt_auto_relogin_alerts import send_smtp_test_email
+
+    result = send_smtp_test_email(config=snapshot)
+    if bool(result.get("sent")):
+        return {
+            "ok": True,
+            "message": "测试邮件已发送",
+            "recipient_count": int(result.get("recipient_count") or 0),
+        }
+    if result.get("reason") == "smtp_not_configured":
+        raise HTTPException(
+            status_code=400,
+            detail="请完整填写 SMTP 服务器、发送者和接收邮箱",
+        )
+    error_type = str(result.get("error_type") or "SMTPError")[:80]
+    raise HTTPException(
+        status_code=502,
+        detail=f"SMTP 测试邮件发送失败（{error_type}）",
+    )
 
 
 @router.post("/applemail/import")

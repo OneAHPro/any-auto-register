@@ -3,6 +3,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { Form } from 'antd'
+import userEvent from '@testing-library/user-event'
 
 import { apiFetch } from '@/lib/utils'
 import ChatGPTAutoReloginSection from './ChatGPTAutoReloginSection'
@@ -84,6 +85,79 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: '发送测试邮件' })).toBeTruthy()
+  })
+
+  it('sends a test email with the current unsaved SMTP form values', async () => {
+    const user = userEvent.setup()
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/automations/chatgpt-relogin') {
+        return { state: 'idle', eligible_accounts: 2 }
+      }
+      if (path === '/config/smtp/test') {
+        return { ok: true, message: '测试邮件已发送' }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    renderSection({
+      smtp_host: 'smtp.example.com',
+      smtp_port: 465,
+      smtp_username: 'sender@example.com',
+      smtp_password: '',
+      smtp_sender_email: 'sender@example.com',
+      smtp_recipient_email: '1666606639@qq.com',
+      smtp_use_ssl: true,
+      smtp_force_auth_login: false,
+    })
+
+    await user.click(await screen.findByRole('button', { name: '发送测试邮件' }))
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith(
+        '/config/smtp/test',
+        expect.objectContaining({ method: 'POST' }),
+      )
+    })
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      ([path]) => path === '/config/smtp/test',
+    )
+    const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+    expect(payload.data).toMatchObject({
+      smtp_host: 'smtp.example.com',
+      smtp_port: 465,
+      smtp_username: 'sender@example.com',
+      smtp_password: '',
+      smtp_sender_email: 'sender@example.com',
+      smtp_recipient_email: '1666606639@qq.com',
+      smtp_use_ssl: true,
+      smtp_force_auth_login: false,
+    })
+    expect(await screen.findByText('测试邮件已发送')).toBeTruthy()
+  })
+
+  it('shows the SMTP test failure detail and allows another attempt', async () => {
+    const user = userEvent.setup()
+    let attempts = 0
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/automations/chatgpt-relogin') {
+        return { state: 'idle', eligible_accounts: 2 }
+      }
+      if (path === '/config/smtp/test') {
+        attempts += 1
+        if (attempts === 1) throw new Error('SMTP 认证失败')
+        return { ok: true, message: '测试邮件已发送' }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    renderSection({ smtp_host: 'smtp.example.com', smtp_port: 465 })
+
+    const button = await screen.findByRole('button', { name: '发送测试邮件' })
+    await user.click(button)
+    expect((await screen.findByRole('alert')).textContent).toContain('SMTP 认证失败')
+
+    await user.click(button)
+    expect(await screen.findByText('测试邮件已发送')).toBeTruthy()
+    expect(attempts).toBe(2)
   })
 
   it('shows the explicit no-account paused status', async () => {
