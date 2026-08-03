@@ -988,30 +988,38 @@ class AppleMailMailbox(BaseMailbox):
         from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
         extra = account.extra or {}
-        source_url = str(extra.get("totp_url") or "").strip()
-        if not source_url:
+        configured_totp_url = str(extra.get("totp_url") or "").strip()
+        if not configured_totp_url:
             raise RuntimeError("远程 2FA 地址为空")
-        try:
-            parsed = urlsplit(source_url)
-            if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-                raise ValueError
-            path = parsed.path.rstrip("/")
-            if path.endswith("/view"):
-                path = f"{path[:-5]}/api/v1/2fa"
-            elif not path.endswith("/api/v1/2fa"):
-                path = "/api/v1/2fa"
-            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-            query.setdefault("email", str(account.email or "").strip())
-            api_url = urlunsplit(
-                (parsed.scheme, parsed.netloc, path, urlencode(query), "")
-            )
-        except Exception as exc:
-            raise RuntimeError("远程 2FA 地址格式无效") from exc
 
-        def fetch_once() -> tuple[str, float | None]:
+        source_urls = [configured_totp_url]
+        for key in ("mail_api_url", "mailapi_url"):
+            candidate = str(extra.get(key) or "").strip()
+            if candidate and candidate not in source_urls:
+                source_urls.append(candidate)
+
+        def build_api_url(source_url: str) -> str:
+            try:
+                parsed = urlsplit(source_url)
+                if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+                    raise ValueError
+                path = parsed.path.rstrip("/")
+                if path.endswith("/view"):
+                    path = f"{path[:-5]}/api/v1/2fa"
+                elif not path.endswith("/api/v1/2fa"):
+                    path = "/api/v1/2fa"
+                query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+                query.setdefault("email", str(account.email or "").strip())
+                return urlunsplit(
+                    (parsed.scheme, parsed.netloc, path, urlencode(query), "")
+                )
+            except Exception as exc:
+                raise RuntimeError("远程 2FA 地址格式无效") from exc
+
+        def fetch_once(source_url: str) -> tuple[str, float | None]:
             try:
                 response = requests.get(
-                    api_url,
+                    build_api_url(source_url),
                     headers={"accept": "application/json"},
                     proxies=self.proxy,
                     timeout=15,
@@ -1037,10 +1045,29 @@ class AppleMailMailbox(BaseMailbox):
                 suffix = f": {status_match.group(0)}" if status_match else ""
                 raise RuntimeError(f"远程 2FA 获取失败{suffix}") from exc
 
-        code, remaining = fetch_once()
+        failures = []
+        selected_source_url = ""
+        code = ""
+        remaining = None
+        for source_url in source_urls:
+            try:
+                code, remaining = fetch_once(source_url)
+                selected_source_url = source_url
+                break
+            except RuntimeError as exc:
+                failures.append(exc)
+        if not selected_source_url:
+            raise failures[0]
+
+        if selected_source_url != configured_totp_url:
+            extra["totp_url"] = selected_source_url
+            extra["mail_api_url"] = configured_totp_url
+            extra["mailapi_url"] = configured_totp_url
+            self._log("[2FA] 已自动识别反向 URL 字段顺序")
+
         if remaining is not None and 0 <= remaining <= 5:
             self._sleep_with_checkpoint(remaining + 0.5)
-            code, _remaining = fetch_once()
+            code, _remaining = fetch_once(selected_source_url)
         self._log("[2FA] 已获取一次性验证码")
         return code
 

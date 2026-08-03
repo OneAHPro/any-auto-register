@@ -916,6 +916,61 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertNotIn("TOTP_SECRET", rendered_logs)
             self.assertNotIn("654321", rendered_logs)
 
+    def test_url_credentials_detect_reversed_mail_and_totp_links(self):
+        totp_url = (
+            "https://2fa.example.test/view?token=TOTP_SECRET&email=url%40example.com"
+        )
+        mail_url = (
+            "https://oauth.example.test/view?token=MAIL_SECRET&email=url%40example.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"url@example.com----password----{totp_url}----{mail_url}",
+                pool_dir=tmp_dir,
+                filename="reversed-url.json",
+            )
+            logs = []
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="reversed-url.json",
+            )
+            mailbox._log_fn = logs.append
+            account = mailbox.get_email()
+
+            wrong_role_response = mock.Mock(status_code=401)
+            totp_response = mock.Mock(status_code=200)
+            totp_response.json.return_value = {
+                "ok": True,
+                "email": "url@example.com",
+                "code": "654321",
+                "remaining": 20,
+            }
+
+            with mock.patch(
+                "requests.get",
+                side_effect=[wrong_role_response, totp_response],
+            ) as request_get:
+                code = mailbox.get_totp_code(account)
+
+            self.assertEqual(code, "654321")
+            self.assertEqual(request_get.call_count, 2)
+            self.assertIn(
+                "oauth.example.test/api/v1/2fa",
+                request_get.call_args_list[0].args[0],
+            )
+            self.assertIn(
+                "2fa.example.test/api/v1/2fa",
+                request_get.call_args_list[1].args[0],
+            )
+            self.assertEqual(account.extra["totp_url"], totp_url)
+            self.assertEqual(account.extra["mail_api_url"], mail_url)
+            self.assertEqual(account.extra["mailapi_url"], mail_url)
+            rendered_logs = "\n".join(logs)
+            self.assertIn("自动识别反向 URL 字段顺序", rendered_logs)
+            self.assertNotIn("MAIL_SECRET", rendered_logs)
+            self.assertNotIn("TOTP_SECRET", rendered_logs)
+            self.assertNotIn("654321", rendered_logs)
+
     def test_remote_totp_failure_is_redacted(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
