@@ -4826,6 +4826,55 @@ class OutlookMailbox(BaseMailbox):
             candidates.append(key)
         return candidates
 
+    @staticmethod
+    def _redact_oauth_error_detail(value: Any, *secrets: str) -> str:
+        import re
+
+        detail = str(value or "")
+        for secret in secrets:
+            normalized = str(secret or "").strip()
+            if normalized:
+                detail = detail.replace(normalized, "***")
+        detail = re.sub(
+            r"(?i)(\b(?:access_token|refresh_token|id_token|client_secret|password|assertion)\b\s*[\"']?\s*[:=]\s*[\"']?)[^\s\"',}&]+",
+            r"\1***",
+            detail,
+        )
+        detail = re.sub(
+            r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+",
+            r"\1***",
+            detail,
+        )
+        return detail[:500]
+
+    def _oauth_error_detail(self, response: Any, *secrets: str) -> str:
+        payload: dict[str, Any] = {}
+        try:
+            parsed = response.json()
+            if isinstance(parsed, dict):
+                payload = parsed
+        except Exception:
+            try:
+                parsed = json.loads(str(getattr(response, "text", "") or ""))
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+
+        parts = []
+        error = str(payload.get("error") or "").strip()
+        description = str(payload.get("error_description") or "").strip()
+        if error:
+            parts.append(error)
+        if description:
+            parts.append(description)
+        error_codes = payload.get("error_codes")
+        if isinstance(error_codes, list) and error_codes:
+            parts.append(f"error_code={error_codes[0]}")
+        if not parts:
+            parts.append(f"HTTP {getattr(response, 'status_code', 0) or 0}")
+        return self._redact_oauth_error_detail(": ".join(parts), *secrets)
+
     def probe_oauth_availability(
         self,
         *,
@@ -4875,16 +4924,20 @@ class OutlookMailbox(BaseMailbox):
                         f"email={email} endpoint={endpoint} scope_label={scope_label} status={resp.status_code}"
                     )
                 except Exception as exc:
-                    last_error = str(exc)
+                    last_error = self._redact_oauth_error_detail(
+                        exc,
+                        refresh_token,
+                    )
                     self._log(
                         "[微软邮箱] OAuth token 请求异常: "
-                        f"email={email} endpoint={endpoint} scope_label={scope_label} error={exc}"
+                        f"email={email} endpoint={endpoint} scope_label={scope_label} error={last_error}"
                     )
                     continue
 
-                body_text = str(resp.text or "")[:500]
+                body_text = str(resp.text or "")
                 if resp.status_code >= 400:
-                    self._log(f"[微软邮箱] OAuth token 失败响应: {body_text[:200]}")
+                    safe_error = self._oauth_error_detail(resp, refresh_token)
+                    self._log(f"[微软邮箱] OAuth token 失败响应: {safe_error[:200]}")
                     lowered = body_text.lower()
                     if "invalid_grant" in lowered and "service abuse mode" in lowered:
                         return {
@@ -4895,7 +4948,7 @@ class OutlookMailbox(BaseMailbox):
                             "endpoint": endpoint,
                             "scope_label": scope_label,
                         }
-                    last_error = body_text or f"HTTP {resp.status_code}"
+                    last_error = safe_error
                     continue
 
                 try:
@@ -4915,6 +4968,9 @@ class OutlookMailbox(BaseMailbox):
                             "reason": "ok",
                             "message": "微软邮箱可用性检测通过",
                             "access_token": access_token,
+                            "refresh_token": str(
+                                data.get("refresh_token") or refresh_token
+                            ).strip(),
                             "scope_label": scope_label,
                             "endpoint": endpoint,
                             "expires_in": expires_in_value,
@@ -4923,12 +4979,12 @@ class OutlookMailbox(BaseMailbox):
                     self._log(
                         f"[微软邮箱] OAuth token 响应未包含 access_token: keys={sorted(list(data.keys()))[:10]}"
                     )
-                    last_error = body_text or "OAuth 响应未包含 access_token"
+                    last_error = "OAuth 响应未包含 access_token"
                 except Exception as exc:
-                    last_error = body_text or str(exc) or "OAuth 响应解析失败"
+                    last_error = "OAuth 响应解析失败"
                     self._log(
                         "[微软邮箱] OAuth token 响应解析异常: "
-                        f"email={email} endpoint={endpoint} scope_label={scope_label} error={exc}"
+                        f"email={email} endpoint={endpoint} scope_label={scope_label} error={type(exc).__name__ or 'Error'}"
                     )
                     continue
 
@@ -4955,6 +5011,9 @@ class OutlookMailbox(BaseMailbox):
         if probe.get("ok"):
             return {
                 "access_token": str(probe.get("access_token") or ""),
+                "refresh_token": str(
+                    probe.get("refresh_token") or refresh_token
+                ).strip(),
                 "scope_label": probe.get("scope_label", ""),
                 "expires_in": probe.get("expires_in", 0),
                 "endpoint": probe.get("endpoint", ""),
@@ -5015,6 +5074,10 @@ class OutlookMailbox(BaseMailbox):
             reason = bundle.get("reason", "")
             suffix = f" [{reason}]" if reason else ""
             raise RuntimeError(f"微软邮箱 OAuth access token 获取失败{suffix}")
+
+        rotated_refresh_token = str(bundle.get("refresh_token") or "").strip()
+        if rotated_refresh_token and rotated_refresh_token != refresh_token:
+            extra["refresh_token"] = rotated_refresh_token
 
         expires_in = bundle.get("expires_in")
         try:

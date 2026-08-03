@@ -486,12 +486,56 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertIn("service abuse mode", result["message"])
 
     @mock.patch("requests.post")
+    def test_probe_oauth_availability_redacts_refresh_token_from_failure(self, mock_post):
+        mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
+        logs = []
+        mailbox._log_fn = logs.append
+        secret = "sensitive-refresh-token"
+        mock_post.return_value = _FakeResponse(
+            400,
+            payload={
+                "error": "invalid_grant",
+                "error_description": (
+                    f"Rejected refresh_token={secret} "
+                    "access_token=server-access-secret "
+                    "Bearer server-bearer-secret"
+                ),
+            },
+            text=(
+                '{"error":"invalid_grant","error_description":'
+                f'"Rejected refresh_token={secret} '
+                'access_token=server-access-secret '
+                'Bearer server-bearer-secret"}'
+            ),
+        )
+
+        result = mailbox.probe_oauth_availability(
+            email="demo@hotmail.com",
+            client_id="client-id",
+            refresh_token=secret,
+        )
+
+        rendered = "\n".join(logs) + json.dumps(result)
+        self.assertFalse(result["ok"])
+        self.assertIn("invalid_grant", rendered)
+        for sensitive_value in (
+            secret,
+            "server-access-secret",
+            "server-bearer-secret",
+        ):
+            self.assertNotIn(sensitive_value, rendered)
+
+    @mock.patch("requests.post")
     def test_probe_oauth_availability_returns_ok_when_access_token_is_obtained(self, mock_post):
         mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
         mock_post.return_value = _FakeResponse(
             200,
-            payload={"access_token": "ok-token", "expires_in": 3600},
-            text='{"access_token":"ok-token","expires_in":3600}',
+            payload={
+                "access_token": "ok-token",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": 3600,
+            },
+            text='{"access_token":"ok-token","refresh_token":"rotated-refresh-token","expires_in":3600}',
         )
 
         result = mailbox.probe_oauth_availability(
@@ -503,6 +547,71 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["reason"], "ok")
         self.assertEqual(result["access_token"], "ok-token")
+        self.assertEqual(result["refresh_token"], "rotated-refresh-token")
+
+    @mock.patch("requests.post")
+    def test_probe_oauth_availability_keeps_original_refresh_token_when_not_rotated(
+        self,
+        mock_post,
+    ):
+        mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
+        mock_post.return_value = _FakeResponse(
+            200,
+            payload={"access_token": "ok-token", "expires_in": 3600},
+            text='{"access_token":"ok-token","expires_in":3600}',
+        )
+
+        result = mailbox.probe_oauth_availability(
+            email="demo@outlook.com",
+            client_id="client-id",
+            refresh_token="original-refresh-token",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["refresh_token"], "original-refresh-token")
+
+    def test_get_oauth_access_token_keeps_rotated_refresh_token_on_account(self):
+        mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
+        account = MailboxAccount(
+            email="demo@outlook.com",
+            extra={
+                "client_id": "client-id",
+                "refresh_token": "original-refresh-token",
+            },
+        )
+
+        with mock.patch.object(
+            mailbox,
+            "_fetch_oauth_token_bundle",
+            return_value={
+                "access_token": "access-token",
+                "refresh_token": "rotated-refresh-token",
+                "expires_in": 3600,
+                "scope_label": "graph_default",
+            },
+        ):
+            token = mailbox._get_oauth_access_token(account)
+
+        self.assertEqual(token, "access-token")
+        self.assertEqual(
+            account.extra["refresh_token"],
+            "rotated-refresh-token",
+        )
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        with mock.patch("core.db.engine", test_engine):
+            mailbox.requeue_account(account)
+        with Session(test_engine) as session:
+            persisted = session.exec(
+                select(OutlookAccountModel).where(
+                    OutlookAccountModel.email == "demo@outlook.com"
+                )
+            ).one()
+        self.assertEqual(persisted.refresh_token, "rotated-refresh-token")
 
     @mock.patch("requests.post")
     @mock.patch("requests.request")

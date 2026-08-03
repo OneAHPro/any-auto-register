@@ -356,7 +356,13 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
             }
 
         if result.get("ok"):
-            return {"ok": True, "message": "ok"}
+            return {
+                "ok": True,
+                "message": "ok",
+                "refresh_token": str(
+                    result.get("refresh_token") or record.refresh_token
+                ).strip(),
+            }
         return {
             "ok": False,
             "message": f"行 {record.line_number}: {result.get('message') or '微软邮箱可用性检测未通过'}",
@@ -514,6 +520,9 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                 failed += 1
                 errors.append(str(check_result.get("message") or f"行 {record.line_number}: 导入失败"))
                 continue
+            refreshed_token = str(check_result.get("refresh_token") or "").strip()
+            if refreshed_token:
+                record.refresh_token = refreshed_token
             passed_records.append(record)
 
         with Session(engine) as session:

@@ -7,9 +7,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import SQLModel, Session, create_engine, select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from core.db import OutlookAccountModel
 
 
 def load_microsoft_import_rules_module():
@@ -335,10 +337,24 @@ class MailImportServiceTests(unittest.TestCase):
                 with patch("services.mail_imports.providers.engine", test_engine), \
                      patch("services.mail_imports.providers.OutlookMailbox") as mailbox_cls:
                     mailbox = mailbox_cls.return_value
-                    mailbox.probe_oauth_availability.side_effect = [
-                        {"ok": True, "reason": "ok", "message": "微软邮箱可用性检测通过", "access_token": "token-a"},
-                        {"ok": False, "reason": "service_abuse_mode", "message": "微软邮箱可用性检测未通过，账号处于 service abuse mode"},
-                    ]
+                    def probe_oauth_availability(**kwargs):
+                        if kwargs.get("email") == "first@outlook.com":
+                            return {
+                                "ok": True,
+                                "reason": "ok",
+                                "message": "微软邮箱可用性检测通过",
+                                "access_token": "token-a",
+                                "refresh_token": "rotated-refresh-a",
+                            }
+                        return {
+                            "ok": False,
+                            "reason": "service_abuse_mode",
+                            "message": "微软邮箱可用性检测未通过，账号处于 service abuse mode",
+                        }
+
+                    mailbox.probe_oauth_availability.side_effect = (
+                        probe_oauth_availability
+                    )
 
                     response = strategy.execute(
                         MailImportExecuteRequest(
@@ -357,6 +373,13 @@ class MailImportServiceTests(unittest.TestCase):
                     self.assertEqual(response.snapshot.count, 1)
                     self.assertEqual(response.snapshot.items[0].email, "first@outlook.com")
                     self.assertIn("service abuse mode", response.errors[0])
+                    with Session(test_engine) as session:
+                        imported = session.exec(
+                            select(OutlookAccountModel).where(
+                                OutlookAccountModel.email == "first@outlook.com"
+                            )
+                        ).one()
+                    self.assertEqual(imported.refresh_token, "rotated-refresh-a")
             finally:
                 test_engine.dispose()
 
