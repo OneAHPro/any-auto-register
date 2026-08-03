@@ -2,6 +2,7 @@ import threading
 import time
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -11,6 +12,8 @@ from sqlmodel import Session, SQLModel, create_engine
 from core.base_mailbox import MailboxAccount
 from core.db import AccountModel, OutlookAccountModel
 from core.task_runtime import RegisterTaskControl, StopTaskRequested
+from platforms.chatgpt.oauth_client import OAuthClient
+from platforms.chatgpt.utils import FlowState
 from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
 from services.chatgpt_relogin import (
     _build_email_service,
@@ -1093,6 +1096,160 @@ class ChatGPTReloginTests(unittest.TestCase):
             self.assertEqual(saved.token, "old-at")
             self.assertEqual(saved.get_extra()["refresh_token"], "old-rt")
 
+    def test_password_verify_deactivation_removes_account_through_login_stack(self):
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"message":'
+            '"You do not have an account because it has been deleted or deactivated. '
+            'If you believe this was an error, please contact us through our help center."}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "You do not have an account because it has been deleted or "
+                    "deactivated. If you believe this was an error, please contact "
+                    "us through our help center."
+                ),
+            }
+        }
+
+        oauth_client = OAuthClient({}, verbose=False)
+        oauth_client.session.post = mock.Mock(return_value=response)
+        oauth_client._recreate_session = mock.Mock()
+        oauth_client._bootstrap_oauth_session = mock.Mock(
+            return_value="https://auth.openai.com/log-in/password"
+        )
+        oauth_client._submit_authorize_continue = mock.Mock(
+            return_value=FlowState(
+                page_type="login_password",
+                current_url="https://auth.openai.com/log-in/password",
+                continue_url="https://auth.openai.com/log-in/password",
+            )
+        )
+
+        email_service = mock.Mock()
+        email_service.service_type = SimpleNamespace(value="fixture")
+        email_service.create_email.return_value = {"email": "demo@example.com"}
+        sync = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_relogin.engine",
+            self.engine,
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=email_service,
+        ), mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine."
+            "RefreshTokenRegistrationEngine._build_oauth_client",
+            return_value=oauth_client,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_password_verify_nested_error_type_is_explicit_deactivation(self):
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = '{"error":{"type":"account_deactivated"}}'
+        response.json.return_value = {
+            "error": {
+                "type": "account_deactivated",
+                "message": "Account unavailable",
+            }
+        }
+        oauth_client = OAuthClient({}, verbose=False)
+        oauth_client.session.post = mock.Mock(return_value=response)
+        oauth_client._browser_pause = mock.Mock()
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ):
+            with self.assertRaises(ChatGPTAccountDeactivatedError):
+                oauth_client._submit_password_verify(
+                    "saved-password",
+                    "device-id",
+                )
+
+    def test_password_verify_diagnostic_does_not_remove_account_through_login_stack(self):
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"message":"diagnostic: upstream did not say account '
+            'has been deleted or deactivated"}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "diagnostic: upstream did not say account has been deleted "
+                    "or deactivated"
+                ),
+            }
+        }
+
+        oauth_client = OAuthClient({}, verbose=False)
+        oauth_client.session.post = mock.Mock(return_value=response)
+        oauth_client._recreate_session = mock.Mock()
+        oauth_client._bootstrap_oauth_session = mock.Mock(
+            return_value="https://auth.openai.com/log-in/password"
+        )
+        oauth_client._submit_authorize_continue = mock.Mock(
+            return_value=FlowState(
+                page_type="login_password",
+                current_url="https://auth.openai.com/log-in/password",
+                continue_url="https://auth.openai.com/log-in/password",
+            )
+        )
+
+        email_service = mock.Mock()
+        email_service.service_type = SimpleNamespace(value="fixture")
+        email_service.create_email.return_value = {"email": "demo@example.com"}
+        sync = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_relogin.engine",
+            self.engine,
+        ), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=email_service,
+        ), mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine."
+            "RefreshTokenRegistrationEngine._build_oauth_client",
+            return_value=oauth_client,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertNotIn("account_removed", result)
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
+
     def test_deactivated_signal_from_login_log_interrupts_and_deletes_account(self):
         logs = []
         sync = mock.Mock()
@@ -1254,6 +1411,45 @@ class ChatGPTReloginTests(unittest.TestCase):
             replacement = session.get(AccountModel, self.account_id)
             self.assertIsNotNone(replacement)
             self.assertEqual(replacement.email, "replacement@example.com")
+
+    def test_concurrent_same_row_refresh_prevents_stale_deactivation_delete(self):
+        sync = mock.Mock()
+        concurrent_updated_at = datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc)
+
+        def login(saved, **kwargs):
+            with Session(self.engine) as session:
+                current = session.get(AccountModel, self.account_id)
+                current.token = "concurrent-access-token"
+                current.updated_at = concurrent_updated_at
+                extra = dict(current.get_extra() or {})
+                extra["refresh_token"] = "concurrent-refresh-token"
+                current.set_extra(extra)
+                session.add(current)
+                session.commit()
+            kwargs["log_fn"]("账号已被删除或停用")
+            raise ChatGPTAccountDeactivatedError()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["account_removed"])
+        self.assertEqual(result["stage"], "account_remove_failed")
+        self.assertIn("记录已发生变化", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            current = session.get(AccountModel, self.account_id)
+            self.assertIsNotNone(current)
+            self.assertEqual(current.token, "concurrent-access-token")
+            self.assertEqual(
+                current.get_extra()["refresh_token"],
+                "concurrent-refresh-token",
+            )
 
     def test_reused_account_id_does_not_receive_fresh_tokens_or_sync(self):
         sync = mock.Mock(

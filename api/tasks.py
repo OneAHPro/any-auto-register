@@ -41,6 +41,7 @@ CHATGPT_SMS_POOL_ITEM_IDS_KEY = "chatgpt_sms_pool_item_ids"
 CHATGPT_RETRY_BINDINGS_KEY = "chatgpt_retry_bindings"
 CHATGPT_MAIL_PROVIDER_PLAN_KEY = "chatgpt_existing_account_mail_provider_plan"
 CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
+CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS = 45.0
 MAX_PERSISTED_TASK_LOG_ENTRIES = 500
 MAX_PERSISTED_TASK_LOG_BYTES = 256 * 1024
 TASK_SNAPSHOT_PERSIST_INTERVAL_SECONDS = 1.0
@@ -67,6 +68,8 @@ _task_snapshot_write_locks: dict[str, threading.Lock] = {}
 _automation_stop_watchdog_lock = threading.Lock()
 _automation_runner_active_tasks: set[str] = set()
 _automation_stop_watchdog_tasks: dict[str, threading.Event] = {}
+_sms_pool_quarantine_lock = threading.Lock()
+_sms_pool_quarantine_item_ids_by_task: dict[str, set[int]] = {}
 
 
 def _automation_force_stop_seconds() -> float:
@@ -1167,7 +1170,7 @@ def _create_chatgpt_relogin_task_record(
         account_count=len(normalized_ids),
     )
     task_meta = {
-        "mode": "relogin",
+        "mode": "remote_auth_monitor" if automation else "relogin",
         "automation": automation,
         "account_ids": normalized_ids,
         "concurrency": effective_concurrency,
@@ -1345,9 +1348,22 @@ def _chatgpt_task_observation(
     if str(snapshot.get("platform") or "") != "chatgpt":
         return None
     status = str(snapshot.get("status") or "")
+    updated_at = _as_aware_utc(snapshot.get("updated_at"))
+    meta = snapshot.get("meta") if isinstance(snapshot.get("meta"), dict) else {}
+    raw_completed_at = meta.get("completed_at")
+    has_completed_at = raw_completed_at is not None and bool(
+        str(raw_completed_at).strip()
+    )
+    completed_at = (
+        _as_aware_utc(raw_completed_at)
+        if status in {"done", "failed", "stopped"}
+        and has_completed_at
+        else updated_at
+    )
     return {
         "status": status,
-        "updated_at": _as_aware_utc(snapshot.get("updated_at")),
+        "completed_at": completed_at,
+        "updated_at": updated_at,
         "live": memory and status in {"pending", "running"},
         "orphaned": bool(orphaned),
     }
@@ -2109,27 +2125,117 @@ def _complete_chatgpt_leadbee_verification(
     attempt_id: int | None,
 ) -> dict:
     """Enter one of LeadBee's five provider slots and wait for completion."""
-    from services.chatgpt_phone_verification import leadbee_phone_flow_lock
+    from services.chatgpt_phone_verification import (
+        LEADBEE_PROVIDER_SLOT_WAIT_SECONDS,
+        leadbee_phone_flow_lock,
+        phone_verification_manager,
+    )
 
-    while not leadbee_phone_flow_lock.acquire(timeout=0.25):
+    slot_deadline = (
+        time.monotonic() + LEADBEE_PROVIDER_SLOT_WAIT_SECONDS
+    )
+    acquired_provider_slot = leadbee_phone_flow_lock.acquire(blocking=False)
+    while not acquired_provider_slot:
         control.checkpoint(attempt_id=attempt_id)
+        remaining = slot_deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
+            )
+        acquired_provider_slot = leadbee_phone_flow_lock.acquire(
+            timeout=min(0.25, remaining)
+        )
+    provider_slot_handed_off = False
+    provider_slot_released = False
+    provider_session_id = ""
+    result: dict = {}
+
+    def _tracked_provider_start() -> None:
+        if callable(on_provider_start):
+            on_provider_start()
+
+    def _mark_provider_slot_handed_off(session_id: str = "") -> None:
+        nonlocal provider_slot_handed_off, provider_session_id
+        provider_slot_handed_off = True
+        provider_session_id = str(session_id or "").strip()
+
+    def _release_reused_provider_slot() -> None:
+        nonlocal provider_slot_released
+        if acquired_provider_slot and not provider_slot_released:
+            leadbee_phone_flow_lock.release()
+            provider_slot_released = True
+
     try:
         # A task may be stopped while this attempt waits behind the active card.
         # Check once more before handing a fresh exchange code to LeadBee.
         control.checkpoint(attempt_id=attempt_id)
-        return _complete_chatgpt_leadbee_verification_serialized(
+        result = _complete_chatgpt_leadbee_verification_serialized(
             task_id=task_id,
             account_id=account_id,
             leadbee_code=leadbee_code,
             leadbee_base_url=leadbee_base_url,
-            on_provider_start=on_provider_start,
+            on_provider_start=(
+                _tracked_provider_start if callable(on_provider_start) else None
+            ),
             on_exchange_code_consumed=on_exchange_code_consumed,
             on_exchange_code_restored=on_exchange_code_restored,
+            on_provider_lock_handoff=_mark_provider_slot_handed_off,
+            on_provider_lock_reuse=_release_reused_provider_slot,
             control=control,
             attempt_id=attempt_id,
         )
+        return result
+    except (StopTaskRequested, SkipCurrentAttemptRequested):
+        raise
+    except Exception as exc:
+        if not provider_slot_handed_off:
+            raise
+        _append_task_log_best_effort(
+            task_id,
+            "  [接码] LeadBee 状态读取异常，改为直接等待后台 worker 清理终态"
+            f"（{type(exc).__name__}）",
+        )
+        # Ownership was transferred to the manager worker. Do not let the
+        # attempt/final task cleanup release its pool card until that worker
+        # has released the permit and published a definitive settlement.
+        fallback_finalization_deadline: float | None = None
+        while True:
+            cleanup = phone_verification_manager.wait_for_provider_cleanup(
+                int(account_id),
+                provider_session_id,
+                timeout=0.25,
+            )
+            cleanup_status = str(
+                cleanup.get("status") or ""
+            ).strip().lower()
+            if cleanup_status == "persisting":
+                now = time.monotonic()
+                if fallback_finalization_deadline is None:
+                    fallback_finalization_deadline = (
+                        now + CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS
+                    )
+                if now >= fallback_finalization_deadline:
+                    return {
+                        **dict(cleanup),
+                        "status": "failed",
+                        "message": (
+                            "Refresh Token 本地保存超过等待期限，尚未确认成功；"
+                            "任务已停止等待，账号状态将在后续巡检中重新确认"
+                        ),
+                        "finalization_pending": True,
+                    }
+            if (
+                bool(cleanup.get("provider_cleanup_settled", False))
+                and cleanup_status in {"completed", "failed", "expired"}
+            ):
+                return dict(cleanup)
     finally:
-        leadbee_phone_flow_lock.release()
+        if (
+            acquired_provider_slot
+            and not provider_slot_handed_off
+            and not provider_slot_released
+        ):
+            leadbee_phone_flow_lock.release()
 
 
 def _complete_chatgpt_leadbee_verification_serialized(
@@ -2141,6 +2247,8 @@ def _complete_chatgpt_leadbee_verification_serialized(
     on_provider_start=None,
     on_exchange_code_consumed=None,
     on_exchange_code_restored=None,
+    on_provider_lock_handoff=None,
+    on_provider_lock_reuse=None,
     control,
     attempt_id: int | None,
 ) -> dict:
@@ -2158,10 +2266,106 @@ def _complete_chatgpt_leadbee_verification_serialized(
         start_kwargs["on_provider_start"] = on_provider_start
     if callable(on_exchange_code_restored):
         start_kwargs["on_exchange_code_restored"] = on_exchange_code_restored
+    if callable(on_provider_lock_handoff):
+        start_kwargs["on_provider_lock_handoff"] = on_provider_lock_handoff
     snapshot = phone_verification_manager.start(int(account_id), **start_kwargs)
     session_id = str(snapshot.get("session_id") or "").strip()
     if not session_id:
         raise RuntimeError("LeadBee 自动接码会话启动失败")
+    if bool(snapshot.get("reused", False)):
+        if callable(on_provider_lock_reuse):
+            on_provider_lock_reuse()
+        lifecycle_callbacks_present = any(
+            callable(callback)
+            for callback in (
+                on_provider_start,
+                on_exchange_code_consumed,
+                on_exchange_code_restored,
+            )
+        )
+        if lifecycle_callbacks_present:
+            # The existing broker owns a different callback lifecycle. It is
+            # unsafe to bind a newly reserved pool row to that old worker.
+            # Reconcile only the state already published by that broker; never
+            # attach callbacks that could fire later in a different task.
+            callback_errors: list[str] = []
+
+            def replay_callback(name: str, callback) -> None:
+                if not callable(callback):
+                    return
+                try:
+                    callback()
+                except Exception as exc:
+                    callback_errors.append(f"{name}:{type(exc).__name__}")
+
+            settlement = str(
+                snapshot.get("exchange_code_settlement") or ""
+            ).strip().lower()
+            existing_provider_started = bool(snapshot.get("provider_started"))
+            existing_cleanup_settled = bool(
+                snapshot.get("provider_cleanup_settled", False)
+            )
+            known_settlements = {"restored", "consumed", "unusable"}
+            safe_without_provider_start = bool(
+                not existing_provider_started
+                and existing_cleanup_settled
+                and not settlement
+            )
+            must_quarantine = bool(
+                settlement == "active_unknown"
+                or (
+                    settlement not in known_settlements
+                    and not safe_without_provider_start
+                )
+            )
+
+            if existing_provider_started or must_quarantine:
+                replay_callback("provider_start", on_provider_start)
+            if settlement == "restored":
+                replay_callback("restored", on_exchange_code_restored)
+            elif settlement in {"consumed", "unusable"}:
+                replay_callback("consumed", on_exchange_code_consumed)
+
+            effective_settlement = (
+                "active_unknown" if must_quarantine else settlement
+            )
+            effective_provider_started = bool(
+                existing_provider_started or must_quarantine
+            )
+            return {
+                **dict(snapshot),
+                "session_id": session_id,
+                "status": "failed",
+                "message": (
+                    "同一 LeadBee 卡密已有独立会话在运行；"
+                    + (
+                        "当前任务的卡密副本已隔离，未接管旧会话"
+                        if must_quarantine
+                        else "当前任务已按旧会话的已知卡密终态安全结算"
+                    )
+                ),
+                "provider_started": effective_provider_started,
+                "provider_cleanup_settled": True,
+                "existing_provider_cleanup_settled": existing_cleanup_settled,
+                "exchange_code_settlement": effective_settlement,
+                "exchange_code_restoration_confirmed": (
+                    settlement == "restored"
+                ),
+                "exchange_code_consumed": settlement == "consumed",
+                "exchange_code_unusable": settlement == "unusable",
+                "reused": True,
+                "ownership_conflict": True,
+                "lifecycle_callback_errors": callback_errors,
+                "provider_start_callback_error": next(
+                    (
+                        error.split(":", 1)[1]
+                        for error in callback_errors
+                        if error.startswith("provider_start:")
+                    ),
+                    "",
+                ),
+                "logs": list(snapshot.get("logs") or []),
+            }
 
     def cancel_phone_session(message: str) -> dict | None:
         try:
@@ -2177,6 +2381,9 @@ def _complete_chatgpt_leadbee_verification_serialized(
     forwarded_logs = 0
     waiting_for_finalization = False
     control_request_deferred = False
+    deadline_cancel_requested = False
+    cleanup_wait_logged = False
+    finalization_deadline: float | None = None
     expires_in = max(1, int(snapshot.get("expires_in") or 600))
     deadline = time.monotonic() + expires_in + 5
     while True:
@@ -2189,16 +2396,71 @@ def _complete_chatgpt_leadbee_verification_serialized(
         forwarded_logs = max(forwarded_logs, len(logs))
 
         status = str(snapshot.get("status") or "").strip().lower()
-        if status in {"completed", "failed", "expired"}:
+        terminal = status in {"completed", "failed", "expired"}
+        cleanup_settled = bool(
+            snapshot.get("provider_cleanup_settled", False)
+        )
+        if status == "persisting":
+            finalization_now = time.monotonic()
+            if (
+                not deadline_cancel_requested
+                and finalization_now >= deadline
+            ):
+                cancelled = cancel_phone_session(
+                    "LeadBee 自动接码等待超时，后台任务已取消"
+                )
+                deadline_cancel_requested = True
+                if cancelled is not None:
+                    snapshot = cancelled
+            if finalization_deadline is None:
+                finalization_deadline = (
+                    finalization_now + CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS
+                )
+                _log(
+                    task_id,
+                    "  [接码] LeadBee 已结束，正在确认 Refresh Token 本地保存",
+                )
+            if not control_request_deferred:
+                try:
+                    control.checkpoint(attempt_id=attempt_id)
+                except (StopTaskRequested, SkipCurrentAttemptRequested):
+                    _log(
+                        task_id,
+                        "  [接码] 已收到任务控制请求；Refresh Token 正在提交，"
+                        "为避免把已消费卡密误判失败，将等待本次保存确认或达到保存期限",
+                    )
+                    control_request_deferred = True
+            waiting_for_finalization = True
+            if finalization_now >= finalization_deadline:
+                return {
+                    **dict(snapshot),
+                    "status": "failed",
+                    "message": (
+                        "Refresh Token 本地保存超过等待期限，尚未确认成功；"
+                        "任务已停止等待，账号状态将在后续巡检中重新确认"
+                    ),
+                    "provider_cleanup_settled": cleanup_settled,
+                    "finalization_pending": True,
+                }
+        if terminal and cleanup_settled:
             return dict(snapshot)
+        if terminal and not cleanup_settled and not cleanup_wait_logged:
+            _log(
+                task_id,
+                "  [接码] 业务结果已结束，正在等待 LeadBee 后台清理确认终态",
+            )
+            cleanup_wait_logged = True
         if (
-            not waiting_for_finalization
+            not terminal
+            and not waiting_for_finalization
             and not control_request_deferred
+            and not deadline_cancel_requested
             and time.monotonic() >= deadline
         ):
             cancelled = cancel_phone_session(
                 "LeadBee 自动接码等待超时，后台任务已取消"
             )
+            deadline_cancel_requested = True
             cancelled_status = str(
                 (cancelled or {}).get("status") or ""
             ).strip().lower()
@@ -2206,6 +2468,11 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 snapshot = cancelled or snapshot
                 waiting_for_finalization = cancelled_status == "persisting"
                 if waiting_for_finalization:
+                    if finalization_deadline is None:
+                        finalization_deadline = (
+                            time.monotonic()
+                            + CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS
+                        )
                     _log(
                         task_id,
                         "  [接码] Refresh Token 正在安全保存，等待当前账号完成后再结束任务",
@@ -2213,19 +2480,24 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 continue
             if cancelled is not None:
                 snapshot = cancelled
-            if bool(snapshot.get("provider_cleanup_settled", False)):
+            if (
+                str(snapshot.get("status") or "").strip().lower()
+                in {"completed", "failed", "expired"}
+                and bool(snapshot.get("provider_cleanup_settled", False))
+            ):
                 return dict(snapshot)
-            return {
-                **dict(snapshot),
-                "status": "failed",
-                "message": (
-                    "LeadBee 自动接码等待超时，服务端未确认卡密恢复，"
-                    "卡密不可复用"
-                ),
-                "exchange_code_unusable": True,
-            }
+            _log(
+                task_id,
+                "  [接码] 已请求结束超时会话，继续等待服务端清理确认；"
+                "期间不会释放卡密或并发槽位",
+            )
+            continue
 
-        if not waiting_for_finalization and not control_request_deferred:
+        if (
+            not terminal
+            and not waiting_for_finalization
+            and not control_request_deferred
+        ):
             try:
                 control.checkpoint(attempt_id=attempt_id)
             except (StopTaskRequested, SkipCurrentAttemptRequested) as exc:
@@ -2241,11 +2513,34 @@ def _complete_chatgpt_leadbee_verification_serialized(
         try:
             snapshot = phone_verification_manager.status(int(account_id), session_id)
         except ValueError as exc:
-            return {
+            fallback = {
                 **dict(snapshot),
                 "status": "failed",
                 "message": _redact_task_secret(exc, leadbee_code),
+                # Automatic sessions are retired only after the worker has
+                # released its provider permit and published cleanup. A
+                # missing session here therefore settled between snapshots.
+                "provider_cleanup_settled": True,
             }
+            if (
+                bool(snapshot.get("provider_started"))
+                and not bool(snapshot.get("exchange_code_consumed"))
+                and not bool(snapshot.get("exchange_code_unusable"))
+                and not bool(
+                    snapshot.get("exchange_code_restoration_confirmed")
+                )
+                and str(
+                    snapshot.get("exchange_code_settlement") or ""
+                ).strip().lower()
+                not in {"restored", "consumed", "unusable"}
+            ):
+                fallback["exchange_code_settlement"] = "active_unknown"
+                fallback["exchange_code_unusable"] = False
+                fallback["message"] = (
+                    "LeadBee 会话记录已结束，但服务端卡密终态不可确认；"
+                    "卡密保持隔离等待人工核对"
+                )
+            return fallback
 
 
 def _reload_saved_account(account_id: int, fallback):
@@ -2291,6 +2586,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         return _run_register_inner(task_id, req)
 
     uses_sms_pool = _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
+    if uses_sms_pool:
+        with _sms_pool_quarantine_lock:
+            _sms_pool_quarantine_item_ids_by_task[task_id] = set()
     lease: object | None = None
     try:
         control = _task_store.control_for(task_id)
@@ -2315,7 +2613,20 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     finally:
         try:
             if uses_sms_pool:
-                sms_pool_service.release_task(task_id)
+                with _sms_pool_quarantine_lock:
+                    quarantine_item_ids = (
+                        _sms_pool_quarantine_item_ids_by_task.pop(
+                            task_id,
+                            set(),
+                        )
+                    )
+                if quarantine_item_ids:
+                    sms_pool_service.release_task(
+                        task_id,
+                        quarantine_item_ids=quarantine_item_ids,
+                    )
+                else:
+                    sms_pool_service.release_task(task_id)
         finally:
             if lease is not None:
                 chatgpt_task_gate.leave_foreground(lease)
@@ -2334,6 +2645,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     from services.chatgpt_account_state import chatgpt_account_refresh_token
 
     control = _task_store.control_for(task_id)
+    with _sms_pool_quarantine_lock:
+        quarantine_item_ids = _sms_pool_quarantine_item_ids_by_task.get(task_id)
+    if quarantine_item_ids is None:
+        quarantine_item_ids = set()
+    quarantine_item_ids_lock = threading.Lock()
     _task_store.mark_running(task_id)
     _persist_task_snapshot(task_id)
     success = 0
@@ -2493,6 +2809,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             saved_account_created_by_attempt = False
             saved_account_extra_snapshot: str | None = None
             phone_flow_completed = False
+            phone_background_ownership_pending = False
             retry_binding = _retry_bindings[i] if _retry_bindings else {}
             bound_email = str(retry_binding.get("email") or "").strip()
             bound_mail_provider = str(
@@ -2503,6 +2820,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             sms_pool_item_id = _sms_pool_item_ids[i] if _use_sms_pool else 0
             sms_pool_consumed = False
             sms_pool_restoration_confirmed = False
+            sms_pool_settlement_pending = False
             parent_binding_id = int(retry_binding.get("id") or 0)
             current_email = bound_email or req.email or ""
             current_stage = "login"
@@ -2890,6 +3208,24 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 False,
                             )
                         )
+                        exchange_code_settlement = str(
+                            phone_result.get("exchange_code_settlement") or ""
+                        ).strip().lower()
+                        sms_pool_settlement_pending = (
+                            exchange_code_settlement == "active_unknown"
+                            or (
+                                bool(phone_result.get("provider_started"))
+                                and exchange_code_settlement
+                                not in {"restored", "consumed", "unusable"}
+                            )
+                        )
+                        if sms_pool_settlement_pending and active_pool_item_id:
+                            with quarantine_item_ids_lock:
+                                quarantine_item_ids.add(active_pool_item_id)
+                        phone_background_ownership_pending = bool(
+                            phone_result.get("finalization_pending", False)
+                            or phone_result.get("ownership_conflict", False)
+                        )
                         exchange_code_consumed = bool(
                             phone_result.get("exchange_code_consumed", False)
                             or (
@@ -2994,6 +3330,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         sms_pool_item_id = int(replacement.id or 0)
                         sms_pool_consumed = False
                         sms_pool_restoration_confirmed = False
+                        sms_pool_settlement_pending = False
                         _log(
                             task_id,
                             "  [接码] 当前卡不可用于本轮会话，已为同一邮箱"
@@ -3034,7 +3371,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "exchange_code_consumed": exchange_code_consumed,
                             },
                         )
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        if phone_background_ownership_pending:
+                            _log(
+                                task_id,
+                                "[WARN] 后台手机验证会话仍持有当前账号；"
+                                "保留账号与邮箱凭据，不回池、不删除，等待后续巡检确认",
+                            )
+                        else:
+                            _requeue_chatgpt_login_mailbox(_mailbox, account)
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -3168,7 +3512,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     error=str(e),
                 )
                 if _bind_phone_and_get_rt:
-                    if current_stage == "phone" and account is not None:
+                    if (
+                        current_stage == "phone"
+                        and account is not None
+                        and not phone_background_ownership_pending
+                    ):
                         _requeue_chatgpt_login_mailbox(_mailbox, account)
                     _persist_binding(
                         task_id=task_id,
@@ -3185,7 +3533,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             except StopTaskRequested as e:
                 _log(task_id, f"[STOP] {e}")
                 if _bind_phone_and_get_rt:
-                    if current_stage == "phone" and account is not None:
+                    if (
+                        current_stage == "phone"
+                        and account is not None
+                        and not phone_background_ownership_pending
+                    ):
                         _requeue_chatgpt_login_mailbox(_mailbox, account)
                     _persist_binding(
                         task_id=task_id,
@@ -3210,7 +3562,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     error=str(e),
                 )
                 if _bind_phone_and_get_rt:
-                    if current_stage == "phone" and account is not None:
+                    if (
+                        current_stage == "phone"
+                        and account is not None
+                        and not phone_background_ownership_pending
+                    ):
                         _requeue_chatgpt_login_mailbox(_mailbox, account)
                     _persist_binding(
                         task_id=task_id,
@@ -3229,6 +3585,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     _bind_phone_and_get_rt
                     and saved_account_created_by_attempt
                     and not phone_flow_completed
+                    and not phone_background_ownership_pending
                     and saved_account is not None
                     and saved_account_extra_snapshot is not None
                 ):
@@ -3257,7 +3614,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "[WARN] 未获取 Refresh Token 的半成品账号清理失败"
                                 f"（{type(exc).__name__}）",
                             )
-                if sms_pool_item_id:
+                if sms_pool_item_id and not sms_pool_settlement_pending:
                     try:
                         sms_pool_service.finalize(
                             item_id=sms_pool_item_id,
@@ -3272,6 +3629,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             "[WARN] SMS 接码池状态更新失败"
                             f"（{type(exc).__name__}）",
                         )
+                elif sms_pool_item_id and sms_pool_settlement_pending:
+                    _log(
+                        task_id,
+                        "[WARN] LeadBee 服务端未确认卡密终态；"
+                        "该卡保持隔离，不会重新分配或标记为已使用",
+                    )
                 control.finish_attempt(attempt_id)
 
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed

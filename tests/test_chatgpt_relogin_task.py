@@ -147,7 +147,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["source"], "schedule")
         self.assertEqual(snapshot["total"], 101)
-        self.assertEqual(snapshot["meta"]["mode"], "relogin")
+        self.assertEqual(snapshot["meta"]["mode"], "remote_auth_monitor")
         self.assertTrue(snapshot["meta"]["automation"])
         self.assertEqual(snapshot["meta"]["account_ids"], list(range(1, 102)))
         self.assertEqual(snapshot["meta"]["concurrency"], 10)
@@ -1848,6 +1848,28 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertFalse(observation["orphaned"])
         finalize.assert_not_called()
         persisted.assert_not_called()
+
+    def test_observe_terminal_task_uses_immutable_completion_time(self):
+        completed_at = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+        updated_at = datetime(2026, 8, 2, 12, 5, tzinfo=timezone.utc)
+        memory = {
+            "id": "task-terminal",
+            "platform": "chatgpt",
+            "status": "done",
+            "meta": {"completed_at": completed_at.timestamp()},
+            "updated_at": updated_at.timestamp(),
+        }
+
+        with mock.patch.object(
+            _task_store,
+            "snapshot_if_present",
+            return_value=memory,
+        ):
+            observation = tasks_module.observe_chatgpt_task("task-terminal")
+
+        self.assertEqual(observation["completed_at"], completed_at)
+        self.assertEqual(observation["updated_at"], updated_at)
+        self.assertFalse(observation["live"])
 
     def test_observe_chatgpt_task_finalizes_persisted_orphan_and_marks_it(self):
         test_engine = db._create_database_engine("sqlite://")

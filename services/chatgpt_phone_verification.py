@@ -20,6 +20,11 @@ logger = logging.getLogger(__name__)
 # provider limit while allowing the user's mailbox-login concurrency to flow
 # through instead of serializing every card behind a single global lock.
 leadbee_phone_flow_lock = threading.BoundedSemaphore(5)
+LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS = 60.0
+LEADBEE_PROVIDER_SLOT_WAIT_SECONDS = 30.0
+KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset(
+    {"restored", "consumed", "unusable"}
+)
 
 
 def normalize_e164_phone(value: str) -> str:
@@ -87,6 +92,7 @@ class InteractivePhoneVerificationBroker:
         self.exchange_code_unusable = False
         self.exchange_code_unusable_reason = ""
         self.exchange_code_restoration_confirmed = False
+        self.exchange_code_settlement = ""
         self._on_provider_start = on_provider_start
         self._exchange_code_callback_fired = False
         self._on_exchange_code_consumed = on_exchange_code_consumed
@@ -155,6 +161,7 @@ class InteractivePhoneVerificationBroker:
                 "exchange_code_restoration_confirmed": (
                     self.exchange_code_restoration_confirmed
                 ),
+                "exchange_code_settlement": self.exchange_code_settlement,
                 "provider_cleanup_settled": self._provider_cleanup_settled,
                 "logs": list(self._logs),
                 "expires_in": self.remaining_seconds(),
@@ -209,6 +216,7 @@ class InteractivePhoneVerificationBroker:
                 self._exchange_code_callback_fired = True
             self.exchange_code_consumed = True
             self.exchange_code_unusable = True
+            self.exchange_code_settlement = "consumed"
             self.status = "verifying"
             self.message = "已自动获取短信验证码，正在提交验证"
             self._append_log_locked(self.message)
@@ -245,9 +253,12 @@ class InteractivePhoneVerificationBroker:
         """Record the provider's explicit confirmation that the code is reusable."""
         restored_callback = None
         with self._condition:
+            if self.exchange_code_settlement in {"consumed", "unusable"}:
+                return
             if self.exchange_code_restoration_confirmed:
                 return
             self.exchange_code_restoration_confirmed = True
+            self.exchange_code_settlement = "restored"
             if not self._restoration_callback_fired:
                 restored_callback = self._on_exchange_code_restored
                 self._restoration_callback_fired = True
@@ -255,15 +266,29 @@ class InteractivePhoneVerificationBroker:
         if restored_callback is not None:
             restored_callback()
 
+    def mark_exchange_code_active_unknown(self, message: str = "") -> None:
+        """Quarantine a card whose provider session never reached a known end."""
+        normalized_message = str(message or "").strip()
+        with self._condition:
+            if self.exchange_code_settlement in KNOWN_EXCHANGE_CODE_SETTLEMENTS:
+                return
+            self.exchange_code_settlement = "active_unknown"
+            if normalized_message:
+                self._append_log_locked(normalized_message)
+            self._condition.notify_all()
+
     def mark_exchange_code_unusable(self, message: str = "") -> None:
         """Record a provider-settled/ambiguous card without relying on log text."""
         consumed_callback = None
         normalized_message = str(message or "").strip()
         with self._condition:
+            if self.exchange_code_settlement in {"restored", "consumed"}:
+                return
             if not self._exchange_code_callback_fired:
                 consumed_callback = self._on_exchange_code_consumed
                 self._exchange_code_callback_fired = True
             self.exchange_code_unusable = True
+            self.exchange_code_settlement = "unusable"
             if normalized_message:
                 self.exchange_code_unusable_reason = normalized_message
                 self._append_log_locked(normalized_message)
@@ -381,8 +406,24 @@ class InteractivePhoneVerificationBroker:
             return self.snapshot()
 
     def raise_if_cancelled(self) -> None:
-        if self._cancel_event.is_set():
-            raise PhoneVerificationCancelled(self.message or "手机验证已取消")
+        with self._condition:
+            if (
+                self._is_expired()
+                and not self._terminal
+                and not self._finalizing
+            ):
+                self._cancel_event.set()
+                self.status = "failed"
+                self.message = "手机验证会话已过期，后台流程已取消"
+                self._append_log_locked(self.message)
+                self._terminal = True
+                self.terminal_at = time.time()
+                self._command_pending = False
+                self._condition.notify_all()
+            cancelled = self._cancel_event.is_set()
+            message = self.message
+        if cancelled:
+            raise PhoneVerificationCancelled(message or "手机验证已取消")
 
     def wait_for_cancellation(self, timeout: float) -> bool:
         return self._cancel_event.wait(max(0.0, float(timeout or 0)))
@@ -613,8 +654,16 @@ class ChatGPTPhoneVerificationManager:
             cancelled = broker.cancel(cancel_message)
             if cancelled.get("status") not in {"completed", "failed", "expired"}:
                 return False
-        if broker.automatic and broker.snapshot().get("status") in {"failed", "expired"}:
-            broker.wait_until_provider_cleanup_settled(self.command_timeout_seconds)
+        if (
+            broker.automatic
+            and not bool(
+                broker.snapshot().get("provider_cleanup_settled", False)
+            )
+        ):
+            # The provider worker still owns (or is waiting for) its semaphore
+            # permit. Never retire the only snapshot that can carry its final
+            # restored/active_unknown settlement.
+            return False
         self._sessions.pop(session_id, None)
         current = self._account_sessions.get(broker.account_id)
         if current == session_id:
@@ -681,12 +730,9 @@ class ChatGPTPhoneVerificationManager:
             if not broker or broker.account_id != int(account_id):
                 raise ValueError("手机验证会话不存在，请重新获取验证码")
             if broker.snapshot()["status"] == "expired":
-                removed = self._remove_session_locked(
-                    broker.session_id,
-                    cancel_message="手机验证会话已过期，后台流程已取消",
+                broker.cancel(
+                    "手机验证会话已过期，后台流程已取消"
                 )
-                if removed:
-                    raise ValueError("手机验证会话已过期，请重新获取验证码")
             return broker
 
     def _refresh_status_best_effort(
@@ -730,18 +776,72 @@ class ChatGPTPhoneVerificationManager:
         exchange_code: str,
         provider_lock_already_held: bool = False,
     ) -> None:
-        acquired_provider_lock = False
+        provider_lock_owned = bool(provider_lock_already_held)
+        provider_cleanup_published = False
+
+        def settle_provider_cleanup() -> None:
+            nonlocal provider_lock_owned, provider_cleanup_published
+            if provider_cleanup_published:
+                return
+            if provider_lock_owned:
+                leadbee_phone_flow_lock.release()
+                provider_lock_owned = False
+            settlement = broker.snapshot()
+            if (
+                bool(settlement.get("provider_started"))
+                and str(settlement.get("exchange_code_settlement") or "")
+                not in KNOWN_EXCHANGE_CODE_SETTLEMENTS
+            ):
+                broker.mark_exchange_code_active_unknown(
+                    "LeadBee provider worker 已结束或超时，"
+                    "服务端未明确确认卡密恢复；卡密保持隔离"
+                )
+            broker.mark_provider_cleanup_settled()
+            provider_cleanup_published = True
+
         try:
             if not provider_lock_already_held:
-                while not leadbee_phone_flow_lock.acquire(timeout=0.25):
+                provider_lock_owned = leadbee_phone_flow_lock.acquire(
+                    blocking=False
+                )
+                slot_wait_seconds = min(
+                    LEADBEE_PROVIDER_SLOT_WAIT_SECONDS,
+                    max(
+                        0.0,
+                        float(broker.expires_at)
+                        - time.time()
+                        - LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS,
+                    ),
+                )
+                slot_deadline = time.monotonic() + slot_wait_seconds
+                while not provider_lock_owned:
                     broker.raise_if_cancelled()
-                acquired_provider_lock = True
+                    remaining = slot_deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise RuntimeError(
+                            "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
+                        )
+                    provider_lock_owned = leadbee_phone_flow_lock.acquire(
+                        timeout=min(0.25, remaining)
+                    )
                 broker.raise_if_cancelled()
-            tokens = self.automatic_flow_runner(
-                broker.account_id,
-                exchange_code,
-                broker,
-            )
+            try:
+                # The built-in LeadBee runner applies one absolute deadline to
+                # every request, poll and sleep.  Keep it in this worker: a
+                # Python thread cannot safely terminate another thread, and
+                # publishing cleanup while provider code is still executing
+                # would allow more than five live provider operations and late
+                # settlement callbacks after the task has already returned.
+                tokens = self.automatic_flow_runner(
+                    broker.account_id,
+                    exchange_code,
+                    broker,
+                )
+            finally:
+                # The provider/card lifecycle ends with the runner. Token DB
+                # persistence and status refresh must not retain a scarce
+                # LeadBee slot if either downstream operation blocks.
+                settle_provider_cleanup()
             broker.raise_if_cancelled()
             if not isinstance(tokens, dict) or not str(tokens.get("refresh_token") or "").strip():
                 raise RuntimeError("手机验证完成后未获取 Refresh Token")
@@ -757,15 +857,16 @@ class ChatGPTPhoneVerificationManager:
                 _redact_secret(exc, exchange_code) or "LeadBee 自动接码失败"
             )
         finally:
-            if acquired_provider_lock:
-                leadbee_phone_flow_lock.release()
-            # The provider runner owns cancellation/restoration.  Publish that
-            # its cleanup has settled before taking the manager lock so an
-            # expiry path already holding that lock can wait without deadlock.
-            broker.mark_provider_cleanup_settled()
+            # Slot-wait and other pre-run failures also publish cleanup. Both
+            # operations stay outside the manager lock, avoiding a lock /
+            # broker-condition cycle during expiry or cancellation.
+            settle_provider_cleanup()
             with self._lock:
                 current = self._account_sessions.get(broker.account_id)
-                if current == broker.session_id and broker.status in {"completed", "failed"}:
+                if (
+                    current == broker.session_id
+                    and broker.status in {"completed", "failed"}
+                ):
                     self._account_sessions.pop(broker.account_id, None)
                 self._prune_locked()
 
@@ -780,6 +881,7 @@ class ChatGPTPhoneVerificationManager:
         on_exchange_code_consumed: Optional[Callable[[], None]] = None,
         on_exchange_code_restored: Optional[Callable[[], None]] = None,
         provider_lock_already_held: bool = False,
+        on_provider_lock_handoff: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
         automatic = leadbee_code is not None
         exchange_code = str(leadbee_code or "").strip()
@@ -818,6 +920,19 @@ class ChatGPTPhoneVerificationManager:
                         )
                         if not removed:
                             existing_snapshot = existing.snapshot()
+                            if existing.matches_request(
+                                provider,
+                                request_fingerprint,
+                            ):
+                                existing_snapshot["reused"] = True
+                                existing_snapshot["message"] = (
+                                    "当前接码会话仍在清理服务端终态，请稍候"
+                                )
+                                return existing_snapshot
+                            raise ValueError(
+                                "该账号上一接码会话仍在清理服务端终态；"
+                                "请等待清理完成后再启动新卡"
+                            )
                     if existing_snapshot["status"] not in {
                         "completed",
                         "failed",
@@ -848,14 +963,32 @@ class ChatGPTPhoneVerificationManager:
             self._sessions[broker.session_id] = broker
             self._account_sessions[account_key] = broker.session_id
 
-        if automatic:
-            threading.Thread(
-                target=self._run_automatic,
-                args=(broker, exchange_code, bool(provider_lock_already_held)),
-                daemon=True,
-            ).start()
-        else:
-            threading.Thread(target=self._run, args=(broker,), daemon=True).start()
+        try:
+            if automatic:
+                worker = threading.Thread(
+                    target=self._run_automatic,
+                    args=(broker, exchange_code, bool(provider_lock_already_held)),
+                    daemon=True,
+                )
+            else:
+                worker = threading.Thread(target=self._run, args=(broker,), daemon=True)
+            worker.start()
+        except Exception:
+            # No worker owns this broker or a pre-acquired provider permit.
+            # Retire the dead mapping immediately so the same account is not
+            # blocked by an uncleanable `starting` session forever.
+            broker.mark_failed("手机验证后台线程启动失败")
+            if automatic:
+                broker.mark_provider_cleanup_settled()
+            with self._lock:
+                self._sessions.pop(broker.session_id, None)
+                if self._account_sessions.get(account_key) == broker.session_id:
+                    self._account_sessions.pop(account_key, None)
+            raise
+        if automatic and provider_lock_already_held and callable(on_provider_lock_handoff):
+            # From this point onward the worker owns the pre-acquired permit
+            # and releases it before publishing cleanup settlement.
+            on_provider_lock_handoff(broker.session_id)
         return broker.wait_until_ready(self.start_timeout_seconds)
 
     def status(self, account_id: int, session_id: str) -> dict[str, Any]:
@@ -873,13 +1006,40 @@ class ChatGPTPhoneVerificationManager:
             snapshot = broker.snapshot()
             if snapshot["status"] != "expired":
                 return snapshot
-            removed = self._remove_session_locked(
-                broker.session_id,
-                cancel_message="手机验证会话已过期，后台流程已取消",
+            broker.cancel(
+                "手机验证会话已过期，后台流程已取消"
             )
-            if removed:
-                raise ValueError("手机验证会话已过期，请重新获取验证码")
             return broker.snapshot()
+
+    def wait_for_provider_cleanup(
+        self,
+        account_id: int,
+        session_id: str,
+        timeout: float = 1.0,
+    ) -> dict[str, Any]:
+        """Wait directly on a broker when normal status observation fails."""
+        normalized_session_id = str(session_id or "")
+        with self._lock:
+            broker = self._sessions.get(normalized_session_id)
+        if not broker or broker.account_id != int(account_id):
+            # Automatic sessions are removed only after cleanup settlement.
+            return {
+                "session_id": normalized_session_id,
+                "account_id": int(account_id),
+                "status": "failed",
+                "message": "LeadBee 会话已完成后台清理",
+                "provider_cleanup_settled": True,
+                "exchange_code_settlement": "active_unknown",
+                "exchange_code_unusable": False,
+            }
+        cleanup = broker.wait_until_provider_cleanup_settled(timeout)
+        if (
+            bool(cleanup.get("provider_cleanup_settled", False))
+            and str(cleanup.get("status") or "")
+            not in {"completed", "failed", "expired"}
+        ):
+            return broker.wait_until_terminal(timeout)
+        return cleanup
 
     def submit_code(self, account_id: int, session_id: str, code: str) -> dict[str, Any]:
         broker = self._get(account_id, session_id)
@@ -931,7 +1091,10 @@ class ChatGPTPhoneVerificationManager:
                 "completed",
                 "failed",
                 "expired",
-            }:
+            } and (
+                not broker.automatic
+                or bool(snapshot.get("provider_cleanup_settled", False))
+            ):
                 self._account_sessions.pop(account_key, None)
         return snapshot
 

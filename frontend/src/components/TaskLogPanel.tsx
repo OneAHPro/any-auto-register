@@ -11,6 +11,7 @@ interface TaskLogPanelProps {
 }
 
 type TaskTerminalStatus = 'idle' | 'done' | 'partial' | 'failed' | 'stopped'
+type TaskDisplayMode = NonNullable<TaskLogPanelProps['mode']> | 'remote_auth_monitor'
 
 const CHATGPT_RETRY_MAX_CONCURRENCY = 10
 
@@ -55,7 +56,7 @@ function resolveTerminalStatus(
 
 export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanelProps) {
   const [activeTaskId, setActiveTaskId] = useState(taskId)
-  const [resolvedMode, setResolvedMode] = useState(mode)
+  const [resolvedMode, setResolvedMode] = useState<TaskDisplayMode>(mode)
   const [lines, setLines] = useState<string[]>([])
   const [summary, setSummary] = useState<RegisterSummary>({ success: 0, registered: 0, total: 0 })
   const [error, setError] = useState('')
@@ -71,29 +72,37 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
   const nextSinceRef = useRef(0)
 
   const isFinished = terminalStatus !== 'idle' || stopRequested
-  const wording = resolvedMode === 'relogin'
+  const wording = resolvedMode === 'remote_auth_monitor'
     ? {
-        action: '重登并同步',
-        success: '重登并同步成功',
-        processed: '已处理',
-        total: '重登总数',
-        completed: '重登并同步完成',
+        action: '探针检查',
+        success: '探针正常',
+        processed: '已检查',
+        total: '检查总数',
+        completed: '探针检查完成',
       }
-    : resolvedMode === 'login'
+    : resolvedMode === 'relogin'
       ? {
-          action: '登录',
-          success: '登录成功',
+          action: '重登',
+          success: '重登成功',
           processed: '已处理',
-          total: '登录总数',
-          completed: '登录完成',
+          total: '处理总数',
+          completed: '重登完成',
         }
-      : {
-          action: '注册',
-          success: '注册成功',
-          processed: '已注册',
-          total: '总共注册',
-          completed: '注册完成',
-        }
+      : resolvedMode === 'login'
+        ? {
+            action: '登录',
+            success: '登录成功',
+            processed: '已处理',
+            total: '登录总数',
+            completed: '登录完成',
+          }
+        : {
+            action: '注册',
+            success: '注册成功',
+            processed: '已注册',
+            total: '总共注册',
+            completed: '注册完成',
+          }
 
   const handleCopyAll = async () => {
     try {
@@ -224,7 +233,8 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
           success?: number
           registered?: number
           total?: number
-          meta?: { mode?: string }
+          source?: string
+          meta?: { automation?: boolean; mode?: string }
           control?: { stop_requested?: boolean }
         }
         if (cancelled) return true
@@ -237,7 +247,13 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
           total: snapshot.total,
         })
         setSummary(latestSummary)
-        if (snapshot.meta?.mode === 'login' || snapshot.meta?.mode === 'relogin') {
+        if (
+          snapshot.source === 'schedule'
+          && snapshot.meta?.automation === true
+          && snapshot.meta?.mode === 'remote_auth_monitor'
+        ) {
+          setResolvedMode('remote_auth_monitor')
+        } else if (snapshot.meta?.mode === 'login' || snapshot.meta?.mode === 'relogin') {
           setResolvedMode(snapshot.meta.mode)
         }
         nextSinceRef.current = snapshotLines.length

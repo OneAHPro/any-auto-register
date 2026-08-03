@@ -387,22 +387,32 @@ def tick_chatgpt_auto_relogin(
                         next_run_at=None,
                     )
                 completed_at = _parse_utc_datetime(
+                    (observation or {}).get("completed_at")
+                ) or _parse_utc_datetime(
                     (observation or {}).get("updated_at")
                 ) or wall_now
-                cycle_started_at = _parse_utc_datetime(
-                    snapshot.get(_STATUS_KEY_BY_FIELD["last_started_at"], "")
-                )
-                return _persist_tick_transition(
+                next_run_at = completed_at + interval
+                reconciled = _persist_tick_transition(
                     resolved_store,
                     snapshot,
                     state="idle",
                     reason="scheduled",
                     eligible_accounts=eligible_count,
                     active_task_id=None,
-                    next_run_at=_utc_iso(
-                        (cycle_started_at or completed_at) + interval
-                    ),
+                    next_run_at=_utc_iso(next_run_at),
                     scheduled_interval_minutes=settings.interval_minutes,
+                )
+                if wall_now < next_run_at:
+                    return reconciled
+                # The immutable completion deadline may already be overdue
+                # after restart or a delayed observation. Re-enter once with
+                # the active task cleared so this same scheduler tick can enqueue.
+                return tick_chatgpt_auto_relogin(
+                    store=resolved_store,
+                    list_eligible=lambda: eligible_ids,
+                    try_enqueue=try_enqueue,
+                    observe=observe,
+                    now=wall_now,
                 )
 
             if eligible_count == 0:

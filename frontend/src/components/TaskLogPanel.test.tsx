@@ -83,7 +83,7 @@ describe('TaskLogPanel terminal feedback', () => {
     expect(await screen.findByText('登录完成')).toBeTruthy()
   })
 
-  it('uses explicit relogin and sync wording for relogin tasks', async () => {
+  it('uses relogin wording for relogin tasks', async () => {
     vi.mocked(apiFetch).mockResolvedValue({
       logs: ['重登已成功，但 Codex2API 同步失败: token invalid'],
       status: 'done',
@@ -95,12 +95,73 @@ describe('TaskLogPanel terminal feedback', () => {
 
     render(<TaskLogPanel taskId="relogin-task" />)
 
-    expect(await screen.findByText('重登并同步失败（成功 0 / 1）')).toBeTruthy()
-    expect(screen.getByText('重登并同步成功：0')).toBeTruthy()
+    expect(await screen.findByText('重登失败（成功 0 / 1）')).toBeTruthy()
+    expect(screen.getByText('重登成功：0')).toBeTruthy()
     expect(screen.queryByText(/注册完成/)).toBeNull()
   })
 
-  it('announces a partial relogin and sync result as terminal status', async () => {
+  it('uses probe wording for scheduled remote authentication monitors', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      logs: ['RT 探针检查完成'],
+      status: 'done',
+      source: 'schedule',
+      success: 72,
+      registered: 100,
+      total: 101,
+      meta: {
+        automation: true,
+        mode: 'remote_auth_monitor',
+      },
+    })
+
+    render(<TaskLogPanel taskId="scheduled-probe-task" />)
+
+    expect(await screen.findByText('探针正常：72')).toBeTruthy()
+    expect(screen.getByText('已检查：100')).toBeTruthy()
+    expect(screen.getByText('检查总数：101')).toBeTruthy()
+    expect(screen.getByText('探针检查部分完成（成功 72 / 101）')).toBeTruthy()
+    expect(screen.queryByText(/注册/)).toBeNull()
+  })
+
+  it('uses processing wording for manual relogin tasks', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      logs: ['手动重登完成'],
+      status: 'done',
+      source: 'manual_relogin',
+      success: 2,
+      registered: 2,
+      total: 2,
+      meta: { mode: 'relogin' },
+    })
+
+    render(<TaskLogPanel taskId="manual-relogin-task" />)
+
+    expect(await screen.findByText('重登成功：2')).toBeTruthy()
+    expect(screen.getByText('已处理：2')).toBeTruthy()
+    expect(screen.getByText('处理总数：2')).toBeTruthy()
+    expect(screen.getByText('重登完成')).toBeTruthy()
+  })
+
+  it('keeps registration wording for actual registration tasks', async () => {
+    vi.mocked(apiFetch).mockResolvedValue({
+      logs: ['注册完成'],
+      status: 'done',
+      source: 'manual',
+      success: 3,
+      registered: 3,
+      total: 3,
+      meta: {},
+    })
+
+    render(<TaskLogPanel taskId="registration-task" />)
+
+    expect(await screen.findByText('注册成功：3')).toBeTruthy()
+    expect(screen.getByText('已注册：3')).toBeTruthy()
+    expect(screen.getByText('总共注册：3')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toBe('注册完成')
+  })
+
+  it('announces a partial relogin result as terminal status', async () => {
     vi.mocked(apiFetch).mockResolvedValue({
       logs: ['一个账号同步失败'],
       status: 'done',
@@ -113,7 +174,7 @@ describe('TaskLogPanel terminal feedback', () => {
     render(<TaskLogPanel taskId="partial-relogin-task" />)
 
     const terminalStatus = await screen.findByRole('status')
-    expect(terminalStatus.textContent).toBe('重登并同步部分完成（成功 1 / 2）')
+    expect(terminalStatus.textContent).toBe('重登部分完成（成功 1 / 2）')
     expect(terminalStatus.getAttribute('aria-live')).toBe('polite')
     expect(terminalStatus.getAttribute('aria-atomic')).toBe('true')
   })

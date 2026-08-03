@@ -1,5 +1,6 @@
 import threading
 import unittest
+from unittest import mock
 
 from core.task_runtime import (
     RegisterTaskControl,
@@ -200,6 +201,35 @@ class RegisterTaskStoreTests(unittest.TestCase):
                 "alert_sent": False,
             },
         )
+
+    def test_terminal_completion_time_is_immutable_after_post_processing(self):
+        store = RegisterTaskStore()
+        task_id = "task-runtime-completed-at"
+        store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="schedule",
+            meta={"automation": True},
+        )
+
+        with mock.patch("core.task_runtime.time.time", side_effect=[100.0, 200.0, 300.0]):
+            store.finish(
+                task_id,
+                status="done",
+                success=1,
+                registered=1,
+                skipped=0,
+                errors=[],
+            )
+            completed_at = store.snapshot(task_id)["meta"]["completed_at"]
+            store.append_log(task_id, "alert sent")
+            store.update_meta(task_id, alert_sent=True)
+
+        snapshot = store.snapshot(task_id)
+        self.assertEqual(completed_at, 100.0)
+        self.assertEqual(snapshot["meta"]["completed_at"], completed_at)
+        self.assertEqual(snapshot["updated_at"], 300.0)
 
     def test_snapshot_contains_control_and_skip_fields(self):
         store = RegisterTaskStore()

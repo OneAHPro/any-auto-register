@@ -236,7 +236,7 @@ class SmsPoolServiceTests(unittest.TestCase):
         self.assertEqual(recovered, 1)
         self.assertEqual(self.pool.stats()["unused"], 1)
 
-    def test_recovery_never_requeues_a_card_after_provider_work_started(self):
+    def test_recovery_quarantines_card_after_provider_work_started(self):
         self.pool.import_text(
             "active-card\nnot-started-card",
             default_base_url="https://sms.example.com/box",
@@ -258,9 +258,10 @@ class SmsPoolServiceTests(unittest.TestCase):
         with Session(self.engine) as session:
             active = session.get(SmsPoolItemModel, reserved[0].id)
             not_started = session.get(SmsPoolItemModel, reserved[1].id)
-            self.assertEqual(active.status, "used")
+            self.assertEqual(active.status, "active")
             self.assertEqual(active.used_by_email, "active@example.com")
-            self.assertIsNotNone(active.used_at)
+            self.assertIsNone(active.used_at)
+            self.assertEqual(active.reserved_task_id, "")
             self.assertEqual(not_started.status, "unused")
 
     def test_active_card_without_confirmed_restoration_is_conservatively_used(self):
@@ -354,7 +355,7 @@ class SmsPoolServiceTests(unittest.TestCase):
         self.assertEqual(self.pool.recover_interrupted(), 1)
         self.assertEqual(self.pool.stats()["unused"], 1)
 
-    def test_new_provider_attempt_after_restoration_is_conservatively_used(self):
+    def test_new_provider_attempt_after_restoration_is_quarantined_on_restart(self):
         self.pool.import_text(
             "restored-then-retried",
             default_base_url="https://sms.example.com/box",
@@ -375,8 +376,8 @@ class SmsPoolServiceTests(unittest.TestCase):
         )
 
         # A fresh provider call moves the card back to ``active``. If that
-        # attempt is interrupted without another restoration callback, the
-        # card must not be reissued to a different mailbox.
+        # attempt is interrupted without another restoration callback, keep
+        # it quarantined instead of reissuing or permanently burning it.
         self.assertTrue(
             self.pool.mark_active(
                 item_id=reserved.id,
@@ -388,9 +389,30 @@ class SmsPoolServiceTests(unittest.TestCase):
 
         with Session(self.engine) as session:
             row = session.get(SmsPoolItemModel, reserved.id)
-            self.assertEqual(row.status, "used")
+            self.assertEqual(row.status, "active")
             self.assertEqual(row.used_by_email, "retried@example.com")
-            self.assertIsNotNone(row.used_at)
+            self.assertIsNone(row.used_at)
+            self.assertEqual(row.reserved_task_id, "")
+
+    def test_task_release_persists_explicit_reserved_card_quarantine(self):
+        self.pool.import_text(
+            "conflicted-card",
+            default_base_url="https://sms.example.com/box",
+        )
+        reserved = self.pool.reserve(task_id="task-conflict", count=1)[0]
+
+        released = self.pool.release_task(
+            "task-conflict",
+            quarantine_item_ids={int(reserved.id)},
+        )
+
+        self.assertEqual(released, 1)
+        with Session(self.engine) as session:
+            row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(row.status, "active")
+            self.assertEqual(row.reserved_task_id, "")
+            self.assertIsNone(row.reserved_at)
+            self.assertIsNone(row.used_at)
 
 
 class SmsPoolTaskIntegrationTests(unittest.TestCase):
@@ -516,6 +538,7 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
             "session_id": "phone-session",
             "status": "completed",
             "exchange_code_consumed": True,
+            "provider_cleanup_settled": True,
             "logs": [],
         }
 
@@ -535,14 +558,450 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual(result["status"], "completed")
-        manager.start.assert_called_once_with(
-            9,
-            leadbee_code="card-secret",
-            leadbee_base_url="https://sms.example.com/custom-box",
-            on_provider_start=provider_started,
-            provider_lock_already_held=True,
+        manager.start.assert_called_once()
+        start_args, start_kwargs = manager.start.call_args
+        self.assertEqual(start_args, (9,))
+        tracked_provider_start = start_kwargs.pop("on_provider_start")
+        provider_lock_handoff = start_kwargs.pop("on_provider_lock_handoff")
+        self.assertTrue(callable(tracked_provider_start))
+        self.assertTrue(callable(provider_lock_handoff))
+        self.assertIsNot(tracked_provider_start, provider_started)
+        self.assertEqual(
+            start_kwargs,
+            {
+                "leadbee_code": "card-secret",
+                "leadbee_base_url": "https://sms.example.com/custom-box",
+                "provider_lock_already_held": True,
+            },
         )
         provider_started.assert_not_called()
+
+    def test_reused_phone_session_quarantines_card_when_start_callback_raises(self):
+        manager = mock.Mock()
+        manager.start.return_value = {
+            "session_id": "phone-session-existing-owner",
+            "status": "starting",
+            "message": "existing provider flow",
+            "reused": True,
+            "provider_started": True,
+            "provider_cleanup_settled": False,
+            "logs": [],
+        }
+        provider_slot = threading.BoundedSemaphore(1)
+        provider_started = mock.Mock(
+            side_effect=RuntimeError("pool state persistence failed")
+        )
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ):
+            result = _complete_chatgpt_leadbee_verification(
+                task_id="task-pool-reused-conflict",
+                account_id=9,
+                leadbee_code="card-secret",
+                on_provider_start=provider_started,
+                control=mock.Mock(),
+                attempt_id=1,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["provider_started"])
+        self.assertTrue(result["provider_cleanup_settled"])
+        self.assertEqual(result["exchange_code_settlement"], "active_unknown")
+        self.assertTrue(result["ownership_conflict"])
+        self.assertEqual(result["provider_start_callback_error"], "RuntimeError")
+        provider_started.assert_called_once_with()
+        self.assertTrue(provider_slot.acquire(blocking=False))
+        provider_slot.release()
+
+    def test_reused_phone_session_replays_known_settlement_without_unknown_override(self):
+        cases = [
+            (
+                "restored",
+                {"provider_started": True, "exchange_code_settlement": "restored"},
+                True,
+                False,
+            ),
+            (
+                "consumed",
+                {"provider_started": True, "exchange_code_settlement": "consumed"},
+                False,
+                True,
+            ),
+            (
+                "unusable",
+                {"provider_started": True, "exchange_code_settlement": "unusable"},
+                False,
+                True,
+            ),
+            (
+                "not-started",
+                {
+                    "provider_started": False,
+                    "provider_cleanup_settled": True,
+                    "exchange_code_settlement": "",
+                },
+                False,
+                False,
+            ),
+        ]
+
+        for name, published, expect_restored, expect_consumed in cases:
+            with self.subTest(name=name):
+                manager = mock.Mock()
+                manager.start.return_value = {
+                    "session_id": f"phone-session-{name}",
+                    "status": "persisting",
+                    "message": "existing provider flow",
+                    "reused": True,
+                    "provider_cleanup_settled": False,
+                    "logs": [],
+                    **published,
+                }
+                provider_slot = threading.BoundedSemaphore(1)
+                provider_started = mock.Mock()
+                restored = mock.Mock()
+                consumed = mock.Mock()
+
+                with mock.patch(
+                    "services.chatgpt_phone_verification.phone_verification_manager",
+                    manager,
+                ), mock.patch(
+                    "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                    provider_slot,
+                ):
+                    result = _complete_chatgpt_leadbee_verification(
+                        task_id=f"task-pool-known-{name}",
+                        account_id=9,
+                        leadbee_code="card-secret",
+                        on_provider_start=provider_started,
+                        on_exchange_code_restored=restored,
+                        on_exchange_code_consumed=consumed,
+                        control=mock.Mock(),
+                        attempt_id=1,
+                    )
+
+                self.assertEqual(
+                    result["exchange_code_settlement"],
+                    published.get("exchange_code_settlement", ""),
+                )
+                self.assertNotEqual(
+                    result["exchange_code_settlement"],
+                    "active_unknown",
+                )
+                self.assertEqual(restored.called, expect_restored)
+                self.assertEqual(consumed.called, expect_consumed)
+                self.assertEqual(
+                    provider_started.called,
+                    bool(published.get("provider_started")),
+                )
+                self.assertTrue(provider_slot.acquire(blocking=False))
+                provider_slot.release()
+
+    def test_phone_helper_waits_for_terminal_provider_cleanup(self):
+        manager = mock.Mock()
+        events = []
+
+        class ProviderSlot:
+            def acquire(self, **_kwargs):
+                events.append("acquire")
+                return True
+
+            def release(self):
+                events.append("release")
+
+        provider_slot = ProviderSlot()
+
+        initial = {
+            "session_id": "phone-session-cleanup",
+            "status": "failed",
+            "message": "provider state unknown",
+            "provider_started": True,
+            "provider_cleanup_settled": False,
+            "exchange_code_settlement": "active_unknown",
+            "logs": [],
+            "expires_in": 600,
+        }
+        settled = {
+            **initial,
+            "provider_cleanup_settled": True,
+        }
+
+        def start(*_args, **kwargs):
+            provider_start = kwargs.get("on_provider_start")
+            if callable(provider_start):
+                provider_start()
+            events.append("provider_started")
+            kwargs["on_provider_lock_handoff"]()
+            events.append("handoff")
+            return initial
+
+        def status(*_args):
+            provider_slot.release()
+            events.append("cleanup_settled")
+            return settled
+
+        manager.start.side_effect = start
+        manager.status.side_effect = status
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ), mock.patch("api.tasks.time.sleep"):
+            result = _complete_chatgpt_leadbee_verification(
+                task_id="task-pool-cleanup",
+                account_id=9,
+                leadbee_code="card-secret",
+                control=mock.Mock(),
+                attempt_id=1,
+            )
+
+        manager.status.assert_called_once_with(9, "phone-session-cleanup")
+        self.assertTrue(result["provider_cleanup_settled"])
+        self.assertEqual(result["exchange_code_settlement"], "active_unknown")
+        self.assertEqual(
+            events,
+            [
+                "acquire",
+                "provider_started",
+                "handoff",
+                "release",
+                "cleanup_settled",
+            ],
+        )
+
+    def test_phone_helper_bounds_refresh_token_finalization_wait(self):
+        manager = mock.Mock()
+        provider_slot = threading.BoundedSemaphore(1)
+        persisting = {
+            "session_id": "phone-session-persisting",
+            "status": "persisting",
+            "message": "saving refresh token",
+            "provider_started": True,
+            "provider_cleanup_settled": True,
+            "exchange_code_settlement": "consumed",
+            "exchange_code_consumed": True,
+            "logs": [],
+            "expires_in": 600,
+        }
+
+        def start(*_args, **kwargs):
+            provider_slot.release()
+            kwargs["on_provider_lock_handoff"]("phone-session-persisting")
+            return persisting
+
+        manager.start.side_effect = start
+        with mock.patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ), mock.patch(
+            "api.tasks.CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS",
+            0.0,
+        ):
+            result = _complete_chatgpt_leadbee_verification(
+                task_id="task-pool-persist-timeout",
+                account_id=9,
+                leadbee_code="card-secret",
+                control=mock.Mock(),
+                attempt_id=1,
+            )
+
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["finalization_pending"])
+        self.assertTrue(result["provider_cleanup_settled"])
+        self.assertEqual(result["exchange_code_settlement"], "consumed")
+        manager.status.assert_not_called()
+        self.assertTrue(provider_slot.acquire(blocking=False))
+        provider_slot.release()
+
+    def test_post_start_log_error_waits_for_cleanup_without_leaking_slot(self):
+        from services.chatgpt_phone_verification import (
+            ChatGPTPhoneVerificationManager,
+        )
+
+        provider_slot = threading.BoundedSemaphore(1)
+        worker_started = threading.Event()
+        release_worker = threading.Event()
+
+        def automatic_runner(_account_id, _exchange_code, broker):
+            broker.mark_provider_started()
+            worker_started.set()
+            release_worker.wait(timeout=1)
+            broker.mark_exchange_code_active_unknown("provider state unknown")
+            raise RuntimeError("provider failed after observer error")
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=automatic_runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0.01,
+        )
+        results = []
+        errors = []
+
+        def run_helper():
+            try:
+                results.append(
+                    _complete_chatgpt_leadbee_verification(
+                        task_id="task-provider-observer-error",
+                        account_id=19,
+                        leadbee_code="card-secret",
+                        control=mock.Mock(),
+                        attempt_id=1,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ), mock.patch(
+            "api.tasks._log",
+            side_effect=RuntimeError("task log persistence unavailable"),
+        ), mock.patch("api.tasks.time.sleep"):
+            helper = threading.Thread(target=run_helper)
+            helper.start()
+            self.assertTrue(worker_started.wait(timeout=1))
+            self.assertFalse(provider_slot.acquire(blocking=False))
+            release_worker.set()
+            helper.join(timeout=1)
+
+            self.assertFalse(helper.is_alive())
+            self.assertEqual(errors, [])
+            self.assertEqual(len(results), 1)
+            result = results[0]
+            self.assertEqual(result["status"], "failed")
+            self.assertEqual(result["exchange_code_settlement"], "active_unknown")
+            self.assertTrue(result["provider_cleanup_settled"])
+            self.assertTrue(provider_slot.acquire(timeout=1))
+            provider_slot.release()
+
+    def test_post_handoff_log_error_bounds_blocked_token_persistence(self):
+        from services.chatgpt_phone_verification import (
+            ChatGPTPhoneVerificationManager,
+        )
+
+        provider_slot = threading.BoundedSemaphore(1)
+        persister_started = threading.Event()
+        release_persister = threading.Event()
+
+        def automatic_runner(_account_id, _exchange_code, broker):
+            broker.mark_provider_started()
+            return {"refresh_token": "new-rt"}
+
+        def token_persister(_account_id, _tokens):
+            persister_started.set()
+            release_persister.wait(timeout=2)
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=automatic_runner,
+            token_persister=token_persister,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0.05,
+        )
+        results = []
+        errors = []
+
+        def run_helper():
+            try:
+                results.append(
+                    _complete_chatgpt_leadbee_verification(
+                        task_id="task-provider-persist-observer-error",
+                        account_id=29,
+                        leadbee_code="card-secret",
+                        control=mock.Mock(),
+                        attempt_id=1,
+                    )
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        try:
+            with mock.patch(
+                "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                provider_slot,
+            ), mock.patch(
+                "services.chatgpt_phone_verification.phone_verification_manager",
+                manager,
+            ), mock.patch(
+                "api.tasks._log",
+                side_effect=RuntimeError("task log persistence unavailable"),
+            ), mock.patch(
+                "api.tasks.CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS",
+                0.0,
+            ):
+                helper = threading.Thread(target=run_helper)
+                helper.start()
+                self.assertTrue(persister_started.wait(timeout=1))
+                helper.join(timeout=0.5)
+
+                self.assertFalse(helper.is_alive())
+                self.assertEqual(errors, [])
+                self.assertEqual(len(results), 1)
+                self.assertEqual(results[0]["status"], "failed")
+                self.assertTrue(results[0]["finalization_pending"])
+                self.assertTrue(results[0]["provider_cleanup_settled"])
+                self.assertTrue(provider_slot.acquire(blocking=False))
+                provider_slot.release()
+        finally:
+            release_persister.set()
+
+        session_id = next(iter(manager._sessions))
+        completed = manager._sessions[session_id].wait_until_terminal(1)
+        self.assertEqual(completed["status"], "completed")
+
+    def test_task_provider_slot_wait_has_wall_clock_deadline(self):
+        clock = {"now": 0.0}
+        acquire_calls = 0
+
+        class BusyProviderSlots:
+            def acquire(self, **_kwargs):
+                nonlocal acquire_calls
+                acquire_calls += 1
+                clock["now"] += 31.0
+                if acquire_calls > 1:
+                    raise AssertionError("task slot wait did not honor deadline")
+                return False
+
+            def release(self):
+                raise AssertionError("unacquired provider slot was released")
+
+        manager = mock.Mock(ttl_seconds=61)
+        control = mock.Mock()
+        with mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            BusyProviderSlots(),
+        ), mock.patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ), mock.patch(
+            "api.tasks.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "排队.*超时"):
+                _complete_chatgpt_leadbee_verification(
+                    task_id="task-pool-slot-timeout",
+                    account_id=9,
+                    leadbee_code="card-secret",
+                    control=control,
+                    attempt_id=1,
+                )
+
+        manager.start.assert_not_called()
 
     def test_receiving_an_sms_marks_the_pool_card_consumed_immediately_once(self):
         consumed = mock.Mock()
@@ -789,6 +1248,309 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(all(context["sms_pool_managed"] for context in pool_contexts))
         reserve_replacement.assert_not_called()
+
+    def test_task_keeps_unknown_active_card_quarantined(self):
+        task_id = "task-pool-active-unknown"
+        req = self._pool_request(count=1)
+        req.extra.update(
+            {
+                "chatgpt_existing_account_leadbee_codes": ["pending-card"],
+                "chatgpt_existing_account_leadbee_base_urls": [
+                    "https://sms.example.com/box"
+                ],
+                "chatgpt_sms_pool_item_ids": [11],
+            }
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        def save_account(account):
+            extra = dict(account.extra or {})
+            return SimpleNamespace(
+                id=1,
+                platform=account.platform,
+                email=account.email,
+                extra=extra,
+                extra_json=json.dumps(extra, ensure_ascii=False),
+                created_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+            )
+
+        def complete_phone(**kwargs):
+            kwargs["on_provider_start"]()
+            return {
+                "status": "failed",
+                "message": "服务端仍未确认卡密恢复",
+                "phone_verified": False,
+                "exchange_code_consumed": False,
+                "exchange_code_unusable": False,
+                "exchange_code_settlement": "active_unknown",
+            }
+
+        with (
+            mock.patch("core.registry.get", return_value=_ExistingAccountPlatform),
+            mock.patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_: _LoginMailbox(),
+            ),
+            mock.patch("core.db.save_account", side_effect=save_account),
+            mock.patch(
+                "core.db.save_account_with_creation_state",
+                side_effect=lambda account: (save_account(account), True),
+            ),
+            mock.patch(
+                "core.db.delete_incomplete_chatgpt_account",
+                return_value=True,
+            ),
+            mock.patch(
+                "api.tasks._complete_chatgpt_leadbee_verification",
+                side_effect=complete_phone,
+            ),
+            mock.patch("api.tasks._refresh_saved_chatgpt_login", return_value=""),
+            mock.patch("api.tasks._auto_upload_integrations"),
+            mock.patch("api.tasks._save_task_log"),
+            mock.patch("api.tasks._upsert_chatgpt_attempt_binding"),
+            mock.patch(
+                "api.tasks.sms_pool_service.mark_active",
+                return_value=True,
+            ) as mark_active,
+            mock.patch("api.tasks.sms_pool_service.finalize") as finalize,
+            mock.patch("api.tasks.sms_pool_service.release_task"),
+            mock.patch("core.proxy_pool.proxy_pool.report_success"),
+            mock.patch("core.proxy_pool.proxy_pool.report_fail"),
+            mock.patch("core.config_store.config_store.get_all", return_value={}),
+        ):
+            _run_register(task_id, req)
+
+        mark_active.assert_called_once_with(
+            item_id=11,
+            task_id=task_id,
+            account_email=mock.ANY,
+        )
+        finalize.assert_not_called()
+
+    def test_reused_session_callback_failure_is_quarantined_after_task_cleanup(self):
+        task_id = "task-pool-reuse-callback-failure"
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+        pool = SmsPoolService(engine)
+        pool.import_text(
+            "duplicated-active-card",
+            default_base_url="https://sms.example.com/box",
+        )
+        reserved = pool.reserve(task_id=task_id, count=1)[0]
+
+        req = self._pool_request(count=1)
+        req.extra.update(
+            {
+                "chatgpt_existing_account_leadbee_codes": [reserved.code],
+                "chatgpt_existing_account_leadbee_base_urls": [reserved.base_url],
+                "chatgpt_sms_pool_item_ids": [int(reserved.id)],
+            }
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        def save_account(account):
+            extra = dict(account.extra or {})
+            return SimpleNamespace(
+                id=1,
+                platform=account.platform,
+                email=account.email,
+                extra=extra,
+                extra_json=json.dumps(extra, ensure_ascii=False),
+                created_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+            )
+
+        manager = mock.Mock()
+        manager.start.return_value = {
+            "session_id": "existing-provider-owner",
+            "status": "starting",
+            "message": "existing provider flow",
+            "reused": True,
+            "provider_started": True,
+            "provider_cleanup_settled": False,
+            "logs": [],
+        }
+        provider_slot = threading.BoundedSemaphore(1)
+
+        with (
+            mock.patch("core.registry.get", return_value=_ExistingAccountPlatform),
+            mock.patch(
+                "core.base_mailbox.create_mailbox",
+                side_effect=lambda **_: _LoginMailbox(),
+            ),
+            mock.patch("core.db.save_account", side_effect=save_account),
+            mock.patch(
+                "core.db.save_account_with_creation_state",
+                side_effect=lambda account: (save_account(account), True),
+            ),
+            mock.patch(
+                "core.db.delete_incomplete_chatgpt_account",
+                return_value=True,
+            ) as delete_incomplete,
+            mock.patch("api.tasks._refresh_saved_chatgpt_login", return_value=""),
+            mock.patch("api.tasks._auto_upload_integrations"),
+            mock.patch("api.tasks._save_task_log"),
+            mock.patch("api.tasks._upsert_chatgpt_attempt_binding"),
+            mock.patch(
+                "api.tasks._requeue_chatgpt_login_mailbox",
+                return_value=True,
+            ) as requeue_mailbox,
+            mock.patch("api.tasks.sms_pool_service", pool),
+            mock.patch.object(pool, "mark_active", return_value=False) as mark_active,
+            mock.patch(
+                "services.chatgpt_phone_verification.phone_verification_manager",
+                manager,
+            ),
+            mock.patch(
+                "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                provider_slot,
+            ),
+            mock.patch("core.proxy_pool.proxy_pool.report_success"),
+            mock.patch("core.proxy_pool.proxy_pool.report_fail"),
+            mock.patch("core.config_store.config_store.get_all", return_value={}),
+        ):
+            _run_register(task_id, req)
+
+        mark_active.assert_called_once_with(
+            item_id=int(reserved.id),
+            task_id=task_id,
+            account_email=mock.ANY,
+        )
+        delete_incomplete.assert_not_called()
+        requeue_mailbox.assert_not_called()
+        with Session(engine) as session:
+            row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(row.status, "active")
+            self.assertEqual(row.reserved_task_id, "")
+            self.assertIsNone(row.reserved_at)
+            self.assertIsNone(row.used_at)
+        self.assertEqual(pool.stats()["unused"], 0)
+
+    def test_finalization_timeout_preserves_account_and_mailbox_until_persister_finishes(self):
+        from services.chatgpt_phone_verification import (
+            ChatGPTPhoneVerificationManager,
+        )
+
+        task_id = "task-pool-finalization-pending"
+        engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(engine)
+        pool = SmsPoolService(engine)
+        pool.import_text(
+            "not-activated-card",
+            default_base_url="https://sms.example.com/box",
+        )
+        reserved = pool.reserve(task_id=task_id, count=1)[0]
+
+        req = self._pool_request(count=1)
+        req.extra.update(
+            {
+                "chatgpt_existing_account_leadbee_codes": [reserved.code],
+                "chatgpt_existing_account_leadbee_base_urls": [reserved.base_url],
+                "chatgpt_sms_pool_item_ids": [int(reserved.id)],
+            }
+        )
+        _create_task_record(task_id, req, "manual", None)
+
+        saved_rows = []
+
+        def save_account(account):
+            extra = dict(account.extra or {})
+            row = SimpleNamespace(
+                id=1,
+                platform=account.platform,
+                email=account.email,
+                extra=extra,
+                extra_json=json.dumps(extra, ensure_ascii=False),
+                created_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
+            )
+            saved_rows.append(row)
+            return row
+
+        persister_started = threading.Event()
+        release_persister = threading.Event()
+        persistence_finished = threading.Event()
+
+        def token_persister(_account_id, _tokens):
+            persister_started.set()
+            release_persister.wait(timeout=2)
+            persistence_finished.set()
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=lambda *_args: {"refresh_token": "late-rt"},
+            token_persister=token_persister,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0.05,
+        )
+        provider_slot = threading.BoundedSemaphore(1)
+
+        try:
+            with (
+                mock.patch("core.registry.get", return_value=_ExistingAccountPlatform),
+                mock.patch(
+                    "core.base_mailbox.create_mailbox",
+                    side_effect=lambda **_: _LoginMailbox(),
+                ),
+                mock.patch("core.db.save_account", side_effect=save_account),
+                mock.patch(
+                    "core.db.save_account_with_creation_state",
+                    side_effect=lambda account: (save_account(account), True),
+                ),
+                mock.patch(
+                    "core.db.delete_incomplete_chatgpt_account",
+                    return_value=True,
+                ) as delete_incomplete,
+                mock.patch("api.tasks._refresh_saved_chatgpt_login", return_value=""),
+                mock.patch("api.tasks._auto_upload_integrations"),
+                mock.patch("api.tasks._save_task_log"),
+                mock.patch("api.tasks._upsert_chatgpt_attempt_binding"),
+                mock.patch(
+                    "api.tasks._requeue_chatgpt_login_mailbox",
+                    return_value=True,
+                ) as requeue_mailbox,
+                mock.patch("api.tasks.sms_pool_service", pool),
+                mock.patch(
+                    "services.chatgpt_phone_verification.phone_verification_manager",
+                    manager,
+                ),
+                mock.patch(
+                    "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                    provider_slot,
+                ),
+                mock.patch(
+                    "api.tasks.CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS",
+                    0.0,
+                ),
+                mock.patch("core.proxy_pool.proxy_pool.report_success"),
+                mock.patch("core.proxy_pool.proxy_pool.report_fail"),
+                mock.patch("core.config_store.config_store.get_all", return_value={}),
+            ):
+                _run_register(task_id, req)
+
+            self.assertTrue(persister_started.is_set())
+            self.assertFalse(persistence_finished.is_set())
+            self.assertGreaterEqual(len(saved_rows), 1)
+            delete_incomplete.assert_not_called()
+            requeue_mailbox.assert_not_called()
+
+            release_persister.set()
+            self.assertTrue(persistence_finished.wait(timeout=1))
+            session_id = next(iter(manager._sessions))
+            completed = manager._sessions[session_id].wait_until_terminal(1)
+            self.assertEqual(completed["status"], "completed")
+        finally:
+            release_persister.set()
+
+        with Session(engine) as session:
+            row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(row.status, "unused")
+            self.assertEqual(row.reserved_task_id, "")
 
     def test_task_switches_to_spare_pool_card_without_repeating_email_login(self):
         task_id = "task-pool-card-failover"

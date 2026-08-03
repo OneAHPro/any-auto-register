@@ -13,6 +13,7 @@ from core.db import AccountModel, OutlookAccountModel
 from services.chatgpt_phone_verification import (
     ChatGPTPhoneVerificationManager,
     InteractivePhoneVerificationBroker,
+    PhoneVerificationCancelled,
     _load_account_and_email_service,
     merge_chatgpt_phone_tokens,
     normalize_e164_phone,
@@ -523,6 +524,206 @@ class PhoneOAuthResumeTests(unittest.TestCase):
 
 
 class PhoneVerificationManagerTests(unittest.TestCase):
+    def test_provider_slot_is_released_before_token_persistence_finishes(self):
+        provider_slot = threading.BoundedSemaphore(1)
+        persister_started = threading.Event()
+        release_persister = threading.Event()
+
+        def token_persister(_account_id, _tokens):
+            persister_started.set()
+            release_persister.wait(timeout=1)
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=lambda *_args: {"refresh_token": "new-rt"},
+            token_persister=token_persister,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0.01,
+        )
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ):
+            started = manager.start(88, leadbee_code="bei-sms-PERSIST-BLOCK")
+            self.assertTrue(persister_started.wait(timeout=1))
+            self.assertTrue(started["provider_cleanup_settled"])
+            self.assertTrue(provider_slot.acquire(blocking=False))
+            provider_slot.release()
+            release_persister.set()
+
+            deadline = time.monotonic() + 1
+            result = started
+            while result["status"] not in {"completed", "failed"}:
+                if time.monotonic() >= deadline:
+                    self.fail("token persistence worker did not finish")
+                time.sleep(0.01)
+                result = manager.status(88, started["session_id"])
+
+        self.assertEqual(result["status"], "completed")
+
+    def test_blocked_provider_does_not_publish_cleanup_or_release_slot_early(self):
+        provider_slot = threading.BoundedSemaphore(1)
+        runner_started = threading.Event()
+        release_runner = threading.Event()
+        actual_provider_finished = threading.Event()
+
+        def automatic_runner(_account_id, _exchange_code, broker):
+            broker.mark_provider_started()
+            runner_started.set()
+            try:
+                release_runner.wait(timeout=2)
+                return {"refresh_token": "late-rt"}
+            finally:
+                actual_provider_finished.set()
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=automatic_runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0.01,
+            command_timeout_seconds=0.05,
+        )
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            provider_slot,
+        ):
+            started = manager.start(87, leadbee_code="bei-sms-BLOCKED-RUNNER")
+            self.assertTrue(runner_started.wait(timeout=1))
+            cancelled = manager.cancel(87, started["session_id"])
+
+            self.assertEqual(cancelled["status"], "failed")
+            self.assertFalse(cancelled["provider_cleanup_settled"])
+            self.assertFalse(actual_provider_finished.is_set())
+            self.assertFalse(provider_slot.acquire(blocking=False))
+
+            release_runner.set()
+            cleanup_deadline = time.monotonic() + 1
+            snapshot = cancelled
+            while not snapshot["provider_cleanup_settled"]:
+                if time.monotonic() >= cleanup_deadline:
+                    self.fail("provider execution did not publish cleanup after returning")
+                time.sleep(0.01)
+                snapshot = manager.wait_for_provider_cleanup(
+                    87,
+                    started["session_id"],
+                    timeout=0.01,
+                )
+
+            self.assertTrue(actual_provider_finished.is_set())
+            self.assertTrue(provider_slot.acquire(blocking=False))
+            provider_slot.release()
+
+    def test_worker_start_failure_rolls_back_dead_session_mapping(self):
+        manager = ChatGPTPhoneVerificationManager(start_timeout_seconds=0.01)
+        worker = mock.Mock()
+        worker.start.side_effect = RuntimeError("thread start failed")
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.threading.Thread",
+            return_value=worker,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "thread start failed"):
+                manager.start(89, leadbee_code="bei-sms-THREAD-FAIL")
+
+        self.assertEqual(manager._sessions, {})
+        self.assertEqual(manager._account_sessions, {})
+
+    def test_worker_checkpoint_self_enforces_broker_expiry(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=90,
+            provider="leadbee",
+        )
+        broker.expires_at = time.time() - 1
+
+        with self.assertRaises(PhoneVerificationCancelled):
+            broker.raise_if_cancelled()
+
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["status"], "failed")
+        self.assertIn("已过期", snapshot["message"])
+
+    def test_provider_slot_wait_expires_without_status_polling(self):
+        clock = {"now": 100.0}
+        acquire_calls = 0
+
+        class BusyProviderSlots:
+            def acquire(self, **_kwargs):
+                nonlocal acquire_calls
+                acquire_calls += 1
+                clock["now"] += 61.0
+                if acquire_calls > 1:
+                    raise AssertionError("provider slot wait did not honor expiry")
+                return False
+
+            def release(self):
+                raise AssertionError("unacquired provider slot was released")
+
+        runner = mock.Mock()
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda _account_id: None,
+            ttl_seconds=120,
+            start_timeout_seconds=1,
+        )
+
+        with mock.patch(
+            "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+            BusyProviderSlots(),
+        ), mock.patch(
+            "services.chatgpt_phone_verification.time.time",
+            side_effect=lambda: clock["now"],
+        ):
+            result = manager.start(91, leadbee_code="bei-sms-SLOT-DEADLINE")
+
+        self.assertEqual(result["status"], "failed")
+        self.assertIn("排队", result["message"])
+        self.assertIn("超时", result["message"])
+        self.assertTrue(result["provider_cleanup_settled"])
+        runner.assert_not_called()
+
+    def test_unsettled_automatic_session_is_not_removed(self):
+        manager = ChatGPTPhoneVerificationManager(command_timeout_seconds=0.01)
+        broker = InteractivePhoneVerificationBroker(
+            account_id=92,
+            provider="leadbee",
+        )
+        manager._sessions[broker.session_id] = broker
+        manager._account_sessions[broker.account_id] = broker.session_id
+
+        with manager._lock:
+            removed = manager._remove_session_locked(broker.session_id)
+
+        self.assertFalse(removed)
+        self.assertIn(broker.session_id, manager._sessions)
+        broker.mark_exchange_code_active_unknown("provider state unknown")
+        broker.mark_provider_cleanup_settled()
+
+        with manager._lock:
+            removed = manager._remove_session_locked(broker.session_id)
+
+        self.assertTrue(removed)
+        self.assertNotIn(broker.session_id, manager._sessions)
+
+    def test_expired_status_preserves_active_unknown_settlement(self):
+        manager = ChatGPTPhoneVerificationManager(command_timeout_seconds=0.01)
+        broker = InteractivePhoneVerificationBroker(
+            account_id=93,
+            provider="leadbee",
+        )
+        broker.mark_exchange_code_active_unknown("provider state unknown")
+        broker.mark_provider_cleanup_settled()
+        broker.expires_at = time.time() - 1
+        manager._sessions[broker.session_id] = broker
+        manager._account_sessions[broker.account_id] = broker.session_id
+
+        result = manager.status(broker.account_id, broker.session_id)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["exchange_code_settlement"], "active_unknown")
+        self.assertTrue(result["provider_cleanup_settled"])
+
     def setUp(self):
         self.persisted = []
         self.refreshed = []
@@ -973,7 +1174,7 @@ class PhoneVerificationManagerTests(unittest.TestCase):
         self.assertTrue(cancel_result["exchange_code_restoration_confirmed"])
         self.assertFalse(cancel_result["exchange_code_unusable"])
 
-    def test_expired_status_retires_session_before_late_automatic_tokens(self):
+    def test_expired_status_cancels_before_late_tokens_and_retains_snapshot(self):
         runner_started = threading.Event()
         release_runner = threading.Event()
         persisted = threading.Event()
@@ -1010,15 +1211,23 @@ class PhoneVerificationManagerTests(unittest.TestCase):
         manager._sessions[session_id].expires_at = time.time() - 1
 
         try:
-            with self.assertRaisesRegex(ValueError, "已过期"):
-                manager.status(account_id, session_id)
+            expired = manager.status(account_id, session_id)
+            self.assertEqual(expired["status"], "failed")
+            self.assertIn("已过期", expired["message"])
+            self.assertFalse(expired["provider_cleanup_settled"])
+            self.assertIn(session_id, manager._sessions)
+            self.assertEqual(manager._account_sessions[account_id], session_id)
         finally:
             release_runner.set()
             worker.join(timeout=1)
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(persisted.is_set())
-        self.assertNotIn(session_id, manager._sessions)
+        self.assertIn(session_id, manager._sessions)
+        self.assertTrue(
+            manager._sessions[session_id]
+            .snapshot()["provider_cleanup_settled"]
+        )
         self.assertNotIn(account_id, manager._account_sessions)
 
     def test_status_expiry_between_get_and_snapshot_retires_before_late_tokens(self):
@@ -1066,26 +1275,26 @@ class PhoneVerificationManagerTests(unittest.TestCase):
                 broker.expires_at = time.time() - 1
             return snapshot
 
-        expiry_observed = False
         try:
             with mock.patch.object(broker, "snapshot", side_effect=snapshot_then_expire):
-                try:
-                    status = manager.status(account_id, session_id)
-                except ValueError as exc:
-                    self.assertIn("已过期", str(exc))
-                    expiry_observed = True
-                else:
-                    expiry_observed = status["status"] == "expired"
+                status = manager.status(account_id, session_id)
+                self.assertEqual(status["status"], "failed")
+                self.assertIn("已过期", status["message"])
+                self.assertFalse(status["provider_cleanup_settled"])
+                self.assertIn(session_id, manager._sessions)
         finally:
             release_runner.set()
             worker.join(timeout=1)
 
         self.assertNotEqual(snapshot_statuses[0], "expired")
         self.assertIn("expired", snapshot_statuses[1:])
-        self.assertTrue(expiry_observed)
         self.assertFalse(worker.is_alive())
         self.assertFalse(persisted.is_set())
-        self.assertNotIn(session_id, manager._sessions)
+        self.assertIn(session_id, manager._sessions)
+        self.assertTrue(
+            manager._sessions[session_id]
+            .snapshot()["provider_cleanup_settled"]
+        )
         self.assertNotIn(account_id, manager._account_sessions)
 
     def test_expired_replaced_session_cannot_persist_over_new_request(self):
@@ -1118,6 +1327,16 @@ class PhoneVerificationManagerTests(unittest.TestCase):
         self.assertTrue(first_runner_started.wait(timeout=1))
         first_broker = manager._sessions[first["session_id"]]
         first_broker.expires_at = time.time() - 1
+
+        with self.assertRaisesRegex(ValueError, "仍在清理服务端终态"):
+            manager.start(23, leadbee_code="bei-sms-NEW-CODE")
+        self.assertFalse(first_broker.snapshot()["provider_cleanup_settled"])
+        release_first_runner.set()
+        cleanup_deadline = time.monotonic() + 1
+        while not first_broker.snapshot()["provider_cleanup_settled"]:
+            if time.monotonic() >= cleanup_deadline:
+                self.fail("expired provider worker did not settle cleanup")
+            time.sleep(0.01)
 
         second = manager.start(23, leadbee_code="bei-sms-NEW-CODE")
         try:

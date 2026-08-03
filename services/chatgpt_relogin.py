@@ -404,6 +404,7 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             "id": normalized_id,
             "email": email,
             "created_at": account.created_at,
+            "updated_at": account.updated_at,
             "password": str(account.password or ""),
             "user_id": _text(account.user_id),
             "extra": extra,
@@ -1102,6 +1103,7 @@ def _delete_local_chatgpt_account(
     *,
     expected_email: str,
     expected_created_at: datetime,
+    expected_updated_at: datetime,
 ) -> bool:
     """Delete exactly one local ChatGPT account; missing is an idempotent success."""
     with Session(engine) as session:
@@ -1112,6 +1114,7 @@ def _delete_local_chatgpt_account(
                 .where(AccountModel.platform == "chatgpt")
                 .where(func.lower(AccountModel.email) == _text(expected_email).lower())
                 .where(AccountModel.created_at == expected_created_at)
+                .where(AccountModel.updated_at == expected_updated_at)
             )
             deleted_count = int(getattr(result, "rowcount", 0) or 0)
             if deleted_count == 1:
@@ -1133,6 +1136,7 @@ def _remove_deactivated_local_account(
     *,
     email: str,
     created_at: datetime,
+    updated_at: datetime,
     log_fn: LogFn | None,
 ) -> dict[str, Any]:
     try:
@@ -1140,6 +1144,7 @@ def _remove_deactivated_local_account(
             account_id,
             expected_email=email,
             expected_created_at=created_at,
+            expected_updated_at=updated_at,
         )
     except Exception as exc:
         detail = _text(exc) or type(exc).__name__
@@ -1211,6 +1216,7 @@ def _relogin_chatgpt_account_locked(
             saved["id"],
             email=email,
             created_at=saved["created_at"],
+            updated_at=saved["updated_at"],
             log_fn=log_fn,
         )
     except TaskInterruption:

@@ -331,6 +331,7 @@ class RegisterTaskStore:
     ) -> str:
         with self._lock:
             record = self._records[task_id]
+            completed_at = time.time()
             resolved_status = str(status or "")
             if (
                 resolved_status == "done"
@@ -346,7 +347,10 @@ class RegisterTaskStore:
             record.skipped = skipped
             record.errors = list(errors)
             record.error = error
-            record.updated_at = time.time()
+            # This remains stable while optional alerting and cleanup append
+            # logs after the business task has already reached a terminal state.
+            record.meta.setdefault("completed_at", completed_at)
+            record.updated_at = completed_at
             return resolved_status
 
     def snapshot(self, task_id: str) -> dict[str, Any]:

@@ -41,6 +41,66 @@ from .sentinel_token import build_sentinel_token
 from .sentinel_browser import get_sentinel_token_via_browser
 
 
+def _is_password_verify_deactivation_response(
+    status_code,
+    error_code,
+    error_message,
+):
+    """Accept only the structured 403 signals that may delete a local account."""
+    try:
+        normalized_status = int(status_code or 0)
+    except (TypeError, ValueError):
+        normalized_status = 0
+    if normalized_status != 403:
+        return False
+
+    normalized_code = str(error_code or "").strip().lower()
+    if normalized_code in {"account_deactivated", "account_deleted"}:
+        return True
+
+    normalized_message = " ".join(
+        str(error_message or "").strip().lower().split()
+    )
+    canonical_messages = (
+        "you do not have an account because it has been deleted or deactivated",
+        "your account was deleted or deactivated",
+        "account has been deleted or deactivated",
+        "你没有账号，因为它已被删除或停用",
+        "您没有账号，因为它已被删除或停用",
+        "账号已被删除或停用",
+        "账号已被停用或删除",
+        "帐号已被删除或停用",
+        "帐号已被停用或删除",
+        "账户已被删除或停用",
+        "账户已被停用或删除",
+        "帳號已被刪除或停用",
+        "帳戶已被刪除或停用",
+    )
+    if normalized_message.rstrip(".!。！") in canonical_messages:
+        return True
+
+    canonical_remediation_messages = (
+        "you do not have an account because it has been deleted or deactivated. "
+        "if you believe this was an error, please contact us through our help center",
+        "你没有账号，因为它已被删除或停用。如果您认为这是错误，请通过我们的帮助中心联系我们",
+        "您没有账号，因为它已被删除或停用。如果您认为这是错误，请通过我们的帮助中心联系我们",
+        "你沒有帳號，因為它已被刪除或停用。如果您認為這是錯誤，請透過我們的幫助中心聯絡我們",
+    )
+    normalized_without_terminal_punctuation = normalized_message.rstrip(".!。！")
+    if normalized_without_terminal_punctuation in canonical_remediation_messages:
+        return True
+
+    help_center_url = r"(?:https?://)?help\.openai\.com(?:/[^\s，。！!]*)?"
+    for remediation in canonical_remediation_messages:
+        if re.fullmatch(
+            rf"{re.escape(remediation)}"
+            rf"(?:[.,，:：]?\s*(?:at\s+|地址(?:为|是)\s*){help_center_url})",
+            normalized_without_terminal_punctuation,
+        ):
+            return True
+    return False
+
+
 class OAuthClient:
     """OAuth 客户端 - 用于获取 Access Token 和 Refresh Token"""
 
@@ -1398,7 +1458,55 @@ class OAuthClient:
             self._log(f"/password/verify -> {r.status_code}")
 
             if r.status_code != 200:
-                self._set_error(f"密码验证失败: {r.status_code} - {r.text[:180]}")
+                response_text = str(r.text or "")
+                error_code = ""
+                error_message = ""
+                try:
+                    error_payload = r.json()
+                except Exception:
+                    error_payload = None
+                if isinstance(error_payload, dict):
+                    error_detail = error_payload.get("error") or error_payload.get("错误")
+                    if isinstance(error_detail, dict):
+                        error_code = str(
+                            error_detail.get("code")
+                            or error_detail.get("error_code")
+                            or error_detail.get("type")
+                            or error_detail.get("代码")
+                            or ""
+                        ).strip()
+                        error_message = str(
+                            error_detail.get("message")
+                            or error_detail.get("消息")
+                            or ""
+                        ).strip()
+                    error_code = error_code or str(
+                        error_payload.get("code")
+                        or error_payload.get("error_code")
+                        or error_payload.get("type")
+                        or (
+                            error_payload.get("error")
+                            if isinstance(error_payload.get("error"), str)
+                            else ""
+                        )
+                        or ""
+                    ).strip()
+                    error_message = error_message or str(
+                        error_payload.get("message")
+                        or error_payload.get("error_description")
+                        or ""
+                    ).strip()
+                if _is_password_verify_deactivation_response(
+                    r.status_code,
+                    error_code,
+                    error_message,
+                ):
+                    terminal_message = error_message or "账号已被删除或停用"
+                    self._set_error(terminal_message)
+                    raise ChatGPTAccountDeactivatedError(terminal_message)
+                self._set_error(
+                    f"密码验证失败: {r.status_code} - {response_text[:180]}"
+                )
                 return None
 
             data = r.json()
@@ -1407,6 +1515,8 @@ class OAuthClient:
             )
             self._log(f"verify {describe_flow_state(flow_state)}")
             return flow_state
+        except TaskInterruption:
+            raise
         except Exception as e:
             self._set_error(f"密码验证异常: {e}")
             return None

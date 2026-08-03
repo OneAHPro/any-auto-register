@@ -843,10 +843,10 @@ def test_live_active_task_never_overlaps_even_when_no_accounts_remain():
     assert status["next_run_at"] is None
 
 
-def test_terminal_active_schedules_from_last_start_without_stacking_runtime():
+def test_terminal_active_schedules_full_interval_from_completion():
     service = _service_module()
-    started_at = datetime(2026, 8, 2, 11, 30, tzinfo=timezone.utc)
     completed_at = datetime(2026, 8, 2, 11, 40, tzinfo=timezone.utc)
+    mutable_updated_at = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
     store = _enabled_store(
         chatgpt_auto_relogin_status_state="running",
         chatgpt_auto_relogin_status_active_task_id="task-complete",
@@ -862,23 +862,61 @@ def test_terminal_active_schedules_from_last_start_without_stacking_runtime():
         try_enqueue=lambda *args: enqueues.append(args) or _accepted("task-next"),
         observe=lambda _: {
             "status": "done",
-            "updated_at": completed_at,
+            "completed_at": completed_at,
+            "updated_at": mutable_updated_at,
             "live": False,
             "orphaned": False,
         },
     )
-    next_tick = service.tick_chatgpt_auto_relogin(
+    before_due = service.tick_chatgpt_auto_relogin(
         store=store,
-        now=datetime(2026, 8, 2, 12, 5, 1, tzinfo=timezone.utc),
+        now=datetime(2026, 8, 2, 12, 9, 59, tzinfo=timezone.utc),
+        list_eligible=lambda: [4, 5],
+        try_enqueue=lambda *args: enqueues.append(args) or _accepted("task-next"),
+        observe=lambda _: None,
+    )
+    at_due = service.tick_chatgpt_auto_relogin(
+        store=store,
+        now=datetime(2026, 8, 2, 12, 10, tzinfo=timezone.utc),
         list_eligible=lambda: [4, 5],
         try_enqueue=lambda *args: enqueues.append(args) or _accepted("task-next"),
         observe=lambda _: None,
     )
 
     assert reconciled["active_task_id"] is None
-    assert reconciled["next_run_at"] == "2026-08-02T12:00:00Z"
+    assert reconciled["next_run_at"] == "2026-08-02T12:10:00Z"
+    assert before_due["next_run_at"] == reconciled["next_run_at"]
     assert enqueues == [([4, 5], 10)]
-    assert next_tick["active_task_id"] == "task-next"
+    assert at_due["active_task_id"] == "task-next"
+
+
+def test_overdue_terminal_task_enqueues_without_waiting_for_another_tick():
+    service = _service_module()
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="running",
+        chatgpt_auto_relogin_status_active_task_id="task-overdue",
+        chatgpt_auto_relogin_status_next_run_at="",
+    )
+    enqueues = []
+
+    status = service.tick_chatgpt_auto_relogin(
+        store=store,
+        now=datetime(2026, 8, 2, 12, 5, tzinfo=timezone.utc),
+        list_eligible=lambda: [4, 5],
+        try_enqueue=lambda *args: enqueues.append(args) or _accepted("task-next"),
+        observe=lambda _: {
+            "status": "done",
+            "completed_at": datetime(2026, 8, 2, 11, 0, tzinfo=timezone.utc),
+            "updated_at": datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc),
+            "live": False,
+            "orphaned": False,
+        },
+    )
+
+    assert enqueues == [([4, 5], 10)]
+    assert status["state"] == "running"
+    assert status["active_task_id"] == "task-next"
+    assert status["next_run_at"] is None
 
 
 @pytest.mark.parametrize(

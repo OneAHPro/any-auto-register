@@ -267,22 +267,40 @@ class SmsPoolService:
             session.commit()
             return True
 
-    def release_task(self, task_id: str) -> int:
+    def release_task(
+        self,
+        task_id: str,
+        *,
+        quarantine_item_ids: set[int] | None = None,
+    ) -> int:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:
             return 0
+        quarantined_ids = {
+            int(item_id)
+            for item_id in (quarantine_item_ids or set())
+            if int(item_id or 0) > 0
+        }
         with self._lock, Session(self.engine) as session:
             self._begin_write(session)
             rows = session.exec(
                 select(SmsPoolItemModel)
-                .where(SmsPoolItemModel.status == "reserved")
+                .where(SmsPoolItemModel.status.in_(["reserved", "active"]))
                 .where(SmsPoolItemModel.reserved_task_id == normalized_task_id)
             ).all()
             now = _utcnow()
             for row in rows:
-                row.status = "unused"
+                must_quarantine = bool(
+                    row.status == "active" or int(row.id or 0) in quarantined_ids
+                )
+                row.status = "active" if must_quarantine else "unused"
                 row.reserved_task_id = ""
                 row.reserved_at = None
+                if must_quarantine:
+                    row.used_at = None
+                else:
+                    row.used_by_email = ""
+                    row.used_at = None
                 row.updated_at = now
                 session.add(row)
             session.commit()
@@ -299,9 +317,10 @@ class SmsPoolService:
             now = _utcnow()
             for row in rows:
                 was_active = row.status == "active"
-                row.status = "used" if was_active else "unused"
-                if was_active:
-                    row.used_at = now
+                # An active card with no provider-confirmed terminal outcome is
+                # quarantined in place.  Reissuing it is unsafe, but labelling
+                # it used would permanently burn a card that may later recover.
+                row.status = "active" if was_active else "unused"
                 row.reserved_task_id = ""
                 row.reserved_at = None
                 if not was_active:

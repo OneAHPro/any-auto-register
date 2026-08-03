@@ -40,6 +40,204 @@ class OAuthCookieDecodeTests(unittest.TestCase):
 
 
 class OAuthEntryRetryTests(unittest.TestCase):
+    def test_password_verify_raises_typed_signal_for_deactivated_account_response(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"message":'
+            '"You do not have an account because it has been deleted or deactivated. '
+            'If you believe this was an error, please contact us through our help center."}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "You do not have an account because it has been deleted or "
+                    "deactivated. If you believe this was an error, please contact "
+                    "us through our help center."
+                ),
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ), self.assertRaises(ChatGPTAccountDeactivatedError):
+            client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+    def test_password_verify_raises_for_top_level_deactivation_code(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"type":"account_deactivated","message":"Account unavailable"}'
+        )
+        response.json.return_value = {
+            "type": "account_deactivated",
+            "message": "Account unavailable",
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ), self.assertRaises(ChatGPTAccountDeactivatedError):
+            client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+    def test_password_verify_accepts_canonical_chinese_help_center_message(self):
+        client = OAuthClient({}, verbose=False)
+        message = (
+            "你没有账号，因为它已被删除或停用。如果您认为这是错误，"
+            "请通过我们的帮助中心联系我们，地址为 https://help.openai.com。"
+        )
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = json.dumps(
+            {"错误": {"消息": message}},
+            ensure_ascii=False,
+        )
+        response.json.return_value = {"错误": {"消息": message}}
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ), self.assertRaises(ChatGPTAccountDeactivatedError):
+            client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+    def test_password_verify_does_not_raise_for_diagnostic_deactivation_text(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"message":"diagnostic: upstream did not say account '
+            'has been deleted or deactivated"}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "diagnostic: upstream did not say account has been deleted "
+                    "or deactivated"
+                ),
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ):
+            result = client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("密码验证失败: 403", client.last_error)
+
+    def test_password_verify_does_not_raise_for_canonical_prefix_diagnostic(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 403
+        response.text = (
+            '{"error":{"message":"Account has been deleted or deactivated '
+            'in the diagnostic fixture, but this is not an account-state signal."}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "Account has been deleted or deactivated in the diagnostic "
+                    "fixture, but this is not an account-state signal."
+                ),
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ):
+            result = client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("密码验证失败: 403", client.last_error)
+
+    def test_password_verify_does_not_raise_for_remediation_prefix_diagnostic(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 403
+        message = (
+            "You do not have an account because it has been deleted or "
+            "deactivated. If you believe this was an error, please contact us "
+            "through our help center. Diagnostic fixture only; this is not an "
+            "account-state signal."
+        )
+        response.text = json.dumps({"error": {"message": message}})
+        response.json.return_value = {"error": {"message": message}}
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ):
+            result = client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("密码验证失败: 403", client.last_error)
+
+    def test_password_verify_does_not_raise_for_deactivation_text_on_non_403(self):
+        client = OAuthClient({}, verbose=False)
+        response = mock.Mock()
+        response.status_code = 502
+        response.text = (
+            '{"error":{"message":'
+            '"You do not have an account because it has been deleted or deactivated."}}'
+        )
+        response.json.return_value = {
+            "error": {
+                "message": (
+                    "You do not have an account because it has been deleted or "
+                    "deactivated."
+                ),
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="browser-token",
+        ):
+            result = client._submit_password_verify(
+                "saved-password",
+                "device-id",
+                referer="https://auth.openai.com/log-in/password",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("密码验证失败: 502", client.last_error)
+
     def test_email_otp_raises_typed_signal_for_deactivated_account_response(self):
         client = OAuthClient(
             {"chatgpt_oauth_otp_wait_seconds": 30},
@@ -830,10 +1028,11 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
         snapshot = broker.snapshot()
         self.assertEqual(snapshot["provider_error_code"], "CARD_NOT_IN_SESSION")
         self.assertFalse(snapshot["exchange_code_restoration_confirmed"])
-        self.assertTrue(snapshot["exchange_code_unusable"])
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
         provider_started.assert_called_once_with()
         restored.assert_not_called()
-        consumed.assert_called_once_with()
+        consumed.assert_not_called()
 
     def test_poll_no_inventory_is_reported_as_released_not_browser_occupied(self):
         restored = mock.Mock()
@@ -869,6 +1068,486 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
         self.assertFalse(snapshot["exchange_code_unusable"])
         self.assertFalse(service.card_at_risk)
         restored.assert_called_once_with()
+
+    def test_terminal_unavailable_card_is_reported_as_restored(self):
+        restored = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_restored=restored,
+        )
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(status="processing"),
+            },
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="unavailable",
+                    is_terminal=True,
+                    can_auto_poll=False,
+                    can_refresh=False,
+                ),
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-TERMINAL-NO-INVENTORY",
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch("platforms.chatgpt.phone_service.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "暂时无可用号码"):
+                service.acquire_phone()
+
+        self.assertFalse(service.card_at_risk)
+        self.assertTrue(
+            broker.snapshot()["exchange_code_restoration_confirmed"]
+        )
+        restored.assert_called_once_with()
+
+    def test_phone_timeout_keeps_polling_when_provider_refuses_cancellation(self):
+        consumed = mock.Mock()
+        restored = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+            on_exchange_code_restored=restored,
+        )
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="processing",
+                    number_queue_seconds=180,
+                ),
+            },
+            {
+                "ok": False,
+                "error": "CANCEL_NOT_ALLOWED",
+                "message": "任务当前不能取消",
+            },
+            {
+                "ok": False,
+                "error": "CARD_NOT_IN_SESSION",
+                "message": "当前会话无权操作该卡密",
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-UNCANCELABLE-QUEUE",
+                "leadbee_phone_timeout_seconds": 5,
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        clock = {"now": 0.0}
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), mock.patch(
+            "platforms.chatgpt.phone_service.time.sleep",
+            side_effect=lambda _seconds: clock.update(now=5.0),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "暂时无可用号码"):
+                service.acquire_phone()
+
+        self.assertEqual(
+            [call[0] for call in session.calls],
+            [
+                "https://sms.leadbee.cn/smsbox/api/activate",
+                "https://sms.leadbee.cn/smsbox/api/cancel",
+                "https://sms.leadbee.cn/smsbox/api/receive-sms",
+            ],
+        )
+        self.assertFalse(service.card_at_risk)
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["provider_error_code"], "CARD_NOT_IN_SESSION")
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        consumed.assert_not_called()
+        restored.assert_called_once_with()
+
+    def test_replacement_timeout_keeps_polling_without_poisoning_card_state(self):
+        consumed = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+        )
+        first_phone = "+447456344799"
+        replacement_phone = "+447911123456"
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="number_ready",
+                    phone=first_phone,
+                ),
+            },
+            {
+                "ok": True,
+                "card": _leadbee_card(status="processing", phone=None),
+            },
+            {
+                "ok": False,
+                "error": "CANCEL_NOT_ALLOWED",
+                "message": "任务当前不能取消",
+            },
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="number_ready",
+                    phone=replacement_phone,
+                ),
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-UNCANCELABLE-REPLACEMENT",
+                "leadbee_phone_timeout_seconds": 5,
+                "leadbee_total_timeout_seconds": 30,
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        clock = {"now": 0.0}
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), mock.patch(
+            "platforms.chatgpt.phone_service.time.sleep",
+            side_effect=lambda _seconds: clock.update(now=5.0),
+        ):
+            first_entry = service.acquire_phone()
+            service.request_replacement(first_entry.phone)
+            replacement_entry = service.acquire_phone()
+
+        self.assertEqual(replacement_entry.phone, replacement_phone)
+        self.assertEqual(
+            [call[0] for call in session.calls],
+            [
+                "https://sms.leadbee.cn/smsbox/api/activate",
+                "https://sms.leadbee.cn/smsbox/api/replace-number",
+                "https://sms.leadbee.cn/smsbox/api/cancel",
+                "https://sms.leadbee.cn/smsbox/api/receive-sms",
+            ],
+        )
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["provider_error_code"], "")
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        consumed.assert_not_called()
+
+    def test_total_deadline_quarantines_uncancelable_active_card(self):
+        consumed = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+        )
+        session = _LeadBeeSession(
+            {"ok": True, "card": _leadbee_card(status="processing")},
+            {
+                "ok": False,
+                "error": "CANCEL_NOT_ALLOWED",
+                "message": "任务当前不能取消",
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-TOTAL-DEADLINE",
+                "leadbee_phone_timeout_seconds": 20,
+                "leadbee_total_timeout_seconds": 5,
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=[0, 5],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "结算期限"):
+                service.acquire_phone()
+
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertEqual(snapshot["provider_error_code"], "")
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        self.assertTrue(service.card_at_risk)
+        consumed.assert_not_called()
+
+    def test_late_activate_response_cannot_escape_total_deadline(self):
+        clock = {"now": 0.0}
+        calls = []
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/api/activate"):
+                clock["now"] = 6.0
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="number_ready",
+                            phone="+447456344799",
+                        ),
+                    }
+                )
+            if url.endswith("/api/cancel"):
+                return _LeadBeeResponse(
+                    {
+                        "ok": False,
+                        "error": "CANCEL_NOT_ALLOWED",
+                        "message": "任务当前不能取消",
+                    }
+                )
+            raise AssertionError(f"unexpected LeadBee request: {url}")
+
+        session = mock.Mock()
+        session.post.side_effect = post
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-LATE-ACTIVATE",
+                "leadbee_total_timeout_seconds": 5,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "结算期限"):
+                service.acquire_phone()
+
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for url, _ in calls],
+            ["activate"],
+        )
+        self.assertEqual(
+            broker.snapshot()["exchange_code_settlement"],
+            "active_unknown",
+        )
+        self.assertFalse(broker.snapshot()["exchange_code_unusable"])
+
+    def test_late_unavailable_phone_response_restores_before_deadline_error(self):
+        clock = {"now": 0.0}
+        calls = []
+        restored = mock.Mock()
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/api/activate"):
+                return _LeadBeeResponse(
+                    {"ok": True, "card": _leadbee_card(status="processing")}
+                )
+            if url.endswith("/api/receive-sms"):
+                clock["now"] = 6.0
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="unavailable",
+                            is_terminal=True,
+                            can_auto_poll=False,
+                            can_refresh=False,
+                        ),
+                    }
+                )
+            raise AssertionError(f"unexpected LeadBee request: {url}")
+
+        session = mock.Mock()
+        session.post.side_effect = post
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_restored=restored,
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-LATE-PHONE-UNAVAILABLE",
+                "leadbee_total_timeout_seconds": 5,
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ), mock.patch("platforms.chatgpt.phone_service.time.sleep"):
+            with self.assertRaisesRegex(RuntimeError, "结算期限.*确认恢复"):
+                service.acquire_phone()
+
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for url, _ in calls],
+            ["activate", "receive-sms"],
+        )
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "restored")
+        self.assertTrue(snapshot["exchange_code_restoration_confirmed"])
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        restored.assert_called_once_with()
+
+    def test_late_unavailable_sms_response_restores_before_deadline_error(self):
+        clock = {"now": 0.0}
+        calls = []
+        restored = mock.Mock()
+        phone = "+447456344799"
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/api/activate"):
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="number_ready",
+                            phone=phone,
+                        ),
+                    }
+                )
+            if url.endswith("/api/receive-sms"):
+                clock["now"] = 6.0
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="unavailable",
+                            is_terminal=True,
+                            can_auto_poll=False,
+                            can_refresh=False,
+                        ),
+                    }
+                )
+            raise AssertionError(f"unexpected LeadBee request: {url}")
+
+        session = mock.Mock()
+        session.post.side_effect = post
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_restored=restored,
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-LATE-SMS-UNAVAILABLE",
+                "leadbee_total_timeout_seconds": 5,
+                "leadbee_otp_timeout_seconds": 30,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            entry = service.acquire_phone()
+            with self.assertRaisesRegex(RuntimeError, "结算期限.*确认恢复"):
+                service.wait_for_code(entry)
+
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for url, _ in calls],
+            ["activate", "receive-sms"],
+        )
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "restored")
+        self.assertTrue(snapshot["exchange_code_restoration_confirmed"])
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        restored.assert_called_once_with()
+
+    def test_late_sms_response_is_not_accepted_after_total_deadline(self):
+        clock = {"now": 0.0}
+        calls = []
+        phone = "+447456344799"
+
+        def post(url, **kwargs):
+            calls.append((url, kwargs))
+            if url.endswith("/api/activate"):
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="number_ready",
+                            phone=phone,
+                        ),
+                    }
+                )
+            if url.endswith("/api/receive-sms"):
+                clock["now"] = 6.0
+                return _LeadBeeResponse(
+                    {
+                        "ok": True,
+                        "card": _leadbee_card(
+                            status="sms_received",
+                            phone=phone,
+                            sms_code="654321",
+                            is_terminal=True,
+                            can_auto_poll=False,
+                            can_refresh=False,
+                        ),
+                    }
+                )
+            if url.endswith("/api/cancel"):
+                return _LeadBeeResponse(
+                    {
+                        "ok": False,
+                        "error": "CANCEL_NOT_ALLOWED",
+                        "message": "任务当前不能取消",
+                    }
+                )
+            raise AssertionError(f"unexpected LeadBee request: {url}")
+
+        session = mock.Mock()
+        session.post.side_effect = post
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-LATE-SMS",
+                "leadbee_total_timeout_seconds": 5,
+                "leadbee_otp_timeout_seconds": 30,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.phone_service.time.monotonic",
+            side_effect=lambda: clock["now"],
+        ):
+            entry = service.acquire_phone()
+            with self.assertRaisesRegex(RuntimeError, "结算期限"):
+                service.wait_for_code(entry)
+
+        self.assertEqual(
+            [url.rsplit("/", 1)[-1] for url, _ in calls],
+            ["activate", "receive-sms"],
+        )
+        self.assertEqual(
+            broker.snapshot()["exchange_code_settlement"],
+            "unusable",
+        )
+        self.assertTrue(broker.snapshot()["exchange_code_unusable"])
 
     def test_poll_card_with_error_payload_is_isolated_as_foreign_session(self):
         consumed = mock.Mock()
@@ -906,10 +1585,11 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
         snapshot = broker.snapshot()
         self.assertEqual(snapshot["provider_error_code"], "CARD_NOT_IN_SESSION")
         self.assertFalse(snapshot["exchange_code_restoration_confirmed"])
-        self.assertTrue(snapshot["exchange_code_unusable"])
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
         self.assertTrue(service.card_at_risk)
         restored.assert_not_called()
-        consumed.assert_called_once_with()
+        consumed.assert_not_called()
 
     def test_wait_for_code_returns_sms_from_terminal_received_card(self):
         session = _LeadBeeSession(
@@ -952,6 +1632,52 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
             code = service.wait_for_code(entry)
 
         self.assertEqual(code, "654321")
+
+    def test_wait_for_code_restores_terminal_unavailable_card(self):
+        restored = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_restored=restored,
+        )
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="number_ready",
+                    phone="+447456344799",
+                ),
+            },
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="unavailable",
+                    phone=None,
+                    is_terminal=True,
+                    can_auto_poll=False,
+                    can_refresh=False,
+                ),
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-SMS-TERMINAL-UNAVAILABLE",
+                "leadbee_poll_interval_seconds": 1,
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        entry = service.acquire_phone()
+        with mock.patch("platforms.chatgpt.phone_service.time.sleep"):
+            code = service.wait_for_code(entry)
+
+        self.assertIsNone(code)
+        self.assertFalse(service.card_at_risk)
+        self.assertTrue(
+            broker.snapshot()["exchange_code_restoration_confirmed"]
+        )
+        restored.assert_called_once_with()
 
     def test_rejected_phone_is_replaced_in_same_session_before_next_acquire(self):
         logs = []
@@ -1054,12 +1780,19 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
         snapshot = broker.snapshot()
         self.assertEqual(snapshot["provider_error_code"], "CARD_NOT_IN_SESSION")
         self.assertFalse(snapshot["exchange_code_restoration_confirmed"])
-        self.assertTrue(snapshot["exchange_code_unusable"])
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
         self.assertTrue(service.card_at_risk)
         restored.assert_not_called()
-        consumed.assert_called_once_with()
+        consumed.assert_not_called()
 
     def test_completed_exchange_code_is_not_reused_for_a_new_login(self):
+        consumed = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+        )
         session = _LeadBeeSession(
             {
                 "ok": True,
@@ -1076,7 +1809,10 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
             }
         )
         service = LeadBeePhoneService(
-            {"leadbee_code": "bei-sms-USED-CODE"},
+            {
+                "leadbee_code": "bei-sms-USED-CODE",
+                "chatgpt_phone_progress_broker": broker,
+            },
             session=session,
         )
 
@@ -1084,6 +1820,85 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
             service.acquire_phone()
 
         self.assertEqual(len(session.calls), 1)
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "unusable")
+        self.assertTrue(snapshot["exchange_code_unusable"])
+        consumed.assert_called_once_with()
+
+    def test_terminal_failed_activation_is_quarantined(self):
+        consumed = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+        )
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="failed",
+                    is_terminal=True,
+                    can_auto_poll=False,
+                    can_refresh=False,
+                ),
+            }
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-TERMINAL-FAILED",
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "任务已结束"):
+            service.acquire_phone()
+
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        consumed.assert_not_called()
+
+    def test_terminal_failed_sms_poll_is_quarantined(self):
+        consumed = mock.Mock()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=17,
+            provider="leadbee",
+            on_exchange_code_consumed=consumed,
+        )
+        phone = "+447456344799"
+        session = _LeadBeeSession(
+            {
+                "ok": True,
+                "card": _leadbee_card(status="number_ready", phone=phone),
+            },
+            {
+                "ok": True,
+                "card": _leadbee_card(
+                    status="failed",
+                    phone=phone,
+                    sms_code="999999",
+                    is_terminal=True,
+                    can_auto_poll=False,
+                    can_refresh=False,
+                ),
+            },
+        )
+        service = LeadBeePhoneService(
+            {
+                "leadbee_code": "bei-sms-SMS-TERMINAL-FAILED",
+                "chatgpt_phone_progress_broker": broker,
+            },
+            session=session,
+        )
+
+        entry = service.acquire_phone()
+        self.assertIsNone(service.wait_for_code(entry))
+
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
+        consumed.assert_not_called()
 
     def test_cancellation_after_activation_restores_the_exchange_code(self):
         broker = mock.Mock()
@@ -1193,7 +2008,9 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
 
         self.assertFalse(service.cancel_active())
         self.assertTrue(service.card_at_risk)
-        self.assertTrue(broker.snapshot()["exchange_code_unusable"])
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
 
     def test_cancel_card_not_in_session_is_not_treated_as_restored(self):
         consumed = mock.Mock()
@@ -1232,12 +2049,13 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
         snapshot = broker.snapshot()
         self.assertEqual(snapshot["provider_error_code"], "CARD_NOT_IN_SESSION")
         self.assertFalse(snapshot["exchange_code_restoration_confirmed"])
-        self.assertTrue(snapshot["exchange_code_unusable"])
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
         self.assertTrue(service.card_at_risk)
         restored.assert_not_called()
-        consumed.assert_called_once_with()
+        consumed.assert_not_called()
 
-    def test_ambiguous_activate_failure_marks_exchange_code_unusable(self):
+    def test_ambiguous_activate_failure_quarantines_exchange_code(self):
         broker = InteractivePhoneVerificationBroker(
             account_id=18,
             provider="leadbee",
@@ -1252,11 +2070,13 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
             session=session,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "激活结果未知.*卡密不可复用"):
+        with self.assertRaisesRegex(RuntimeError, "激活结果未知.*卡密保持隔离"):
             service.acquire_phone()
 
         self.assertTrue(service.card_at_risk)
-        self.assertTrue(broker.snapshot()["exchange_code_unusable"])
+        snapshot = broker.snapshot()
+        self.assertEqual(snapshot["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(snapshot["exchange_code_unusable"])
 
 
 class LeadBeeOAuthFlowTests(unittest.TestCase):
@@ -1452,6 +2272,11 @@ class LeadBeeOAuthFlowTests(unittest.TestCase):
             continue_url="http://localhost:1455/auth/callback?code=done",
         )
 
+        monotonic_values = iter([0.0, 0.0, 0.0, 0.0, 11.0])
+
+        def monotonic_now():
+            return next(monotonic_values, 11.0)
+
         with mock.patch(
             "platforms.chatgpt.oauth_client.create_phone_service",
             return_value=phone_service,
@@ -1472,7 +2297,7 @@ class LeadBeeOAuthFlowTests(unittest.TestCase):
             return_value=(True, completed_state, ""),
         ), mock.patch(
             "platforms.chatgpt.phone_service.time.monotonic",
-            side_effect=[0, 0, 11, 0, 0, 0],
+            side_effect=monotonic_now,
         ), mock.patch(
             "platforms.chatgpt.phone_service.time.sleep"
         ):

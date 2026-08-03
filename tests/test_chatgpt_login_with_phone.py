@@ -167,6 +167,7 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
                 return {
                     "session_id": "phone-session-second",
                     "status": "completed",
+                    "provider_cleanup_settled": True,
                     "logs": [],
                     "expires_in": 600,
                 }
@@ -177,6 +178,7 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
                 return {
                     "session_id": "phone-session-first",
                     "status": "completed",
+                    "provider_cleanup_settled": True,
                     "logs": [],
                     "expires_in": 600,
                 }
@@ -237,6 +239,7 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
             "status": "completed",
             "message": "手机验证完成，Refresh Token 已保存",
             "exchange_code_consumed": True,
+            "provider_cleanup_settled": True,
         }
         control = Mock()
         control.checkpoint.side_effect = lambda **_: (
@@ -268,11 +271,23 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
             "logs": [],
             "expires_in": 1,
         }
+        manager.cancel.return_value = {
+            **manager.start.return_value,
+            "status": "failed",
+            "message": (
+                "LeadBee 自动接码等待超时，服务端卡密终态不可确认；"
+                "卡密保持隔离等待人工核对"
+            ),
+            "provider_started": True,
+            "provider_cleanup_settled": True,
+            "exchange_code_settlement": "active_unknown",
+            "exchange_code_unusable": False,
+        }
 
         with patch(
             "services.chatgpt_phone_verification.phone_verification_manager",
             manager,
-        ), patch("api.tasks.time.monotonic", side_effect=[100.0, 107.0]):
+        ), patch("api.tasks.time.monotonic", side_effect=[100.0, 100.0, 107.0]):
             result = _complete_chatgpt_leadbee_verification(
                 task_id="task-timeout-leadbee",
                 account_id=8,
@@ -283,7 +298,9 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "failed")
         self.assertIn("超时", result["message"])
-        self.assertIn("卡密不可复用", result["message"])
+        self.assertIn("卡密保持隔离", result["message"])
+        self.assertEqual(result["exchange_code_settlement"], "active_unknown")
+        self.assertFalse(result["exchange_code_unusable"])
         manager.cancel.assert_called_once_with(
             8,
             "phone-session-timeout",
@@ -310,7 +327,7 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
         with patch(
             "services.chatgpt_phone_verification.phone_verification_manager",
             manager,
-        ), patch("api.tasks.time.monotonic", side_effect=[100.0, 107.0]):
+        ), patch("api.tasks.time.monotonic", side_effect=[100.0, 100.0, 107.0]):
             result = _complete_chatgpt_leadbee_verification(
                 task_id="task-restored-timeout-leadbee",
                 account_id=11,
@@ -339,6 +356,7 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
             **manager.start.return_value,
             "status": "completed",
             "message": "手机验证完成，Refresh Token 已保存",
+            "provider_cleanup_settled": True,
         }
         control = Mock()
         control.checkpoint.side_effect = lambda **_: (
@@ -379,12 +397,16 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
             **manager.start.return_value,
             "status": "completed",
             "message": "手机验证完成，Refresh Token 已保存",
+            "provider_cleanup_settled": True,
         }
 
         with patch(
             "services.chatgpt_phone_verification.phone_verification_manager",
             manager,
-        ), patch("api.tasks.time.monotonic", side_effect=[100.0, 107.0]), patch(
+        ), patch(
+            "api.tasks.time.monotonic",
+            side_effect=[100.0, 100.0, 107.0],
+        ), patch(
             "api.tasks.time.sleep"
         ):
             result = _complete_chatgpt_leadbee_verification(
