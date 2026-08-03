@@ -1451,9 +1451,13 @@ class OAuthClient:
             response = self.session.post(request_url, **kwargs)
             self._log(f"/password/send-otp -> {response.status_code}")
             if response.status_code != 200:
+                response_detail = sanitize_chatgpt_log_message(
+                    str(response.text or "")[:240]
+                ).strip()
                 self._set_error(
                     "密码重置验证码发送失败: "
                     f"HTTP {response.status_code}"
+                    + (f" - {response_detail}" if response_detail else "")
                 )
                 return None
             next_state = self._state_from_payload(

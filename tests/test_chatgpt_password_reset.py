@@ -6,11 +6,11 @@ from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.utils import FlowState
 
 
-def _response(payload, *, url, status_code=200):
+def _response(payload, *, url, status_code=200, text=""):
     return types.SimpleNamespace(
         status_code=status_code,
         url=url,
-        text="",
+        text=text,
         json=lambda: payload,
     )
 
@@ -51,6 +51,27 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         )
         self.assertNotIn("password", call.kwargs)
         self.assertEqual(call.kwargs["headers"]["oai-device-id"], "device-id")
+
+    def test_password_reset_send_otp_failure_keeps_response_detail(self):
+        self.client.session.post.return_value = _response(
+            {},
+            url="https://auth.openai.com/api/accounts/password/send-otp",
+            status_code=400,
+            text='{"error":{"message":"RESET_REQUEST_DETAIL","code":"invalid"}}',
+        )
+        state = FlowState(
+            page_type="login_password",
+            current_url="https://auth.openai.com/log-in/password",
+        )
+
+        result = self.client._request_password_reset_otp(
+            state,
+            device_id="device-id",
+        )
+
+        self.assertIsNone(result)
+        self.assertIn("HTTP 400", self.client.last_error)
+        self.assertIn("RESET_REQUEST_DETAIL", self.client.last_error)
 
     def test_password_reset_submits_new_password_with_sentinel(self):
         self.client.session.post.return_value = _response(
