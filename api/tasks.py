@@ -86,6 +86,14 @@ class ChatGPTReloginTaskRequest(BaseModel):
     )
 
 
+class ChatGPTRetryFailedTaskRequest(BaseModel):
+    concurrency: StrictInt = Field(
+        default=1,
+        ge=1,
+        le=CHATGPT_RELOGIN_MAX_CONCURRENCY,
+    )
+
+
 def _normalize_chatgpt_relogin_account_ids(
     value,
     *,
@@ -244,13 +252,20 @@ def _normalize_chatgpt_mail_provider_plan(value) -> list[str]:
     return normalized
 
 
-def _build_chatgpt_retry_request(bindings) -> RegisterTaskRequest:
-    """Build a serial retry task while preserving mailbox/card order."""
+def _build_chatgpt_retry_request(
+    bindings,
+    concurrency: int = 1,
+) -> RegisterTaskRequest:
+    """Build a bounded retry task while preserving each mailbox/card binding."""
     from core.config_store import config_store
 
     normalized = _normalize_chatgpt_retry_bindings(bindings)
     if not normalized:
         raise HTTPException(400, "没有可重试的失败账号")
+    normalized_concurrency = _normalize_chatgpt_relogin_concurrency(
+        concurrency,
+        account_count=len(normalized),
+    )
     config = config_store.get_all().copy()
     executor_type = str(config.get("default_executor") or "headless").strip()
     captcha_solver = str(
@@ -278,7 +293,7 @@ def _build_chatgpt_retry_request(bindings) -> RegisterTaskRequest:
     return RegisterTaskRequest(
         platform="chatgpt",
         count=len(normalized),
-        concurrency=1,
+        concurrency=normalized_concurrency,
         register_delay_seconds=1,
         executor_type=executor_type,
         captcha_solver=captcha_solver,
@@ -3194,6 +3209,7 @@ def get_retryable_task_bindings(task_id: str):
 def retry_failed_task_bindings(
     task_id: str,
     background_tasks: BackgroundTasks,
+    req: ChatGPTRetryFailedTaskRequest | None = None,
 ):
     snapshot = _get_task_snapshot(task_id)
     if str(snapshot.get("platform") or "") != "chatgpt":
@@ -3204,7 +3220,10 @@ def retry_failed_task_bindings(
         rows = _retryable_chatgpt_bindings(task_id)
         if not rows:
             raise HTTPException(400, "当前任务没有可重试的失败账号")
-        request = _build_chatgpt_retry_request(rows)
+        request = _build_chatgpt_retry_request(
+            rows,
+            concurrency=req.concurrency if req is not None else 1,
+        )
         row_ids = [int(row.id) for row in rows if row.id is not None]
         with Session(engine) as s:
             for row_id in row_ids:
@@ -3236,6 +3255,7 @@ def retry_failed_task_bindings(
         "task_id": retry_task_id,
         "parent_task_id": task_id,
         "retry_count": len(rows),
+        "concurrency": request.concurrency,
     }
 
 

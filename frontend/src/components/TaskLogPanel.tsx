@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Button, message, Space, Tag } from 'antd'
+import { Button, InputNumber, message, Popconfirm, Space, Tag } from 'antd'
 import { CopyOutlined, FastForwardOutlined, RedoOutlined, StopOutlined } from '@ant-design/icons'
 
 import { API_BASE, apiFetch, getToken } from '@/lib/utils'
@@ -11,6 +11,8 @@ interface TaskLogPanelProps {
 }
 
 type TaskTerminalStatus = 'idle' | 'done' | 'partial' | 'failed' | 'stopped'
+
+const CHATGPT_RETRY_MAX_CONCURRENCY = 10
 
 interface RegisterSummary {
   success: number
@@ -62,6 +64,7 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
   const [stopLoading, setStopLoading] = useState(false)
   const [retryLoading, setRetryLoading] = useState(false)
   const [retryableCount, setRetryableCount] = useState(0)
+  const [retryConcurrency, setRetryConcurrency] = useState(1)
   const [stopRequested, setStopRequested] = useState(false)
   const panelRef = useRef<HTMLDivElement>(null)
   const onDoneRef = useRef(onDone)
@@ -170,15 +173,23 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
 
   const handleRetryFailed = async () => {
     if (retryableCount <= 0 || retryLoading) return
+    const concurrency = Math.min(
+      Math.max(Math.trunc(Number(retryConcurrency) || 1), 1),
+      CHATGPT_RETRY_MAX_CONCURRENCY,
+      retryableCount,
+    )
     setRetryLoading(true)
     try {
       const result = await apiFetch(`/tasks/${activeTaskId}/retry-failed`, {
         method: 'POST',
-      }) as { task_id?: string, retry_count?: number }
+        body: JSON.stringify({ concurrency }),
+      }) as { task_id?: string, retry_count?: number, concurrency?: number }
       const nextTaskId = String(result.task_id || '').trim()
       if (!nextTaskId) throw new Error('重试任务未返回任务 ID')
-      message.success(`已按原邮箱启动 ${parseCounter(result.retry_count)} 个失败账号重试；接码池任务会重新领取卡密`)
+      const actualConcurrency = parseCounter(result.concurrency) || concurrency
+      message.success(`已按原邮箱启动 ${parseCounter(result.retry_count)} 个失败账号重试（并发 ${actualConcurrency}）；接码池任务会重新领取卡密`)
       setRetryableCount(0)
+      setRetryConcurrency(1)
       setActiveTaskId(nextTaskId)
     } catch (error_: unknown) {
       const detail = error_ instanceof Error ? error_.message : '启动重试失败'
@@ -382,16 +393,49 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
       <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
         <Space>
           {terminalStatus !== 'idle' && retryableCount > 0 ? (
-            <Button
-              size="small"
-              type="primary"
-              aria-label={`重试失败账号（${retryableCount}）`}
-              icon={<RedoOutlined />}
-              onClick={handleRetryFailed}
-              loading={retryLoading}
+            <Popconfirm
+              title={`确认重试 ${retryableCount} 个失败账号？`}
+              description={(
+                <Space size={8}>
+                  <span>并发数</span>
+                  <InputNumber
+                    aria-label="失败账号重试并发数"
+                    min={1}
+                    max={Math.min(CHATGPT_RETRY_MAX_CONCURRENCY, retryableCount)}
+                    precision={0}
+                    size="small"
+                    value={retryConcurrency}
+                    onChange={(value) => {
+                      const nextValue = Math.trunc(Number(value) || 1)
+                      setRetryConcurrency(Math.min(
+                        Math.max(nextValue, 1),
+                        CHATGPT_RETRY_MAX_CONCURRENCY,
+                        retryableCount,
+                      ))
+                    }}
+                    style={{ width: 72 }}
+                  />
+                  <span>（最多 {Math.min(CHATGPT_RETRY_MAX_CONCURRENCY, retryableCount)}）</span>
+                </Space>
+              )}
+              onConfirm={handleRetryFailed}
+              onOpenChange={(open) => {
+                if (open) setRetryConcurrency(1)
+              }}
+              okText="开始重试"
+              cancelText="取消"
+              disabled={retryLoading}
             >
-              重试失败账号（{retryableCount}）
-            </Button>
+              <Button
+                size="small"
+                type="primary"
+                aria-label={`重试失败账号（${retryableCount}）`}
+                icon={<RedoOutlined />}
+                loading={retryLoading}
+              >
+                重试失败账号（{retryableCount}）
+              </Button>
+            </Popconfirm>
           ) : null}
           <Button
             size="small"

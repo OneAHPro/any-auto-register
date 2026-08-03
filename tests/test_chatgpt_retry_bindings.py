@@ -1,11 +1,17 @@
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
-from fastapi import BackgroundTasks
+from fastapi import BackgroundTasks, FastAPI
+from fastapi.testclient import TestClient
+from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
+import api.tasks as tasks_module
 from api.tasks import (
+    ChatGPTRetryFailedTaskRequest,
+    RegisterTaskRequest,
     _build_chatgpt_retry_request,
     get_retryable_task_bindings,
     retry_failed_task_bindings,
@@ -61,6 +67,81 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
                 {"id": 42, "email": "second@example.com", "leadbee_code": "bei-sms-SECOND"},
             ],
         )
+
+    def test_build_retry_request_uses_requested_concurrency_bounded_by_count(self):
+        bindings = [
+            {
+                "id": 41,
+                "email": "first@example.com",
+                "leadbee_code": "bei-sms-FIRST",
+            },
+            {
+                "id": 42,
+                "email": "second@example.com",
+                "leadbee_code": "bei-sms-SECOND",
+            },
+        ]
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ):
+            request = _build_chatgpt_retry_request(bindings, concurrency=10)
+
+        self.assertEqual(request.concurrency, 2)
+
+    def test_retry_route_keeps_empty_body_compatible_and_accepts_concurrency(self):
+        app = FastAPI()
+        app.include_router(tasks_module.router)
+        client = TestClient(app)
+        row = SimpleNamespace(id=41)
+
+        def build_request(_rows, concurrency=1):
+            return RegisterTaskRequest(
+                platform="chatgpt",
+                count=1,
+                concurrency=concurrency,
+            )
+
+        with (
+            mock.patch(
+                "api.tasks._get_task_snapshot",
+                return_value={"platform": "chatgpt", "status": "done"},
+            ),
+            mock.patch(
+                "api.tasks._retryable_chatgpt_bindings",
+                return_value=[row],
+            ),
+            mock.patch(
+                "api.tasks._build_chatgpt_retry_request",
+                side_effect=build_request,
+            ) as build,
+            mock.patch("api.tasks.Session") as session,
+            mock.patch(
+                "api.tasks.enqueue_register_task",
+                side_effect=["task-default", "task-concurrent"],
+            ),
+        ):
+            session.return_value.__enter__.return_value.get.return_value = None
+            default_response = client.post("/tasks/task-failed/retry-failed")
+            concurrent_response = client.post(
+                "/tasks/task-failed/retry-failed",
+                json={"concurrency": 4},
+            )
+
+        self.assertEqual(default_response.status_code, 200)
+        self.assertEqual(default_response.json()["concurrency"], 1)
+        self.assertEqual(concurrent_response.status_code, 200)
+        self.assertEqual(concurrent_response.json()["concurrency"], 4)
+        self.assertEqual(
+            [call.kwargs["concurrency"] for call in build.call_args_list],
+            [1, 4],
+        )
+
+    def test_retry_request_rejects_non_integer_concurrency(self):
+        for invalid in (True, 1.0, "1"):
+            with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
+                ChatGPTRetryFailedTaskRequest(concurrency=invalid)
 
     def test_failed_binding_is_persisted_with_email_and_card_for_later_retry(self):
         test_engine = create_engine(

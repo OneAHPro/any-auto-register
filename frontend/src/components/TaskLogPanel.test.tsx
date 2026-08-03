@@ -121,10 +121,10 @@ describe('TaskLogPanel terminal feedback', () => {
   it('retries persisted failed login bindings and follows the new task', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path, options) => {
       if (path === '/tasks/failed-login-task/retryable') {
-        return { count: 1, items: [{ id: 7, email: 'failed@example.com' }] }
+        return { count: 5, items: [{ id: 7, email: 'failed@example.com' }] }
       }
       if (path === '/tasks/failed-login-task/retry-failed' && options?.method === 'POST') {
-        return { task_id: 'retry-login-task', retry_count: 1 }
+        return { task_id: 'retry-login-task', retry_count: 5, concurrency: 4 }
       }
       if (path === '/tasks/retry-login-task/retryable') {
         return { count: 0, items: [] }
@@ -151,13 +151,20 @@ describe('TaskLogPanel terminal feedback', () => {
 
     render(<TaskLogPanel taskId="failed-login-task" />)
 
-    const retryButton = await screen.findByRole('button', { name: '重试失败账号（1）' })
+    const retryButton = await screen.findByRole('button', { name: '重试失败账号（5）' })
     fireEvent.click(retryButton)
+
+    const concurrencyInput = await screen.findByRole('spinbutton', { name: '失败账号重试并发数' })
+    fireEvent.change(concurrencyInput, { target: { value: '4' } })
+    fireEvent.click(screen.getByRole('button', { name: '开始重试' }))
 
     await waitFor(() => {
       expect(apiFetch).toHaveBeenCalledWith(
         '/tasks/failed-login-task/retry-failed',
-        { method: 'POST' },
+        {
+          method: 'POST',
+          body: JSON.stringify({ concurrency: 4 }),
+        },
       )
     })
     expect(await screen.findByText('重试成功')).toBeTruthy()
