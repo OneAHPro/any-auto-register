@@ -87,7 +87,7 @@ def _build_message(
         "ChatGPT 自动认证周期触发了邮件告警。\n\n"
         f"任务 ID：{task_id}\n"
         f"本轮账号总数：{total_accounts}\n"
-        f"RT 明确失效：{invalid_rt_count}\n"
+        f"Codex2API 鉴权失效：{invalid_rt_count}\n"
         f"完整重登失败：{relogin_failed_count}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"

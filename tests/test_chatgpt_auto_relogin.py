@@ -77,7 +77,7 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
 
     assert PUBLIC_KEYS.issubset(config_api.CONFIG_KEYS)
     assert response["chatgpt_auto_relogin_enabled"] == "0"
-    assert response["chatgpt_auto_relogin_interval_minutes"] == "10"
+    assert response["chatgpt_auto_relogin_interval_minutes"] == "2"
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
     assert response["chatgpt_auto_relogin_alert_threshold"] == "5"
     assert response["smtp_port"] == "587"
@@ -208,7 +208,7 @@ def test_public_config_put_normalizes_enabled_to_zero_or_one(
 @pytest.mark.parametrize(
     ("key", "value"),
     [
-        ("chatgpt_auto_relogin_interval_minutes", 9),
+        ("chatgpt_auto_relogin_interval_minutes", 1),
         ("chatgpt_auto_relogin_interval_minutes", 1441),
         ("chatgpt_auto_relogin_interval_minutes", "not-an-integer"),
         ("chatgpt_auto_relogin_concurrency", 0),
@@ -263,10 +263,10 @@ def test_service_normalizes_defaults_and_bounds_from_an_isolated_store():
     )
 
     assert defaults.enabled is False
-    assert defaults.interval_minutes == 10
+    assert defaults.interval_minutes == 2
     assert defaults.concurrency == 10
     assert bounded.enabled is True
-    assert bounded.interval_minutes == 10
+    assert bounded.interval_minutes == 2
     assert bounded.concurrency == 10
     assert invalid == defaults
 
@@ -351,7 +351,7 @@ def test_internal_status_can_receive_scheduler_state_without_becoming_public_con
         "last_task_id": "task-active",
         "last_started_at": "2026-08-02T12:00:00Z",
         "next_run_at": "2026-08-02T12:30:00Z",
-        "interval_minutes": 10,
+        "interval_minutes": 2,
         "concurrency": 10,
     }
     assert set(service.INTERNAL_STATUS_CONFIG_KEYS).isdisjoint(CONFIG_KEYS)
@@ -377,7 +377,7 @@ def test_status_endpoint_has_a_coherent_disabled_response(monkeypatch):
         "last_task_id": None,
         "last_started_at": None,
         "next_run_at": None,
-        "interval_minutes": 10,
+        "interval_minutes": 2,
         "concurrency": 10,
     }
 
@@ -729,13 +729,13 @@ def test_enabling_after_disabled_waits_a_complete_interval():
     )
     service.tick_chatgpt_auto_relogin(
         store=store,
-        now=t0 + timedelta(minutes=9, seconds=59),
+        now=t0 + timedelta(minutes=1, seconds=59),
         list_eligible=lambda: [7],
         try_enqueue=lambda *args: enqueues.append(args) or _accepted(),
         observe=lambda _: None,
     )
 
-    assert enabled["next_run_at"] == "2026-08-02T12:10:00Z"
+    assert enabled["next_run_at"] == "2026-08-02T12:02:00Z"
     assert enqueues == []
 
 

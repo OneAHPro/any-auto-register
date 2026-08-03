@@ -1278,20 +1278,20 @@ def _run_chatgpt_relogin_task_inner(
         ThreadPoolExecutor,
         wait,
     )
-    from services.chatgpt_relogin import (
-        refresh_or_relogin_chatgpt_account,
-        relogin_chatgpt_account,
-    )
+    from services.chatgpt_relogin import relogin_chatgpt_account
 
     control = _task_store.control_for(task_id)
     task_snapshot = _task_store.snapshot(task_id)
     automation = _is_truthy((task_snapshot.get("meta") or {}).get("automation"))
-    account_action = (
-        refresh_or_relogin_chatgpt_account
-        if automation
-        else relogin_chatgpt_account
-    )
-    task_label = "自动认证维护" if automation else "重登"
+    remote_health: dict[int, dict[str, object]] = {}
+    if automation:
+        from services.chatgpt_codex2api_health import (
+            confirm_codex2api_auth_failure,
+            inspect_codex2api_account_health,
+        )
+
+        remote_health = inspect_codex2api_account_health(account_ids)
+    task_label = "Codex2API 鉴权巡检" if automation else "重登"
     total = len(account_ids)
     max_workers = min(
         max(int(concurrency or 1), 1),
@@ -1307,13 +1307,20 @@ def _run_chatgpt_relogin_task_inner(
     invalid_rt_count = 0
     relogin_failed_count = 0
 
+    def _record_confirmed_auth_failure() -> None:
+        nonlocal invalid_rt_count
+        with cycle_counts_lock:
+            invalid_rt_count += 1
+            _task_store.update_meta(
+                task_id,
+                invalid_rt_count=invalid_rt_count,
+                relogin_failed_count=relogin_failed_count,
+            )
+
     def _record_automatic_result(result: dict) -> None:
-        nonlocal invalid_rt_count, relogin_failed_count
+        nonlocal relogin_failed_count
         if not automation:
             return
-        refresh_invalid = (
-            str(result.get("refresh_state") or "").strip().lower() == "invalid"
-        )
         full_relogin_failed = (
             str(result.get("mode") or "").strip().lower() == "full_login"
             and not bool(result.get("relogin_ok"))
@@ -1321,8 +1328,6 @@ def _run_chatgpt_relogin_task_inner(
             and str(result.get("stage") or "").strip() != "account_removed"
         )
         with cycle_counts_lock:
-            if refresh_invalid:
-                invalid_rt_count += 1
             if full_relogin_failed:
                 relogin_failed_count += 1
             _task_store.update_meta(
@@ -1332,10 +1337,17 @@ def _run_chatgpt_relogin_task_inner(
             )
 
     _task_store.mark_running(task_id)
+    if automation:
+        _task_store.update_meta(
+            task_id,
+            mode="remote_auth_monitor",
+            invalid_rt_count=invalid_rt_count,
+            relogin_failed_count=0,
+        )
     _persist_task_snapshot_best_effort(task_id)
     _log(
         task_id,
-        f"开始{task_label}并同步 Codex2API，共 {total} 个账号，并发 {max_workers}",
+        f"开始{task_label}，共 {total} 个账号，并发 {max_workers}",
     )
 
     def _do_one(index: int, account_id: int) -> AttemptResult:
@@ -1352,12 +1364,68 @@ def _run_chatgpt_relogin_task_inner(
                 if text:
                     _log(task_id, f"  [账号 {account_id}] {text}")
 
-            result = account_action(
-                account_id,
-                log_fn=_service_log,
-                task_control=control,
-                attempt_id=attempt_id,
-            )
+            if automation:
+                health = dict(remote_health.get(account_id) or {})
+                health_state = str(health.get("state") or "").strip().lower()
+                if health_state == "auth_failed":
+                    health = confirm_codex2api_auth_failure(health)
+                    health_state = str(
+                        health.get("state") or ""
+                    ).strip().lower()
+                email = str(health.get("email") or "").strip()
+                if health_state == "healthy":
+                    healthy_message = str(
+                        health.get("message")
+                        or "Codex2API 远端鉴权正常"
+                    )
+                    if "无需" not in healthy_message:
+                        healthy_message += "，无需重登"
+                    result = {
+                        "ok": True,
+                        "relogin_ok": False,
+                        "stage": "remote_healthy",
+                        "mode": "remote_probe",
+                        "account_id": account_id,
+                        "email": email,
+                        "remote_status": health.get("remote_status"),
+                        "message": healthy_message,
+                    }
+                elif health_state == "auth_failed":
+                    _record_confirmed_auth_failure()
+                    result = relogin_chatgpt_account(
+                        account_id,
+                        log_fn=_service_log,
+                        task_control=control,
+                        attempt_id=attempt_id,
+                    )
+                    if isinstance(result, dict):
+                        result = {
+                            **result,
+                            "mode": "full_login",
+                            "remote_auth_state": "auth_failed",
+                            "remote_status": health.get("remote_status"),
+                        }
+                else:
+                    result = {
+                        "ok": False,
+                        "relogin_ok": False,
+                        "stage": "remote_probe_deferred",
+                        "mode": "remote_probe",
+                        "account_id": account_id,
+                        "email": email,
+                        "remote_status": health.get("remote_status"),
+                        "message": str(
+                            health.get("message")
+                            or "Codex2API 状态暂不可判定，等待下一轮复查"
+                        ),
+                    }
+            else:
+                result = relogin_chatgpt_account(
+                    account_id,
+                    log_fn=_service_log,
+                    task_control=control,
+                    attempt_id=attempt_id,
+                )
             if not isinstance(result, dict):
                 raise RuntimeError("重登服务返回了无效结果")
 
@@ -1366,7 +1434,7 @@ def _run_chatgpt_relogin_task_inner(
             message = _redact_chatgpt_relogin_log(result.get("message"))
             stage = str(result.get("stage") or "").strip()
             result_mode = str(result.get("mode") or "").strip() or (
-                "refresh_token" if automation else "relogin"
+                "remote_probe" if automation else "relogin"
             )
             relogin_ok = bool(result.get("relogin_ok"))
             account_removed = bool(result.get("account_removed")) or stage == "account_removed"
@@ -1375,23 +1443,28 @@ def _run_chatgpt_relogin_task_inner(
             if bool(result.get("ok")):
                 detail_message = message or "重登并同步成功"
                 success_label = (
-                    "RT 刷新并同步成功"
-                    if result_mode == "refresh_token"
+                    "远端认证正常"
+                    if result_mode == "remote_probe"
                     else "完整登录并同步成功"
-                    if automation
+                    if automation and result_mode == "full_login"
                     else "重登并同步成功"
                 )
                 _log(task_id, f"[OK] {success_label}: {account_label}（{detail_message}）")
-                _save_task_log(
-                    "chatgpt",
-                    email,
-                    "success",
-                    detail={
-                        "mode": result_mode,
-                        "account_id": account_id,
-                        "stage": stage or "completed",
-                    },
-                )
+                if not (
+                    automation
+                    and result_mode == "remote_probe"
+                    and stage == "remote_healthy"
+                ):
+                    _save_task_log(
+                        "chatgpt",
+                        email,
+                        "success",
+                        detail={
+                            "mode": result_mode,
+                            "account_id": account_id,
+                            "stage": stage or "completed",
+                        },
+                    )
                 return AttemptResult.success()
             else:
                 detail_message = message or "未返回失败详情"
@@ -1409,8 +1482,8 @@ def _run_chatgpt_relogin_task_inner(
                         if automation
                         else "重登成功，但 Codex2API 覆盖更新失败"
                     )
-                elif stage == "refresh_deferred":
-                    failure_label = "RT 检测暂时失败，等待下轮重试"
+                elif stage == "remote_probe_deferred":
+                    failure_label = "Codex2API 状态暂不可判定，等待下轮复查"
                 else:
                     failure_label = f"{task_label}失败"
                 if failure_label:
@@ -1529,7 +1602,7 @@ def _run_chatgpt_relogin_task_inner(
         )
     if automation:
         summary += (
-            f"，RT 明确失效 {invalid_rt_count} 个，"
+            f"，Codex2API 鉴权失效 {invalid_rt_count} 个，"
             f"完整重登失败 {relogin_failed_count} 个"
         )
     _log(task_id, summary)

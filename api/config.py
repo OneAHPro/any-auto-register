@@ -193,7 +193,7 @@ def get_config():
     if not str(all_cfg.get("chatgpt_auto_relogin_enabled", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_enabled"] = "0"
     if not str(all_cfg.get("chatgpt_auto_relogin_interval_minutes", "") or "").strip():
-        all_cfg["chatgpt_auto_relogin_interval_minutes"] = "10"
+        all_cfg["chatgpt_auto_relogin_interval_minutes"] = "2"
     if not str(all_cfg.get("chatgpt_auto_relogin_concurrency", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
     if not str(all_cfg.get("chatgpt_auto_relogin_alert_threshold", "") or "").strip():
@@ -242,7 +242,7 @@ def update_config(body: ConfigUpdate):
         # 前端留空表示保留现有凭证，避免读取配置后误清空。
         safe.pop("smtp_password", None)
     for key, minimum, maximum, label in (
-        ("chatgpt_auto_relogin_interval_minutes", 10, 1440, "自动重登间隔"),
+        ("chatgpt_auto_relogin_interval_minutes", 2, 1440, "鉴权巡检间隔"),
         ("chatgpt_auto_relogin_concurrency", 1, 10, "自动重登并发数"),
         ("chatgpt_auto_relogin_alert_threshold", 1, 10000, "邮件告警阈值"),
         ("smtp_port", 1, 65535, "SMTP 端口"),

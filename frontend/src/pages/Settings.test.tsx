@@ -76,8 +76,8 @@ describe('Settings ChatGPT automatic relogin config', () => {
     render(<Settings />)
 
     await user.click(screen.getByText('Codex2API'))
-    const interval = await screen.findByRole('spinbutton', { name: '自动重登间隔（分钟）' }) as HTMLInputElement
-    const concurrency = screen.getByRole('spinbutton', { name: '自动重登并发数' }) as HTMLInputElement
+    const interval = await screen.findByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
+    const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
     expect(interval.value).toBe('45')
     expect(concurrency.value).toBe('3')
     expect(screen.getByRole('switch', { name: '启用 ChatGPT 自动重登' }).getAttribute('aria-checked')).toBe('false')
@@ -113,8 +113,8 @@ describe('Settings ChatGPT automatic relogin config', () => {
     await user.click(screen.getByText('Codex2API'))
 
     await waitFor(() => {
-      expect((screen.getByRole('spinbutton', { name: '自动重登间隔（分钟）' }) as HTMLInputElement).value).toBe('10')
-      expect((screen.getByRole('spinbutton', { name: '自动重登并发数' }) as HTMLInputElement).value).toBe('10')
+      expect((screen.getByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement).value).toBe('2')
+      expect((screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement).value).toBe('10')
     })
   })
 

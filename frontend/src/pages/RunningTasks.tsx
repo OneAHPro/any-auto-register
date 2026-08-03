@@ -248,7 +248,7 @@ export default function RunningTasks() {
                 {isAutomaticAuthentication && (
                   <>
                     <Tag color={invalidRtCount > 0 ? 'warning' : 'default'} style={{ margin: 0 }}>
-                      RT失效 {invalidRtCount}
+                      鉴权失效 {invalidRtCount}
                     </Tag>
                     <Tag color={reloginFailedCount > 0 ? 'error' : 'default'} style={{ margin: 0 }}>
                       重登失败 {reloginFailedCount}

@@ -123,7 +123,7 @@ def test_reaching_either_threshold_sends_one_starttls_message(
     assert send_call[1]["to_addrs"] == ["owner@example.test"]
     body = smtp.message.get_content()
     assert "task-threshold" in body
-    assert f"RT 明确失效：{invalid_rt_count}" in body
+    assert f"Codex2API 鉴权失效：{invalid_rt_count}" in body
     assert f"完整重登失败：{relogin_failed_count}" in body
     assert "smtp-test-credential" not in smtp.message.as_string()
 
@@ -245,5 +245,5 @@ def test_smtp_test_email_uses_dedicated_subject_without_alert_threshold(
     smtp = FakeSMTP.instances[0]
     assert smtp.message["Subject"] == "[Any Auto Register] SMTP 测试成功"
     assert "SMTP 邮件配置可用" in smtp.message.get_content()
-    assert "RT 明确失效" not in smtp.message.get_content()
+    assert "Codex2API 鉴权失效" not in smtp.message.get_content()
     assert "smtp-test-credential" not in smtp.message.as_string()

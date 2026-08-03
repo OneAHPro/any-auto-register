@@ -377,7 +377,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["registered"], 2)
         self.assertEqual(snapshot["meta"]["concurrency"], 2)
 
-    def test_automatic_task_uses_refresh_first_account_action(self):
+    def test_automatic_task_skips_remote_healthy_account_without_refreshing_rt(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
             task_id,
@@ -385,28 +385,38 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             source="schedule",
             automation=True,
         )
-        result = {
-            "ok": True,
-            "relogin_ok": False,
-            "refresh_ok": True,
-            "mode": "refresh_token",
-            "stage": "completed",
-            "account_id": 17,
-            "email": "refresh@example.com",
-            "message": "RT 刷新并同步 Codex2API 成功",
-        }
 
         with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                17: {
+                    "account_id": 17,
+                    "email": "healthy@example.com",
+                    "state": "healthy",
+                    "remote_id": 101,
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常（active）",
+                }
+            },
+        ) as inspect_remote, mock.patch(
             "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
-            return_value=result,
         ) as refresh_first, mock.patch(
             "services.chatgpt_relogin.relogin_chatgpt_account"
-        ) as full_login:
+        ) as full_login, mock.patch(
+            "api.tasks._save_task_log"
+        ) as save_task_log:
             _run_chatgpt_relogin_task(task_id, [17])
 
-        refresh_first.assert_called_once()
+        inspect_remote.assert_called_once_with([17])
+        refresh_first.assert_not_called()
         full_login.assert_not_called()
-        self.assertEqual(_task_store.snapshot(task_id)["success"], 1)
+        save_task_log.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertTrue(
+            any("无需重登" in line for line in snapshot["logs"])
+        )
 
     def test_manual_task_keeps_forced_full_login_action(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -433,6 +443,51 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.alert_sender.assert_not_called()
         self.assertEqual(_task_store.snapshot(task_id)["success"], 1)
 
+    def test_automatic_task_lets_codex2api_self_refresh_before_full_login(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [19],
+            source="schedule",
+            automation=True,
+        )
+        initial = {
+            "account_id": 19,
+            "email": "recovered@example.com",
+            "state": "auth_failed",
+            "remote_id": 1019,
+            "remote_status": "unauthorized",
+            "remote_updated_at": "2026-08-03T08:00:00+08:00",
+            "message": "Codex2API 已明确标记账号鉴权失效",
+        }
+        recovered = {
+            **initial,
+            "state": "healthy",
+            "remote_status": "active",
+            "resolution": "remote_refresh_recovered",
+            "message": "Codex2API 已使用自身 RT 恢复鉴权，无需本地重登",
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={19: initial},
+        ), mock.patch(
+            "services.chatgpt_codex2api_health."
+            "confirm_codex2api_auth_failure",
+            return_value=recovered,
+        ) as confirm_remote, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account"
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [19])
+
+        confirm_remote.assert_called_once_with(initial)
+        full_login.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["invalid_rt_count"], 0)
+        self.assertTrue(any("无需本地重登" in line for line in snapshot["logs"]))
+
     def test_automatic_task_records_cycle_counts_and_sends_one_summary_alert(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         account_ids = [201, 202, 203, 204]
@@ -442,12 +497,10 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             source="schedule",
             automation=True,
         )
-        results = [
+        relogin_results = [
             {
                 "ok": False,
                 "relogin_ok": False,
-                "refresh_state": "invalid",
-                "mode": "full_login",
                 "stage": "relogin",
                 "account_id": 201,
                 "email": "failed@example.com",
@@ -456,8 +509,6 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             {
                 "ok": True,
                 "relogin_ok": True,
-                "refresh_state": "invalid",
-                "mode": "full_login",
                 "stage": "completed",
                 "account_id": 202,
                 "email": "recovered@example.com",
@@ -466,36 +517,65 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             {
                 "ok": False,
                 "relogin_ok": True,
-                "refresh_state": "invalid",
-                "mode": "full_login",
                 "stage": "codex2api_sync",
                 "account_id": 203,
                 "email": "sync-failed@example.com",
                 "message": "登录成功但同步失败",
             },
-            {
-                "ok": False,
-                "relogin_ok": False,
-                "refresh_state": "transient_error",
-                "mode": "refresh_token",
-                "stage": "refresh_deferred",
-                "account_id": 204,
-                "email": "retry@example.com",
-                "message": "下轮重试",
-            },
         ]
+        health_snapshot = {
+            account_id: {
+                "account_id": account_id,
+                "email": f"account-{account_id}@example.com",
+                "state": "auth_failed",
+                "remote_id": account_id + 1000,
+                "remote_status": "unauthorized",
+                "message": "Codex2API 已明确标记账号鉴权失效",
+            }
+            for account_id in account_ids[:3]
+        }
+        health_snapshot[204] = {
+            "account_id": 204,
+            "email": "retry@example.com",
+            "state": "deferred",
+            "remote_id": 1204,
+            "remote_status": "error",
+            "message": "Codex2API 账号状态为临时错误，等待下一轮复查",
+        }
         self.alert_sender.return_value = {
             "sent": True,
             "reason": "sent",
             "threshold": 2,
         }
 
+        confirmed_failures = {
+            account_id: {
+                **health_snapshot[account_id],
+                "resolution": "remote_refresh_confirmed_failure",
+                "message": "Codex2API 自刷新后仍鉴权失败",
+            }
+            for account_id in account_ids[:3]
+        }
+
         with mock.patch(
-            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
-            side_effect=results,
-        ):
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value=health_snapshot,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health."
+            "confirm_codex2api_auth_failure",
+            side_effect=lambda health: confirmed_failures[health["account_id"]],
+        ) as confirm_remote, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=relogin_results,
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account"
+        ) as refresh_first:
             _run_chatgpt_relogin_task(task_id, account_ids, concurrency=1)
 
+        self.assertEqual(full_login.call_count, 3)
+        self.assertEqual(confirm_remote.call_count, 3)
+        refresh_first.assert_not_called()
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["meta"]["invalid_rt_count"], 3)
@@ -521,20 +601,27 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.alert_sender.side_effect = RuntimeError("smtp secret detail")
 
         with mock.patch(
-            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account",
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
             return_value={
-                "ok": True,
-                "relogin_ok": False,
-                "refresh_state": "valid",
-                "mode": "refresh_token",
-                "stage": "completed",
-                "account_id": 205,
-                "email": "valid@example.com",
-                "message": "RT 刷新成功",
+                205: {
+                    "account_id": 205,
+                    "email": "valid@example.com",
+                    "state": "healthy",
+                    "remote_id": 1205,
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常（active）",
+                }
             },
-        ):
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account"
+        ) as full_login, mock.patch(
+            "services.chatgpt_relogin.refresh_or_relogin_chatgpt_account"
+        ) as refresh_first:
             _run_chatgpt_relogin_task(task_id, [205])
 
+        full_login.assert_not_called()
+        refresh_first.assert_not_called()
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 1)
@@ -1004,10 +1091,32 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             target=run,
             args=(manual_task_id, [99], 1),
         )
+        remote_failures = {
+            account_id: {
+                "account_id": account_id,
+                "email": f"account-{account_id}@example.com",
+                "state": "auth_failed",
+                "remote_id": 1000 + account_id,
+                "remote_status": "unauthorized",
+                "message": "Codex2API 已明确标记账号鉴权失效",
+            }
+            for account_id in (51, 52, 53)
+        }
 
         with mock.patch(
             "api.tasks.chatgpt_task_gate",
             gate,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value=remote_failures,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health."
+            "confirm_codex2api_auth_failure",
+            side_effect=lambda health: {
+                **health,
+                "resolution": "remote_refresh_confirmed_failure",
+            },
         ), mock.patch(
             "services.chatgpt_relogin.relogin_chatgpt_account",
             side_effect=relogin,

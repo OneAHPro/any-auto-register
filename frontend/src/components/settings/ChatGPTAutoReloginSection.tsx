@@ -129,21 +129,21 @@ export default function ChatGPTAutoReloginSection() {
       </Form.Item>
       <Form.Item
         name="chatgpt_auto_relogin_interval_minutes"
-        label="自动重登间隔（分钟）"
-        initialValue={10}
+        label="Codex2API 鉴权巡检间隔（分钟）"
+        initialValue={2}
       >
-        <InputNumber aria-label="自动重登间隔（分钟）" min={10} max={1440} precision={0} style={{ width: '100%' }} />
+        <InputNumber aria-label="Codex2API 鉴权巡检间隔（分钟）" min={2} max={1440} precision={0} style={{ width: '100%' }} />
       </Form.Item>
       <Form.Item
         name="chatgpt_auto_relogin_concurrency"
-        label="自动重登并发数"
+        label="异常账号重登并发数"
         initialValue={10}
       >
-        <InputNumber aria-label="自动重登并发数" min={1} max={10} precision={0} style={{ width: '100%' }} />
+        <InputNumber aria-label="异常账号重登并发数" min={1} max={10} precision={0} style={{ width: '100%' }} />
       </Form.Item>
 
       <Typography.Paragraph type="secondary">
-        每轮优先刷新全部账号 RT；仅服务端明确判定 RT 失效时才获取验证码完整登录。前台新增邮箱、注册、登录和接码任务优先执行。
+        每轮主动触发 Codex2API 的 wham-only 轻量鉴权探针，正常与限流账号不会刷新本地 RT。发现 401 后先让 Codex2API 用自身 RT 自刷新；仍明确鉴权失效时才获取验证码完整登录并覆盖同步。前台新增邮箱、注册、登录和接码任务优先执行。
       </Typography.Paragraph>
 
       <Divider orientation="left">邮件告警</Divider>
@@ -151,7 +151,7 @@ export default function ChatGPTAutoReloginSection() {
         name="chatgpt_auto_relogin_alert_threshold"
         label="邮件告警阈值（账号数）"
         initialValue={5}
-        extra="RT 明确失效数或完整重登失败数达到此值时，每轮最多发送一封。"
+        extra="Codex2API 鉴权失效数或完整重登失败数达到此值时，每轮最多发送一封。"
       >
         <InputNumber aria-label="邮件告警阈值（账号数）" min={1} max={10000} precision={0} style={{ width: '100%' }} />
       </Form.Item>

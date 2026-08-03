@@ -68,7 +68,7 @@ describe('RunningTasks automatic authentication history', () => {
     render(<RunningTasks />)
 
     expect(await screen.findByText('自动认证')).toBeTruthy()
-    expect(screen.getByText('RT失效 6')).toBeTruthy()
+    expect(screen.getByText('鉴权失效 6')).toBeTruthy()
     expect(screen.getByText('重登失败 5')).toBeTruthy()
     expect(screen.getByText('邮件已提醒')).toBeTruthy()
   })

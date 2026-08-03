@@ -1869,8 +1869,8 @@ export default function Settings() {
       data.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(data.chatgpt_auto_relogin_enabled)
       data.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_interval_minutes,
-        10,
-        10,
+        2,
+        2,
         1440,
       )
       data.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
@@ -1979,8 +1979,8 @@ export default function Settings() {
       values.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(values.chatgpt_auto_relogin_enabled)
       values.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_interval_minutes,
-        10,
-        10,
+        2,
+        2,
         1440,
       )
       values.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
