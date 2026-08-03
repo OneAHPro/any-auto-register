@@ -383,6 +383,81 @@ class RefreshTokenRegistrationEngine:
         )
         return any(marker in text for marker in markers)
 
+    @staticmethod
+    def _is_explicit_password_rejection(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        if "invalid_credentials" in text:
+            return True
+        password_failure_markers = (
+            "密码验证失败",
+            "password verification failed",
+            "invalid password",
+        )
+        return "401" in text and any(
+            marker in text for marker in password_failure_markers
+        )
+
+    def _can_reset_rejected_url_password(self, result: RegistrationResult) -> bool:
+        email_info = self.email_info if isinstance(self.email_info, dict) else {}
+        return bool(
+            not result.success
+            and self._is_explicit_password_rejection(result.error_message)
+            and str(email_info.get("account_type") or "").strip()
+            == "chatgpt_password_url_otp"
+            and str(
+                email_info.get("mail_api_url")
+                or email_info.get("mailapi_url")
+                or ""
+            ).strip()
+            and callable(getattr(self.email_service, "commit_password_reset", None))
+        )
+
+    def _prepare_rejected_url_password_reset(
+        self,
+        result: RegistrationResult,
+    ) -> None:
+        replacement = generate_random_password(20)
+        self.password = replacement
+        self.password_reset_required = True
+        result.password = replacement
+        result.error_message = ""
+        if isinstance(self.email_info, dict):
+            self.email_info["new_password"] = replacement
+            self.email_info["password_reset_required"] = True
+        self._log(
+            "已保存密码被认证服务明确拒绝，自动改走忘记密码流程",
+            "warning",
+        )
+
+    def _login_existing_account_with_password_reset_fallback(
+        self,
+        *,
+        result: RegistrationResult,
+        email_adapter: EmailServiceAdapter,
+        otp_wait_seconds: int,
+        otp_resend_wait_seconds: int,
+    ) -> RegistrationResult:
+        login_method = (
+            self._login_existing_account_access_token
+            if self._existing_account_login_stage() == "access_token"
+            else self._login_existing_account
+        )
+        first_result = login_method(
+            result=result,
+            email_adapter=email_adapter,
+            otp_wait_seconds=otp_wait_seconds,
+            otp_resend_wait_seconds=otp_resend_wait_seconds,
+        )
+        if not self._can_reset_rejected_url_password(first_result):
+            return first_result
+        self._prepare_rejected_url_password_reset(first_result)
+        return login_method(
+            result=first_result,
+            email_adapter=email_adapter,
+            otp_wait_seconds=otp_wait_seconds,
+            otp_resend_wait_seconds=otp_resend_wait_seconds,
+        )
+
     def _build_chatgpt_client(self) -> ChatGPTClient:
         client = ChatGPTClient(
             proxy=self.proxy_url,
@@ -836,14 +911,7 @@ class RefreshTokenRegistrationEngine:
                 self._log,
             )
             if existing_account_login_only:
-                if self._existing_account_login_stage() == "access_token":
-                    return self._login_existing_account_access_token(
-                        result=result,
-                        email_adapter=email_adapter,
-                        otp_wait_seconds=register_otp_wait_seconds,
-                        otp_resend_wait_seconds=register_otp_resend_wait_seconds,
-                    )
-                return self._login_existing_account(
+                return self._login_existing_account_with_password_reset_fallback(
                     result=result,
                     email_adapter=email_adapter,
                     otp_wait_seconds=register_otp_wait_seconds,

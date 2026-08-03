@@ -797,7 +797,10 @@ def commit_applemail_password_reset(
             )
         if record is None:
             return False
-        if str(record.get("account_type") or "").strip() != "chatgpt_password_reset_url_mail":
+        if str(record.get("account_type") or "").strip() not in {
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+        }:
             return False
         record["password"] = password
         record["password_reset_required"] = False

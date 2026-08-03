@@ -1022,6 +1022,41 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertEqual(records[0]["pool_state"], "claimed")
             self.assertNotIn("new_password", records[0])
 
+    def test_url_login_account_can_persist_password_replaced_after_401(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "url@example.com----Old-Password-2026----"
+                "https://mail.example.test/mail?token=MAIL_SECRET----"
+                "https://2fa.example.test/view?token=TOTP_SECRET",
+                pool_dir=tmp_dir,
+                filename="url-password-replaced.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="url-password-replaced.json",
+            )
+            account = mailbox.get_email()
+
+            self.assertEqual(
+                account.extra["account_type"],
+                "chatgpt_password_url_otp",
+            )
+            self.assertTrue(mailbox.mark_account_used(account))
+            replacement = "Replacement-Password-2026!"
+            self.assertTrue(mailbox.commit_password_reset(account, replacement))
+
+            _path, records = load_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="url-password-replaced.json",
+            )
+            self.assertEqual(records[0]["password"], replacement)
+            self.assertEqual(
+                records[0]["account_type"],
+                "chatgpt_password_url_otp",
+            )
+            self.assertFalse(records[0].get("password_reset_required", False))
+            self.assertEqual(records[0]["pool_state"], "used")
+
     def test_used_reset_url_account_can_persist_a_replacement_password(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
