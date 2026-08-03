@@ -320,6 +320,78 @@ class SmsPoolServiceTests(unittest.TestCase):
             self.assertEqual(row.used_by_email, "")
             self.assertIsNone(row.used_at)
 
+    def test_provider_restoration_returns_active_card_to_task_reservation(self):
+        self.pool.import_text(
+            "restored-before-retry",
+            default_base_url="https://sms.example.com/box",
+        )
+        reserved = self.pool.reserve(task_id="task-retry-wait", count=1)[0]
+        self.assertTrue(
+            self.pool.mark_active(
+                item_id=reserved.id,
+                task_id="task-retry-wait",
+                account_email="waiting@example.com",
+            )
+        )
+
+        self.assertTrue(
+            self.pool.mark_restored(
+                item_id=reserved.id,
+                task_id="task-retry-wait",
+            )
+        )
+
+        with Session(self.engine) as session:
+            row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(row.status, "reserved")
+            self.assertEqual(row.reserved_task_id, "task-retry-wait")
+            self.assertEqual(row.used_by_email, "")
+            self.assertIsNone(row.used_at)
+
+        # Simulate the service restarting while the task is waiting to retry.
+        # Persisting the restoration as ``reserved`` must survive process loss
+        # and be recovered as an unused card.
+        self.assertEqual(self.pool.recover_interrupted(), 1)
+        self.assertEqual(self.pool.stats()["unused"], 1)
+
+    def test_new_provider_attempt_after_restoration_is_conservatively_used(self):
+        self.pool.import_text(
+            "restored-then-retried",
+            default_base_url="https://sms.example.com/box",
+        )
+        reserved = self.pool.reserve(task_id="task-retry-active", count=1)[0]
+        self.assertTrue(
+            self.pool.mark_active(
+                item_id=reserved.id,
+                task_id="task-retry-active",
+                account_email="retried@example.com",
+            )
+        )
+        self.assertTrue(
+            self.pool.mark_restored(
+                item_id=reserved.id,
+                task_id="task-retry-active",
+            )
+        )
+
+        # A fresh provider call moves the card back to ``active``. If that
+        # attempt is interrupted without another restoration callback, the
+        # card must not be reissued to a different mailbox.
+        self.assertTrue(
+            self.pool.mark_active(
+                item_id=reserved.id,
+                task_id="task-retry-active",
+                account_email="retried@example.com",
+            )
+        )
+        self.assertEqual(self.pool.recover_interrupted(), 1)
+
+        with Session(self.engine) as session:
+            row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(row.status, "used")
+            self.assertEqual(row.used_by_email, "retried@example.com")
+            self.assertIsNotNone(row.used_at)
+
 
 class SmsPoolTaskIntegrationTests(unittest.TestCase):
     def setUp(self):
@@ -509,7 +581,7 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
     def test_task_preserves_provider_lifecycle_when_finalizing_pool_cards(self):
         task_id = "task-pool-finalize"
         req = self._pool_request()
-        req.count = 3
+        req.count = 4
         req.concurrency = 1
         req.extra.update(
             {
@@ -517,13 +589,15 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
                     "card-one",
                     "card-two",
                     "card-three",
+                    "card-four",
                 ],
                 "chatgpt_existing_account_leadbee_base_urls": [
                     "https://sms-one.example.com/box",
                     "https://sms-two.example.com/box",
                     "https://sms-three.example.com/box",
+                    "https://sms-four.example.com/box",
                 ],
-                "chatgpt_sms_pool_item_ids": [11, 12, 13],
+                "chatgpt_sms_pool_item_ids": [11, 12, 13, 14],
             }
         )
         _create_task_record(task_id, req, "manual", None)
@@ -575,9 +649,23 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
                 "exchange_code_consumed": True,
                 "exchange_code_restoration_confirmed": False,
             },
+            {
+                "status": "failed",
+                "message": (
+                    "获取手机号失败: LeadBee 当前暂时无可用号码，"
+                    "卡密已自动释放"
+                ),
+                "phone_verified": False,
+                "phone": "",
+                "provider_error_code": "CARD_NOT_IN_SESSION",
+                "exchange_code_consumed": False,
+                "exchange_code_restoration_confirmed": True,
+            },
         ]
+        stop_during_restored_delay = False
 
         def complete_phone(**kwargs):
+            nonlocal stop_during_restored_delay
             result = phone_results.pop(0)
             if kwargs["leadbee_code"] == "card-one":
                 kwargs["on_provider_start"]()
@@ -587,9 +675,17 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
                 kwargs["on_exchange_code_consumed"]()
                 if result.get("provider_error_code") == "CARD_NOT_IN_SESSION":
                     kwargs["on_exchange_code_restored"]()
+            elif kwargs["leadbee_code"] == "card-four":
+                kwargs["on_provider_start"]()
+                kwargs["on_exchange_code_restored"]()
+                stop_during_restored_delay = True
             if str(result.get("status") or "").lower() == "completed":
                 saved[int(kwargs["account_id"]) - 1].extra["refresh_token"] = "rt"
             return result
+
+        def interrupt_restored_retry(_seconds):
+            if stop_during_restored_delay:
+                _task_store.control_for(task_id).request_stop()
 
         with (
             mock.patch("core.registry.get", return_value=_ExistingAccountPlatform),
@@ -617,12 +713,19 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
                 return_value=True,
             ) as mark_active,
             mock.patch(
+                "api.tasks.sms_pool_service.mark_restored",
+                return_value=True,
+            ) as mark_restored,
+            mock.patch(
                 "api.tasks.sms_pool_service.reserve",
                 side_effect=SmsPoolExhaustedError("no spare card"),
             ) as reserve_replacement,
             mock.patch("api.tasks.sms_pool_service.finalize") as finalize,
             mock.patch("api.tasks.sms_pool_service.release_task"),
-            mock.patch("api.tasks.time.sleep"),
+            mock.patch(
+                "api.tasks.time.sleep",
+                side_effect=interrupt_restored_retry,
+            ),
             mock.patch("core.proxy_pool.proxy_pool.report_success"),
             mock.patch("core.proxy_pool.proxy_pool.report_fail"),
             mock.patch("core.config_store.config_store.get_all", return_value={}),
@@ -636,23 +739,28 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
                 "https://sms-two.example.com/box",
                 "https://sms-three.example.com/box",
                 "https://sms-three.example.com/box",
+                "https://sms-four.example.com/box",
             ],
         )
         self.assertEqual(
             [call.kwargs["item_id"] for call in mark_active.call_args_list],
-            [11, 13, 13],
+            [11, 13, 13, 14],
+        )
+        self.assertEqual(
+            [call.kwargs["item_id"] for call in mark_restored.call_args_list],
+            [13, 14],
         )
         # Provider restoration must supersede an earlier conservative
         # "unusable" callback.  Settlement happens once per card so the
         # temporary callback cannot leave a restored card marked as used.
-        self.assertEqual(finalize.call_count, 3)
+        self.assertEqual(finalize.call_count, 4)
         finalized = {
             item_id: [
                 call.kwargs
                 for call in finalize.call_args_list
                 if call.kwargs["item_id"] == item_id
             ]
-            for item_id in (11, 12, 13)
+            for item_id in (11, 12, 13, 14)
         }
         self.assertTrue(all(call["consumed"] for call in finalized[11]))
         self.assertTrue(all(not call["consumed"] for call in finalized[12]))
@@ -662,6 +770,10 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
         )
         self.assertTrue(
             all(not call["restoration_confirmed"] for call in finalized[13])
+        )
+        self.assertTrue(all(not call["consumed"] for call in finalized[14]))
+        self.assertTrue(
+            all(call["restoration_confirmed"] for call in finalized[14])
         )
         self.assertTrue(all(call["task_id"] == task_id for call in finalized[11]))
         self.assertTrue(all(call["task_id"] == task_id for call in finalized[12]))
@@ -673,7 +785,7 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
         ]
         self.assertEqual(
             {context["sms_pool_item_id"] for context in pool_contexts},
-            {11, 12, 13},
+            {11, 12, 13, 14},
         )
         self.assertTrue(all(context["sms_pool_managed"] for context in pool_contexts))
         reserve_replacement.assert_not_called()

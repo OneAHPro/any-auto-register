@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from core.task_runtime import (
@@ -29,6 +30,28 @@ class RegisterTaskControlTests(unittest.TestCase):
         with self.assertRaises(StopTaskRequested):
             control.checkpoint()
 
+    def test_only_one_concurrent_stop_request_is_reported_as_new(self):
+        control = RegisterTaskControl()
+        barrier = threading.Barrier(8)
+        results: list[bool] = []
+        results_lock = threading.Lock()
+
+        def request_stop() -> None:
+            barrier.wait()
+            is_new = control.request_stop_once()
+            with results_lock:
+                results.append(is_new)
+
+        workers = [threading.Thread(target=request_stop) for _ in range(8)]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join(timeout=1)
+
+        self.assertTrue(all(not worker.is_alive() for worker in workers))
+        self.assertEqual(results.count(True), 1)
+        self.assertEqual(results.count(False), 7)
+
     def test_skip_current_targets_only_active_attempts_in_multithread_mode(self):
         control = RegisterTaskControl()
         attempt_a = control.start_attempt()
@@ -50,6 +73,105 @@ class RegisterTaskControlTests(unittest.TestCase):
 
 
 class RegisterTaskStoreTests(unittest.TestCase):
+    def test_cleanup_preserves_terminal_record_until_runner_releases_it(self):
+        store = RegisterTaskStore(
+            max_finished_tasks=1,
+            cleanup_threshold=1,
+        )
+        protected_id = "task-runtime-finalizing"
+        newer_id = "task-runtime-newer"
+        store.create(
+            protected_id,
+            platform="chatgpt",
+            total=1,
+            source="schedule",
+        )
+        store.finish(
+            protected_id,
+            status="done",
+            success=1,
+            registered=1,
+            skipped=0,
+            errors=[],
+        )
+        store.protect_from_cleanup(protected_id)
+        store.create(
+            newer_id,
+            platform="chatgpt",
+            total=1,
+            source="manual",
+        )
+        store.finish(
+            newer_id,
+            status="done",
+            success=1,
+            registered=1,
+            skipped=0,
+            errors=[],
+        )
+
+        store.cleanup()
+
+        self.assertTrue(store.exists(protected_id))
+        self.assertFalse(store.exists(newer_id))
+
+        store.release_cleanup_protection(protected_id)
+        latest_id = "task-runtime-latest"
+        store.create(
+            latest_id,
+            platform="chatgpt",
+            total=1,
+            source="manual",
+        )
+        store.finish(
+            latest_id,
+            status="done",
+            success=1,
+            registered=1,
+            skipped=0,
+            errors=[],
+        )
+        store.cleanup()
+        self.assertFalse(store.exists(protected_id))
+        self.assertTrue(store.exists(latest_id))
+
+    def test_request_stop_if_active_checks_state_and_sets_flag_atomically(self):
+        store = RegisterTaskStore()
+        task_id = "task-runtime-atomic-stop"
+        store.create(
+            task_id,
+            platform="chatgpt",
+            total=1,
+            source="schedule",
+        )
+
+        state, first_request, control = store.request_stop_if_active(task_id)
+
+        self.assertEqual(state, "active")
+        self.assertTrue(first_request)
+        self.assertTrue(control["stop_requested"])
+
+        state, first_request, _ = store.request_stop_if_active(task_id)
+        self.assertEqual(state, "active")
+        self.assertFalse(first_request)
+
+        store.finish(
+            task_id,
+            status="stopped",
+            success=0,
+            registered=0,
+            skipped=0,
+            errors=[],
+        )
+        state, first_request, _ = store.request_stop_if_active(task_id)
+        self.assertEqual(state, "terminal")
+        self.assertFalse(first_request)
+
+        state, first_request, control = store.request_stop_if_active("missing")
+        self.assertEqual(state, "missing")
+        self.assertFalse(first_request)
+        self.assertEqual(control, {})
+
     def test_update_meta_merges_cycle_results_without_dropping_task_identity(self):
         store = RegisterTaskStore()
         task_id = "task-runtime-meta"

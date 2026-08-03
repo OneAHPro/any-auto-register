@@ -68,8 +68,14 @@ class RegisterTaskControl:
         self._skip_active_attempt_ids: set[int] = set()
 
     def request_stop(self) -> None:
+        self.request_stop_once()
+
+    def request_stop_once(self) -> bool:
+        """Set the sticky stop flag and report whether this call changed it."""
         with self._lock:
+            first_request = not self._stop_requested
             self._stop_requested = True
+            return first_request
 
     def request_skip_current(self) -> None:
         with self._lock:
@@ -185,6 +191,7 @@ class RegisterTaskStore:
     ):
         self._lock = threading.Lock()
         self._records: dict[str, RegisterTaskRecord] = {}
+        self._cleanup_protected_task_ids: set[str] = set()
         self.max_finished_tasks = max_finished_tasks
         self.cleanup_threshold = cleanup_threshold
 
@@ -238,6 +245,26 @@ class RegisterTaskStore:
         control = self.control_for(task_id)
         control.request_stop()
         return control.snapshot()
+
+    def request_stop_once(self, task_id: str) -> tuple[bool, dict[str, Any]]:
+        control = self.control_for(task_id)
+        first_request = control.request_stop_once()
+        return first_request, control.snapshot()
+
+    def request_stop_if_active(
+        self,
+        task_id: str,
+    ) -> tuple[str, bool, dict[str, Any]]:
+        """Atomically validate active state and set the sticky stop flag."""
+        with self._lock:
+            record = self._records.get(task_id)
+            if record is None:
+                return "missing", False, {}
+            if record.status in ("done", "failed", "stopped"):
+                return "terminal", False, record.control.snapshot()
+            first_request = record.control.request_stop_once()
+            record.updated_at = time.time()
+            return "active", first_request, record.control.snapshot()
 
     def request_skip_current(self, task_id: str) -> dict[str, Any]:
         control = self.control_for(task_id)
@@ -301,10 +328,16 @@ class RegisterTaskStore:
         skipped: int,
         errors: list[str],
         error: str = "",
-    ) -> None:
+    ) -> str:
         with self._lock:
             record = self._records[task_id]
-            record.status = status
+            resolved_status = str(status or "")
+            if (
+                resolved_status == "done"
+                and record.control.is_stop_requested()
+            ):
+                resolved_status = "stopped"
+            record.status = resolved_status
             record.success = success
             if registered is None:
                 record.registered = max(success + skipped + len(errors), 0)
@@ -314,6 +347,7 @@ class RegisterTaskStore:
             record.errors = list(errors)
             record.error = error
             record.updated_at = time.time()
+            return resolved_status
 
     def snapshot(self, task_id: str) -> dict[str, Any]:
         with self._lock:
@@ -341,6 +375,17 @@ class RegisterTaskStore:
         with self._lock:
             return [record.to_dict() for record in self._records.values()]
 
+    def protect_from_cleanup(self, task_id: str) -> None:
+        """Keep a task record alive while its runner still needs post-processing."""
+        with self._lock:
+            if task_id not in self._records:
+                raise KeyError(task_id)
+            self._cleanup_protected_task_ids.add(task_id)
+
+    def release_cleanup_protection(self, task_id: str) -> None:
+        with self._lock:
+            self._cleanup_protected_task_ids.discard(task_id)
+
     def log_state(self, task_id: str) -> tuple[list[str], str]:
         with self._lock:
             record = self._records[task_id]
@@ -357,8 +402,14 @@ class RegisterTaskStore:
             ]
             if len(finished) <= self.max_finished_tasks:
                 return
-            finished.sort(key=lambda item: item[1].created_at)
-            to_remove = finished[: len(finished) - self.max_finished_tasks]
+            removable = [
+                item
+                for item in finished
+                if item[0] not in self._cleanup_protected_task_ids
+            ]
+            removable.sort(key=lambda item: item[1].created_at)
+            excess = len(finished) - self.max_finished_tasks
+            to_remove = removable[:excess]
             for task_id, _ in to_remove:
                 self._records.pop(task_id, None)
 

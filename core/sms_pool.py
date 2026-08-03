@@ -239,6 +239,34 @@ class SmsPoolService:
             session.commit()
             return True
 
+    def mark_restored(
+        self,
+        *,
+        item_id: int,
+        task_id: str,
+    ) -> bool:
+        """Persist provider-confirmed restoration while keeping task ownership."""
+        normalized_task_id = str(task_id or "").strip()
+        with self._lock, Session(self.engine) as session:
+            self._begin_write(session)
+            row = session.get(SmsPoolItemModel, int(item_id))
+            if row is None or row.reserved_task_id != normalized_task_id:
+                session.rollback()
+                return False
+            if row.status == "reserved":
+                session.rollback()
+                return True
+            if row.status != "active":
+                session.rollback()
+                return False
+            row.status = "reserved"
+            row.used_by_email = ""
+            row.used_at = None
+            row.updated_at = _utcnow()
+            session.add(row)
+            session.commit()
+            return True
+
     def release_task(self, task_id: str) -> int:
         normalized_task_id = str(task_id or "").strip()
         if not normalized_task_id:

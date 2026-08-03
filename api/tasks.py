@@ -6,6 +6,8 @@ from typing import Optional
 from copy import deepcopy
 from datetime import datetime, timezone
 from weakref import WeakKeyDictionary
+import math
+import os
 import uuid
 from core.db import (
     AccountModel,
@@ -62,6 +64,105 @@ _chatgpt_binding_table_ready = WeakKeyDictionary()
 _task_snapshot_persist_lock = threading.RLock()
 _task_snapshot_last_persisted_at: dict[str, float] = {}
 _task_snapshot_write_locks: dict[str, threading.Lock] = {}
+_automation_stop_watchdog_lock = threading.Lock()
+_automation_runner_active_tasks: set[str] = set()
+_automation_stop_watchdog_tasks: dict[str, threading.Event] = {}
+
+
+def _automation_force_stop_seconds() -> float:
+    """Return the grace period before recycling a stuck automation worker."""
+    raw_value = os.getenv("CHATGPT_AUTOMATION_FORCE_STOP_SECONDS", "30")
+    try:
+        seconds = float(raw_value)
+    except (TypeError, ValueError):
+        seconds = 30.0
+    if not math.isfinite(seconds):
+        seconds = 30.0
+    return min(max(seconds, 0.01), 300.0)
+
+
+def _is_automatic_chatgpt_task(snapshot: dict) -> bool:
+    return (
+        str(snapshot.get("platform") or "").strip().lower() == "chatgpt"
+        and _is_truthy((snapshot.get("meta") or {}).get("automation"))
+    )
+
+
+def _mark_automation_runner_started(task_id: str) -> None:
+    with _automation_stop_watchdog_lock:
+        _automation_runner_active_tasks.add(task_id)
+
+
+def _mark_automation_runner_finished(task_id: str) -> None:
+    """Signal completion only after the automation gate has been released."""
+    with _automation_stop_watchdog_lock:
+        _automation_runner_active_tasks.discard(task_id)
+        completion = _automation_stop_watchdog_tasks.get(task_id)
+        if completion is not None:
+            completion.set()
+
+
+def _arm_automation_stop_watchdog(task_id: str) -> bool:
+    """Recycle the service if a stopped automation runner cannot quiesce."""
+    with _automation_stop_watchdog_lock:
+        if task_id in _automation_stop_watchdog_tasks:
+            # The runner is already protected. Treat this as successfully
+            # armed so repeated stop requests remain idempotent even after the
+            # task snapshot has reached a terminal state.
+            return True
+        runner_active = task_id in _automation_runner_active_tasks
+        snapshot = _task_store.snapshot_if_present(task_id)
+        if snapshot is None and not runner_active:
+            return False
+        if not runner_active:
+            if not _is_automatic_chatgpt_task(snapshot or {}):
+                return False
+            if str((snapshot or {}).get("status") or "") not in {
+                "pending",
+                "running",
+            }:
+                return False
+        runner_finished = threading.Event()
+        _automation_stop_watchdog_tasks[task_id] = runner_finished
+
+    grace_seconds = _automation_force_stop_seconds()
+
+    def _watch() -> None:
+        try:
+            if runner_finished.wait(timeout=grace_seconds):
+                return
+            # Do not take a logging or database lock here. The watchdog must
+            # still terminate the process when one of those locks is wedged.
+            os._exit(75)
+        finally:
+            # This also keeps tests deterministic when os._exit is mocked.
+            with _automation_stop_watchdog_lock:
+                if (
+                    _automation_stop_watchdog_tasks.get(task_id)
+                    is runner_finished
+                ):
+                    _automation_stop_watchdog_tasks.pop(task_id, None)
+
+    watchdog = threading.Thread(
+        target=_watch,
+        name=f"automation-stop-watchdog-{task_id[-12:]}",
+        daemon=True,
+    )
+    try:
+        watchdog.start()
+    except Exception:
+        with _automation_stop_watchdog_lock:
+            if (
+                _automation_stop_watchdog_tasks.get(task_id)
+                is runner_finished
+            ):
+                _automation_stop_watchdog_tasks.pop(task_id, None)
+        # The gate deliberately swallows stop-callback exceptions. If a
+        # watchdog thread cannot start, recycle synchronously instead of
+        # leaving foreground work blocked forever.
+        os._exit(75)
+        return False
+    return True
 
 
 class RegisterTaskRequest(BaseModel):
@@ -1298,6 +1399,12 @@ def _run_chatgpt_relogin_task_inner(
     control = _task_store.control_for(task_id)
     task_snapshot = _task_store.snapshot(task_id)
     automation = _is_truthy((task_snapshot.get("meta") or {}).get("automation"))
+    if control.is_stop_requested():
+        _terminalize_stopped_task(
+            task_id,
+            "任务尚未开始账号处理，停止请求已生效",
+        )
+        return
     remote_health: dict[int, dict[str, object]] = {}
     if automation:
         from services.chatgpt_codex2api_health import (
@@ -1306,6 +1413,13 @@ def _run_chatgpt_relogin_task_inner(
         )
 
         remote_health = inspect_codex2api_account_health(account_ids)
+        if control.is_stop_requested():
+            _terminalize_stopped_task(
+                task_id,
+                "Codex2API 鉴权探针结束后检测到停止请求，"
+                "未派发账号处理",
+            )
+            return
     task_label = "Codex2API 鉴权巡检" if automation else "重登"
     total = len(account_ids)
     max_workers = min(
@@ -1556,6 +1670,7 @@ def _run_chatgpt_relogin_task_inner(
             while pending:
                 completed, _ = wait(
                     tuple(pending),
+                    timeout=0.1,
                     return_when=FIRST_COMPLETED,
                 )
                 for future in completed:
@@ -1592,9 +1707,17 @@ def _run_chatgpt_relogin_task_inner(
                     _persist_task_snapshot_best_effort(task_id)
 
                 if stopped or control.is_stop_requested():
+                    first_stop_observation = not stopped
                     stopped = True
-                    for future in pending:
-                        future.cancel()
+                    for future in tuple(pending):
+                        if future.cancel():
+                            pending.pop(future, None)
+                    if first_stop_observation:
+                        _log(
+                            task_id,
+                            "停止请求已生效，已取消未开始账号，"
+                            "正在等待当前步骤安全退出",
+                        )
                 else:
                     while len(pending) < max_workers and _submit_next():
                         pass
@@ -1605,6 +1728,22 @@ def _run_chatgpt_relogin_task_inner(
             raise
 
     final_status = "stopped" if stopped or control.is_stop_requested() else "done"
+    # Freeze the business outcome before starting optional SMTP work. This is
+    # the atomic boundary: every stop accepted before it resolves to stopped
+    # and suppresses alerts; after it the task is terminal and cleanup-only
+    # stop requests must not rewrite its outcome.
+    final_status = _task_store.finish(
+        task_id,
+        status=final_status,
+        success=success,
+        registered=processed,
+        skipped=skipped,
+        errors=errors,
+    )
+    # Persist the terminal business outcome before optional SMTP/log work.
+    # If cleanup later needs to recycle the process, restart recovery must see
+    # the already-decided result rather than the previous running snapshot.
+    _persist_task_snapshot_best_effort(task_id)
     if final_status == "stopped":
         summary = (
             f"{task_label}任务已停止: 完整成功 {success} 个，"
@@ -1670,14 +1809,6 @@ def _run_chatgpt_relogin_task_inner(
             alert_reason="task_stopped",
         )
 
-    _task_store.finish(
-        task_id,
-        status=final_status,
-        success=success,
-        registered=processed,
-        skipped=skipped,
-        errors=errors,
-    )
     _persist_task_snapshot_best_effort(task_id)
     _task_store.cleanup()
 
@@ -1729,7 +1860,7 @@ def _run_chatgpt_relogin_task_body(
             _task_store.cleanup()
 
 
-def _run_chatgpt_relogin_task(
+def _run_chatgpt_relogin_task_coordinated(
     task_id: str,
     account_ids: list[int],
     concurrency: int = 1,
@@ -1740,42 +1871,57 @@ def _run_chatgpt_relogin_task(
     automation = _is_truthy((snapshot.get("meta") or {}).get("automation"))
 
     if automation:
+        _mark_automation_runner_started(task_id)
+
         def _request_automation_stop() -> None:
-            try:
+            state, first_request, _ = _task_store.request_stop_if_active(task_id)
+            _arm_automation_stop_watchdog(task_id)
+            if state == "active" and first_request:
                 _log(
                     task_id,
                     "手工任务优先：正在安全停止自动重登，不再派发新账号",
                 )
-            finally:
-                control.request_stop()
+            if state == "active":
+                _persist_task_snapshot_best_effort(task_id)
 
-        lease = chatgpt_task_gate.try_enter_automation(
-            stop_callback=_request_automation_stop,
-        )
-        if lease is None:
-            _terminalize_stopped_task(
-                task_id,
-                "自动重登未启动：已有手工 ChatGPT 任务等待/运行，"
-                "或另一自动重登正在运行",
+        lease = None
+        try:
+            lease = chatgpt_task_gate.try_enter_automation(
+                stop_callback=_request_automation_stop,
             )
-            return
-        leave_gate = chatgpt_task_gate.leave_automation
-    else:
-        lease = chatgpt_task_gate.enter_foreground(
-            on_wait=lambda: _log(
+            if lease is None:
+                _terminalize_stopped_task(
+                    task_id,
+                    "自动重登未启动：已有手工 ChatGPT 任务等待/运行，"
+                    "或另一自动重登正在运行",
+                )
+                return
+            _run_chatgpt_relogin_task_body(
                 task_id,
-                "等待自动重登释放；手工任务优先，自动重登将安全停止",
-            ),
-            cancelled=control.is_stop_requested,
-        )
-        if lease is None:
-            _terminalize_stopped_task(
-                task_id,
-                "手工重登任务已停止：等待自动重登释放期间收到停止请求",
+                account_ids,
+                concurrency=concurrency,
             )
-            return
-        leave_gate = chatgpt_task_gate.leave_foreground
+        finally:
+            if lease is not None:
+                chatgpt_task_gate.leave_automation(lease)
+            # Keep this after leave_automation. A stopped task is not fully
+            # quiescent while it can still hold the automation gate.
+            _mark_automation_runner_finished(task_id)
+        return
 
+    lease = chatgpt_task_gate.enter_foreground(
+        on_wait=lambda: _log(
+            task_id,
+            "等待自动重登释放；手工任务优先，自动重登将安全停止",
+        ),
+        cancelled=control.is_stop_requested,
+    )
+    if lease is None:
+        _terminalize_stopped_task(
+            task_id,
+            "手工重登任务已停止：等待自动重登释放期间收到停止请求",
+        )
+        return
     try:
         _run_chatgpt_relogin_task_body(
             task_id,
@@ -1783,7 +1929,24 @@ def _run_chatgpt_relogin_task(
             concurrency=concurrency,
         )
     finally:
-        leave_gate(lease)
+        chatgpt_task_gate.leave_foreground(lease)
+
+
+def _run_chatgpt_relogin_task(
+    task_id: str,
+    account_ids: list[int],
+    concurrency: int = 1,
+) -> None:
+    """Keep the live record until all runner and gate cleanup has completed."""
+    _task_store.protect_from_cleanup(task_id)
+    try:
+        _run_chatgpt_relogin_task_coordinated(
+            task_id,
+            account_ids,
+            concurrency=concurrency,
+        )
+    finally:
+        _task_store.release_cleanup_protection(task_id)
 
 
 def _ensure_chatgpt_attempt_binding_table() -> None:
@@ -2645,6 +2808,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         def _mark_sms_pool_active(
                             _item_id=active_pool_item_id,
                         ) -> None:
+                            nonlocal sms_pool_consumed
+                            nonlocal sms_pool_restoration_confirmed
                             if _item_id and not sms_pool_service.mark_active(
                                 item_id=_item_id,
                                 task_id=task_id,
@@ -2653,12 +2818,26 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 raise RuntimeError(
                                     "SMS 接码池卡密使用中状态保存失败"
                                 )
+                            # A previously restored card stays reusable while
+                            # waiting to retry. It becomes at-risk again only
+                            # when the provider actually starts a new attempt.
+                            sms_pool_consumed = False
+                            sms_pool_restoration_confirmed = False
 
                         def _mark_sms_pool_restored(
                             _item_id=active_pool_item_id,
                         ) -> None:
+                            nonlocal sms_pool_consumed
                             nonlocal sms_pool_restoration_confirmed
                             if int(sms_pool_item_id or 0) == int(_item_id or 0):
+                                if _item_id and not sms_pool_service.mark_restored(
+                                    item_id=_item_id,
+                                    task_id=task_id,
+                                ):
+                                    raise RuntimeError(
+                                        "SMS 接码池卡密恢复状态保存失败"
+                                    )
+                                sms_pool_consumed = False
                                 sms_pool_restoration_confirmed = True
 
                         try:
@@ -2751,7 +2930,6 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "不占用其他邮箱的卡密",
                             )
                             sms_pool_consumed = False
-                            sms_pool_restoration_confirmed = False
                             _sleep_with_control(2, attempt_id=attempt_id)
                             continue
 
@@ -3272,12 +3450,26 @@ def skip_current_account(task_id: str):
 
 @router.post("/{task_id}/stop")
 def stop_task(task_id: str):
-    _finalize_orphan_tasks()
-    _ensure_task_mutable(task_id)
-    if not _task_store.exists(task_id):
+    state, first_request, control = _task_store.request_stop_if_active(task_id)
+    if state == "missing":
+        # Persisted-only records need reconciliation. Live records deliberately
+        # skip SQLite so a database stall cannot block emergency stop control.
+        _finalize_orphan_tasks()
+        _ensure_task_mutable(task_id)
         raise HTTPException(409, "任务已结束或服务已重启，无法停止")
-    control = _task_store.request_stop(task_id)
-    _log(task_id, "收到手动停止任务请求")
+    if state == "terminal":
+        # A runner can reach an in-memory terminal snapshot and then wedge
+        # while persisting that snapshot or releasing the automation gate.
+        # It is still stoppable until the runner-completed Event is set.
+        if not _arm_automation_stop_watchdog(task_id):
+            raise HTTPException(409, "任务已结束，无法再执行控制操作")
+        return {"ok": True, "task_id": task_id, "control": control}
+    # Arm before log/SQLite persistence: if either is the wedged resource,
+    # the independent watchdog must already be able to recycle the process.
+    _arm_automation_stop_watchdog(task_id)
+    if first_request:
+        _log(task_id, "收到手动停止任务请求")
+    _persist_task_snapshot_best_effort(task_id)
     return {"ok": True, "task_id": task_id, "control": control}
 
 
