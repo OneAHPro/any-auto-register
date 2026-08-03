@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import tempfile
+from urllib.error import URLError
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -54,9 +55,16 @@ def main() -> None:
         addon_dir.mkdir(parents=True, exist_ok=True)
         addon_path = temp_dir / "ublock-origin.xpi"
         print(f"Downloading default addon UBO: {addon_url}")
-        urllib.request.urlretrieve(addon_url, addon_path)
-        with zipfile.ZipFile(addon_path) as zf:
-            zf.extractall(addon_dir)
+        try:
+            urllib.request.urlretrieve(addon_url, addon_path)
+            with zipfile.ZipFile(addon_path) as zf:
+                zf.extractall(addon_dir)
+        except (OSError, URLError, zipfile.BadZipFile) as exc:
+            shutil.rmtree(addon_dir, ignore_errors=True)
+            print(
+                "Optional UBO addon download skipped: "
+                f"{type(exc).__name__}"
+            )
 
         for path in install_dir.rglob("*"):
             if path.is_dir():
