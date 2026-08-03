@@ -4,6 +4,7 @@ import sys
 import os
 import time
 import threading
+from pathlib import Path
 import requests
 
 _proc: subprocess.Popen = None
@@ -31,6 +32,18 @@ def _solver_browser_type() -> str:
     return os.getenv("SOLVER_BROWSER_TYPE", "camoufox")
 
 
+def _solver_log_path() -> Path:
+    configured_path = os.getenv("SOLVER_LOG_PATH")
+    if configured_path:
+        return Path(configured_path)
+
+    runtime_dir = os.getenv("APP_RUNTIME_DIR")
+    if runtime_dir:
+        return Path(runtime_dir) / "logs" / "solver.log"
+
+    return Path(__file__).resolve().parent / "turnstile_solver" / "solver.log"
+
+
 def is_running() -> bool:
     try:
         r = requests.get(f"{_solver_url()}/", timeout=2)
@@ -51,9 +64,8 @@ def start():
         solver_script = os.path.join(
             os.path.dirname(__file__), "turnstile_solver", "start.py"
         )
-        log_path = os.path.join(
-            os.path.dirname(__file__), "turnstile_solver", "solver.log"
-        )
+        log_path = _solver_log_path()
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         _log_file = open(log_path, "a", encoding="utf-8")
         _proc = subprocess.Popen(
             [

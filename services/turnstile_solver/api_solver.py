@@ -15,6 +15,11 @@ except ImportError:
     AsyncCamoufox = None
 
 try:
+    from camoufox.addons import DefaultAddons
+except ImportError:
+    DefaultAddons = None
+
+try:
     from patchright.async_api import async_playwright
 except ImportError:
     async_playwright = None
@@ -36,6 +41,16 @@ COLORS = {
     'RED': '\033[31m',
     'RESET': '\033[0m',
 }
+
+
+def _camoufox_launch_options(headless: bool) -> dict:
+    options = {"headless": headless}
+    if DefaultAddons is not None:
+        # uBlock Origin is optional for Turnstile solving.  Some deployment
+        # networks reject addons.mozilla.org, and Camoufox otherwise leaves an
+        # incomplete addon directory that prevents every browser from starting.
+        options["exclude_addons"] = [DefaultAddons.UBO]
+    return options
 
 
 class CustomLogger(logging.Logger):
@@ -179,7 +194,9 @@ class TurnstileAPIServer:
                 raise RuntimeError(
                     "当前浏览器模式需要 camoufox，但未安装。请执行: pip install camoufox && python -m camoufox fetch"
                 )
-            camoufox = AsyncCamoufox(headless=self.headless)
+            camoufox = AsyncCamoufox(
+                **_camoufox_launch_options(headless=self.headless)
+            )
 
         browser_configs = []
         for _ in range(self.thread_count):
