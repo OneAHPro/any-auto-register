@@ -9,7 +9,7 @@
     compress
     delaycompress
     copytruncate
-    su any-auto-register any-auto-register
+    su root any-auto-register
 }
 
 /www/any-auto-register/shared/logs/nginx-access.log
