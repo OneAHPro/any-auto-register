@@ -337,7 +337,9 @@ def init_db():
     _recover_chatgpt_attempt_bindings()
     from core.sms_pool import SmsPoolService
 
-    SmsPoolService(engine).recover_interrupted()
+    sms_pool = SmsPoolService(engine)
+    sms_pool.recover_interrupted()
+    sms_pool.recover_stale_active()
 
 
 def get_session():

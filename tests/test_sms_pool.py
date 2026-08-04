@@ -2,7 +2,7 @@ import unittest
 import tempfile
 import threading
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -32,7 +32,7 @@ from api.sms_pool import (
     import_sms_pool_items,
     list_sms_pool_items,
 )
-from core.db import ChatGPTAttemptBindingModel, SmsPoolItemModel
+from core.db import ChatGPTAttemptBindingModel, SmsPoolItemModel, TaskRunModel
 from core.sms_pool import SmsPoolExhaustedError, SmsPoolService
 from services.chatgpt_phone_verification import InteractivePhoneVerificationBroker
 from tests.test_chatgpt_login_with_phone import (
@@ -126,7 +126,7 @@ class SmsPoolServiceTests(unittest.TestCase):
             self.assertEqual(second.reserved_task_id, "")
         self.assertEqual(
             self.pool.stats(),
-            {"total": 2, "unused": 1, "reserved": 0, "used": 1},
+            {"total": 2, "unused": 1, "reserved": 0, "active": 0, "used": 1},
         )
 
     def test_insufficient_reservation_is_atomic(self):
@@ -249,7 +249,8 @@ class SmsPoolServiceTests(unittest.TestCase):
                 account_email="active@example.com",
             )
         )
-        self.assertEqual(self.pool.stats()["reserved"], 2)
+        self.assertEqual(self.pool.stats()["reserved"], 1)
+        self.assertEqual(self.pool.stats()["active"], 1)
         self.assertEqual(self.pool.stats()["used"], 0)
 
         recovered = self.pool.recover_interrupted()
@@ -413,6 +414,235 @@ class SmsPoolServiceTests(unittest.TestCase):
             self.assertEqual(row.reserved_task_id, "")
             self.assertIsNone(row.reserved_at)
             self.assertIsNone(row.used_at)
+
+    def test_release_preserves_existing_active_since_but_stamps_new_quarantine(self):
+        self.pool.import_text(
+            "already-active\nreserved-conflict",
+            default_base_url="https://sms.example.com/box",
+        )
+        active, reserved = self.pool.reserve(task_id="task-release", count=2)
+        active_since = datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc)
+        release_time = active_since + timedelta(hours=2)
+        with mock.patch("core.sms_pool._utcnow", return_value=active_since):
+            self.assertTrue(
+                self.pool.mark_active(
+                    item_id=int(active.id),
+                    task_id="task-release",
+                    account_email="active@example.com",
+                )
+            )
+        with Session(self.engine) as session:
+            active_row = session.get(SmsPoolItemModel, active.id)
+            active_row.used_at = active_since
+            session.add(active_row)
+            session.commit()
+
+        with mock.patch("core.sms_pool._utcnow", return_value=release_time):
+            released = self.pool.release_task(
+                "task-release",
+                quarantine_item_ids={int(reserved.id)},
+            )
+
+        self.assertEqual(released, 2)
+        with Session(self.engine) as session:
+            active_row = session.get(SmsPoolItemModel, active.id)
+            new_active_row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(active_row.status, "active")
+            self.assertEqual(
+                active_row.updated_at,
+                active_since.replace(tzinfo=None),
+            )
+            self.assertEqual(new_active_row.status, "active")
+            self.assertEqual(
+                new_active_row.updated_at,
+                release_time.replace(tzinfo=None),
+            )
+            self.assertEqual(active_row.reserved_task_id, "")
+            self.assertIsNone(active_row.reserved_at)
+            self.assertEqual(active_row.used_at, active_since.replace(tzinfo=None))
+
+    def test_restart_preserves_active_since_and_only_refreshes_released_reservation(self):
+        self.pool.import_text(
+            "active-at-restart\nreserved-at-restart",
+            default_base_url="https://sms.example.com/box",
+        )
+        active, reserved = self.pool.reserve(task_id="task-restart", count=2)
+        active_since = datetime(2026, 8, 5, 2, 0, tzinfo=timezone.utc)
+        restart_time = active_since + timedelta(hours=3)
+        with mock.patch("core.sms_pool._utcnow", return_value=active_since):
+            self.assertTrue(
+                self.pool.mark_active(
+                    item_id=int(active.id),
+                    task_id="task-restart",
+                    account_email="restart@example.com",
+                )
+            )
+
+        with mock.patch("core.sms_pool._utcnow", return_value=restart_time):
+            self.assertEqual(self.pool.recover_interrupted(), 2)
+
+        with Session(self.engine) as session:
+            active_row = session.get(SmsPoolItemModel, active.id)
+            reserved_row = session.get(SmsPoolItemModel, reserved.id)
+            self.assertEqual(active_row.status, "active")
+            self.assertEqual(
+                active_row.updated_at,
+                active_since.replace(tzinfo=None),
+            )
+            self.assertEqual(active_row.reserved_task_id, "")
+            self.assertEqual(reserved_row.status, "unused")
+            self.assertEqual(
+                reserved_row.updated_at,
+                restart_time.replace(tzinfo=None),
+            )
+
+    def test_stale_active_recovery_respects_owner_state_boundary_and_clears_fields(self):
+        now = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+        stale = now - timedelta(seconds=1801)
+        boundary = now - timedelta(seconds=1800)
+        with Session(self.engine) as session:
+            for task_id, status in (
+                ("task-done", "done"),
+                ("task-failed", "failed"),
+                ("task-stopped", "stopped"),
+                ("task-pending", "pending"),
+                ("task-running", "running"),
+            ):
+                session.add(
+                    TaskRunModel(
+                        id=task_id,
+                        platform="chatgpt",
+                        status=status,
+                        logs_json='["sensitive-log"]',
+                    )
+                )
+            rows = []
+            for code, owner, updated_at in (
+                ("ownerless", "", stale),
+                ("missing-owner", "task-missing", stale),
+                ("done-owner", "task-done", stale),
+                ("failed-owner", "task-failed", stale),
+                ("stopped-owner", "task-stopped", stale),
+                ("pending-owner", "task-pending", stale),
+                ("running-owner", "task-running", stale),
+                ("exact-boundary", "", boundary),
+                ("fresh-ownerless", "", now - timedelta(seconds=60)),
+            ):
+                row = SmsPoolItemModel(
+                    code=code,
+                    base_url="https://sms.example.com/box",
+                    status="active",
+                    reserved_task_id=owner,
+                    reserved_at=stale,
+                    used_at=stale,
+                    used_by_email=f"{code}@example.com",
+                    created_at=stale,
+                    updated_at=updated_at,
+                )
+                session.add(row)
+                rows.append(row)
+            session.commit()
+
+        statements: list[str] = []
+
+        def capture_query(_conn, _cursor, statement, _parameters, _context, _many):
+            if "FROM task_runs" in statement:
+                statements.append(statement)
+
+        from sqlalchemy import event
+
+        event.listen(self.engine, "before_cursor_execute", capture_query)
+        try:
+            recovered = self.pool.recover_stale_active(now=now)
+        finally:
+            event.remove(self.engine, "before_cursor_execute", capture_query)
+
+        self.assertEqual(recovered, 5)
+        self.assertEqual(len(statements), 1)
+        projected = statements[0].lower().split("from task_runs", 1)[0]
+        self.assertIn("task_runs.id", projected)
+        self.assertIn("task_runs.status", projected)
+        self.assertNotIn("logs_json", projected)
+        self.assertNotIn("meta_json", projected)
+        with Session(self.engine) as session:
+            by_code = {
+                row.code: row
+                for row in session.exec(select(SmsPoolItemModel)).all()
+            }
+            for code in (
+                "ownerless",
+                "missing-owner",
+                "done-owner",
+                "failed-owner",
+                "stopped-owner",
+            ):
+                row = by_code[code]
+                self.assertEqual(row.status, "unused")
+                self.assertEqual(row.reserved_task_id, "")
+                self.assertIsNone(row.reserved_at)
+                self.assertIsNone(row.used_at)
+                self.assertEqual(row.used_by_email, "")
+                self.assertEqual(row.updated_at, now.replace(tzinfo=None))
+            for code in (
+                "pending-owner",
+                "running-owner",
+                "exact-boundary",
+                "fresh-ownerless",
+            ):
+                self.assertEqual(by_code[code].status, "active")
+
+    def test_api_filters_reserved_and_active_as_distinct_states(self):
+        now = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+        with Session(self.engine) as session:
+            session.add(
+                SmsPoolItemModel(
+                    code="reserved-only",
+                    base_url="https://sms.example.com/box",
+                    status="reserved",
+                    updated_at=now,
+                )
+            )
+            session.add(
+                SmsPoolItemModel(
+                    code="active-only",
+                    base_url="https://sms.example.com/box",
+                    status="active",
+                    updated_at=now,
+                )
+            )
+            session.commit()
+
+        with (
+            mock.patch("api.sms_pool.engine", self.engine),
+            mock.patch("api.sms_pool.sms_pool_service", self.pool),
+        ):
+            reserved = list_sms_pool_items(status="reserved", page=1, page_size=50)
+            active = list_sms_pool_items(status="active", page=1, page_size=50)
+            stats = get_sms_pool_stats()
+
+        self.assertEqual([item["code"] for item in reserved["items"]], ["reserved-only"])
+        self.assertEqual([item["code"] for item in active["items"]], ["active-only"])
+        self.assertEqual(stats["reserved"], 1)
+        self.assertEqual(stats["active"], 1)
+
+
+class SmsPoolStartupRecoveryTests(unittest.TestCase):
+    def test_init_db_runs_interrupted_recovery_before_stale_active_recovery(self):
+        from core import db as db_module
+
+        calls: list[str] = []
+        pool = mock.Mock()
+        pool.recover_interrupted.side_effect = lambda: calls.append("interrupted")
+        pool.recover_stale_active.side_effect = lambda: calls.append("stale-active")
+        with (
+            mock.patch.object(db_module.SQLModel.metadata, "create_all"),
+            mock.patch.object(db_module, "_migrate_outlook_accounts_schema"),
+            mock.patch.object(db_module, "_recover_chatgpt_attempt_bindings"),
+            mock.patch("core.sms_pool.SmsPoolService", return_value=pool),
+        ):
+            db_module.init_db()
+
+        self.assertEqual(calls, ["interrupted", "stale-active"])
 
 
 class SmsPoolTaskIntegrationTests(unittest.TestCase):

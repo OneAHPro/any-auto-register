@@ -39,15 +39,21 @@ def list_sms_pool_items(
     page_size: int = Query(default=50, ge=1, le=200),
 ):
     normalized_status = str(status or "").strip().lower()
-    if normalized_status and normalized_status not in {"unused", "reserved", "used"}:
+    if normalized_status and normalized_status not in {
+        "unused",
+        "reserved",
+        "active",
+        "used",
+    }:
         raise HTTPException(400, "SMS 接码池状态无效")
     with Session(engine) as session:
         query = select(SmsPoolItemModel)
         count_query = select(func.count()).select_from(SmsPoolItemModel)
         if normalized_status:
-            statuses = ["reserved", "active"] if normalized_status == "reserved" else [normalized_status]
-            query = query.where(SmsPoolItemModel.status.in_(statuses))
-            count_query = count_query.where(SmsPoolItemModel.status.in_(statuses))
+            query = query.where(SmsPoolItemModel.status == normalized_status)
+            count_query = count_query.where(
+                SmsPoolItemModel.status == normalized_status
+            )
         total = int(session.exec(count_query).one() or 0)
         rows = session.exec(
             query.order_by(SmsPoolItemModel.id.desc())

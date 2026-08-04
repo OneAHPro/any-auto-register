@@ -35,11 +35,11 @@ describe('SmsPool', () => {
     vi.mocked(apiFetch).mockReset()
     vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
       if (path === '/sms-pool/stats') {
-        return { total: 3, unused: 1, reserved: 1, used: 1 }
+        return { total: 4, unused: 1, reserved: 1, active: 1, used: 1 }
       }
       if (path.startsWith('/sms-pool?')) {
         return {
-          total: 3,
+          total: 4,
           page: 1,
           page_size: 50,
           items: [
@@ -68,7 +68,17 @@ describe('SmsPool', () => {
               base_url: 'https://sms.example.com/box',
               status: 'active',
               reserved_task_id: 'task-active',
-              reserved_at: '2026-08-01T00:05:00Z',
+              updated_at: '2026-08-01T00:05:00Z',
+              created_at: '2026-08-01T00:00:00Z',
+            },
+            {
+              id: 4,
+              code: 'bei-sms-FULL-SECRET-0004',
+              code_hint: 'bei-****-0004',
+              base_url: 'https://sms.example.com/box',
+              status: 'reserved',
+              reserved_task_id: 'task-reserved',
+              reserved_at: '2026-08-01T00:04:00Z',
               created_at: '2026-08-01T00:00:00Z',
             },
           ],
@@ -97,8 +107,13 @@ describe('SmsPool', () => {
     expect(screen.getAllByText('https://sms.example.com/box').length).toBeGreaterThan(0)
     expect(screen.getByText('未使用')).toBeTruthy()
     expect(screen.getByText('已使用')).toBeTruthy()
-    expect(screen.getByText('使用中')).toBeTruthy()
+    expect(screen.getAllByText('使用中').length).toBeGreaterThan(0)
+    expect(screen.getByText('待回收')).toBeTruthy()
     expect(screen.getByText('可用 1')).toBeTruthy()
+    expect(screen.getByText('待回收 1')).toBeTruthy()
+    expect(
+      screen.getByText(new Date('2026-08-01T00:05:00Z').toLocaleString('zh-CN')),
+    ).toBeTruthy()
   })
 
   it('copies the full card code', async () => {
@@ -160,5 +175,22 @@ describe('SmsPool', () => {
       ).toBeGreaterThan(1)
     })
     intervalSpy.mockRestore()
+  })
+
+  it('requests active cards independently through the pending-recovery filter', async () => {
+    const user = userEvent.setup()
+    render(<SmsPool />)
+    await screen.findByText('bei-sms-FULL-SECRET-0001')
+
+    await user.click(screen.getByRole('combobox', { name: '状态筛选' }))
+    await user.click(await screen.findByText('待回收', { selector: '.ant-select-item-option-content' }))
+
+    await waitFor(() => {
+      expect(
+        vi.mocked(apiFetch).mock.calls.some(
+          ([path]) => String(path).includes('status=active'),
+        ),
+      ).toBe(true)
+    })
   })
 })

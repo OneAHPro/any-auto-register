@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from sqlalchemy import func
 from sqlmodel import Session, select
 
-from core.db import SmsPoolItemModel, engine
+from core.db import SmsPoolItemModel, TaskRunModel, engine
 
 
 DEFAULT_SMS_BASE_URL = "https://sms.leadbee.cn/smsbox"
@@ -290,18 +290,21 @@ class SmsPoolService:
             ).all()
             now = _utcnow()
             for row in rows:
+                was_active = row.status == "active"
                 must_quarantine = bool(
-                    row.status == "active" or int(row.id or 0) in quarantined_ids
+                    was_active or int(row.id or 0) in quarantined_ids
                 )
                 row.status = "active" if must_quarantine else "unused"
                 row.reserved_task_id = ""
                 row.reserved_at = None
                 if must_quarantine:
-                    row.used_at = None
+                    if not was_active:
+                        row.used_at = None
                 else:
                     row.used_by_email = ""
                     row.used_at = None
-                row.updated_at = now
+                if not was_active:
+                    row.updated_at = now
                 session.add(row)
             session.commit()
             return len(rows)
@@ -325,10 +328,69 @@ class SmsPoolService:
                 row.reserved_at = None
                 if not was_active:
                     row.used_by_email = ""
-                row.updated_at = now
+                    row.updated_at = now
                 session.add(row)
             session.commit()
             return len(rows)
+
+    def recover_stale_active(
+        self,
+        *,
+        now: datetime | None = None,
+        quarantine_seconds: int = 1800,
+    ) -> int:
+        """Release stale quarantines whose owning task can no longer be active."""
+        effective_now = now or _utcnow()
+        cutoff = effective_now - timedelta(seconds=max(0, int(quarantine_seconds)))
+        with self._lock, Session(self.engine) as session:
+            self._begin_write(session)
+            rows = session.exec(
+                select(SmsPoolItemModel)
+                .where(SmsPoolItemModel.status == "active")
+                .where(SmsPoolItemModel.updated_at < cutoff)
+            ).all()
+            if not rows:
+                session.rollback()
+                return 0
+
+            owner_ids = {
+                str(row.reserved_task_id or "").strip()
+                for row in rows
+                if str(row.reserved_task_id or "").strip()
+            }
+            owner_statuses: dict[str, str] = {}
+            if owner_ids:
+                owner_statuses = {
+                    str(task_id): str(status or "")
+                    for task_id, status in session.exec(
+                        select(TaskRunModel.id, TaskRunModel.status).where(
+                            TaskRunModel.id.in_(owner_ids)
+                        )
+                    ).all()
+                }
+
+            terminal_statuses = {"done", "failed", "stopped"}
+            recovered = 0
+            for row in rows:
+                owner_id = str(row.reserved_task_id or "").strip()
+                owner_status = owner_statuses.get(owner_id) if owner_id else None
+                owner_is_missing = bool(owner_id and owner_status is None)
+                if not (
+                    not owner_id
+                    or owner_is_missing
+                    or owner_status in terminal_statuses
+                ):
+                    continue
+                row.status = "unused"
+                row.reserved_task_id = ""
+                row.reserved_at = None
+                row.used_at = None
+                row.used_by_email = ""
+                row.updated_at = effective_now
+                session.add(row)
+                recovered += 1
+            session.commit()
+            return recovered
 
     def stats(self) -> dict[str, int]:
         with Session(self.engine) as session:
@@ -340,7 +402,8 @@ class SmsPoolService:
         return {
             "total": sum(counts.values()),
             "unused": counts.get("unused", 0),
-            "reserved": counts.get("reserved", 0) + counts.get("active", 0),
+            "reserved": counts.get("reserved", 0),
+            "active": counts.get("active", 0),
             "used": counts.get("used", 0),
         }
 

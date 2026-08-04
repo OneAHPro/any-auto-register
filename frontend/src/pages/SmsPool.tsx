@@ -37,12 +37,14 @@ interface SmsPoolItem {
   created_at?: string
   reserved_at?: string
   used_at?: string
+  updated_at?: string
 }
 
 interface SmsPoolStats {
   total: number
   unused: number
   reserved: number
+  active: number
   used: number
 }
 
@@ -59,13 +61,20 @@ function formatTime(value?: string) {
 
 function statusTag(status: SmsPoolStatus) {
   if (status === 'used') return <Tag color="default">已使用</Tag>
-  if (status === 'reserved' || status === 'active') return <Tag color="processing">使用中</Tag>
+  if (status === 'active') return <Tag color="warning">待回收</Tag>
+  if (status === 'reserved') return <Tag color="processing">使用中</Tag>
   return <Tag color="success">未使用</Tag>
 }
 
 export default function SmsPool() {
   const [items, setItems] = useState<SmsPoolItem[]>([])
-  const [stats, setStats] = useState<SmsPoolStats>({ total: 0, unused: 0, reserved: 0, used: 0 })
+  const [stats, setStats] = useState<SmsPoolStats>({
+    total: 0,
+    unused: 0,
+    reserved: 0,
+    active: 0,
+    used: 0,
+  })
   const [total, setTotal] = useState(0)
   const [page, setPage] = useState(1)
   const [status, setStatus] = useState<'all' | SmsPoolStatus>('all')
@@ -97,7 +106,6 @@ export default function SmsPool() {
 
   useEffect(() => {
     // This effect is the page's server-state synchronization entry point.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     load()
     const refreshTimer = window.setInterval(() => {
       void load(true)
@@ -175,7 +183,9 @@ export default function SmsPool() {
       title: '状态时间',
       key: 'status_time',
       width: 180,
-      render: (_, item) => formatTime(item.used_at || item.reserved_at || item.created_at),
+      render: (_, item) => formatTime(
+        item.used_at || item.reserved_at || item.updated_at || item.created_at,
+      ),
     },
   ]
 
@@ -201,6 +211,7 @@ export default function SmsPool() {
         <Space wrap>
           <Tag color="success" icon={<InboxOutlined />}>可用 {stats.unused}</Tag>
           <Tag color="processing">使用中 {stats.reserved}</Tag>
+          <Tag color="warning">待回收 {stats.active}</Tag>
           <Tag icon={<SafetyCertificateOutlined />}>已使用 {stats.used}</Tag>
           <Tag>总计 {stats.total}</Tag>
           <Button icon={<ReloadOutlined />} loading={loading} onClick={() => load()}>刷新</Button>
@@ -255,6 +266,7 @@ export default function SmsPool() {
               { value: 'all', label: '全部状态' },
               { value: 'unused', label: '未使用' },
               { value: 'reserved', label: '使用中' },
+              { value: 'active', label: '待回收' },
               { value: 'used', label: '已使用' },
             ]}
           />

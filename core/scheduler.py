@@ -19,6 +19,14 @@ def tick_chatgpt_auto_relogin(*, now: datetime):
     return tick(now=now)
 
 
+def recover_stale_sms_pool(*, now: datetime) -> int:
+    """Lazy import keeps SMS pool startup recovery owned by database init."""
+
+    from core.sms_pool import sms_pool_service
+
+    return sms_pool_service.recover_stale_active(now=now)
+
+
 class Scheduler:
     def __init__(self):
         self._running = False
@@ -28,9 +36,11 @@ class Scheduler:
         self._loop_interval_seconds = 60
         self._trial_check_interval_seconds = 3600
         self._task_history_cleanup_interval_seconds = 600
+        self._sms_pool_recovery_interval_seconds = 600
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
         self._last_task_history_cleanup_at = 0.0
+        self._last_sms_pool_recovery_at = 0.0
 
     def start(self):
         with self._lifecycle_lock:
@@ -47,6 +57,7 @@ class Scheduler:
             self._last_task_history_cleanup_at = (
                 now - self._task_history_cleanup_interval_seconds
             )
+            self._last_sms_pool_recovery_at = now
 
             self._thread = threading.Thread(
                 target=self._loop,
@@ -75,6 +86,19 @@ class Scheduler:
             tick_chatgpt_auto_relogin(now=wall_now)
         except Exception as e:
             print(f"[Scheduler] ChatGPT 自动重登错误: {e}")
+
+        if (
+            monotonic_now - self._last_sms_pool_recovery_at
+            >= self._sms_pool_recovery_interval_seconds
+        ):
+            try:
+                recovered = recover_stale_sms_pool(now=wall_now)
+            except Exception as e:
+                print(f"[Scheduler] SMS 接码池回收错误: {type(e).__name__}")
+            else:
+                self._last_sms_pool_recovery_at = monotonic_now
+                if recovered:
+                    print(f"[Scheduler] 已回收过期 SMS 接码卡密: {recovered} 张")
 
         if (
             monotonic_now - self._last_task_history_cleanup_at

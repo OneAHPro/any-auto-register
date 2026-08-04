@@ -13,6 +13,79 @@ def test_task_history_cleanup_defaults_to_ten_minutes():
     assert scheduler._task_history_cleanup_interval_seconds == 600
 
 
+def test_stale_sms_pool_recovery_defaults_to_ten_minutes():
+    scheduler = scheduler_module.Scheduler()
+
+    assert scheduler._sms_pool_recovery_interval_seconds == 600
+
+
+def test_stale_sms_pool_recovery_waits_599_seconds_and_runs_at_600(monkeypatch):
+    scheduler = scheduler_module.Scheduler()
+    scheduler._last_sms_pool_recovery_at = 1_000.0
+    scheduler._last_task_history_cleanup_at = 1_600.0
+    scheduler._last_trial_check_at = 1_600.0
+    scheduler._last_cpa_maintenance_at = 1_600.0
+    wall_now = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    recover = mock.Mock(return_value=0)
+
+    monkeypatch.setattr(scheduler_module, "tick_chatgpt_auto_relogin", mock.Mock())
+    monkeypatch.setattr(scheduler_module, "recover_stale_sms_pool", recover)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_cpa_maintenance_interval_seconds",
+        lambda: 3_600,
+    )
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=1_599.0)
+    recover.assert_not_called()
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=1_600.0)
+    recover.assert_called_once_with(now=wall_now)
+    assert scheduler._last_sms_pool_recovery_at == 1_600.0
+
+
+def test_stale_sms_pool_recovery_failure_retries_without_blocking_other_jobs(monkeypatch):
+    scheduler = scheduler_module.Scheduler()
+    scheduler._last_sms_pool_recovery_at = 0.0
+    scheduler._last_task_history_cleanup_at = 0.0
+    scheduler._last_trial_check_at = 0.0
+    scheduler._last_cpa_maintenance_at = 0.0
+    scheduler._sms_pool_recovery_interval_seconds = 10
+    scheduler._task_history_cleanup_interval_seconds = 10
+    scheduler._trial_check_interval_seconds = 10
+    wall_now = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    recover = mock.Mock(side_effect=[RuntimeError("pool failed"), 2])
+    auto_tick = mock.Mock()
+    cleanup = mock.Mock(return_value={"task_runs": 0, "task_logs": 0})
+    trial = mock.Mock()
+    cpa = mock.Mock()
+
+    monkeypatch.setattr(scheduler_module, "tick_chatgpt_auto_relogin", auto_tick)
+    monkeypatch.setattr(scheduler_module, "recover_stale_sms_pool", recover)
+    monkeypatch.setattr(scheduler_module, "cleanup_task_history", cleanup)
+    monkeypatch.setattr(scheduler, "check_trial_expiry", trial)
+    monkeypatch.setattr(scheduler, "check_cpa_credentials", cpa)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_cpa_maintenance_interval_seconds",
+        lambda: 10,
+    )
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=10.0)
+
+    assert scheduler._last_sms_pool_recovery_at == 0.0
+    auto_tick.assert_called_once_with(now=wall_now)
+    cleanup.assert_called_once_with()
+    trial.assert_called_once_with()
+    cpa.assert_called_once_with()
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=11.0)
+
+    assert recover.call_count == 2
+    assert scheduler._last_sms_pool_recovery_at == 11.0
+    assert auto_tick.call_count == 2
+
+
 def test_task_history_cleanup_waits_599_seconds_and_runs_at_600(monkeypatch):
     scheduler = scheduler_module.Scheduler()
     scheduler._last_task_history_cleanup_at = 1_000.0
