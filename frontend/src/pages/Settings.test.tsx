@@ -101,6 +101,54 @@ describe('Settings ChatGPT automatic relogin config', () => {
     })
   })
 
+  it('hydrates and saves the Codex2API account-removal switch independently', async () => {
+    configResponse = {
+      ...configResponse,
+      codex2api_enabled: '1',
+      codex2api_delete_on_account_remove_enabled: '1',
+    }
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(screen.getByText('Codex2API'))
+    const removalSwitch = await screen.findByRole('switch', {
+      name: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
+    })
+    expect(screen.getByText('删除联动')).toBeTruthy()
+    expect(
+      screen.getByText('自动清理、单个删除和批量删除均生效；远端删除失败时保留本地账号。'),
+    ).toBeTruthy()
+    expect(removalSwitch.getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByRole('switch', { name: '启用自动上传' }).getAttribute('aria-checked')).toBe('true')
+
+    await user.click(removalSwitch)
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+
+    await waitFor(() => {
+      const call = vi.mocked(apiFetch).mock.calls.find(
+        ([path, options]) => path === '/config' && options?.method === 'PUT',
+      )
+      const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+      expect(payload.data).toMatchObject({
+        codex2api_enabled: true,
+        codex2api_delete_on_account_remove_enabled: false,
+      })
+    })
+    expect(removalSwitch.getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByRole('switch', { name: '启用自动上传' }).getAttribute('aria-checked')).toBe('true')
+  })
+
+  it('defaults the Codex2API account-removal switch to off when the key is missing', async () => {
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(screen.getByText('Codex2API'))
+    const removalSwitch = await screen.findByRole('switch', {
+      name: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
+    })
+    expect(removalSwitch.getAttribute('aria-checked')).toBe('false')
+  })
+
   it.each([
     ['missing interval and null concurrency', { mail_provider: 'luckmail', chatgpt_auto_relogin_concurrency: null }],
     ['blank interval and missing concurrency', { mail_provider: 'luckmail', chatgpt_auto_relogin_interval_minutes: '   ' }],

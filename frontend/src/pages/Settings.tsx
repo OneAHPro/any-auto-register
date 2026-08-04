@@ -336,6 +336,17 @@ const TAB_ITEMS = [
           { key: 'codex2api_admin_key', label: 'Admin Key', secret: true },
         ],
       },
+      {
+        title: '删除联动',
+        fields: [
+          {
+            key: 'codex2api_delete_on_account_remove_enabled',
+            label: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
+            type: 'boolean',
+            help: '自动清理、单个删除和批量删除均生效；远端删除失败时保留本地账号。',
+          },
+        ],
+      },
     ],
   },
   {
@@ -417,6 +428,7 @@ interface FieldConfig {
   key: string
   label: string
   placeholder?: string
+  help?: string
   type?: 'select' | 'input' | 'boolean'
   secret?: boolean
 }
@@ -603,7 +615,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const [showSecret, setShowSecret] = useState(false)
   const options = SELECT_FIELDS[field.key]
   const isBooleanField = field.type === 'boolean'
-  const helpText =
+  const helpText = field.help || (
     field.key === 'default_executor'
       ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
       : field.key === 'email_domain_rule_enabled'
@@ -611,6 +623,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
       : field.key === 'email_domain_level_count'
       ? '例如 2=example.com，3=a.example.com，4=a.b.example.com。'
       : undefined
+  )
 
   return (
     <Form.Item
@@ -1866,6 +1879,9 @@ export default function Settings() {
         Boolean(String(data.sub2api_api_url ?? '').trim() && String(data.sub2api_api_key ?? '').trim()),
       )
       data.codex2api_enabled = parseBooleanConfigValue(data.codex2api_enabled)
+      data.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
+        data.codex2api_delete_on_account_remove_enabled,
+      )
       data.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(data.chatgpt_auto_relogin_enabled)
       data.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_interval_minutes,
@@ -1976,6 +1992,9 @@ export default function Settings() {
       values.cpa_enabled = parseBooleanConfigValue(values.cpa_enabled)
       values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
       values.codex2api_enabled = parseBooleanConfigValue(values.codex2api_enabled)
+      values.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
+        values.codex2api_delete_on_account_remove_enabled,
+      )
       values.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(values.chatgpt_auto_relogin_enabled)
       values.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_interval_minutes,
@@ -2022,6 +2041,7 @@ export default function Settings() {
         cpa_enabled: values.cpa_enabled,
         sub2api_enabled: values.sub2api_enabled,
         codex2api_enabled: values.codex2api_enabled,
+        codex2api_delete_on_account_remove_enabled: values.codex2api_delete_on_account_remove_enabled,
         chatgpt_auto_relogin_enabled: values.chatgpt_auto_relogin_enabled,
         chatgpt_auto_relogin_interval_minutes: values.chatgpt_auto_relogin_interval_minutes,
         chatgpt_auto_relogin_concurrency: values.chatgpt_auto_relogin_concurrency,

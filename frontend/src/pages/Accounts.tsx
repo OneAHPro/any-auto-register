@@ -82,6 +82,50 @@ function normalizeAccount(account: any) {
   return { ...account, extra, cpaSync, sub2apiSync, codex2apiSync, cliproxySync, chatgptLocal }
 }
 
+function deletionErrorDetail(error: unknown, fallback: string): string {
+  if (error instanceof Error && error.message.trim()) return error.message.trim()
+  if (error && typeof error === 'object') {
+    const detail = String((error as Record<string, unknown>).detail ?? '').trim()
+    if (detail) return detail
+    const errorMessage = String((error as Record<string, unknown>).message ?? '').trim()
+    if (errorMessage) return errorMessage
+  }
+  const text = String(error ?? '').trim()
+  return text && text !== '[object Object]' ? text : fallback
+}
+
+function singleDeleteSuccessMessage(result: any): string {
+  const remoteStatus = String(result?.codex2api?.status ?? '').trim().toLowerCase()
+  switch (remoteStatus) {
+    case 'deleted':
+      return '本地账号与 Codex2API 认证已删除'
+    case 'already_absent':
+      return '本地账号已删除，Codex2API 认证已不存在'
+    case 'skipped_disabled':
+      return '本地账号已删除，Codex2API 删除联动未启用'
+    case 'not_applicable':
+      return '账号已删除，无需同步 Codex2API'
+    case 'skipped':
+      return '本地账号已删除，Codex2API 删除已跳过'
+    default:
+      return String(result?.message ?? '').trim() || '删除成功'
+  }
+}
+
+function batchFailureDetails(items: any[]): string {
+  const seen = new Set<string>()
+  const details: string[] = []
+  for (const item of items) {
+    if (item?.ok === true || String(item?.status ?? '') === 'not_found') continue
+    const detail = String(item?.message ?? item?.error_code ?? '').trim()
+    if (!detail || seen.has(detail)) continue
+    seen.add(detail)
+    details.push(detail)
+    if (details.length === 2) break
+  }
+  return details.join('；')
+}
+
 function formatSyncTime(value?: string) {
   if (!value) return ''
   const date = new Date(value)
@@ -752,20 +796,62 @@ export default function Accounts() {
   }
 
   const handleDelete = async (id: number) => {
-    await apiFetch(`/accounts/${id}`, { method: 'DELETE' })
-    message.success('删除成功')
-    load()
+    try {
+      const result = await apiFetch(`/accounts/${id}`, { method: 'DELETE' })
+      if (result?.ok === false || result?.local_deleted === false) {
+        message.error(`删除失败：${deletionErrorDetail(result, '账号未删除')}`)
+        return
+      }
+      message.success(singleDeleteSuccessMessage(result))
+      setSelectedRowKeys((current) => current.filter((key) => String(key) !== String(id)))
+      await load()
+    } catch (error: unknown) {
+      message.error(`删除失败：${deletionErrorDetail(error, '请求失败')}`)
+    }
   }
 
   const handleBatchDelete = async () => {
     if (selectedRowKeys.length === 0) return
-    await apiFetch('/accounts/batch-delete', {
-      method: 'POST',
-      body: JSON.stringify({ ids: Array.from(selectedRowKeys) }),
-    })
-    message.success('批量删除成功')
-    setSelectedRowKeys([])
-    load()
+    const requestedKeys = Array.from(selectedRowKeys)
+    try {
+      const result = await apiFetch('/accounts/batch-delete', {
+        method: 'POST',
+        body: JSON.stringify({ ids: requestedKeys }),
+      })
+      const items = Array.isArray(result?.items) ? result.items : []
+      const completedIds = new Set<string>()
+      for (const item of items) {
+        if (item?.ok === true || String(item?.status ?? '') === 'not_found') {
+          completedIds.add(String(item?.account_id ?? ''))
+        }
+      }
+      if (Array.isArray(result?.not_found)) {
+        for (const accountId of result.not_found) completedIds.add(String(accountId))
+      }
+      if (items.length === 0) {
+        for (const key of requestedKeys) completedIds.add(String(key))
+      }
+      setSelectedRowKeys((current) => current.filter((key) => !completedIds.has(String(key))))
+
+      const deleted = Math.max(0, Number(result?.deleted) || 0)
+      const failed = Math.max(
+        0,
+        Number.isFinite(Number(result?.failed))
+          ? Number(result.failed)
+          : items.filter((item: any) => item?.ok !== true && String(item?.status ?? '') !== 'not_found').length,
+      )
+      const detail = batchFailureDetails(items)
+      if (failed === 0) {
+        message.success(`批量删除完成：删除 ${deleted} 个`)
+      } else if (deleted === 0) {
+        message.error(`批量删除失败：失败 ${failed} 个${detail ? `；${detail}` : ''}`)
+      } else {
+        message.warning(`批量删除部分完成：删除 ${deleted} 个，失败 ${failed} 个${detail ? `；${detail}` : ''}`)
+      }
+      await load()
+    } catch (error: unknown) {
+      message.error(`批量删除失败：${deletionErrorDetail(error, '请求失败')}`)
+    }
   }
 
   const handleChatgptRelogin = async () => {

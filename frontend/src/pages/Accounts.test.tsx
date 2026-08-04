@@ -3,6 +3,7 @@
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { message } from 'antd'
 
 import { apiFetch } from '@/lib/utils'
 import { formatAutoReloginCountdown } from '@/lib/chatgptAutoReloginStatus'
@@ -113,6 +114,19 @@ const completedAccount = {
 
 function accountRequestCount() {
   return vi.mocked(apiFetch).mock.calls.filter(([path]) => String(path).startsWith('/accounts?')).length
+}
+
+async function selectAccount(user: ReturnType<typeof userEvent.setup>, email: string) {
+  const row = (await screen.findByText(email)).closest('tr')
+  expect(row).toBeTruthy()
+  await user.click(within(row as HTMLElement).getByRole('checkbox'))
+}
+
+async function confirmBatchDelete(user: ReturnType<typeof userEvent.setup>, count: number) {
+  await user.click(screen.getByRole('button', { name: new RegExp(`删除 ${count} 个$`) }))
+  const popover = screen.getByText(`确认删除选中的 ${count} 个账号？`).closest('.ant-popover')
+  expect(popover).toBeTruthy()
+  await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
 }
 
 describe('Accounts ChatGPT staged login integration', () => {
@@ -448,5 +462,176 @@ describe('Accounts ChatGPT staged login integration', () => {
     rerender(<Accounts />)
     await waitFor(() => expect(screen.queryByTestId('task-log-panel')).toBeNull())
     expect(screen.queryByText('relogin:late-relogin-task')).toBeNull()
+  })
+
+  it('keeps failed batch deletions selected and reports a remote ambiguity', async () => {
+    const warning = vi.spyOn(message, 'warning').mockImplementation(() => undefined as any)
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return {
+          total_requested: 2,
+          total_unique: 2,
+          deleted: 1,
+          failed: 1,
+          not_found: [],
+          remote_deleted: 1,
+          remote_already_absent: 0,
+          remote_skipped: 0,
+          items: [
+            { account_id: 17, ok: true, status: 'deleted', codex2api: { status: 'deleted' } },
+            {
+              account_id: 18,
+              ok: false,
+              status: 'failed',
+              error_code: 'remote_ambiguous',
+              message: 'Codex2API 存在多个匹配认证，已保留本地账号',
+              codex2api: { status: 'ambiguous' },
+            },
+          ],
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.getByText('已选 1 个')).toBeTruthy())
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining('批量删除部分完成：删除 1 个，失败 1 个'),
+    )
+    expect(warning).toHaveBeenCalledWith(expect.stringContaining('Codex2API 存在多个匹配认证'))
+    warning.mockRestore()
+  })
+
+  it('clears all selected accounts after a fully successful batch deletion', async () => {
+    const success = vi.spyOn(message, 'success').mockImplementation(() => undefined as any)
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return {
+          total_requested: 2,
+          total_unique: 2,
+          deleted: 2,
+          failed: 0,
+          not_found: [],
+          remote_deleted: 2,
+          remote_already_absent: 0,
+          remote_skipped: 0,
+          items: [
+            { account_id: 17, ok: true, status: 'deleted', codex2api: { status: 'deleted' } },
+            { account_id: 18, ok: true, status: 'deleted', codex2api: { status: 'deleted' } },
+          ],
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.queryByText('已选 2 个')).toBeNull())
+    expect(success).toHaveBeenCalledWith('批量删除完成：删除 2 个')
+    success.mockRestore()
+  })
+
+  it('keeps every selected account after a fully failed batch deletion', async () => {
+    const error = vi.spyOn(message, 'error').mockImplementation(() => undefined as any)
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return {
+          total_requested: 2,
+          total_unique: 2,
+          deleted: 0,
+          failed: 2,
+          not_found: [],
+          remote_deleted: 0,
+          remote_already_absent: 0,
+          remote_skipped: 0,
+          items: [
+            { account_id: 17, ok: false, status: 'failed', message: '远端服务暂时不可用' },
+            { account_id: 18, ok: false, status: 'failed', message: '远端服务暂时不可用' },
+          ],
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.getByText('已选 2 个')).toBeTruthy())
+    expect(error).toHaveBeenCalledWith(expect.stringContaining('批量删除失败：失败 2 个'))
+    error.mockRestore()
+  })
+
+  it('reports when a single deletion also removes the Codex2API credential', async () => {
+    const success = vi.spyOn(message, 'success').mockImplementation(() => undefined as any)
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/17' && options?.method === 'DELETE') {
+        return {
+          ok: true,
+          account_id: 17,
+          local_deleted: true,
+          codex2api: { enabled: true, status: 'deleted', remote_id: 91 },
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    await user.click(within(row as HTMLElement).getByRole('button', { name: '删除' }))
+    const popover = screen.getByText('确认删除该账号吗？').closest('.ant-popover')
+    await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
+
+    await waitFor(() => {
+      expect(success).toHaveBeenCalledWith('本地账号与 Codex2API 认证已删除')
+    })
+    success.mockRestore()
+  })
+
+  it('shows a single-delete API detail and keeps the failed account selected', async () => {
+    const error = vi.spyOn(message, 'error').mockImplementation(() => undefined as any)
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/17' && options?.method === 'DELETE') {
+        throw { detail: 'Codex2API 匹配结果不唯一，已保留本地账号' }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    const row = screen.getByText('eligible@example.com').closest('tr')
+    await user.click(within(row as HTMLElement).getByRole('button', { name: '删除' }))
+    const popover = screen.getByText('确认删除该账号吗？').closest('.ant-popover')
+    await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
+
+    await waitFor(() => {
+      expect(error).toHaveBeenCalledWith('删除失败：Codex2API 匹配结果不唯一，已保留本地账号')
+    })
+    expect(screen.getByText('已选 1 个')).toBeTruthy()
+    expect(screen.getByText('eligible@example.com')).toBeTruthy()
+    error.mockRestore()
   })
 })
