@@ -31,3 +31,13 @@ def test_nginx_terminates_https_for_accounts_domain():
         "ssl_certificate_key "
         "/etc/letsencrypt/live/accounts.anhepro.com/privkey.pem;"
     ) in config
+
+
+def test_systemd_environment_separates_task_run_and_task_log_retention():
+    environment = (
+        PROJECT_ROOT / "deploy" / "systemd" / "app.env"
+    ).read_text(encoding="utf-8")
+
+    assert "TASK_RUN_RETENTION_HOURS=12" in environment.splitlines()
+    assert "TASK_HISTORY_RETENTION_DAYS=30" in environment.splitlines()
+    assert "TASK_HISTORY_FAILURE_RETENTION_DAYS=90" in environment.splitlines()

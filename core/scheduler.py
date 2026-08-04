@@ -27,7 +27,7 @@ class Scheduler:
         self._lifecycle_lock = threading.Lock()
         self._loop_interval_seconds = 60
         self._trial_check_interval_seconds = 3600
-        self._task_history_cleanup_interval_seconds = 86400
+        self._task_history_cleanup_interval_seconds = 600
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
         self._last_task_history_cleanup_at = 0.0

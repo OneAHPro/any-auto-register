@@ -7,6 +7,46 @@ from unittest import mock
 from core import scheduler as scheduler_module
 
 
+def test_task_history_cleanup_defaults_to_ten_minutes():
+    scheduler = scheduler_module.Scheduler()
+
+    assert scheduler._task_history_cleanup_interval_seconds == 600
+
+
+def test_task_history_cleanup_waits_599_seconds_and_runs_at_600(monkeypatch):
+    scheduler = scheduler_module.Scheduler()
+    scheduler._last_task_history_cleanup_at = 1_000.0
+    scheduler._last_trial_check_at = 1_600.0
+    scheduler._last_cpa_maintenance_at = 1_600.0
+    wall_now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    cleanup = mock.Mock(return_value={"task_runs": 0, "task_logs": 0})
+
+    monkeypatch.setattr(
+        scheduler_module,
+        "tick_chatgpt_auto_relogin",
+        mock.Mock(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "cleanup_task_history",
+        cleanup,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_get_cpa_maintenance_interval_seconds",
+        lambda: 3_600,
+    )
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=1_599.0)
+    cleanup.assert_not_called()
+
+    scheduler.run_once(wall_now=wall_now, monotonic_now=1_600.0)
+    cleanup.assert_called_once_with()
+    assert scheduler._last_task_history_cleanup_at == 1_600.0
+
+
 def test_run_once_calls_auto_tick_exactly_once_and_isolates_its_failure(monkeypatch):
     scheduler = scheduler_module.Scheduler()
     scheduler._last_trial_check_at = 0.0
@@ -75,13 +115,16 @@ def test_run_once_keeps_trial_and_cpa_failures_independent(monkeypatch):
 
 def test_run_once_isolates_task_history_cleanup_failure(monkeypatch):
     scheduler = scheduler_module.Scheduler()
-    scheduler._last_trial_check_at = 100.0
-    scheduler._last_cpa_maintenance_at = 100.0
+    scheduler._last_trial_check_at = 0.0
+    scheduler._last_cpa_maintenance_at = 0.0
     scheduler._last_task_history_cleanup_at = 0.0
+    scheduler._trial_check_interval_seconds = 10
     scheduler._task_history_cleanup_interval_seconds = 10
     wall_now = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
     auto_tick = mock.Mock()
     cleanup = mock.Mock(side_effect=RuntimeError("cleanup failed"))
+    trial = mock.Mock()
+    cpa = mock.Mock()
 
     monkeypatch.setattr(
         scheduler_module,
@@ -95,16 +138,21 @@ def test_run_once_isolates_task_history_cleanup_failure(monkeypatch):
         cleanup,
         raising=False,
     )
+    monkeypatch.setattr(scheduler, "check_trial_expiry", trial)
+    monkeypatch.setattr(scheduler, "check_cpa_credentials", cpa)
     monkeypatch.setattr(
         scheduler,
         "_get_cpa_maintenance_interval_seconds",
-        lambda: 0,
+        lambda: 10,
     )
 
     scheduler.run_once(wall_now=wall_now, monotonic_now=10.0)
+    scheduler.run_once(wall_now=wall_now, monotonic_now=11.0)
 
-    auto_tick.assert_called_once_with(now=wall_now)
-    cleanup.assert_called_once_with()
+    assert auto_tick.call_count == 2
+    assert cleanup.call_count == 2
+    trial.assert_called_once_with()
+    cpa.assert_called_once_with()
     assert scheduler._last_task_history_cleanup_at == 0.0
 
 
