@@ -6,7 +6,10 @@ from unittest import mock
 
 from curl_cffi import requests as cffi_requests
 
-from platforms.chatgpt.codex2api_upload import upload_to_codex2api
+from platforms.chatgpt.codex2api_upload import (
+    delete_codex2api_credential,
+    upload_to_codex2api,
+)
 
 
 class _Response:
@@ -1033,6 +1036,233 @@ class Codex2APIUploadTests(unittest.TestCase):
 
         self.assertFalse(ok)
         self.assertIn("无法解析", message)
+
+
+class Codex2APICredentialDeletionTests(unittest.TestCase):
+    @staticmethod
+    def _configured(key, default=""):
+        return {
+            "codex2api_api_url": "http://codex2api.local:8080/",
+            "codex2api_admin_key": "admin-super-secret",
+        }.get(key, default)
+
+    @staticmethod
+    def _jwt(payload):
+        encoded = base64.urlsafe_b64encode(
+            json.dumps(payload).encode("utf-8")
+        ).decode("ascii").rstrip("=")
+        return f"header.{encoded}.signature"
+
+    def _delete(self, rows, *, identity=None, delete_response=None):
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload._get_config_value",
+            side_effect=self._configured,
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get",
+            return_value=_Response({"accounts": rows}),
+        ) as get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete",
+            return_value=delete_response or _Response({}, status_code=204),
+        ) as delete:
+            result = delete_codex2api_credential(
+                email=" Demo@Example.com ",
+                identity=identity,
+            )
+        return result, get, delete
+
+    def test_deletes_unique_exact_email_stable_identity_match(self):
+        rows = [
+            {
+                "id": 6,
+                "email": "demo@example.com",
+                "workspaceId": "workspace-other",
+            },
+            {
+                "id": 7,
+                "name": "DEMO@example.com",
+                "chatgptAccountId": "workspace-1",
+            },
+        ]
+
+        result, get, delete = self._delete(
+            rows,
+            identity={"workspace_id": "workspace-1"},
+        )
+
+        self.assertEqual(
+            result,
+            {"status": "deleted", "remote_id": 7, "message": ""},
+        )
+        self.assertTrue(
+            get.call_args.args[0].endswith("/api/admin/accounts?channel=codex")
+        )
+        self.assertTrue(
+            delete.call_args.args[0].endswith("/api/admin/accounts/7")
+        )
+
+    def test_deletes_unique_legacy_exact_email_without_identity(self):
+        result, _get, delete = self._delete(
+            [{"id": 11, "name": "demo@example.com"}],
+            identity={"workspace_id": "workspace-1"},
+        )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["remote_id"], 11)
+        delete.assert_called_once()
+
+    def test_identity_can_match_access_jwt_auth_namespace(self):
+        token = self._jwt(
+            {
+                "https://api.openai.com/auth": {
+                    "chatgpt_user_id": "user-stable-1"
+                }
+            }
+        )
+        rows = [
+            {
+                "id": 12,
+                "email": "demo@example.com",
+                "chatgpt_user_id": "user-stable-1",
+            },
+            {
+                "id": 13,
+                "email": "demo@example.com",
+                "chatgpt_user_id": "other-user",
+            },
+        ]
+
+        result, _get, delete = self._delete(
+            rows,
+            identity={"accessToken": token},
+        )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["remote_id"], 12)
+        delete.assert_called_once()
+
+    def test_multiple_remaining_candidates_are_ambiguous_without_delete(self):
+        result, _get, delete = self._delete(
+            [
+                {"id": 21, "email": "demo@example.com"},
+                {"id": 22, "name": "demo@example.com"},
+            ],
+        )
+
+        self.assertEqual(
+            result,
+            {
+                "status": "ambiguous",
+                "remote_id": None,
+                "message": "Codex2API 对应认证不唯一，已停止删除",
+            },
+        )
+        delete.assert_not_called()
+
+    def test_no_exact_email_candidate_is_already_absent(self):
+        result, _get, delete = self._delete(
+            [{"id": 31, "email": "someone@example.com"}],
+        )
+
+        self.assertEqual(
+            result,
+            {"status": "already_absent", "remote_id": None, "message": ""},
+        )
+        delete.assert_not_called()
+
+    def test_delete_404_is_idempotent_already_absent(self):
+        result, _get, delete = self._delete(
+            [{"id": 41, "email": "demo@example.com"}],
+            delete_response=_Response({}, status_code=404),
+        )
+
+        self.assertEqual(
+            result,
+            {"status": "already_absent", "remote_id": 41, "message": ""},
+        )
+        delete.assert_called_once()
+
+    def test_missing_configuration_skips_network(self):
+        for values in (
+            {"codex2api_api_url": "", "codex2api_admin_key": "key"},
+            {"codex2api_api_url": "http://codex.local", "codex2api_admin_key": ""},
+        ):
+            with self.subTest(values=values), mock.patch(
+                "platforms.chatgpt.codex2api_upload._get_config_value",
+                side_effect=lambda key, default="": values.get(key, default),
+            ), mock.patch(
+                "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+            ) as get, mock.patch(
+                "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+            ) as delete:
+                result = delete_codex2api_credential(email="demo@example.com")
+
+            self.assertEqual(result["status"], "config_missing")
+            self.assertIsNone(result["remote_id"])
+            self.assertLessEqual(len(result["message"]), 200)
+            get.assert_not_called()
+            delete.assert_not_called()
+
+    def test_list_failures_are_classified_and_redacted(self):
+        secret_token = "at-private-prefix-value"
+        cases = [
+            (_Response({"error": "admin-super-secret"}, status_code=401), "unauthorized"),
+            (_Response({"error": secret_token}, status_code=503), "failed"),
+            (_Response(ValueError(secret_token), status_code=200), "failed"),
+            (_Response({"accounts": {"token": secret_token}}, status_code=200), "failed"),
+        ]
+        for response, expected in cases:
+            with self.subTest(expected=expected), mock.patch(
+                "platforms.chatgpt.codex2api_upload._get_config_value",
+                side_effect=self._configured,
+            ), mock.patch(
+                "platforms.chatgpt.codex2api_upload.cffi_requests.get",
+                return_value=response,
+            ), mock.patch(
+                "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+            ) as delete:
+                result = delete_codex2api_credential(
+                    email="demo@example.com",
+                    identity={
+                        "access_token": secret_token,
+                        "refresh_token": "rt-private-prefix-value",
+                        "id_token": "id-private-prefix-value",
+                    },
+                )
+
+            self.assertEqual(result["status"], expected)
+            self.assertLessEqual(len(result["message"]), 200)
+            serialized = json.dumps(result, ensure_ascii=False)
+            self.assertNotIn("admin-super-secret", serialized)
+            self.assertNotIn("private-prefix", serialized)
+            delete.assert_not_called()
+
+    def test_transport_and_delete_failures_are_bounded_and_redacted(self):
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload._get_config_value",
+            side_effect=self._configured,
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get",
+            side_effect=TimeoutError("admin-super-secret timed out"),
+        ):
+            unavailable = delete_codex2api_credential(
+                email="demo@example.com",
+                identity={"access_token": "at-secret-value"},
+            )
+        self.assertEqual(unavailable["status"], "unavailable")
+
+        result, _get, _delete = self._delete(
+            [{"id": 51, "email": "demo@example.com"}],
+            delete_response=_Response(
+                {"error": "admin-super-secret at-secret-value"},
+                status_code=500,
+            ),
+        )
+        self.assertEqual(result["status"], "failed")
+        for value in (unavailable, result):
+            self.assertLessEqual(len(value["message"]), 200)
+            serialized = json.dumps(value, ensure_ascii=False)
+            self.assertNotIn("admin-super-secret", serialized)
+            self.assertNotIn("at-secret-value", serialized)
 
 
 if __name__ == "__main__":

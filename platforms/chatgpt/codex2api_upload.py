@@ -6,11 +6,14 @@ import base64
 import json
 import logging
 import time
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
 from curl_cffi import CurlMime
 from curl_cffi import requests as cffi_requests
+
+from services.chatgpt_account_coordination import codex2api_account_mutation_lock
 
 logger = logging.getLogger(__name__)
 MAX_ERROR_DETAIL_LENGTH = 200
@@ -157,7 +160,7 @@ def _jwt_claims_no_verify(token: Any) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
-def _identity_aliases(payload: dict[str, str]) -> set[str]:
+def _identity_aliases(payload: Mapping[str, Any] | None) -> set[str]:
     # These unverified claims are matching aliases only.  A candidate must
     # still match the same email and pass Codex2API's remote credential test.
     aliases: set[str] = set()
@@ -174,17 +177,179 @@ def _identity_aliases(payload: dict[str, str]) -> set[str]:
         if normalized:
             aliases.add(normalized)
 
-    for key in ("workspace_id", "account_id", "user_id"):
-        add(payload.get(key))
-    for token_key in ("id_token", "access_token"):
-        claims = _jwt_claims_no_verify(payload.get(token_key))
+    source = payload if isinstance(payload, Mapping) else {}
+    direct_alias_keys = (
+        "chatgpt_account_id",
+        "chatgptAccountId",
+        "chatgpt_user_id",
+        "chatgptUserId",
+        "workspace_id",
+        "workspaceId",
+        "account_id",
+        "accountId",
+        "user_id",
+        "userId",
+    )
+    for key in direct_alias_keys:
+        add(source.get(key))
+    for token_key in ("id_token", "idToken", "access_token", "accessToken"):
+        claims = _jwt_claims_no_verify(source.get(token_key))
         for key in claim_keys:
             add(claims.get(key))
+        for snake_key, camel_key in (
+            ("chatgpt_account_id", "chatgptAccountId"),
+            ("chatgpt_user_id", "chatgptUserId"),
+            ("workspace_id", "workspaceId"),
+            ("account_id", "accountId"),
+            ("user_id", "userId"),
+        ):
+            add(claims.get(camel_key))
         auth_claims = claims.get("https://api.openai.com/auth")
         if isinstance(auth_claims, dict):
-            for key in claim_keys:
+            for key in (*claim_keys, *direct_alias_keys):
                 add(auth_claims.get(key))
     return aliases
+
+
+def _cleanup_result(
+    status: str,
+    *,
+    remote_id: int | None = None,
+    message: str = "",
+) -> dict[str, Any]:
+    return {
+        "status": str(status),
+        "remote_id": int(remote_id) if remote_id is not None else None,
+        "message": _text(message)[:MAX_ERROR_DETAIL_LENGTH],
+    }
+
+
+def _credential_cleanup_candidates(
+    rows: list[dict[str, Any]],
+    *,
+    email: str,
+    local_aliases: set[str],
+) -> list[dict[str, Any]]:
+    exact = [
+        row
+        for row in _matching_remote_rows(rows, email=email)
+        if _remote_row_id(row) > 0
+    ]
+    if not local_aliases:
+        return exact
+
+    identity_matches = [
+        row
+        for row in exact
+        if _identity_aliases(row)
+        and not local_aliases.isdisjoint(_identity_aliases(row))
+    ]
+    if identity_matches:
+        return identity_matches
+    return [row for row in exact if not _identity_aliases(row)]
+
+
+def delete_codex2api_credential(
+    *,
+    email: str,
+    identity: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Delete the uniquely matched Codex2API credential without exposing rows."""
+    api_url = _get_config_value("codex2api_api_url").rstrip("/")
+    admin_key = _get_config_value("codex2api_admin_key")
+    normalized_email = _text(email).lower()
+    if not api_url or not admin_key:
+        return _cleanup_result(
+            "config_missing",
+            message="Codex2API 删除联动配置不完整",
+        )
+    if not normalized_email:
+        return _cleanup_result("failed", message="本地账号邮箱为空")
+
+    with codex2api_account_mutation_lock():
+        try:
+            response = cffi_requests.get(
+                f"{api_url}/api/admin/accounts?channel=codex",
+                **_admin_read_kwargs(
+                    admin_key,
+                    accept="application/json",
+                    timeout=15,
+                ),
+            )
+        except Exception as exc:
+            return _cleanup_result(
+                "unavailable",
+                message=f"Codex2API 账号清单暂不可用（{type(exc).__name__}）",
+            )
+
+        if response.status_code in (401, 403):
+            return _cleanup_result(
+                "unauthorized",
+                message="Codex2API Admin Key 无效或无权限",
+            )
+        if response.status_code not in (200, 201):
+            return _cleanup_result(
+                "failed",
+                message=f"Codex2API 账号清单请求失败（HTTP {response.status_code}）",
+            )
+        try:
+            payload = response.json()
+        except Exception:
+            return _cleanup_result(
+                "failed",
+                message="Codex2API 账号清单响应无法解析",
+            )
+        raw_accounts = payload.get("accounts") if isinstance(payload, dict) else payload
+        if not isinstance(raw_accounts, list):
+            return _cleanup_result(
+                "failed",
+                message="Codex2API 账号清单格式无法识别",
+            )
+        rows = [row for row in raw_accounts if isinstance(row, dict)]
+        candidates = _credential_cleanup_candidates(
+            rows,
+            email=normalized_email,
+            local_aliases=_identity_aliases(identity),
+        )
+        if not candidates:
+            return _cleanup_result("already_absent")
+        if len(candidates) != 1:
+            return _cleanup_result(
+                "ambiguous",
+                message="Codex2API 对应认证不唯一，已停止删除",
+            )
+
+        remote_id = _remote_row_id(candidates[0])
+        try:
+            response = cffi_requests.delete(
+                f"{api_url}/api/admin/accounts/{remote_id}",
+                **_admin_read_kwargs(
+                    admin_key,
+                    accept="application/json",
+                    timeout=15,
+                ),
+            )
+        except Exception as exc:
+            return _cleanup_result(
+                "unavailable",
+                remote_id=remote_id,
+                message=f"Codex2API 认证删除暂不可用（{type(exc).__name__}）",
+            )
+        if response.status_code in (200, 201, 204):
+            return _cleanup_result("deleted", remote_id=remote_id)
+        if response.status_code == 404:
+            return _cleanup_result("already_absent", remote_id=remote_id)
+        if response.status_code in (401, 403):
+            return _cleanup_result(
+                "unauthorized",
+                remote_id=remote_id,
+                message="Codex2API Admin Key 无效或无权限",
+            )
+        return _cleanup_result(
+            "failed",
+            remote_id=remote_id,
+            message=f"Codex2API 认证删除失败（HTTP {response.status_code}）",
+        )
 
 
 def _admin_read_kwargs(admin_key: str, *, accept: str, timeout: int) -> dict[str, Any]:
