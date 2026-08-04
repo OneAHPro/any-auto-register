@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 
 import pytest
 
 
 BASE_CONFIG = {
-    "chatgpt_auto_relogin_alert_threshold": "5",
+    "chatgpt_auto_relogin_alert_threshold": "20",
     "smtp_host": "smtp.example.test",
     "smtp_port": "587",
     "smtp_username": "sender@example.test",
@@ -63,7 +64,7 @@ def reset_fake_smtp():
     FakeSMTP.instances = []
 
 
-def test_below_threshold_does_not_open_smtp(monkeypatch):
+def test_invalid_rt_count_alone_does_not_open_smtp(monkeypatch):
     from services import chatgpt_auto_relogin_alerts as alerts
 
     smtp = pytest.fail
@@ -71,27 +72,48 @@ def test_below_threshold_does_not_open_smtp(monkeypatch):
     monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", smtp)
 
     result = alerts.send_auto_relogin_alert(
-        task_id="task-below",
+        task_id="task-invalid-only",
         total_accounts=64,
-        invalid_rt_count=4,
-        relogin_failed_count=4,
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=19,
         config=BASE_CONFIG,
     )
 
     assert result == {
         "sent": False,
         "reason": "below_threshold",
-        "threshold": 5,
+        "threshold": 20,
     }
 
 
-@pytest.mark.parametrize(
-    ("invalid_rt_count", "relogin_failed_count"),
-    [(5, 0), (0, 5), (7, 2)],
-)
-def test_reaching_either_threshold_sends_one_starttls_message(
+@pytest.mark.parametrize("configured_threshold", ["", "not-a-number", "0", "-1"])
+def test_invalid_threshold_falls_back_to_twenty(monkeypatch, configured_threshold):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    config = dict(BASE_CONFIG)
+    config["chatgpt_auto_relogin_alert_threshold"] = configured_threshold
+    monkeypatch.setattr(alerts.smtplib, "SMTP", pytest.fail)
+
+    result = alerts.send_auto_relogin_alert(
+        task_id="task-invalid-threshold",
+        total_accounts=64,
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=19,
+        config=config,
+    )
+
+    assert result == {
+        "sent": False,
+        "reason": "below_threshold",
+        "threshold": 20,
+    }
+
+
+@pytest.mark.parametrize("relogin_failed_count", [20, 21])
+def test_default_threshold_relogin_failure_sends_one_starttls_message(
     monkeypatch,
-    invalid_rt_count,
     relogin_failed_count,
 ):
     from services import chatgpt_auto_relogin_alerts as alerts
@@ -106,12 +128,13 @@ def test_reaching_either_threshold_sends_one_starttls_message(
     result = alerts.send_auto_relogin_alert(
         task_id="task-threshold",
         total_accounts=64,
-        invalid_rt_count=invalid_rt_count,
+        successful_accounts=43,
+        invalid_rt_count=100,
         relogin_failed_count=relogin_failed_count,
         config=BASE_CONFIG,
     )
 
-    assert result == {"sent": True, "reason": "sent", "threshold": 5}
+    assert result == {"sent": True, "reason": "sent", "threshold": 20}
     assert len(FakeSMTP.instances) == 1
     smtp = FakeSMTP.instances[0]
     assert smtp.host == "smtp.example.test"
@@ -121,11 +144,42 @@ def test_reaching_either_threshold_sends_one_starttls_message(
     send_call = next(call for call in smtp.calls if call[0] == "send_message")
     assert send_call[1]["from_addr"] == "alerts@example.test"
     assert send_call[1]["to_addrs"] == ["owner@example.test"]
-    body = smtp.message.get_content()
+    body = smtp.message.get_body(preferencelist=("plain",)).get_content()
     assert "task-threshold" in body
-    assert f"Codex2API 鉴权失效：{invalid_rt_count}" in body
-    assert f"完整重登失败：{relogin_failed_count}" in body
+    assert "账号总数：64" in body
+    assert "成功账号：43" in body
+    assert "鉴权失败：100" in body
+    assert f"重登失败：{relogin_failed_count}" in body
     assert "smtp-test-credential" not in smtp.message.as_string()
+
+
+@pytest.mark.parametrize(
+    ("relogin_failed_count", "expected_sent"),
+    [(6, False), (7, True)],
+)
+def test_custom_threshold_only_sends_when_relogin_failure_reaches_it(
+    monkeypatch,
+    relogin_failed_count,
+    expected_sent,
+):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    config = dict(BASE_CONFIG)
+    config["chatgpt_auto_relogin_alert_threshold"] = "7"
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+
+    result = alerts.send_auto_relogin_alert(
+        task_id="task-custom-threshold",
+        total_accounts=64,
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=relogin_failed_count,
+        config=config,
+    )
+
+    assert result["sent"] is expected_sent
+    assert result["threshold"] == 7
+    assert len(FakeSMTP.instances) == int(expected_sent)
 
 
 def test_port_465_uses_smtp_ssl_and_recipient_falls_back_to_username(monkeypatch):
@@ -143,8 +197,9 @@ def test_port_465_uses_smtp_ssl_and_recipient_falls_back_to_username(monkeypatch
     result = alerts.send_auto_relogin_alert(
         task_id="task-ssl",
         total_accounts=64,
-        invalid_rt_count=5,
-        relogin_failed_count=0,
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=20,
         config=config,
     )
 
@@ -166,8 +221,9 @@ def test_force_auth_login_uses_login_mechanism(monkeypatch):
     result = alerts.send_auto_relogin_alert(
         task_id="task-auth-login",
         total_accounts=64,
-        invalid_rt_count=5,
-        relogin_failed_count=0,
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=20,
         config=config,
     )
 
@@ -185,15 +241,16 @@ def test_missing_smtp_configuration_returns_without_connecting(monkeypatch):
     result = alerts.send_auto_relogin_alert(
         task_id="task-not-configured",
         total_accounts=64,
-        invalid_rt_count=5,
-        relogin_failed_count=0,
-        config={"chatgpt_auto_relogin_alert_threshold": "5"},
+        successful_accounts=43,
+        invalid_rt_count=100,
+        relogin_failed_count=20,
+        config={"chatgpt_auto_relogin_alert_threshold": "20"},
     )
 
     assert result == {
         "sent": False,
         "reason": "smtp_not_configured",
-        "threshold": 5,
+        "threshold": 20,
     }
 
 
@@ -210,15 +267,16 @@ def test_send_failure_is_sanitized_and_does_not_raise(monkeypatch, caplog):
         result = alerts.send_auto_relogin_alert(
             task_id="task-failed-send",
             total_accounts=64,
-            invalid_rt_count=5,
-            relogin_failed_count=0,
+            successful_accounts=43,
+            invalid_rt_count=100,
+            relogin_failed_count=20,
             config=BASE_CONFIG,
         )
 
     assert result == {
         "sent": False,
         "reason": "send_failed",
-        "threshold": 5,
+        "threshold": 20,
         "error_type": "RuntimeError",
     }
     assert "smtp-test-credential" not in caplog.text
@@ -233,6 +291,7 @@ def test_smtp_test_email_uses_dedicated_subject_without_alert_threshold(
     config = dict(BASE_CONFIG)
     config["chatgpt_auto_relogin_alert_threshold"] = "999"
     monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(alerts, "_format_beijing_time", lambda: "2026-08-04 20:34:56（北京时间）")
 
     result = alerts.send_smtp_test_email(config=config)
 
@@ -245,5 +304,51 @@ def test_smtp_test_email_uses_dedicated_subject_without_alert_threshold(
     smtp = FakeSMTP.instances[0]
     assert smtp.message["Subject"] == "[Any Auto Register] SMTP 测试成功"
     assert "SMTP 邮件配置可用" in smtp.message.get_content()
-    assert "Codex2API 鉴权失效" not in smtp.message.get_content()
+    assert "2026-08-04 20:34:56（北京时间）" in smtp.message.get_content()
+    assert "鉴权失败" not in smtp.message.get_content()
     assert "smtp-test-credential" not in smtp.message.as_string()
+
+
+def test_format_beijing_time_treats_naive_datetime_as_utc():
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    assert alerts._format_beijing_time(datetime(2026, 8, 4, 12, 34, 56)) == (
+        "2026-08-04 20:34:56（北京时间）"
+    )
+    assert alerts._format_beijing_time(
+        datetime(2026, 8, 4, 12, 34, 56, tzinfo=timezone.utc)
+    ) == "2026-08-04 20:34:56（北京时间）"
+
+
+def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(alerts, "_format_beijing_time", lambda: "2026-08-04 20:34:56（北京时间）")
+
+    result = alerts.send_auto_relogin_alert(
+        task_id="<script>alert('x')</script>",
+        total_accounts=-64,
+        successful_accounts="bad",
+        invalid_rt_count=-1,
+        relogin_failed_count=20,
+        config=BASE_CONFIG,
+    )
+
+    assert result == {"sent": True, "reason": "sent", "threshold": 20}
+    message = FakeSMTP.instances[0].message
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert message["Subject"] == "[Any Auto Register] ChatGPT 重登失败账号告警（20 个）"
+    assert plain.index("账号总数：0") < plain.index("成功账号：0")
+    assert plain.index("成功账号：0") < plain.index("鉴权失败：0")
+    assert plain.index("鉴权失败：0") < plain.index("重登失败：20")
+    assert "鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。" in plain
+    assert "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。" in plain
+    assert "2026-08-04 20:34:56（北京时间）" in plain
+    assert "<script>" not in html
+    assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in html
+    assert html.count('width="25%"') == 4
+    assert "@media only screen and (max-width: 600px)" in html
+    assert "smtp-test-credential" not in plain
+    assert "smtp-test-credential" not in html

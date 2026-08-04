@@ -4,18 +4,21 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from email.message import EmailMessage
+from html import escape
 import logging
 import re
 import smtplib
 import ssl
 from typing import Mapping
+from zoneinfo import ZoneInfo
 
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_ALERT_THRESHOLD = 5
+DEFAULT_ALERT_THRESHOLD = 20
 DEFAULT_SMTP_PORT = 587
 SMTP_TIMEOUT_SECONDS = 20
+BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 def _text(value: object) -> str:
@@ -46,6 +49,15 @@ def _non_negative_int(value: object) -> int:
         return 0
 
 
+def _format_beijing_time(value: datetime | None = None) -> str:
+    occurred_at = value or datetime.now(timezone.utc)
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    return occurred_at.astimezone(BEIJING_TIMEZONE).strftime(
+        "%Y-%m-%d %H:%M:%S（北京时间）"
+    )
+
+
 def _mailboxes(value: object) -> list[str]:
     addresses: list[str] = []
     seen: set[str] = set()
@@ -70,28 +82,71 @@ def _build_message(
     recipients: list[str],
     task_id: str,
     total_accounts: int,
+    successful_accounts: int,
     invalid_rt_count: int,
     relogin_failed_count: int,
     threshold: int,
 ) -> EmailMessage:
     message = EmailMessage()
-    message["Subject"] = "[Any Auto Register] ChatGPT 自动认证告警"
+    message["Subject"] = (
+        "[Any Auto Register] ChatGPT 重登失败账号告警"
+        f"（{relogin_failed_count} 个）"
+    )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
-    occurred_at = (
-        datetime.now(timezone.utc)
-        .astimezone()
-        .isoformat(timespec="seconds")
-    )
+    occurred_at = _format_beijing_time()
     message.set_content(
         "ChatGPT 自动认证周期触发了邮件告警。\n\n"
         f"任务 ID：{task_id}\n"
-        f"本轮账号总数：{total_accounts}\n"
-        f"Codex2API 鉴权失效：{invalid_rt_count}\n"
-        f"完整重登失败：{relogin_failed_count}\n"
+        f"账号总数：{total_accounts}\n"
+        f"成功账号：{successful_accounts}\n"
+        f"鉴权失败：{invalid_rt_count}\n"
+        f"重登失败：{relogin_failed_count}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
+        "鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。"
+        "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。\n\n"
         "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。\n"
+    )
+    escaped_task_id = escape(task_id)
+    escaped_occurred_at = escape(occurred_at)
+    message.add_alternative(
+        f"""<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <style>
+      .metric-cell {{ padding: 16px 10px; text-align: center; vertical-align: top; }}
+      .metric-total {{ background: #e8eef5; color: #425466; }}
+      .metric-success {{ background: #e8f5e9; color: #2e7d32; }}
+      .metric-invalid {{ background: #fff3e0; color: #e67e22; }}
+      .metric-failed {{ background: #ffebee; color: #c62828; }}
+      @media only screen and (max-width: 600px) {{
+        .metric-cell {{ display: block !important; width: 100% !important; box-sizing: border-box; }}
+      }}
+    </style>
+  </head>
+  <body style="margin:0; padding:0; color:#1f2937; font-family:Arial, 'Microsoft YaHei', sans-serif;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center">
+      <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="max-width:640px; width:100%;">
+        <tr><td style="padding:24px 20px 12px;"><h2 style="margin:0;">ChatGPT 重登失败账号告警</h2></td></tr>
+        <tr><td style="padding:0 20px 20px;">任务 ID：{escaped_task_id}</td></tr>
+        <tr><td style="padding:0 20px 20px;">
+          <table role="presentation" width="100%" cellspacing="4" cellpadding="0" border="0"><tr>
+            <td class="metric-cell metric-total" width="25%"><strong>账号总数</strong><br>{total_accounts}</td>
+            <td class="metric-cell metric-success" width="25%"><strong>成功账号</strong><br>{successful_accounts}</td>
+            <td class="metric-cell metric-invalid" width="25%"><strong>鉴权失败</strong><br>{invalid_rt_count}</td>
+            <td class="metric-cell metric-failed" width="25%"><strong>重登失败</strong><br>{relogin_failed_count}</td>
+          </tr></table>
+        </td></tr>
+        <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
+        <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
+        <tr><td style="padding:0 20px 24px;">鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。</td></tr>
+      </table>
+    </td></tr></table>
+  </body>
+</html>""",
+        subtype="html",
     )
     return message
 
@@ -105,11 +160,7 @@ def _build_test_message(
     message["Subject"] = "[Any Auto Register] SMTP 测试成功"
     message["From"] = sender
     message["To"] = ", ".join(recipients)
-    occurred_at = (
-        datetime.now(timezone.utc)
-        .astimezone()
-        .isoformat(timespec="seconds")
-    )
+    occurred_at = _format_beijing_time()
     message.set_content(
         "这是一封 Any Auto Register SMTP 测试邮件。\n\n"
         "SMTP 邮件配置可用，自动认证告警可以正常投递。\n"
@@ -207,11 +258,12 @@ def send_auto_relogin_alert(
     *,
     task_id: str,
     total_accounts: int,
+    successful_accounts: int,
     invalid_rt_count: int,
     relogin_failed_count: int,
     config: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
-    """Send one alert when either cycle counter reaches the configured threshold."""
+    """Send one alert when relogin failures reach the configured threshold."""
 
     snapshot = dict(config) if config is not None else _get_config()
     threshold = _positive_int(
@@ -220,7 +272,7 @@ def send_auto_relogin_alert(
     )
     invalid_count = _non_negative_int(invalid_rt_count)
     failed_count = _non_negative_int(relogin_failed_count)
-    if invalid_count < threshold and failed_count < threshold:
+    if failed_count < threshold:
         return {
             "sent": False,
             "reason": "below_threshold",
@@ -245,6 +297,7 @@ def send_auto_relogin_alert(
         recipients=recipients,
         task_id=_text(task_id),
         total_accounts=_non_negative_int(total_accounts),
+        successful_accounts=_non_negative_int(successful_accounts),
         invalid_rt_count=invalid_count,
         relogin_failed_count=failed_count,
         threshold=threshold,
