@@ -82,6 +82,42 @@ function normalizeAccount(account: any) {
   return { ...account, extra, cpaSync, sub2apiSync, codex2apiSync, cliproxySync, chatgptLocal }
 }
 
+interface Codex2APIDeleteResult {
+  enabled?: boolean
+  status?: string
+  remote_id?: number | null
+}
+
+interface AccountDeleteResponse {
+  ok?: boolean
+  account_id?: number
+  local_deleted?: boolean
+  detail?: string
+  message?: string
+  codex2api?: Codex2APIDeleteResult
+}
+
+interface BatchDeleteItem {
+  account_id: number
+  ok?: boolean
+  status?: string
+  error_code?: string
+  message?: string
+  codex2api?: Codex2APIDeleteResult
+}
+
+interface BatchDeleteResponse {
+  total_requested?: number
+  total_unique?: number
+  deleted?: number
+  failed?: number
+  not_found?: number[]
+  remote_deleted?: number
+  remote_already_absent?: number
+  remote_skipped?: number
+  items?: BatchDeleteItem[]
+}
+
 function deletionErrorDetail(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   if (error && typeof error === 'object') {
@@ -94,7 +130,7 @@ function deletionErrorDetail(error: unknown, fallback: string): string {
   return text && text !== '[object Object]' ? text : fallback
 }
 
-function singleDeleteSuccessMessage(result: any): string {
+function singleDeleteSuccessMessage(result: AccountDeleteResponse): string {
   const remoteStatus = String(result?.codex2api?.status ?? '').trim().toLowerCase()
   switch (remoteStatus) {
     case 'deleted':
@@ -112,7 +148,7 @@ function singleDeleteSuccessMessage(result: any): string {
   }
 }
 
-function batchFailureDetails(items: any[]): string {
+function batchFailureDetails(items: BatchDeleteItem[]): string {
   const seen = new Set<string>()
   const details: string[] = []
   for (const item of items) {
@@ -795,18 +831,27 @@ export default function Accounts() {
     downloadCsv([header.map(quoteCsv).join(','), ...rows].join('\r\n'))
   }
 
+  const refreshAccountListAfterDelete = async () => {
+    try {
+      await load()
+    } catch (error: unknown) {
+      message.error(`刷新账号列表失败：${deletionErrorDetail(error, '请求失败')}`)
+    }
+  }
+
   const handleDelete = async (id: number) => {
     try {
-      const result = await apiFetch(`/accounts/${id}`, { method: 'DELETE' })
+      const result = await apiFetch(`/accounts/${id}`, { method: 'DELETE' }) as AccountDeleteResponse
       if (result?.ok === false || result?.local_deleted === false) {
         message.error(`删除失败：${deletionErrorDetail(result, '账号未删除')}`)
         return
       }
       message.success(singleDeleteSuccessMessage(result))
       setSelectedRowKeys((current) => current.filter((key) => String(key) !== String(id)))
-      await load()
     } catch (error: unknown) {
       message.error(`删除失败：${deletionErrorDetail(error, '请求失败')}`)
+    } finally {
+      await refreshAccountListAfterDelete()
     }
   }
 
@@ -817,29 +862,22 @@ export default function Accounts() {
       const result = await apiFetch('/accounts/batch-delete', {
         method: 'POST',
         body: JSON.stringify({ ids: requestedKeys }),
-      })
-      const items = Array.isArray(result?.items) ? result.items : []
+      }) as BatchDeleteResponse
+      const items: BatchDeleteItem[] = Array.isArray(result.items) ? result.items : []
       const completedIds = new Set<string>()
       for (const item of items) {
         if (item?.ok === true || String(item?.status ?? '') === 'not_found') {
-          completedIds.add(String(item?.account_id ?? ''))
+          completedIds.add(String(item.account_id))
         }
-      }
-      if (Array.isArray(result?.not_found)) {
-        for (const accountId of result.not_found) completedIds.add(String(accountId))
-      }
-      if (items.length === 0) {
-        for (const key of requestedKeys) completedIds.add(String(key))
       }
       setSelectedRowKeys((current) => current.filter((key) => !completedIds.has(String(key))))
 
-      const deleted = Math.max(0, Number(result?.deleted) || 0)
-      const failed = Math.max(
-        0,
-        Number.isFinite(Number(result?.failed))
-          ? Number(result.failed)
-          : items.filter((item: any) => item?.ok !== true && String(item?.status ?? '') !== 'not_found').length,
-      )
+      const deleted = typeof result.deleted === 'number' && Number.isFinite(result.deleted)
+        ? Math.max(0, Math.trunc(result.deleted))
+        : 0
+      const failed = typeof result.failed === 'number' && Number.isFinite(result.failed)
+        ? Math.max(0, Math.trunc(result.failed))
+        : items.filter((item) => item.ok !== true && String(item.status ?? '') !== 'not_found').length
       const detail = batchFailureDetails(items)
       if (failed === 0) {
         message.success(`批量删除完成：删除 ${deleted} 个`)
@@ -848,9 +886,10 @@ export default function Accounts() {
       } else {
         message.warning(`批量删除部分完成：删除 ${deleted} 个，失败 ${failed} 个${detail ? `；${detail}` : ''}`)
       }
-      await load()
     } catch (error: unknown) {
       message.error(`批量删除失败：${deletionErrorDetail(error, '请求失败')}`)
+    } finally {
+      await refreshAccountListAfterDelete()
     }
   }
 
