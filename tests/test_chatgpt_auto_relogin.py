@@ -79,7 +79,7 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert response["chatgpt_auto_relogin_enabled"] == "0"
     assert response["chatgpt_auto_relogin_interval_minutes"] == "2"
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
-    assert response["chatgpt_auto_relogin_alert_threshold"] == "5"
+    assert response["chatgpt_auto_relogin_alert_threshold"] == "20"
     assert response["smtp_port"] == "587"
     assert response["smtp_use_ssl"] == "1"
     assert store.writes == []

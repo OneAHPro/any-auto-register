@@ -197,7 +197,7 @@ def get_config():
     if not str(all_cfg.get("chatgpt_auto_relogin_concurrency", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
     if not str(all_cfg.get("chatgpt_auto_relogin_alert_threshold", "") or "").strip():
-        all_cfg["chatgpt_auto_relogin_alert_threshold"] = "5"
+        all_cfg["chatgpt_auto_relogin_alert_threshold"] = "20"
     if not str(all_cfg.get("smtp_port", "") or "").strip():
         all_cfg["smtp_port"] = "587"
     if not str(all_cfg.get("smtp_use_ssl", "") or "").strip():
@@ -244,7 +244,7 @@ def update_config(body: ConfigUpdate):
     for key, minimum, maximum, label in (
         ("chatgpt_auto_relogin_interval_minutes", 2, 1440, "鉴权巡检间隔"),
         ("chatgpt_auto_relogin_concurrency", 1, 10, "自动重登并发数"),
-        ("chatgpt_auto_relogin_alert_threshold", 1, 10000, "邮件告警阈值"),
+        ("chatgpt_auto_relogin_alert_threshold", 1, 10000, "重登失败告警阈值"),
         ("smtp_port", 1, 65535, "SMTP 端口"),
     ):
         if key not in safe:
