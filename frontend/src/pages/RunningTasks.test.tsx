@@ -2,6 +2,7 @@
 
 import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { StrictMode } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apiFetch } from '@/lib/utils'
@@ -233,6 +234,35 @@ describe('RunningTasks lightweight summaries', () => {
       .filter((message) => /unmounted|state update/i.test(message))
     expect(unmountedWarnings).toEqual([])
     consoleError.mockRestore()
+  })
+
+  it('starts a replacement request immediately after StrictMode cleanup', async () => {
+    let firstSignal: AbortSignal | undefined
+    vi.mocked(apiFetch)
+      .mockReset()
+      .mockImplementationOnce((_path, options) => {
+        firstSignal = options?.signal ?? undefined
+        if (!firstSignal) return new Promise(() => {})
+        return new Promise((_resolve, reject) => {
+          firstSignal?.addEventListener(
+            'abort',
+            () => reject(new DOMException('aborted', 'AbortError')),
+            { once: true },
+          )
+        })
+      })
+      .mockResolvedValueOnce([automaticSummary()])
+
+    render(
+      <StrictMode>
+        <RunningTasks />
+      </StrictMode>,
+    )
+
+    await waitFor(() => expect(apiFetch).toHaveBeenCalledTimes(2))
+    expect(firstSignal?.aborted).toBe(true)
+    expect(await screen.findByText('自动认证')).toBeTruthy()
+    expect(screen.queryByText('任务列表加载失败，正在自动重试')).toBeNull()
   })
 
   it('loads the full task snapshot only after opening the log drawer', async () => {

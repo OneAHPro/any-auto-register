@@ -108,26 +108,25 @@ export default function RunningTasks() {
   const [loadFailed, setLoadFailed] = useState(false)
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now() / 1000)
-  const requestInFlightRef = useRef(false)
-  const requestControllerRef = useRef<AbortController | null>(null)
+  const activeRequestRef = useRef<{ controller: AbortController } | null>(null)
   const mountedRef = useRef(false)
 
   const load = useCallback(async () => {
-    if (requestInFlightRef.current) return
-    requestInFlightRef.current = true
-    const controller = new AbortController()
-    requestControllerRef.current = controller
+    if (activeRequestRef.current) return
+    const request = { controller: new AbortController() }
+    activeRequestRef.current = request
+    const ownsRequest = () => activeRequestRef.current === request
     let timeoutId: ReturnType<typeof setTimeout> | undefined
     if (mountedRef.current) setLoading(true)
     try {
       const timeout = new Promise<never>((_resolve, reject) => {
         timeoutId = setTimeout(() => {
-          controller.abort()
+          request.controller.abort()
           reject(new Error('task summary request timed out'))
         }, TASK_SUMMARY_REQUEST_TIMEOUT_MS)
       })
       const data = (await Promise.race([
-        apiFetch('/tasks/summary', { signal: controller.signal }),
+        apiFetch('/tasks/summary', { signal: request.controller.signal }),
         timeout,
       ])) as TaskSnapshot[]
       // sort: running first, then pending, then finished (newest first)
@@ -139,19 +138,18 @@ export default function RunningTasks() {
         const tb = toUnixSeconds(b.created_at) ?? 0
         return tb - ta
       })
-      if (mountedRef.current) {
+      if (mountedRef.current && ownsRequest()) {
         setTasks(sorted)
         setLoadFailed(false)
       }
     } catch {
-      if (mountedRef.current) setLoadFailed(true)
+      if (mountedRef.current && ownsRequest()) setLoadFailed(true)
     } finally {
       if (timeoutId !== undefined) clearTimeout(timeoutId)
-      if (requestControllerRef.current === controller) {
-        requestControllerRef.current = null
+      if (ownsRequest()) {
+        activeRequestRef.current = null
+        if (mountedRef.current) setLoading(false)
       }
-      requestInFlightRef.current = false
-      if (mountedRef.current) setLoading(false)
     }
   }, [])
 
@@ -166,7 +164,9 @@ export default function RunningTasks() {
     const tick = setInterval(() => setNow(Date.now() / 1000), 1000)
     return () => {
       mountedRef.current = false
-      requestControllerRef.current?.abort()
+      const activeRequest = activeRequestRef.current
+      activeRequestRef.current = null
+      activeRequest?.controller.abort()
       clearInterval(poll)
       clearInterval(tick)
     }
