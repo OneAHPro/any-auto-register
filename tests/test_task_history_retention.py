@@ -133,6 +133,8 @@ def test_cleanup_prefers_completed_at_over_updated_at_in_both_directions():
         '{"completed_at": 1e1000}',
         '{"completed_at": 1000000000000000000000000000000}',
         '{"completed_at": true}',
+        '{"completed_at": 0}',
+        '{"completed_at": -1}',
         "[]",
         '"not-an-object"',
         "{malformed",
@@ -153,6 +155,17 @@ def test_effective_completion_at_accepts_numeric_epoch_strings_in_valid_objects(
 
     assert helper(
         json.dumps({"completed_at": str(completed_at.timestamp())}),
+        NOW,
+    ) == completed_at
+
+
+def test_effective_completion_at_accepts_epoch_milliseconds():
+    helper = getattr(retention, "_effective_completion_at", None)
+    assert helper is not None
+    completed_at = NOW - timedelta(hours=5)
+
+    assert helper(
+        json.dumps({"completed_at": completed_at.timestamp() * 1_000}),
         NOW,
     ) == completed_at
 
@@ -346,7 +359,78 @@ def test_cleanup_deletes_more_than_one_parameter_batch():
         assert len(delete_calls) >= 3
         for statement, params in delete_calls:
             assert " where task_runs.id in " in statement
+            assert "task_runs.status in" in statement
             assert len(params) <= 500
+    finally:
+        database_engine.dispose()
+
+
+def test_cleanup_rechecks_terminal_status_and_counts_only_rows_actually_deleted():
+    database_engine = _engine()
+    delete_statements: list[str] = []
+    status_changed = False
+
+    def capture_delete(_conn, _cursor, statement, _params, _context, _many):
+        if statement.lstrip().lower().startswith("delete from task_runs"):
+            delete_statements.append(statement.lower())
+
+    def change_status_after_candidate_select(
+        connection,
+        _cursor,
+        statement,
+        _params,
+        _context,
+        _many,
+    ):
+        nonlocal status_changed
+        lowered = statement.lstrip().lower()
+        if (
+            not status_changed
+            and lowered.startswith("select")
+            and "from task_runs" in lowered
+        ):
+            status_changed = True
+            connection.exec_driver_sql(
+                "UPDATE task_runs SET status = ? WHERE id = ?",
+                ("running", "became-active"),
+            )
+
+    try:
+        with Session(database_engine) as session:
+            _add_task(
+                session,
+                "became-active",
+                updated_at=NOW - timedelta(days=2),
+            )
+            session.commit()
+
+        event.listen(database_engine, "before_cursor_execute", capture_delete)
+        event.listen(
+            database_engine,
+            "after_cursor_execute",
+            change_status_after_candidate_select,
+        )
+        try:
+            result = retention.cleanup_task_history(
+                database_engine=database_engine,
+                now=NOW,
+            )
+        finally:
+            event.remove(database_engine, "before_cursor_execute", capture_delete)
+            event.remove(
+                database_engine,
+                "after_cursor_execute",
+                change_status_after_candidate_select,
+            )
+
+        assert status_changed is True
+        assert result == {"task_runs": 0, "task_logs": 0}
+        with Session(database_engine) as session:
+            row = session.get(TaskRunModel, "became-active")
+            assert row is not None
+            assert row.status == "running"
+        assert len(delete_statements) == 1
+        assert "task_runs.status in" in delete_statements[0]
     finally:
         database_engine.dispose()
 

@@ -19,6 +19,8 @@ _DEFAULT_TASK_RUN_RETENTION_HOURS = 12
 _DEFAULT_NORMAL_RETENTION_DAYS = 30
 _DEFAULT_FAILURE_RETENTION_DAYS = 90
 _DELETE_BATCH_SIZE = 500
+_TASK_RUN_DELETE_BATCH_SIZE = _DELETE_BATCH_SIZE - len(_TERMINAL_TASK_STATUSES)
+_MILLISECONDS_EPOCH_THRESHOLD = 1_000_000_000_000
 
 
 def _positive_int(value: Any, default: int) -> int:
@@ -57,18 +59,44 @@ def _effective_completion_at(
         timestamp = float(raw_completed_at)
     except (TypeError, ValueError):
         return fallback
-    if not math.isfinite(timestamp):
+    if not math.isfinite(timestamp) or timestamp <= 0:
         return fallback
+    if timestamp > _MILLISECONDS_EPOCH_THRESHOLD:
+        timestamp /= 1_000
     try:
         return datetime.fromtimestamp(timestamp, tz=timezone.utc)
     except (OverflowError, OSError, ValueError):
         return fallback
 
 
-def _delete_ids(session: Session, model, ids: list[Any]) -> None:
+def _deleted_rowcount(result: Any) -> int:
+    try:
+        return max(0, int(result.rowcount))
+    except (AttributeError, TypeError, ValueError):
+        return 0
+
+
+def _delete_ids(session: Session, model, ids: list[Any]) -> int:
+    deleted = 0
     for start in range(0, len(ids), _DELETE_BATCH_SIZE):
         batch = ids[start : start + _DELETE_BATCH_SIZE]
-        session.exec(delete(model).where(model.id.in_(batch)))
+        result = session.exec(delete(model).where(model.id.in_(batch)))
+        deleted += _deleted_rowcount(result)
+    return deleted
+
+
+def _delete_terminal_task_run_ids(session: Session, ids: list[str]) -> int:
+    deleted = 0
+    for start in range(0, len(ids), _TASK_RUN_DELETE_BATCH_SIZE):
+        batch = ids[start : start + _TASK_RUN_DELETE_BATCH_SIZE]
+        result = session.exec(
+            delete(TaskRunModel).where(
+                TaskRunModel.id.in_(batch),
+                TaskRunModel.status.in_(_TERMINAL_TASK_STATUSES),
+            )
+        )
+        deleted += _deleted_rowcount(result)
+    return deleted
 
 
 def cleanup_task_history(
@@ -126,8 +154,10 @@ def cleanup_task_history(
             for task_id, meta_json, updated_at in task_candidates
             if _effective_completion_at(meta_json, updated_at) < task_run_cutoff
         ]
-        _delete_ids(session, TaskRunModel, expired_task_ids)
-        deleted_task_runs = len(expired_task_ids)
+        deleted_task_runs = _delete_terminal_task_run_ids(
+            session,
+            expired_task_ids,
+        )
 
         expired_task_log_ids = session.exec(
             select(TaskLog.id).where(
@@ -146,8 +176,11 @@ def cleanup_task_history(
             for task_log_id in expired_task_log_ids
             if task_log_id is not None
         ]
-        _delete_ids(session, TaskLog, persisted_task_log_ids)
-        deleted_task_logs = len(persisted_task_log_ids)
+        deleted_task_logs = _delete_ids(
+            session,
+            TaskLog,
+            persisted_task_log_ids,
+        )
         session.commit()
 
     return {
