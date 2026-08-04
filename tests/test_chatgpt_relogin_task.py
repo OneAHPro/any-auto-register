@@ -625,8 +625,15 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.alert_sender.assert_called_once_with(
             task_id=task_id,
             total_accounts=4,
+            successful_accounts=1,
             invalid_rt_count=3,
             relogin_failed_count=1,
+        )
+        self.assertTrue(
+            any(
+                "[ALERT] 本轮重登失败告警邮件已发送" in line
+                for line in snapshot["logs"]
+            )
         )
 
     def test_automatic_alert_exception_does_not_change_task_outcome(self):
@@ -714,6 +721,13 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertLess(
             events.index("terminal_persisted"),
             events.index("alert_started"),
+        )
+        snapshot = _task_store.snapshot(task_id)
+        self.assertTrue(
+            any(
+                "邮件告警未触发：本轮重登失败数未达到配置阈值" in line
+                for line in snapshot["logs"]
+            )
         )
 
     def test_stop_accepted_at_completion_boundary_suppresses_alert(self):

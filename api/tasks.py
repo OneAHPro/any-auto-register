@@ -1786,6 +1786,7 @@ def _run_chatgpt_relogin_task_inner(
             alert_result = send_auto_relogin_alert(
                 task_id=task_id,
                 total_accounts=total,
+                successful_accounts=success,
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
             )
@@ -1810,14 +1811,14 @@ def _run_chatgpt_relogin_task_inner(
 
         alert_reason = alert_meta["alert_reason"]
         if alert_meta["alert_sent"]:
-            _log(task_id, "[ALERT] 本轮阈值告警邮件已发送")
+            _log(task_id, "[ALERT] 本轮重登失败告警邮件已发送")
         elif alert_reason == "below_threshold":
-            _log(task_id, "邮件告警未触发：本轮统计低于配置阈值")
+            _log(task_id, "邮件告警未触发：本轮重登失败数未达到配置阈值")
         elif alert_reason == "smtp_not_configured":
-            _log(task_id, "[ALERT] 已达到告警阈值，但 SMTP 配置不完整")
+            _log(task_id, "[ALERT] 本轮重登失败数已达到阈值，但 SMTP 配置不完整")
         else:
             error_type = str(alert_meta.get("alert_error_type") or "UnknownError")
-            _log(task_id, f"[ALERT] 告警邮件发送失败（{error_type}）")
+            _log(task_id, f"[ALERT] 重登失败告警邮件发送失败（{error_type}）")
     elif automation:
         _task_store.update_meta(
             task_id,
