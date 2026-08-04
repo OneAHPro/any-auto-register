@@ -28,6 +28,7 @@ type SmsPoolStatus = 'unused' | 'reserved' | 'active' | 'used'
 
 interface SmsPoolItem {
   id: number
+  code: string
   code_hint: string
   base_url: string
   status: SmsPoolStatus
@@ -138,14 +139,17 @@ export default function SmsPool() {
   const columns: TableColumnsType<SmsPoolItem> = [
     {
       title: '接码卡密',
-      dataIndex: 'code_hint',
-      key: 'code_hint',
-      width: 190,
-      render: value => (
-        <Typography.Text code copyable={{ text: String(value || '') }}>
-          {String(value || '****')}
+      dataIndex: 'code',
+      key: 'code',
+      width: 260,
+      render: value => {
+        const code = String(value || '')
+        return (
+          <Typography.Text code copyable={code ? { text: code, tooltips: ['复制', '已复制'] } : false}>
+            {code || '-'}
         </Typography.Text>
-      ),
+        )
+      },
     },
     {
       title: '接码地址',

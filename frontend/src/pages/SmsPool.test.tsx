@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 
 import { apiFetch } from '@/lib/utils'
@@ -45,6 +45,7 @@ describe('SmsPool', () => {
           items: [
             {
               id: 1,
+              code: 'bei-sms-FULL-SECRET-0001',
               code_hint: 'bei-****-0001',
               base_url: 'https://sms.example.com/box',
               status: 'unused',
@@ -52,6 +53,7 @@ describe('SmsPool', () => {
             },
             {
               id: 2,
+              code: 'bei-sms-FULL-SECRET-0002',
               code_hint: 'bei-****-0002',
               base_url: 'https://sms.example.com/box',
               status: 'used',
@@ -61,6 +63,7 @@ describe('SmsPool', () => {
             },
             {
               id: 3,
+              code: 'bei-sms-FULL-SECRET-0003',
               code_hint: 'bei-****-0003',
               base_url: 'https://sms.example.com/box',
               status: 'active',
@@ -78,14 +81,19 @@ describe('SmsPool', () => {
     })
   })
 
-  afterEach(() => cleanup())
+  afterEach(() => {
+    cleanup()
+    Reflect.deleteProperty(document, 'execCommand')
+  })
 
-  it('shows masked cards, receive URLs, counts and usage states', async () => {
+  it('shows full cards, receive URLs, counts and usage states', async () => {
     render(<SmsPool />)
 
     expect(await screen.findByText('SMS接码池')).toBeTruthy()
-    expect(await screen.findByText('bei-****-0001')).toBeTruthy()
-    expect(screen.getByText('bei-****-0002')).toBeTruthy()
+    expect(await screen.findByText('bei-sms-FULL-SECRET-0001')).toBeTruthy()
+    expect(screen.getByText('bei-sms-FULL-SECRET-0002')).toBeTruthy()
+    expect(screen.queryByText('bei-****-0001')).toBeNull()
+    expect(screen.queryByText('bei-****-0002')).toBeNull()
     expect(screen.getAllByText('https://sms.example.com/box').length).toBeGreaterThan(0)
     expect(screen.getByText('未使用')).toBeTruthy()
     expect(screen.getByText('已使用')).toBeTruthy()
@@ -93,10 +101,31 @@ describe('SmsPool', () => {
     expect(screen.getByText('可用 1')).toBeTruthy()
   })
 
+  it('copies the full card code', async () => {
+    const user = userEvent.setup()
+    const fullCode = 'bei-sms-FULL-SECRET-0001'
+    let copiedText = ''
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true,
+      value: vi.fn(() => {
+        copiedText = document.getSelection()?.toString() || ''
+        return true
+      }),
+    })
+    render(<SmsPool />)
+
+    const code = await screen.findByText(fullCode)
+    const row = code.closest('tr')
+    expect(row).not.toBeNull()
+    await user.click(within(row as HTMLTableRowElement).getByRole('button', { name: '复制' }))
+
+    expect(copiedText).toBe(fullCode)
+  })
+
   it('imports cards with a default receive URL then reloads the pool', async () => {
     const user = userEvent.setup()
     render(<SmsPool />)
-    await screen.findByText('bei-****-0001')
+    await screen.findByText('bei-sms-FULL-SECRET-0001')
 
     await user.clear(screen.getByLabelText('默认接码地址'))
     await user.type(screen.getByLabelText('默认接码地址'), 'https://sms.example.com/new-box')
@@ -119,7 +148,7 @@ describe('SmsPool', () => {
   it('silently refreshes usage state while the page remains open', async () => {
     const intervalSpy = vi.spyOn(window, 'setInterval')
     render(<SmsPool />)
-    await screen.findByText('bei-****-0001')
+    await screen.findByText('bei-sms-FULL-SECRET-0001')
     const refreshCallback = intervalSpy.mock.calls.find(([, delay]) => delay === 5_000)?.[0]
 
     expect(refreshCallback).toBeTypeOf('function')
