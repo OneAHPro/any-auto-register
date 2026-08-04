@@ -70,7 +70,7 @@ class TaskLog(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     platform: str
     email: str
-    status: str        # success | failed
+    status: str        # success | failed | skipped | removed
     error: str = ""
     detail_json: str = "{}"
     created_at: datetime = Field(default_factory=_utcnow)

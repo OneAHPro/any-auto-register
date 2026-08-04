@@ -86,6 +86,7 @@ def _build_message(
     invalid_rt_count: int,
     relogin_failed_count: int,
     threshold: int,
+    deleted_account_count: int = 0,
 ) -> EmailMessage:
     message = EmailMessage()
     message["Subject"] = (
@@ -102,8 +103,10 @@ def _build_message(
         f"成功账号：{successful_accounts}\n"
         f"鉴权失败：{invalid_rt_count}\n"
         f"重登失败：{relogin_failed_count}\n"
+        f"其中已删除或停用账号：{deleted_account_count}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
+        "已删除或停用账号属于重登失败账号的子集。"
         "鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。"
         "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。\n\n"
         "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。\n"
@@ -140,9 +143,10 @@ def _build_message(
             <td class="metric-cell metric-failed" width="25%"><strong>重登失败</strong><br>{relogin_failed_count}</td>
           </tr></table>
         </td></tr>
+        <tr><td style="padding:0 20px 12px;"><strong>其中已删除或停用账号：{deleted_account_count}</strong>（属于重登失败账号的子集）</td></tr>
         <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
         <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
-        <tr><td style="padding:0 20px 24px;">鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。</td></tr>
+        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。</td></tr>
         <tr><td style="padding:0 20px 24px;">请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。</td></tr>
       </table>
     </td></tr></table>
@@ -263,6 +267,7 @@ def send_auto_relogin_alert(
     successful_accounts: int,
     invalid_rt_count: int,
     relogin_failed_count: int,
+    deleted_account_count: int = 0,
     config: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Send one alert when relogin failures reach the configured threshold."""
@@ -274,6 +279,10 @@ def send_auto_relogin_alert(
     )
     invalid_count = _non_negative_int(invalid_rt_count)
     failed_count = _non_negative_int(relogin_failed_count)
+    deleted_count = min(
+        _non_negative_int(deleted_account_count),
+        failed_count,
+    )
     if failed_count < threshold:
         return {
             "sent": False,
@@ -303,6 +312,7 @@ def send_auto_relogin_alert(
         invalid_rt_count=invalid_count,
         relogin_failed_count=failed_count,
         threshold=threshold,
+        deleted_account_count=deleted_count,
     )
 
     result = _send_message(

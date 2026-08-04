@@ -3,11 +3,21 @@ import unittest
 from unittest import mock
 
 from core.task_runtime import (
+    AttemptOutcome,
+    AttemptResult,
     RegisterTaskControl,
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
     StopTaskRequested,
 )
+
+
+class AttemptResultTests(unittest.TestCase):
+    def test_removed_factory_uses_distinct_removed_outcome(self):
+        result = AttemptResult.removed("账号已删除")
+
+        self.assertEqual(result.outcome, AttemptOutcome.REMOVED)
+        self.assertEqual(result.message, "账号已删除")
 
 
 class RegisterTaskControlTests(unittest.TestCase):

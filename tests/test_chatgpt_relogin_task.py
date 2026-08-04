@@ -151,12 +151,68 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertTrue(snapshot["meta"]["automation"])
         self.assertEqual(snapshot["meta"]["account_ids"], list(range(1, 102)))
         self.assertEqual(snapshot["meta"]["concurrency"], 10)
+        self.assertEqual(snapshot["meta"]["deleted_account_count"], 0)
         self.assertEqual(len(background_tasks.tasks), 1)
         queued = background_tasks.tasks[0]
         self.assertIs(queued.func, _run_chatgpt_relogin_task)
         self.assertEqual(
             queued.args,
             (task_id, list(range(1, 102)), 10),
+        )
+
+    def test_automatic_task_freezes_linked_credential_delete_setting_for_cycle(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        with mock.patch(
+            "core.config_store.config_store.get",
+            return_value="1",
+        ):
+            _create_chatgpt_relogin_task_record(
+                task_id,
+                [211],
+                source="schedule",
+                automation=True,
+            )
+
+        health = {
+            211: {
+                "account_id": 211,
+                "email": "frozen@example.com",
+                "state": "auth_failed",
+                "remote_status": "unauthorized",
+            }
+        }
+        with mock.patch(
+            "core.config_store.config_store.get",
+            return_value="0",
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": True,
+                "relogin_ok": True,
+                "stage": "completed",
+                "account_id": 211,
+                "email": "frozen@example.com",
+                "message": "完整登录并同步成功",
+            },
+        ) as relogin:
+            _run_chatgpt_relogin_task(task_id, [211])
+
+        self.assertTrue(
+            _task_store.snapshot(task_id)["meta"][
+                "codex2api_delete_on_account_remove_enabled"
+            ]
+        )
+        self.assertIs(
+            relogin.call_args.kwargs[
+                "codex2api_delete_on_account_remove_enabled"
+            ],
+            True,
         )
 
     def test_manual_route_reuses_enqueue_and_preserves_response_shape(self):
@@ -628,6 +684,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             successful_accounts=1,
             invalid_rt_count=3,
             relogin_failed_count=1,
+            deleted_account_count=0,
         )
         self.assertTrue(
             any(
@@ -635,6 +692,137 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
                 for line in snapshot["logs"]
             )
         )
+
+    def test_automatic_task_counts_removed_accounts_inside_relogin_failures(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        account_ids = list(range(301, 321))
+        with mock.patch(
+            "core.config_store.config_store.get",
+            return_value="1",
+        ):
+            _create_chatgpt_relogin_task_record(
+                task_id,
+                account_ids,
+                source="schedule",
+                automation=True,
+            )
+        health = {
+            account_id: {
+                "account_id": account_id,
+                "email": f"account-{account_id}@example.com",
+                "state": "auth_failed",
+                "remote_status": "unauthorized",
+            }
+            for account_id in account_ids
+        }
+        ordinary_failures = [
+            {
+                "ok": False,
+                "relogin_ok": False,
+                "stage": "relogin",
+                "account_id": account_id,
+                "email": f"failed-{account_id}@example.com",
+                "message": "验证码登录失败",
+            }
+            for account_id in account_ids[:3]
+        ]
+        removed = [
+            {
+                "ok": False,
+                "relogin_ok": False,
+                "account_removed": True,
+                "stage": "account_removed",
+                "account_id": account_id,
+                "email": f"removed-{account_id}@example.com",
+                "message": "账号已被删除或停用，本地记录已自动删除",
+            }
+            for account_id in account_ids[3:]
+        ]
+        self.alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold": 20,
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=[*ordinary_failures, *removed],
+        ) as relogin, mock.patch("api.tasks._save_task_log") as save_task_log:
+            _run_chatgpt_relogin_task(task_id, account_ids, concurrency=1)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["registered"], 20)
+        self.assertEqual(len(snapshot["errors"]), 3)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 20)
+        self.assertEqual(snapshot["meta"]["deleted_account_count"], 17)
+        self.assertTrue(
+            all(
+                call.kwargs[
+                    "codex2api_delete_on_account_remove_enabled"
+                ] is True
+                for call in relogin.call_args_list
+            )
+        )
+        removed_logs = [
+            call for call in save_task_log.call_args_list
+            if len(call.args) >= 3 and call.args[2] == "removed"
+        ]
+        self.assertEqual(len(removed_logs), 17)
+        self.alert_sender.assert_called_once_with(
+            task_id=task_id,
+            total_accounts=20,
+            successful_accounts=0,
+            invalid_rt_count=20,
+            relogin_failed_count=20,
+            deleted_account_count=17,
+        )
+
+    def test_cleanup_failure_counts_as_relogin_failure_but_not_deleted(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [321],
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            321: {
+                "account_id": 321,
+                "email": "cleanup-failed@example.com",
+                "state": "auth_failed",
+                "remote_status": "unauthorized",
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": False,
+                "relogin_ok": False,
+                "account_removed": False,
+                "stage": "account_remove_failed",
+                "account_id": 321,
+                "email": "cleanup-failed@example.com",
+                "message": "远端认证删除失败",
+            },
+        ):
+            _run_chatgpt_relogin_task(task_id, [321])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 1)
+        self.assertEqual(snapshot["meta"]["deleted_account_count"], 0)
+        self.assertEqual(len(snapshot["errors"]), 1)
 
     def test_automatic_alert_exception_does_not_change_task_outcome(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -856,7 +1044,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["success"], 0)
         self.assertEqual(snapshot["registered"], 1)
-        self.assertIn("本地记录已自动删除", snapshot["errors"][0])
+        self.assertEqual(snapshot["errors"], [])
         self.assertTrue(
             any(
                 "[REMOVE]" in line and "本地记录已移除" in line
@@ -866,6 +1054,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertTrue(
             save_task_log.call_args.kwargs["detail"]["account_removed"]
         )
+        self.assertEqual(save_task_log.call_args.args[2], "removed")
 
     def test_stop_requested_after_completed_account_keeps_its_success_result(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"

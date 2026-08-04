@@ -1304,10 +1304,25 @@ def _create_chatgpt_relogin_task_record(
         "concurrency": effective_concurrency,
     }
     if automation:
+        from core.config_store import config_store
+
+        try:
+            delete_linked_credential = _is_truthy(
+                config_store.get(
+                    "codex2api_delete_on_account_remove_enabled",
+                    "0",
+                )
+            )
+        except Exception:
+            delete_linked_credential = False
         task_meta.update(
             {
                 "invalid_rt_count": 0,
                 "relogin_failed_count": 0,
+                "deleted_account_count": 0,
+                "codex2api_delete_on_account_remove_enabled": (
+                    delete_linked_credential
+                ),
                 "alert_sent": False,
                 "alert_reason": "pending",
             }
@@ -1542,7 +1557,15 @@ def _run_chatgpt_relogin_task_inner(
 
     control = _task_store.control_for(task_id)
     task_snapshot = _task_store.snapshot(task_id)
-    automation = _is_truthy((task_snapshot.get("meta") or {}).get("automation"))
+    task_meta = task_snapshot.get("meta") or {}
+    automation = _is_truthy(task_meta.get("automation"))
+    delete_linked_credential = (
+        _is_truthy(
+            task_meta.get("codex2api_delete_on_account_remove_enabled")
+        )
+        if automation
+        else None
+    )
     if control.is_stop_requested():
         _terminalize_stopped_task(
             task_id,
@@ -1579,6 +1602,7 @@ def _run_chatgpt_relogin_task_inner(
     cycle_counts_lock = threading.Lock()
     invalid_rt_count = 0
     relogin_failed_count = 0
+    deleted_account_count = 0
 
     def _record_confirmed_auth_failure() -> None:
         nonlocal invalid_rt_count
@@ -1588,25 +1612,30 @@ def _run_chatgpt_relogin_task_inner(
                 task_id,
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
+                deleted_account_count=deleted_account_count,
             )
 
     def _record_automatic_result(result: dict) -> None:
-        nonlocal relogin_failed_count
+        nonlocal relogin_failed_count, deleted_account_count
         if not automation:
             return
         full_relogin_failed = (
             str(result.get("mode") or "").strip().lower() == "full_login"
             and not bool(result.get("relogin_ok"))
-            and not bool(result.get("account_removed"))
-            and str(result.get("stage") or "").strip() != "account_removed"
+        )
+        account_removed = bool(result.get("account_removed")) or (
+            str(result.get("stage") or "").strip() == "account_removed"
         )
         with cycle_counts_lock:
             if full_relogin_failed:
                 relogin_failed_count += 1
+            if account_removed:
+                deleted_account_count += 1
             _task_store.update_meta(
                 task_id,
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
+                deleted_account_count=deleted_account_count,
             )
 
     _task_store.mark_running(task_id)
@@ -1616,6 +1645,7 @@ def _run_chatgpt_relogin_task_inner(
             mode="remote_auth_monitor",
             invalid_rt_count=invalid_rt_count,
             relogin_failed_count=0,
+            deleted_account_count=0,
         )
     _persist_task_snapshot_best_effort(task_id)
     _log(
@@ -1670,6 +1700,9 @@ def _run_chatgpt_relogin_task_inner(
                         log_fn=_service_log,
                         task_control=control,
                         attempt_id=attempt_id,
+                        codex2api_delete_on_account_remove_enabled=(
+                            delete_linked_credential
+                        ),
                     )
                     if isinstance(result, dict):
                         result = {
@@ -1698,6 +1731,7 @@ def _run_chatgpt_relogin_task_inner(
                     log_fn=_service_log,
                     task_control=control,
                     attempt_id=attempt_id,
+                    codex2api_delete_on_account_remove_enabled=None,
                 )
             if not isinstance(result, dict):
                 raise RuntimeError("重登服务返回了无效结果")
@@ -1767,7 +1801,7 @@ def _run_chatgpt_relogin_task_inner(
                 _save_task_log(
                     "chatgpt",
                     email,
-                    "failed",
+                    "removed" if account_removed else "failed",
                     error=detail_message,
                     detail={
                         "mode": result_mode,
@@ -1777,6 +1811,8 @@ def _run_chatgpt_relogin_task_inner(
                         "account_removed": account_removed,
                     },
                 )
+                if account_removed:
+                    return AttemptResult.removed(error_entry)
                 return AttemptResult.failed(error_entry)
         except SkipCurrentAttemptRequested as exc:
             _log(task_id, f"[SKIP] 已跳过账号 ID {account_id}: {exc}")
@@ -1835,6 +1871,8 @@ def _run_chatgpt_relogin_task_inner(
                         processed += 1
                     elif outcome.outcome == AttemptOutcome.SKIPPED:
                         skipped += 1
+                        processed += 1
+                    elif outcome.outcome == AttemptOutcome.REMOVED:
                         processed += 1
                     elif outcome.outcome == AttemptOutcome.STOPPED:
                         stopped = True
@@ -1901,7 +1939,8 @@ def _run_chatgpt_relogin_task_inner(
     if automation:
         summary += (
             f"，Codex2API 鉴权失效 {invalid_rt_count} 个，"
-            f"完整重登失败 {relogin_failed_count} 个"
+            f"完整重登失败 {relogin_failed_count} 个，"
+            f"已删除账号 {deleted_account_count} 个"
         )
     _log(task_id, summary)
 
@@ -1917,6 +1956,7 @@ def _run_chatgpt_relogin_task_inner(
                 successful_accounts=success,
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
+                deleted_account_count=deleted_account_count,
             )
             if not isinstance(alert_result, dict):
                 raise RuntimeError("invalid alert result")

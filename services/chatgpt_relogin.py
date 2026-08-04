@@ -7,7 +7,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
-from sqlalchemy import delete, func, update
+from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from core.applemail_pool import load_applemail_pool_records
@@ -28,6 +28,7 @@ from services.chatgpt_account_coordination import (
     chatgpt_account_operation_lock,
     codex2api_account_mutation_lock,
 )
+from services.chatgpt_account_removal import remove_account
 from services.external_sync import sync_codex2api_account
 
 
@@ -1097,39 +1098,6 @@ def _persist_fresh_tokens(
         return snapshot
 
 
-def _delete_local_chatgpt_account(
-    account_id: int,
-    *,
-    expected_email: str,
-    expected_created_at: datetime,
-    expected_updated_at: datetime,
-) -> bool:
-    """Delete exactly one local ChatGPT account; missing is an idempotent success."""
-    with Session(engine) as session:
-        try:
-            result = session.exec(
-                delete(AccountModel)
-                .where(AccountModel.id == int(account_id))
-                .where(AccountModel.platform == "chatgpt")
-                .where(func.lower(AccountModel.email) == _text(expected_email).lower())
-                .where(AccountModel.created_at == expected_created_at)
-                .where(AccountModel.updated_at == expected_updated_at)
-            )
-            deleted_count = int(getattr(result, "rowcount", 0) or 0)
-            if deleted_count == 1:
-                session.commit()
-                return True
-            session.rollback()
-        except Exception:
-            session.rollback()
-            raise
-
-        current = session.get(AccountModel, int(account_id))
-        if current is None:
-            return False
-        raise RuntimeError("本地账号记录已发生变化，已停止自动删除")
-
-
 def _remove_deactivated_local_account(
     account_id: int,
     *,
@@ -1137,23 +1105,51 @@ def _remove_deactivated_local_account(
     created_at: datetime,
     updated_at: datetime,
     log_fn: LogFn | None,
+    task_control=None,
+    attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
 ) -> dict[str, Any]:
     try:
-        deleted = _delete_local_chatgpt_account(
+        removal = remove_account(
             account_id,
-            expected_email=email,
+            database_engine=engine,
+            already_locked=True,
             expected_created_at=created_at,
             expected_updated_at=updated_at,
+            task_control=task_control,
+            attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=(
+                codex2api_delete_on_account_remove_enabled
+            ),
         )
+    except TaskInterruption:
+        raise
     except Exception as exc:
-        detail = _text(exc) or type(exc).__name__
-        message = f"检测到账号已被删除或停用，但本地记录删除失败: {detail}"
+        removal = {
+            "status": "remove_exception",
+            "error_code": "account_remove_failed",
+            "message": f"账号删除联动异常（{type(exc).__name__}）",
+        }
+
+    removal_status = _text(removal.get("status"))
+    if removal_status not in {"deleted", "already_absent"}:
+        error_code = _text(removal.get("error_code")) or "account_remove_failed"
+        detail = _text(removal.get("message")) or "账号删除联动未完成"
+        if error_code == "local_delete_conflict":
+            detail = "本地账号记录已发生变化，已停止自动删除"
+        failure_label = (
+            "本地记录删除失败"
+            if error_code in {"database_error", "local_delete_conflict"}
+            else "账号删除联动失败"
+        )
+        message = f"检测到账号已被删除或停用，但{failure_label}: {detail}"
         _emit_observer(log_fn, message)
         return {
             "ok": False,
             "relogin_ok": False,
             "account_removed": False,
             "stage": "account_remove_failed",
+            "error_code": error_code,
             "account_id": int(account_id),
             "email": email,
             "message": message,
@@ -1161,7 +1157,7 @@ def _remove_deactivated_local_account(
 
     message = (
         "账号已被删除或停用，本地记录已自动删除"
-        if deleted
+        if removal_status == "deleted"
         else "账号已被删除或停用，本地记录已不存在"
     )
     _emit_observer(log_fn, message)
@@ -1182,6 +1178,7 @@ def _relogin_chatgpt_account_locked(
     log_fn: LogFn | None = None,
     task_control=None,
     attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Perform a real credential login, persist fresh tokens, then replace Codex2API."""
     email = ""
@@ -1217,6 +1214,11 @@ def _relogin_chatgpt_account_locked(
             created_at=saved["created_at"],
             updated_at=saved["updated_at"],
             log_fn=log_fn,
+            task_control=task_control,
+            attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=(
+                codex2api_delete_on_account_remove_enabled
+            ),
         )
     except TaskInterruption:
         raise
@@ -1317,6 +1319,7 @@ def _refresh_or_relogin_chatgpt_account_locked(
     log_fn: LogFn | None = None,
     task_control=None,
     attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
 ) -> dict[str, Any]:
     email = ""
     try:
@@ -1350,6 +1353,9 @@ def _refresh_or_relogin_chatgpt_account_locked(
                 log_fn=log_fn,
                 task_control=task_control,
                 attempt_id=attempt_id,
+                codex2api_delete_on_account_remove_enabled=(
+                    codex2api_delete_on_account_remove_enabled
+                ),
             )
         )
         result.update(
@@ -1476,6 +1482,9 @@ def _refresh_or_relogin_chatgpt_account_locked(
                 log_fn=log_fn,
                 task_control=task_control,
                 attempt_id=attempt_id,
+                codex2api_delete_on_account_remove_enabled=(
+                    codex2api_delete_on_account_remove_enabled
+                ),
             )
         )
         result.update(
@@ -1514,6 +1523,7 @@ def refresh_or_relogin_chatgpt_account(
     log_fn: LogFn | None = None,
     task_control=None,
     attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Refresh first; run a full credential login only for explicit RT invalidation."""
     with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
@@ -1534,6 +1544,9 @@ def refresh_or_relogin_chatgpt_account(
             log_fn=log_fn,
             task_control=task_control,
             attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=(
+                codex2api_delete_on_account_remove_enabled
+            ),
         )
 
 
@@ -1543,6 +1556,7 @@ def relogin_chatgpt_account(
     log_fn: LogFn | None = None,
     task_control=None,
     attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
 ) -> dict[str, Any]:
     """Run one account at a time so local and remote credentials cannot cross."""
     with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
@@ -1560,4 +1574,7 @@ def relogin_chatgpt_account(
             log_fn=log_fn,
             task_control=task_control,
             attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=(
+                codex2api_delete_on_account_remove_enabled
+            ),
         )

@@ -31,6 +31,7 @@ class AttemptOutcome(str, Enum):
     SUCCESS = "success"
     FAILED = "failed"
     SKIPPED = "skipped"
+    REMOVED = "removed"
     STOPPED = "stopped"
 
 
@@ -50,6 +51,10 @@ class AttemptResult:
     @classmethod
     def skipped(cls, message: str) -> "AttemptResult":
         return cls(AttemptOutcome.SKIPPED, message)
+
+    @classmethod
+    def removed(cls, message: str) -> "AttemptResult":
+        return cls(AttemptOutcome.REMOVED, message)
 
     @classmethod
     def stopped(cls, message: str) -> "AttemptResult":

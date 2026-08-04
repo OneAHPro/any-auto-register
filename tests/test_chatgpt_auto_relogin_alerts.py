@@ -77,6 +77,7 @@ def test_invalid_rt_count_alone_does_not_open_smtp(monkeypatch):
         successful_accounts=43,
         invalid_rt_count=100,
         relogin_failed_count=19,
+        deleted_account_count=19,
         config=BASE_CONFIG,
     )
 
@@ -131,6 +132,7 @@ def test_default_threshold_relogin_failure_sends_one_starttls_message(
         successful_accounts=43,
         invalid_rt_count=100,
         relogin_failed_count=relogin_failed_count,
+        deleted_account_count=17,
         config=BASE_CONFIG,
     )
 
@@ -150,7 +152,34 @@ def test_default_threshold_relogin_failure_sends_one_starttls_message(
     assert "成功账号：43" in body
     assert "鉴权失败：100" in body
     assert f"重登失败：{relogin_failed_count}" in body
+    assert "其中已删除或停用账号：17" in body
     assert "smtp-test-credential" not in smtp.message.as_string()
+
+
+def test_deleted_subset_is_clamped_to_relogin_failures_in_plain_and_html(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+
+    result = alerts.send_auto_relogin_alert(
+        task_id="task-clamped-deleted-subset",
+        total_accounts=20,
+        successful_accounts=0,
+        invalid_rt_count=20,
+        relogin_failed_count=20,
+        deleted_account_count=999,
+        config=BASE_CONFIG,
+    )
+
+    assert result == {"sent": True, "reason": "sent", "threshold": 20}
+    message = FakeSMTP.instances[0].message
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert "其中已删除或停用账号：20" in plain
+    assert "其中已删除或停用账号：20" in html
+    assert "已删除或停用账号属于重登失败账号的子集" in html
+    assert "999" not in plain
+    assert "999" not in html
 
 
 @pytest.mark.parametrize(

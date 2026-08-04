@@ -11,8 +11,15 @@ interface TaskLogItem {
   created_at: string
   platform: string
   email: string
-  status: 'success' | 'failed'
+  status: string
   error: string
+}
+
+const TASK_STATUS_PRESENTATION: Record<string, { label: string; color?: string }> = {
+  success: { label: '成功', color: 'success' },
+  failed: { label: '失败', color: 'error' },
+  skipped: { label: '已跳过' },
+  removed: { label: '已删除', color: 'warning' },
 }
 
 interface TaskLogListResponse {
@@ -93,11 +100,12 @@ export default function TaskHistory() {
       dataIndex: 'status',
       key: 'status',
       width: 80,
-      render: (status: string) => (
-        <Tag color={status === 'success' ? 'success' : 'error'}>
-          {status === 'success' ? '成功' : '失败'}
-        </Tag>
-      ),
+      render: (status: string) => {
+        const presentation = TASK_STATUS_PRESENTATION[status] || {
+          label: status || '未知',
+        }
+        return <Tag color={presentation.color}>{presentation.label}</Tag>
+      },
     },
     {
       title: '错误信息',

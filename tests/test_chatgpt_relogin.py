@@ -1346,6 +1346,79 @@ class ChatGPTReloginTests(unittest.TestCase):
         with Session(self.engine) as session:
             self.assertIsNone(session.get(AccountModel, self.account_id))
 
+    def test_deactivated_account_delegates_to_remote_first_removal_with_frozen_setting(self):
+        removal = mock.Mock(
+            return_value={
+                "ok": True,
+                "status": "deleted",
+                "local_deleted": True,
+                "error_code": "",
+                "message": "账号已删除",
+            }
+        )
+        control = RegisterTaskControl()
+        attempt_id = control.start_attempt()
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            expected_created_at = account.created_at
+            expected_updated_at = account.updated_at
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=ChatGPTAccountDeactivatedError(),
+        ), mock.patch(
+            "services.chatgpt_relogin.remove_account",
+            removal,
+        ):
+            result = relogin_chatgpt_account(
+                self.account_id,
+                task_control=control,
+                attempt_id=attempt_id,
+                codex2api_delete_on_account_remove_enabled=True,
+            )
+
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        removal.assert_called_once_with(
+            self.account_id,
+            database_engine=self.engine,
+            already_locked=True,
+            expected_created_at=expected_created_at,
+            expected_updated_at=expected_updated_at,
+            task_control=control,
+            attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=True,
+        )
+
+    def test_remote_removal_failure_keeps_account_and_reports_stable_failure(self):
+        removal = mock.Mock(
+            return_value={
+                "ok": False,
+                "status": "remote_failed",
+                "local_deleted": False,
+                "error_code": "codex2api_delete_failed",
+                "message": "Codex2API 认证删除未完成",
+            }
+        )
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=ChatGPTAccountDeactivatedError(),
+        ), mock.patch(
+            "services.chatgpt_relogin.remove_account",
+            removal,
+        ):
+            result = relogin_chatgpt_account(
+                self.account_id,
+                codex2api_delete_on_account_remove_enabled=True,
+            )
+
+        self.assertFalse(result["account_removed"])
+        self.assertEqual(result["stage"], "account_remove_failed")
+        self.assertEqual(result["error_code"], "codex2api_delete_failed")
+        self.assertIn("Codex2API 认证删除未完成", result["message"])
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
+
     def test_database_delete_failure_is_reported_without_claiming_account_removed(self):
         sync = mock.Mock()
 
