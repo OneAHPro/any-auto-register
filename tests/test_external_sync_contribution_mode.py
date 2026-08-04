@@ -1,4 +1,6 @@
 import unittest
+from contextlib import contextmanager, redirect_stderr, redirect_stdout
+from io import StringIO
 from unittest import mock
 
 from services.external_sync import sync_account, sync_codex2api_account
@@ -24,6 +26,40 @@ def _config_getter(values: dict[str, str]):
 
 
 class ExternalSyncContributionModeTests(unittest.TestCase):
+    def test_codex2api_upload_runs_inside_shared_mutation_lock(self):
+        account = DummyAccount(extra={"refresh_token": "rt-local"})
+        cfg = {"codex2api_enabled": "1"}
+        events = []
+
+        @contextmanager
+        def tracked_lock():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        def upload(*args, **kwargs):
+            events.append("upload")
+            return True, "ok"
+
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ), mock.patch(
+            "services.external_sync.codex2api_account_mutation_lock",
+            side_effect=tracked_lock,
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+            side_effect=upload,
+        ), mock.patch(
+            "services.external_sync.persist_codex2api_sync_result",
+        ):
+            result = sync_codex2api_account(account)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(events, ["enter", "upload", "exit"])
+
     def test_codex2api_sync_reports_status_persistence_failure(self):
         account = DummyAccount()
         cfg = {"codex2api_enabled": "1"}
@@ -129,6 +165,44 @@ class ExternalSyncContributionModeTests(unittest.TestCase):
         self.assertEqual(payload["token_json"]["access_token"], "at-camel-case")
         self.assertEqual(payload["token_json"]["id_token"], "id-camel-case")
         self.assertEqual(payload["token_json"]["client_id"], "client-camel-case")
+
+    def test_custom_contribution_does_not_print_token_keys_or_prefixes(self):
+        account = DummyAccount(
+            extra={
+                "refreshToken": "rt-super-secret-prefix-value",
+                "accessToken": "at-super-secret-prefix-value",
+            }
+        )
+        cfg = {
+            "contribution_enabled": "1",
+            "contribution_mode": "custom",
+            "custom_contribution_url": "http://custom.local:5000",
+            "custom_contribution_token": "custom-token",
+        }
+        response = mock.Mock(status_code=200)
+        response.json.return_value = {"message": "queued"}
+        captured_stdout = StringIO()
+        captured_stderr = StringIO()
+
+        with mock.patch(
+            "core.config_store.config_store.get",
+            side_effect=_config_getter(cfg),
+        ), mock.patch(
+            "platforms.chatgpt.cpa_upload.generate_token_json",
+            return_value={"type": "codex", "email": account.email},
+        ), mock.patch(
+            "requests.post",
+            return_value=response,
+        ), mock.patch(
+            "services.external_sync.persist_cpa_sync_result",
+        ), redirect_stdout(captured_stdout), redirect_stderr(captured_stderr):
+            result = sync_account(account)
+
+        self.assertTrue(result[0]["ok"])
+        output = captured_stdout.getvalue() + captured_stderr.getvalue()
+        self.assertNotIn("rt-super-secret", output)
+        self.assertNotIn("at-super-secret", output)
+        self.assertNotIn("Final token_json keys", output)
 
     def test_contribution_disabled_keeps_existing_cpa_sync(self):
         account = DummyAccount()

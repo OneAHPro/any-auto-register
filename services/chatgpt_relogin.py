@@ -24,15 +24,14 @@ from services.chatgpt_account_state import (
     ChatGPTAccountDeactivatedError,
     account_is_visible_in_default_list,
 )
+from services.chatgpt_account_coordination import (
+    chatgpt_account_operation_lock,
+    codex2api_account_mutation_lock,
+)
 from services.external_sync import sync_codex2api_account
 
 
 LogFn = Callable[[str], None]
-_ACCOUNT_RELOGIN_LOCKS_GUARD = threading.Lock()
-_ACCOUNT_RELOGIN_LOCKS: dict[int | str, threading.Lock] = {}
-_CODEX2API_RELOGIN_SYNC_LOCK = threading.Lock()
-
-
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -1234,7 +1233,7 @@ def _relogin_chatgpt_account_locked(
 
     _emit_observer(log_fn, "正在按账号身份覆盖 Codex2API 旧凭据")
     try:
-        with _CODEX2API_RELOGIN_SYNC_LOCK:
+        with codex2api_account_mutation_lock():
             sync_result = sync_codex2api_account(
                 account,
                 force=True,
@@ -1428,7 +1427,7 @@ def _refresh_or_relogin_chatgpt_account_locked(
 
         _emit_observer(log_fn, "RT 刷新成功并已保存，正在覆盖 Codex2API 凭据")
         try:
-            with _CODEX2API_RELOGIN_SYNC_LOCK:
+            with codex2api_account_mutation_lock():
                 sync_result = sync_codex2api_account(
                     account,
                     force=True,
@@ -1517,36 +1516,25 @@ def refresh_or_relogin_chatgpt_account(
     attempt_id: int | None = None,
 ) -> dict[str, Any]:
     """Refresh first; run a full credential login only for explicit RT invalidation."""
-    try:
-        lock_key: int | str = int(account_id)
-    except (TypeError, ValueError):
-        lock_key = _text(account_id)
-    with _ACCOUNT_RELOGIN_LOCKS_GUARD:
-        account_lock = _ACCOUNT_RELOGIN_LOCKS.setdefault(
-            lock_key,
-            threading.Lock(),
-        )
-    if not account_lock.acquire(blocking=False):
-        return {
-            "ok": False,
-            "relogin_ok": False,
-            "refresh_ok": False,
-            "refresh_state": "transient_error",
-            "mode": "refresh_token",
-            "stage": "refresh_deferred",
-            "account_id": account_id,
-            "email": "",
-            "message": "认证维护失败: 该账号正在重登或刷新，请等待当前任务完成",
-        }
-    try:
+    with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
+        if not acquired:
+            return {
+                "ok": False,
+                "relogin_ok": False,
+                "refresh_ok": False,
+                "refresh_state": "transient_error",
+                "mode": "refresh_token",
+                "stage": "refresh_deferred",
+                "account_id": account_id,
+                "email": "",
+                "message": "认证维护失败: 该账号正在重登或刷新，请等待当前任务完成",
+            }
         return _refresh_or_relogin_chatgpt_account_locked(
             account_id,
             log_fn=log_fn,
             task_control=task_control,
             attempt_id=attempt_id,
         )
-    finally:
-        account_lock.release()
 
 
 def relogin_chatgpt_account(
@@ -1557,30 +1545,19 @@ def relogin_chatgpt_account(
     attempt_id: int | None = None,
 ) -> dict[str, Any]:
     """Run one account at a time so local and remote credentials cannot cross."""
-    try:
-        lock_key: int | str = int(account_id)
-    except (TypeError, ValueError):
-        lock_key = _text(account_id)
-    with _ACCOUNT_RELOGIN_LOCKS_GUARD:
-        account_lock = _ACCOUNT_RELOGIN_LOCKS.setdefault(
-            lock_key,
-            threading.Lock(),
-        )
-    if not account_lock.acquire(blocking=False):
-        return {
-            "ok": False,
-            "relogin_ok": False,
-            "stage": "relogin",
-            "account_id": account_id,
-            "email": "",
-            "message": "重登失败: 该账号正在重登并同步，请等待当前任务完成",
-        }
-    try:
+    with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
+        if not acquired:
+            return {
+                "ok": False,
+                "relogin_ok": False,
+                "stage": "relogin",
+                "account_id": account_id,
+                "email": "",
+                "message": "重登失败: 该账号正在重登并同步，请等待当前任务完成",
+            }
         return _relogin_chatgpt_account_locked(
             account_id,
             log_fn=log_fn,
             task_control=task_control,
             attempt_id=attempt_id,
         )
-    finally:
-        account_lock.release()
