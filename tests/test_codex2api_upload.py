@@ -1,6 +1,7 @@
 import base64
 import json
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -45,6 +46,35 @@ class Codex2APIUploadTests(unittest.TestCase):
             json.dumps(payload).encode("utf-8")
         ).decode("ascii").rstrip("=")
         return f"header.{encoded}.signature"
+
+    @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
+    @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")
+    def test_public_upload_entry_holds_shared_mutation_lock(self, post, get_config):
+        events = []
+
+        @contextmanager
+        def tracked_lock():
+            events.append("enter")
+            try:
+                yield
+            finally:
+                events.append("exit")
+
+        get_config.side_effect = self._configured
+
+        def upload(*_args, **_kwargs):
+            events.append("post")
+            return _Response({"success": 1, "failed": 0})
+
+        post.side_effect = upload
+        with mock.patch(
+            "platforms.chatgpt.codex2api_upload.codex2api_account_mutation_lock",
+            side_effect=tracked_lock,
+        ):
+            ok, _message = upload_to_codex2api(self._account())
+
+        self.assertTrue(ok)
+        self.assertEqual(events, ["enter", "post", "exit"])
 
     @mock.patch("platforms.chatgpt.codex2api_upload._get_config_value")
     @mock.patch("platforms.chatgpt.codex2api_upload.cffi_requests.post")

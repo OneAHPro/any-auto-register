@@ -725,12 +725,12 @@ def _confirm_identity_replacement(
     return True, f"远端账号已新增并验证通过（{credential_label}）"
 
 
-def upload_to_codex2api(
+def _upload_to_codex2api_locked(
     account,
     *,
     replace_existing: bool = False,
 ) -> tuple[bool, str]:
-    """Upload one account, optionally replacing credentials by OAuth identity."""
+    """Upload while the caller holds the shared remote-mutation lock."""
     api_url = _get_config_value("codex2api_api_url").rstrip("/")
     admin_key = _get_config_value("codex2api_admin_key")
     refresh_token = _text(getattr(account, "refresh_token", ""))
@@ -905,3 +905,16 @@ def upload_to_codex2api(
     if detail:
         return False, detail
     return False, "Codex2API 未确认账号已导入"
+
+
+def upload_to_codex2api(
+    account,
+    *,
+    replace_existing: bool = False,
+) -> tuple[bool, str]:
+    """Upload one account under the shared reentrant mutation lock."""
+    with codex2api_account_mutation_lock():
+        return _upload_to_codex2api_locked(
+            account,
+            replace_existing=replace_existing,
+        )
