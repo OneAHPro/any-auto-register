@@ -30,7 +30,8 @@ and is explicitly enabled on the current production server after deployment.
 ## Non-goals
 
 - Do not delete incomplete registration rows from Codex2API; those rows have not
-  completed the normal upload lifecycle.
+  completed the normal upload lifecycle and continue to use the existing
+  internal rollback path rather than the explicit account-removal service.
 - Do not use the CLIProxy `/v0/management/auth-files` protocol. Codex2API uses
   its own `/api/admin/accounts/{id}` resource.
 - Do not guess credential filenames from email addresses.
@@ -119,6 +120,18 @@ Automatic cleanup already holds the account re-login lock, so it uses the same
 service without reacquiring that lock. A stop checkpoint runs before the remote
 mutation and again before the local delete.
 
+Every explicit ChatGPT deletion uses remote resolution when the switch is on,
+including imported or legacy rows that currently contain only an Access Token.
+The absence of a local Refresh Token is not evidence that no remote credential
+exists. Internal rollback of a newly created, incomplete registration row keeps
+its current local-only path because it occurs before the normal upload lifecycle.
+
+Initial upload, credential replacement, and credential deletion all acquire the
+same process-wide reentrant Codex2API mutation lock. This prevents an in-flight
+upload from recreating a credential between remote deletion and the guarded
+local delete, while allowing replacement code to use its existing internal
+cleanup operation without self-deadlocking.
+
 ## Manual API behavior
 
 ### Single delete
@@ -169,6 +182,11 @@ processed = success + generic_failures + skipped + deleted_account_count
 removed or already absent. A removed account does not enter `errors`, so the
 task card renders `已删除账号 N` instead of `失败 N` for that result. Its per-account
 history status is `removed`, not `failed`.
+
+For automatic task cards, the summary endpoint derives the red account count
+as `max(relogin_failed_count - deleted_account_count, 0)`. This gives the
+operator's intended invariant: `失败` means an ordinary re-login failure, while
+confirmed bans/deactivations are displayed exactly once under `已删除账号`.
 
 The alert metric intentionally overlaps result categories:
 

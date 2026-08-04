@@ -43,6 +43,19 @@ Each summary item contains only:
 - `meta.alert_sent`
 - `meta.alert_reason`
 
+For ordinary tasks, `error_count` is the persisted error-array length. For an
+automatic authentication task it is the count of ordinary full-login failures
+that are not already represented by the independent deleted-account label:
+
+```text
+error_count = max(meta.relogin_failed_count - meta.deleted_account_count, 0)
+```
+
+This keeps the card's red `失败` number aligned with re-login failures while a
+confirmed ban/deactivation is shown only as `已删除账号`. Other operational
+details, such as a remote probe deferral or sync diagnostic, remain available
+in full task logs instead of changing the red account count.
+
 The summary query projects only the database columns needed to create those values. It must not load or return `logs_json`, full error text, `control_json`, `cashier_urls_json`, or unrelated metadata. Active tasks sort first, followed by terminal tasks newest first.
 
 `GET /api/tasks/{task_id}` and `GET /api/tasks/{task_id}/logs/stream` remain the full-detail paths used by the log drawer.
