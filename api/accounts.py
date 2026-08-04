@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import account_is_visible_in_default_list
+from services.chatgpt_account_removal import remove_account
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
@@ -230,30 +231,67 @@ def batch_delete_accounts(
     if len(body.ids) > 1000:
         raise HTTPException(400, "单次最多删除 1000 个账号")
     
-    deleted_count = 0
-    not_found_ids = []
-    
-    try:
-        for account_id in body.ids:
-            acc = session.get(AccountModel, account_id)
-            if acc:
-                session.delete(acc)
-                deleted_count += 1
-            else:
-                not_found_ids.append(account_id)
-        
-        session.commit()
-        logger.info(f"批量删除成功: {deleted_count} 个账号")
-        
-        return {
-            "deleted": deleted_count,
-            "not_found": not_found_ids,
-            "total_requested": len(body.ids)
-        }
-    except Exception as e:
-        session.rollback()
-        logger.exception("批量删除失败")
-        raise HTTPException(500, f"批量删除失败: {str(e)}")
+    unique_ids = list(dict.fromkeys(body.ids))
+    database_engine = session.get_bind()
+    items: list[dict] = []
+    for account_id in unique_ids:
+        try:
+            result = remove_account(
+                account_id,
+                database_engine=database_engine,
+            )
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "account_id": int(account_id),
+                "status": "database_error",
+                "local_deleted": False,
+                "codex2api": {"enabled": False, "status": "not_attempted"},
+                "error_code": "database_error",
+                "message": f"账号删除异常（{type(exc).__name__}）"[:200],
+            }
+        items.append(result)
+
+    successful = [item for item in items if bool(item.get("ok"))]
+    not_found_ids = [
+        int(item.get("account_id") or 0)
+        for item in items
+        if item.get("status") == "not_found"
+    ]
+    failed_count = sum(
+        1
+        for item in items
+        if not bool(item.get("ok")) and item.get("status") != "not_found"
+    )
+
+    def _remote_count(*statuses: str) -> int:
+        expected = set(statuses)
+        return sum(
+            1
+            for item in successful
+            if str((item.get("codex2api") or {}).get("status") or "") in expected
+        )
+
+    response = {
+        "total_requested": len(body.ids),
+        "total_unique": len(unique_ids),
+        "deleted": len(successful),
+        "failed": failed_count,
+        "not_found": not_found_ids,
+        "remote_deleted": _remote_count("deleted"),
+        "remote_already_absent": _remote_count("already_absent"),
+        "remote_skipped": _remote_count("skipped_disabled", "not_applicable"),
+        "items": items,
+    }
+    logger.info(
+        "批量删除完成: requested=%s unique=%s deleted=%s failed=%s not_found=%s",
+        response["total_requested"],
+        response["total_unique"],
+        response["deleted"],
+        response["failed"],
+        len(not_found_ids),
+    )
+    return response
 
 
 @router.post("/check-all")
@@ -293,12 +331,40 @@ def update_account(account_id: int, body: AccountUpdate,
 
 @router.delete("/{account_id}")
 def delete_account(account_id: int, session: Session = Depends(get_session)):
-    acc = session.get(AccountModel, account_id)
-    if not acc:
-        raise HTTPException(404, "账号不存在")
-    session.delete(acc)
-    session.commit()
-    return {"ok": True}
+    try:
+        result = remove_account(
+            account_id,
+            database_engine=session.get_bind(),
+        )
+    except Exception as exc:
+        result = {
+            "ok": False,
+            "account_id": int(account_id),
+            "status": "database_error",
+            "local_deleted": False,
+            "codex2api": {"enabled": False, "status": "not_attempted"},
+            "error_code": "database_error",
+            "message": f"账号删除异常（{type(exc).__name__}）"[:200],
+        }
+    if bool(result.get("ok")):
+        return result
+    status = str(result.get("status") or "")
+    status_code = (
+        404
+        if status == "not_found"
+        else 409
+        if status in {"busy", "local_delete_conflict"}
+        else 502
+        if status == "remote_failed"
+        else 500
+    )
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            **result,
+            "detail": str(result.get("message") or "删除失败")[:200],
+        },
+    )
 
 
 @router.post("/{account_id}/check")
