@@ -1,7 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
-from sqlalchemy import case, func
+from sqlalchemy import case, func, update
 from sqlmodel import Session, select
 from typing import Optional
 from copy import deepcopy
@@ -849,27 +849,54 @@ def _list_persisted_task_summaries() -> list[dict]:
 def _finalize_orphan_tasks() -> set[str]:
     finalized_ids: set[str] = set()
     with Session(engine) as s:
-        rows = s.exec(
-            select(TaskRunModel).where(TaskRunModel.status.in_(["pending", "running"]))
+        active_task_ids = s.exec(
+            select(TaskRunModel.id).where(
+                TaskRunModel.status.in_(["pending", "running"])
+            )
         ).all()
-        if not rows:
-            return finalized_ids
+    orphan_ids = [
+        str(task_id)
+        for task_id in active_task_ids
+        if not _task_store.exists(str(task_id))
+    ]
+    if not orphan_ids:
+        return finalized_ids
+
+    with Session(engine) as s:
+        rows = s.exec(
+            select(
+                TaskRunModel.id,
+                TaskRunModel.error,
+                TaskRunModel.logs_json,
+            )
+            .where(TaskRunModel.id.in_(orphan_ids))
+            .where(TaskRunModel.status.in_(["pending", "running"]))
+        ).all()
         changed = False
         for row in rows:
+            # A task can enter memory between the lightweight ID scan and the
+            # orphan update. Recheck immediately before changing persistence.
             if _task_store.exists(row.id):
                 continue
-            row.status = "stopped"
-            row.error = row.error or "任务因服务重启中断"
             logs = _json_loads(row.logs_json, [])
             tip = "[SYSTEM] 任务因服务重启中断，已自动标记为已停止"
             if tip not in logs:
                 ts = datetime.now().strftime("%H:%M:%S")
                 logs.append(f"[{ts}] {tip}")
-            row.logs_json = _json_dumps(logs, [])
-            row.updated_at = _utcnow()
-            s.add(row)
-            finalized_ids.add(str(row.id))
-            changed = True
+            result = s.exec(
+                update(TaskRunModel)
+                .where(TaskRunModel.id == row.id)
+                .where(TaskRunModel.status.in_(["pending", "running"]))
+                .values(
+                    status="stopped",
+                    error=row.error or "任务因服务重启中断",
+                    logs_json=_json_dumps(logs, []),
+                    updated_at=_utcnow(),
+                )
+            )
+            if result.rowcount:
+                finalized_ids.add(str(row.id))
+                changed = True
         if changed:
             s.commit()
     return finalized_ids

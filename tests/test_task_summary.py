@@ -25,13 +25,13 @@ def task_api(tmp_path):
     with (
         mock.patch.object(tasks, "engine", test_engine),
         mock.patch.object(
-            tasks,
-            "_finalize_orphan_tasks",
-            return_value=set(),
-        ) as finalize_orphans,
+            tasks._task_store,
+            "exists",
+            return_value=True,
+        ) as live_task_exists,
         TestClient(app) as client,
     ):
-        yield client, test_engine, finalize_orphans
+        yield client, test_engine, live_task_exists
 
     test_engine.dispose()
 
@@ -74,8 +74,9 @@ def _insert_task(
 
 
 def test_summary_contract_is_small_and_does_not_select_large_payload_columns(task_api):
-    client, engine, finalize_orphans = task_api
+    client, engine, live_task_exists = task_api
     secret = "ERROR_BODY_MUST_NOT_LEAVE_SQLITE"
+    active_secret = "ACTIVE_ERROR_BODY_MUST_NOT_LEAVE_SQLITE"
     created_at = datetime(2026, 8, 5, 1, 2, 3, tzinfo=timezone.utc)
     _insert_task(
         engine,
@@ -92,6 +93,14 @@ def test_summary_contract_is_small_and_does_not_select_large_payload_columns(tas
         errors_json=json.dumps([secret, "second error"]),
         logs_json=json.dumps(["L" * 250_000]),
     )
+    _insert_task(
+        engine,
+        "task-active-live",
+        status="running",
+        created_at=created_at + timedelta(minutes=1),
+        errors_json=json.dumps([active_secret] * 2_000),
+        logs_json=json.dumps(["ACTIVE_LOG_SECRET" + ("X" * 250_000)]),
+    )
 
     statements: list[str] = []
 
@@ -105,11 +114,29 @@ def test_summary_contract_is_small_and_does_not_select_large_payload_columns(tas
         event.remove(engine, "before_cursor_execute", capture_statement)
 
     assert response.status_code == 200
-    assert len(response.content) < 1_000
+    assert len(response.content) < 1_500
     assert secret not in response.text
+    assert active_secret not in response.text
+    assert "ACTIVE_LOG_SECRET" not in response.text
     assert "META_SECRET" not in response.text
     assert "TOP_LEVEL_SECRET" not in response.text
     assert response.json() == [
+        {
+            "id": "task-active-live",
+            "platform": "chatgpt",
+            "source": "manual",
+            "status": "running",
+            "total": 11,
+            "success": 7,
+            "registered": 10,
+            "skipped": 1,
+            "error_count": 2_000,
+            "created_at": (created_at + timedelta(minutes=1)).timestamp(),
+            "updated_at": (
+                created_at + timedelta(minutes=1, seconds=45)
+            ).timestamp(),
+            "meta": {},
+        },
         {
             "id": "task-contract",
             "platform": "chatgpt",
@@ -129,22 +156,31 @@ def test_summary_contract_is_small_and_does_not_select_large_payload_columns(tas
             },
         }
     ]
-    select_sql = "\n".join(
+    select_statements = [
         statement.lower()
         for statement in statements
         if statement.lstrip().lower().startswith("select")
-    )
+    ]
+    select_sql = "\n".join(select_statements)
+    assert len(select_statements) == 2
     assert "logs_json" not in select_sql
     assert "control_json" not in select_sql
     assert "cashier_urls_json" not in select_sql
     assert "task_runs.error," not in select_sql
     assert "json_array_length" in select_sql
     assert " as errors_json" not in select_sql
-    finalize_orphans.assert_called_once_with()
+    orphan_scan_sql = next(
+        statement
+        for statement in select_statements
+        if "where task_runs.status in" in statement
+    )
+    assert "select task_runs.id" in orphan_scan_sql
+    assert "json_array_length" not in orphan_scan_sql
+    live_task_exists.assert_called_once_with("task-active-live")
 
 
 def test_summary_uses_automatic_and_regular_error_count_rules(task_api):
-    client, engine, _finalize_orphans = task_api
+    client, engine, _live_task_exists = task_api
     now = datetime.now(timezone.utc)
     _insert_task(
         engine,
@@ -225,7 +261,7 @@ def test_summary_safely_normalizes_invalid_or_missing_json(
     errors_json,
     meta_json,
 ):
-    client, engine, _finalize_orphans = task_api
+    client, engine, _live_task_exists = task_api
     _insert_task(
         engine,
         "task-invalid",
@@ -251,7 +287,7 @@ def test_summary_safely_normalizes_invalid_or_missing_json(
 
 
 def test_summary_orders_active_statuses_then_all_terminal_tasks_by_recency(task_api):
-    client, engine, _finalize_orphans = task_api
+    client, engine, _live_task_exists = task_api
     base = datetime(2026, 8, 5, 1, 0, tzinfo=timezone.utc)
     fixtures = [
         ("terminal-old-done", "done", 1),
@@ -285,7 +321,7 @@ def test_summary_orders_active_statuses_then_all_terminal_tasks_by_recency(task_
 
 
 def test_static_summary_route_does_not_break_full_legacy_tasks_response(task_api):
-    client, engine, _finalize_orphans = task_api
+    client, engine, _live_task_exists = task_api
     _insert_task(
         engine,
         "task-legacy",
@@ -295,6 +331,7 @@ def test_static_summary_route_does_not_break_full_legacy_tasks_response(task_api
 
     summary_response = client.get("/tasks/summary")
     legacy_response = client.get("/tasks")
+    detail_response = client.get("/tasks/task-legacy")
 
     assert summary_response.status_code == 200
     assert summary_response.json()[0]["id"] == "task-legacy"
@@ -302,3 +339,7 @@ def test_static_summary_route_does_not_break_full_legacy_tasks_response(task_api
     assert legacy_response.json()[0]["id"] == "task-legacy"
     assert legacy_response.json()[0]["errors"] == ["legacy error"]
     assert legacy_response.json()[0]["logs"] == ["legacy log"]
+    assert detail_response.status_code == 200
+    assert detail_response.json()["id"] == "task-legacy"
+    assert detail_response.json()["errors"] == ["legacy error"]
+    assert detail_response.json()["logs"] == ["legacy log"]
