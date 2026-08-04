@@ -84,7 +84,7 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(threshold.value).toBe('20')
     expect(threshold.getAttribute('aria-valuemin')).toBe('1')
     expect(threshold.getAttribute('aria-valuemax')).toBe('10000')
-    expect(screen.getByText(/鉴权失败数仅展示，不触发告警/)).toBeTruthy()
+    expect(screen.getByText('每轮自动鉴权完成后，重登失败账号数达到或超过此值时发送一封提醒；鉴权失败数仅展示，不触发告警。')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()
