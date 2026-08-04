@@ -204,7 +204,7 @@ class SmsPoolServiceTests(unittest.TestCase):
 
             self.assertEqual(sorted(outcomes), ["exhausted", "reserved"])
 
-    def test_api_import_and_list_never_return_full_card_secrets(self):
+    def test_api_list_returns_full_card_code_and_legacy_hint(self):
         with (
             mock.patch("api.sms_pool.engine", self.engine),
             mock.patch("api.sms_pool.sms_pool_service", self.pool),
@@ -220,9 +220,9 @@ class SmsPoolServiceTests(unittest.TestCase):
 
         self.assertEqual(imported["imported"], 1)
         self.assertEqual(stats["unused"], 1)
-        serialized = str(response)
-        self.assertNotIn("bei-sms-API-SECRET-0001", serialized)
-        self.assertIn("bei-****-0001", serialized)
+        self.assertEqual(len(response["items"]), 1)
+        self.assertEqual(response["items"][0]["code"], "bei-sms-API-SECRET-0001")
+        self.assertEqual(response["items"][0]["code_hint"], "bei-****-0001")
 
     def test_recovery_releases_reservations_left_by_an_interrupted_process(self):
         self.pool.import_text(

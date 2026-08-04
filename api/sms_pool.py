@@ -19,6 +19,7 @@ class SmsPoolImportRequest(BaseModel):
 def _serialize_item(row: SmsPoolItemModel) -> dict:
     return {
         "id": row.id,
+        "code": row.code,
         "code_hint": mask_sms_code(row.code),
         "base_url": row.base_url,
         "status": row.status,
