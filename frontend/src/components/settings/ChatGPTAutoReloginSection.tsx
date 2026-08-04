@@ -149,11 +149,11 @@ export default function ChatGPTAutoReloginSection() {
       <Divider orientation="left">邮件告警</Divider>
       <Form.Item
         name="chatgpt_auto_relogin_alert_threshold"
-        label="邮件告警阈值（账号数）"
-        initialValue={5}
-        extra="Codex2API 鉴权失效数或完整重登失败数达到此值时，每轮最多发送一封。"
+        label="重登失败告警阈值（账号数）"
+        initialValue={20}
+        extra="每轮自动鉴权完成后，重登失败账号数达到或超过此值时发送一封提醒；鉴权失败数仅展示，不触发告警。"
       >
-        <InputNumber aria-label="邮件告警阈值（账号数）" min={1} max={10000} precision={0} style={{ width: '100%' }} />
+        <InputNumber aria-label="重登失败告警阈值（账号数）" min={1} max={10000} precision={0} style={{ width: '100%' }} />
       </Form.Item>
       <Form.Item name="smtp_host" label="SMTP 服务器地址">
         <Input aria-label="SMTP 服务器地址" placeholder="smtp.example.com" />

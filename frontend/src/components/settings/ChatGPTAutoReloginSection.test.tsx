@@ -74,14 +74,17 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(screen.getByRole('switch', { name: '启用 ChatGPT 自动重登' }).getAttribute('aria-checked')).toBe('false')
     const interval = screen.getByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
-    const threshold = screen.getByRole('spinbutton', { name: '邮件告警阈值（账号数）' }) as HTMLInputElement
+    const threshold = screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement
     expect(interval.value).toBe('2')
     expect(interval.getAttribute('aria-valuemin')).toBe('2')
     expect(interval.getAttribute('aria-valuemax')).toBe('1440')
     expect(concurrency.value).toBe('10')
     expect(concurrency.getAttribute('aria-valuemin')).toBe('1')
     expect(concurrency.getAttribute('aria-valuemax')).toBe('10')
-    expect(threshold.value).toBe('5')
+    expect(threshold.value).toBe('20')
+    expect(threshold.getAttribute('aria-valuemin')).toBe('1')
+    expect(threshold.getAttribute('aria-valuemax')).toBe('10000')
+    expect(screen.getByText(/鉴权失败数仅展示，不触发告警/)).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()

@@ -1881,7 +1881,7 @@ export default function Settings() {
       )
       data.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_alert_threshold,
-        5,
+        20,
         1,
         10000,
       )
@@ -1991,7 +1991,7 @@ export default function Settings() {
       )
       values.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_alert_threshold,
-        5,
+        20,
         1,
         10000,
       )
