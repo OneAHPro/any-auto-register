@@ -85,6 +85,18 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert store.writes == []
 
 
+def test_public_config_preserves_saved_relogin_alert_threshold_without_writes(monkeypatch):
+    from api import config as config_api
+
+    store = FakeConfigStore({"chatgpt_auto_relogin_alert_threshold": "5"})
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    response = config_api.get_config()
+
+    assert response["chatgpt_auto_relogin_alert_threshold"] == "5"
+    assert store.writes == []
+
+
 def test_public_config_never_returns_or_clears_saved_smtp_password(monkeypatch):
     from api import config as config_api
 
@@ -236,6 +248,22 @@ def test_public_config_put_rejects_invalid_auto_relogin_numbers(
         config_api.update_config(config_api.ConfigUpdate(data={key: value}))
 
     assert error.value.status_code == 400
+    assert store.writes == []
+
+
+def test_public_config_put_reports_relogin_alert_threshold_bounds(monkeypatch):
+    from api import config as config_api
+
+    store = FakeConfigStore()
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    with pytest.raises(HTTPException) as error:
+        config_api.update_config(
+            config_api.ConfigUpdate(data={"chatgpt_auto_relogin_alert_threshold": 0})
+        )
+
+    assert error.value.status_code == 400
+    assert error.value.detail == "重登失败告警阈值必须在 1 到 10000 之间"
     assert store.writes == []
 
 
