@@ -348,6 +348,8 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     assert "2026-08-04 20:34:56（北京时间）" in plain
     assert "<script>" not in html
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in html
+    assert "本轮自动鉴权已完成，重登失败账号数已达到告警阈值。" in html
+    assert "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。" in html
     assert html.count('width="25%"') == 4
     assert "@media only screen and (max-width: 600px)" in html
     assert "smtp-test-credential" not in plain

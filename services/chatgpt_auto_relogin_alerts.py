@@ -130,6 +130,7 @@ def _build_message(
     <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center">
       <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="max-width:640px; width:100%;">
         <tr><td style="padding:24px 20px 12px;"><h2 style="margin:0;">ChatGPT 重登失败账号告警</h2></td></tr>
+        <tr><td style="padding:0 20px 20px;">本轮自动鉴权已完成，重登失败账号数已达到告警阈值。</td></tr>
         <tr><td style="padding:0 20px 20px;">任务 ID：{escaped_task_id}</td></tr>
         <tr><td style="padding:0 20px 20px;">
           <table role="presentation" width="100%" cellspacing="4" cellpadding="0" border="0"><tr>
@@ -142,6 +143,7 @@ def _build_message(
         <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
         <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
         <tr><td style="padding:0 20px 24px;">鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。</td></tr>
+        <tr><td style="padding:0 20px 24px;">请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。</td></tr>
       </table>
     </td></tr></table>
   </body>
