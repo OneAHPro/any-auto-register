@@ -107,6 +107,7 @@ CONFIG_KEYS = [
     "codex2api_enabled",
     "codex2api_api_url",
     "codex2api_admin_key",
+    "codex2api_delete_on_account_remove_enabled",
     "team_manager_url",
     "team_manager_key",
     "codex_proxy_url",
@@ -198,6 +199,10 @@ def get_config():
         all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
     if not str(all_cfg.get("chatgpt_auto_relogin_alert_threshold", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_alert_threshold"] = "20"
+    if not str(
+        all_cfg.get("codex2api_delete_on_account_remove_enabled", "") or ""
+    ).strip():
+        all_cfg["codex2api_delete_on_account_remove_enabled"] = "0"
     if not str(all_cfg.get("smtp_port", "") or "").strip():
         all_cfg["smtp_port"] = "587"
     if not str(all_cfg.get("smtp_use_ssl", "") or "").strip():
@@ -234,7 +239,11 @@ def update_config(body: ConfigUpdate):
         safe["chatgpt_auto_relogin_enabled"] = (
             "1" if enabled in {"1", "true", "yes", "on"} else "0"
         )
-    for bool_key in ("smtp_use_ssl", "smtp_force_auth_login"):
+    for bool_key in (
+        "codex2api_delete_on_account_remove_enabled",
+        "smtp_use_ssl",
+        "smtp_force_auth_login",
+    ):
         if bool_key in safe:
             enabled = str(safe.get(bool_key, "")).strip().lower()
             safe[bool_key] = "1" if enabled in {"1", "true", "yes", "on"} else "0"

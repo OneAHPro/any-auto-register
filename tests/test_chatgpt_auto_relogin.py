@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 
 PUBLIC_KEYS = {
+    "codex2api_delete_on_account_remove_enabled",
     "chatgpt_auto_relogin_enabled",
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
@@ -76,6 +77,7 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     response = config_api.get_config()
 
     assert PUBLIC_KEYS.issubset(config_api.CONFIG_KEYS)
+    assert response["codex2api_delete_on_account_remove_enabled"] == "0"
     assert response["chatgpt_auto_relogin_enabled"] == "0"
     assert response["chatgpt_auto_relogin_interval_minutes"] == "2"
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
@@ -83,6 +85,42 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert response["smtp_port"] == "587"
     assert response["smtp_use_ssl"] == "1"
     assert store.writes == []
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected"),
+    [
+        (True, "1"),
+        (" YES ", "1"),
+        ("On", "1"),
+        (False, "0"),
+        ("unexpected", "0"),
+    ],
+)
+def test_codex2api_account_removal_link_normalizes_independently(
+    monkeypatch,
+    submitted,
+    expected,
+):
+    from api import config as config_api
+
+    store = FakeConfigStore({"codex2api_enabled": "0"})
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    result = config_api.update_config(
+        config_api.ConfigUpdate(
+            data={"codex2api_delete_on_account_remove_enabled": submitted}
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "updated": ["codex2api_delete_on_account_remove_enabled"],
+    }
+    assert store.writes == [
+        {"codex2api_delete_on_account_remove_enabled": expected}
+    ]
+    assert store.values["codex2api_enabled"] == "0"
 
 
 def test_public_config_preserves_saved_relogin_alert_threshold_without_writes(monkeypatch):

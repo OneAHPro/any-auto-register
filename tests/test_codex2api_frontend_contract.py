@@ -13,6 +13,7 @@ class Codex2APIFrontendContractTests(unittest.TestCase):
             "codex2api_enabled",
             "codex2api_api_url",
             "codex2api_admin_key",
+            "codex2api_delete_on_account_remove_enabled",
         }
         self.assertTrue(expected_keys.issubset(CONFIG_KEYS))
 
