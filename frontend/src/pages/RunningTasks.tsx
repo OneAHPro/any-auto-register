@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import {
   Badge,
   Button,
@@ -31,18 +31,17 @@ interface TaskSnapshot {
   source: string
   status: 'pending' | 'running' | 'done' | 'failed' | 'stopped'
   total: number
-  progress: string
   success: number
   registered: number
   skipped: number
-  errors: string[]
+  error_count: number
   created_at: number | string | null
   updated_at: number | string | null
-  control: { stop_requested: boolean }
   meta?: {
     automation?: boolean
     invalid_rt_count?: number
     relogin_failed_count?: number
+    deleted_account_count?: number
     alert_sent?: boolean
     alert_reason?: string
   }
@@ -106,36 +105,44 @@ export default function RunningTasks() {
   const [loading, setLoading] = useState(false)
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now() / 1000)
+  const requestInFlightRef = useRef(false)
+  const mountedRef = useRef(false)
 
   const load = useCallback(async () => {
-    setLoading(true)
+    if (requestInFlightRef.current) return
+    requestInFlightRef.current = true
+    if (mountedRef.current) setLoading(true)
     try {
-      const data = (await apiFetch('/tasks')) as TaskSnapshot[]
+      const data = (await apiFetch('/tasks/summary')) as TaskSnapshot[]
       // sort: running first, then pending, then finished (newest first)
-      const order = { running: 0, pending: 1, done: 2, failed: 3, stopped: 4 }
       const sorted = [...(data || [])].sort((a, b) => {
-        const oa = order[a.status] ?? 9
-        const ob = order[b.status] ?? 9
+        const oa = a.status === 'running' ? 0 : a.status === 'pending' ? 1 : 2
+        const ob = b.status === 'running' ? 0 : b.status === 'pending' ? 1 : 2
         if (oa !== ob) return oa - ob
         const ta = toUnixSeconds(a.created_at) ?? 0
         const tb = toUnixSeconds(b.created_at) ?? 0
         return tb - ta
       })
-      setTasks(sorted)
+      if (mountedRef.current) setTasks(sorted)
+    } catch {
+      // Keep the last successful snapshot; the next poll can recover.
     } finally {
-      setLoading(false)
+      requestInFlightRef.current = false
+      if (mountedRef.current) setLoading(false)
     }
   }, [])
 
   useEffect(() => {
-    load()
+    mountedRef.current = true
+    void load()
     const poll = setInterval(() => {
-      load()
+      void load()
       setNow(Date.now() / 1000)
     }, 2500)
     // tick every second for live duration
     const tick = setInterval(() => setNow(Date.now() / 1000), 1000)
     return () => {
+      mountedRef.current = false
       clearInterval(poll)
       clearInterval(tick)
     }
@@ -159,7 +166,7 @@ export default function RunningTasks() {
 
   const renderTask = (task: TaskSnapshot) => {
     const cfg = STATUS_CONFIG[task.status] || { color: 'default', label: task.status }
-    const failed = task.errors?.length ?? 0
+    const failed = Math.max(0, Math.floor(Number(task.error_count) || 0))
     const totalRaw = Number(task.total)
     const doneRaw = Number(task.registered)
     const success = Number.isFinite(Number(task.success)) ? Number(task.success) : 0
@@ -170,6 +177,7 @@ export default function RunningTasks() {
     const isAutomaticAuthentication = Boolean(task.meta?.automation)
     const invalidRtCount = Math.max(0, Number(task.meta?.invalid_rt_count) || 0)
     const reloginFailedCount = Math.max(0, Number(task.meta?.relogin_failed_count) || 0)
+    const deletedAccountCount = Math.max(0, Number(task.meta?.deleted_account_count) || 0)
 
     const duration = isActive(task)
       ? formatDuration(task.created_at, now)
@@ -252,6 +260,9 @@ export default function RunningTasks() {
                     </Tag>
                     <Tag color={reloginFailedCount > 0 ? 'error' : 'default'} style={{ margin: 0 }}>
                       重登失败 {reloginFailedCount}
+                    </Tag>
+                    <Tag color={deletedAccountCount > 0 ? 'warning' : 'default'} style={{ margin: 0 }}>
+                      已删除账号 {deletedAccountCount}
                     </Tag>
                     {task.meta?.alert_sent ? (
                       <Tag color="processing" style={{ margin: 0 }}>邮件已提醒</Tag>

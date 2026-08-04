@@ -1,6 +1,7 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictInt
+from sqlalchemy import case, func
 from sqlmodel import Session, select
 from typing import Optional
 from copy import deepcopy
@@ -45,6 +46,14 @@ CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS = 45.0
 MAX_PERSISTED_TASK_LOG_ENTRIES = 500
 MAX_PERSISTED_TASK_LOG_BYTES = 256 * 1024
 TASK_SNAPSHOT_PERSIST_INTERVAL_SECONDS = 1.0
+TASK_SUMMARY_META_KEYS = (
+    "automation",
+    "invalid_rt_count",
+    "relogin_failed_count",
+    "deleted_account_count",
+    "alert_sent",
+    "alert_reason",
+)
 _CHATGPT_LEADBEE_SECRET_KEYS = {
     CHATGPT_LEADBEE_CODES_KEY,
     CHATGPT_LEADBEE_BASE_URLS_KEY,
@@ -743,6 +752,98 @@ def _list_persisted_tasks() -> list[dict]:
         )
     )
     return snapshots
+
+
+def _nonnegative_int(value) -> int:
+    if isinstance(value, bool):
+        return 0
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return max(parsed, 0)
+
+
+def _task_summary_meta(value) -> dict:
+    meta = _json_loads(value, {})
+    if not isinstance(meta, dict):
+        return {}
+    return {
+        key: meta[key]
+        for key in TASK_SUMMARY_META_KEYS
+        if key in meta
+    }
+
+
+def _list_persisted_task_summaries() -> list[dict]:
+    persisted_error_count = case(
+        (
+            func.json_valid(TaskRunModel.errors_json) == 1,
+            case(
+                (
+                    func.json_type(TaskRunModel.errors_json) == "array",
+                    func.coalesce(
+                        func.json_array_length(TaskRunModel.errors_json),
+                        0,
+                    ),
+                ),
+                else_=0,
+            ),
+        ),
+        else_=0,
+    ).label("error_count")
+    status_order = case(
+        (TaskRunModel.status == "running", 0),
+        (TaskRunModel.status == "pending", 1),
+        else_=2,
+    )
+    statement = (
+        select(
+            TaskRunModel.id,
+            TaskRunModel.platform,
+            TaskRunModel.source,
+            TaskRunModel.status,
+            TaskRunModel.total,
+            TaskRunModel.success,
+            TaskRunModel.registered,
+            TaskRunModel.skipped,
+            TaskRunModel.created_at,
+            TaskRunModel.updated_at,
+            TaskRunModel.meta_json,
+            persisted_error_count,
+        )
+        .order_by(status_order.asc(), TaskRunModel.created_at.desc())
+    )
+    with Session(engine) as session:
+        rows = session.exec(statement).all()
+
+    summaries: list[dict] = []
+    for row in rows:
+        meta = _task_summary_meta(row.meta_json)
+        error_count = _nonnegative_int(row.error_count)
+        if _is_truthy(meta.get("automation")):
+            error_count = max(
+                _nonnegative_int(meta.get("relogin_failed_count"))
+                - _nonnegative_int(meta.get("deleted_account_count")),
+                0,
+            )
+        summaries.append(
+            {
+                "id": str(row.id),
+                "platform": str(row.platform or ""),
+                "source": str(row.source or "manual"),
+                "status": str(row.status or "pending"),
+                "total": _nonnegative_int(row.total),
+                "success": _nonnegative_int(row.success),
+                "registered": _nonnegative_int(row.registered),
+                "skipped": _nonnegative_int(row.skipped),
+                "error_count": error_count,
+                "created_at": _to_epoch_seconds(row.created_at),
+                "updated_at": _to_epoch_seconds(row.updated_at),
+                "meta": meta,
+            }
+        )
+    return summaries
 
 
 def _finalize_orphan_tasks() -> set[str]:
@@ -3938,6 +4039,12 @@ async def stream_logs(task_id: str, since: int = 0):
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@router.get("/summary")
+def list_task_summaries():
+    _finalize_orphan_tasks()
+    return _list_persisted_task_summaries()
 
 
 @router.get("/{task_id}")
