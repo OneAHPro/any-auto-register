@@ -229,24 +229,28 @@ def _credential_cleanup_candidates(
     *,
     email: str,
     local_aliases: set[str],
-) -> list[dict[str, Any]]:
+) -> tuple[bool, list[dict[str, Any]]]:
     exact = [
         row
         for row in _matching_remote_rows(rows, email=email)
         if _remote_row_id(row) > 0
     ]
-    if not local_aliases:
-        return exact
+    if not exact:
+        return False, []
 
-    identity_matches = [
-        row
-        for row in exact
-        if _identity_aliases(row)
-        and not local_aliases.isdisjoint(_identity_aliases(row))
-    ]
-    if identity_matches:
-        return identity_matches
-    return [row for row in exact if not _identity_aliases(row)]
+    remote_aliases = [(row, _identity_aliases(row)) for row in exact]
+    if local_aliases:
+        identity_matches = [
+            row
+            for row, aliases in remote_aliases
+            if aliases and not local_aliases.isdisjoint(aliases)
+        ]
+        if identity_matches:
+            return True, identity_matches
+
+    if len(remote_aliases) == 1 and not remote_aliases[0][1]:
+        return True, [remote_aliases[0][0]]
+    return True, []
 
 
 def delete_codex2api_credential(
@@ -306,12 +310,12 @@ def delete_codex2api_credential(
                 message="Codex2API 账号清单格式无法识别",
             )
         rows = [row for row in raw_accounts if isinstance(row, dict)]
-        candidates = _credential_cleanup_candidates(
+        exact_email_found, candidates = _credential_cleanup_candidates(
             rows,
             email=normalized_email,
             local_aliases=_identity_aliases(identity),
         )
-        if not candidates:
+        if not exact_email_found:
             return _cleanup_result("already_absent")
         if len(candidates) != 1:
             return _cleanup_result(

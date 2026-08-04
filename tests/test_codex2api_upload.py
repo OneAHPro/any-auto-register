@@ -1140,6 +1140,68 @@ class Codex2APICredentialDeletionTests(unittest.TestCase):
         self.assertEqual(result["remote_id"], 11)
         delete.assert_called_once()
 
+    def test_local_identity_does_not_fall_back_to_legacy_among_mismatches(self):
+        result, _get, delete = self._delete(
+            [
+                {
+                    "id": 14,
+                    "email": "demo@example.com",
+                    "workspace_id": "workspace-remote-secret",
+                },
+                {"id": 15, "email": "demo@example.com"},
+            ],
+            identity={"workspace_id": "workspace-local-secret"},
+        )
+
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertIsNone(result["remote_id"])
+        serialized = json.dumps(result, ensure_ascii=False)
+        self.assertNotIn("workspace-remote-secret", serialized)
+        self.assertNotIn("workspace-local-secret", serialized)
+        delete.assert_not_called()
+
+    def test_email_only_cleanup_rejects_unique_identityful_remote_row(self):
+        result, _get, delete = self._delete(
+            [
+                {
+                    "id": 16,
+                    "email": "demo@example.com",
+                    "workspace_id": "workspace-remote-secret",
+                }
+            ],
+            identity=None,
+        )
+
+        self.assertEqual(result["status"], "ambiguous")
+        self.assertIsNone(result["remote_id"])
+        self.assertNotIn(
+            "workspace-remote-secret",
+            json.dumps(result, ensure_ascii=False),
+        )
+        delete.assert_not_called()
+
+    def test_unique_identity_match_wins_over_mismatch_and_legacy_rows(self):
+        result, _get, delete = self._delete(
+            [
+                {
+                    "id": 17,
+                    "email": "demo@example.com",
+                    "workspace_id": "workspace-match",
+                },
+                {
+                    "id": 18,
+                    "email": "demo@example.com",
+                    "workspace_id": "workspace-mismatch",
+                },
+                {"id": 19, "email": "demo@example.com"},
+            ],
+            identity={"workspace_id": "workspace-match"},
+        )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["remote_id"], 17)
+        self.assertTrue(delete.call_args.args[0].endswith("/api/admin/accounts/17"))
+
     def test_identity_can_match_access_jwt_auth_namespace(self):
         token = self._jwt(
             {
