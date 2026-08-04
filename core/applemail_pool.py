@@ -171,6 +171,32 @@ def _looks_like_http_url(value: Any) -> bool:
         return False
 
 
+def _looks_like_mail_message_url(value: Any) -> bool:
+    if not _looks_like_http_url(value):
+        return False
+    parsed = urlsplit(str(value).strip())
+    return "messages" in (
+        segment.lower() for segment in parsed.path.split("/") if segment
+    )
+
+
+def _looks_like_direct_totp_url(value: Any) -> bool:
+    if not _looks_like_http_url(value):
+        return False
+    parsed = urlsplit(str(value).strip())
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    return bool(
+        len(segments) == 1
+        and re.fullmatch(r"[A-Z2-7]{16,128}", segments[0].upper())
+    )
+
+
+def _resolve_url_credential_roles(third: str, fourth: str) -> tuple[str, str]:
+    if _looks_like_direct_totp_url(third) and _looks_like_mail_message_url(fourth):
+        return fourth, third
+    return third, fourth
+
+
 def _is_password_reset_marker(value: Any) -> bool:
     text = str(value or "").strip().lower()
     return any(marker in text for marker in ("忘记密码", "忘記密碼", "forgot password"))
@@ -368,20 +394,21 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
         }
     if len(values) >= 4:
         email, password, third, fourth = values[:4]
-        if _is_password_reset_marker(password) and _looks_like_http_url(third):
+        mail_api_url, totp_url = _resolve_url_credential_roles(third, fourth)
+        if _is_password_reset_marker(password) and _looks_like_http_url(mail_api_url):
             return _normalize_url_credential(
                 email=email,
                 password="",
-                mail_api_url=third,
-                totp_url=fourth,
+                mail_api_url=mail_api_url,
+                totp_url=totp_url,
                 account_type="chatgpt_password_reset_url_mail",
             )
-        if _looks_like_http_url(third) or _looks_like_http_url(fourth):
+        if _looks_like_http_url(mail_api_url) or _looks_like_http_url(totp_url):
             return _normalize_url_credential(
                 email=email,
                 password=password,
-                mail_api_url=third,
-                totp_url=fourth,
+                mail_api_url=mail_api_url,
+                totp_url=totp_url,
                 account_type="chatgpt_password_url_otp",
             )
         client_id, refresh_token = third, fourth

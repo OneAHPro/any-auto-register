@@ -3,10 +3,13 @@ import multiprocessing
 import tempfile
 import threading
 import time
+import traceback
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
+
+import requests
 
 from core.applemail_pool import (
     load_applemail_pool_records,
@@ -824,6 +827,59 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
         self.assertEqual(records[0]["pool_state"], "used")
         self.assertFalse(records[0]["enabled"])
 
+    def test_parses_merchant_totp_then_mail_url_order(self):
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        mail_api_url = (
+            "https://mail.example.test/messages/MAIL_CREDENTIAL/"
+            "user%40example.com"
+        )
+
+        records = parse_applemail_pool_content(
+            f"user@example.com----password----{totp_url}----{mail_api_url}"
+        )
+
+        self.assertEqual(records[0]["mail_api_url"], mail_api_url)
+        self.assertEqual(records[0]["totp_url"], totp_url)
+
+    def test_parses_merchant_mixed_case_mail_message_path(self):
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        mail_api_url = (
+            "https://mail.example.test/Messages/MAIL_CREDENTIAL/"
+            "user%40example.com"
+        )
+
+        records = parse_applemail_pool_content(
+            f"user@example.com----password----{totp_url}----{mail_api_url}"
+        )
+
+        self.assertEqual(records[0]["mail_api_url"], mail_api_url)
+        self.assertEqual(records[0]["totp_url"], totp_url)
+
+    def test_preserves_current_mail_then_direct_totp_url_order(self):
+        mail_api_url = (
+            "https://mail.example.test/messages/MAIL_CREDENTIAL/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+
+        records = parse_applemail_pool_content(
+            f"user@example.com----password----{mail_api_url}----{totp_url}"
+        )
+
+        self.assertEqual(records[0]["mail_api_url"], mail_api_url)
+        self.assertEqual(records[0]["totp_url"], totp_url)
+
+    def test_preserves_ambiguous_legacy_four_field_url_order(self):
+        mail_api_url = "https://mail.example.test/mail?token=MAIL_SECRET"
+        totp_url = "https://totp.example.test/view?token=TOTP_SECRET"
+
+        records = parse_applemail_pool_content(
+            f"user@example.com----password----{mail_api_url}----{totp_url}"
+        )
+
+        self.assertEqual(records[0]["mail_api_url"], mail_api_url)
+        self.assertEqual(records[0]["totp_url"], totp_url)
+
     def test_chatgpt_login_credentials_never_initialize_icloud_client(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
@@ -857,6 +913,182 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 Path(tmp_dir, "chatgpt_mfa.json").stat().st_mode & 0o777,
                 0o600,
             )
+
+    def test_remote_totp_accepts_exact_plaintext_code_without_rewriting_url(self):
+        mail_url = (
+            "https://mail.example.test/messages/MAIL_SECRET/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"user@example.com----password----{mail_url}----{totp_url}",
+                pool_dir=tmp_dir,
+                filename="plaintext-totp.json",
+            )
+            logs = []
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="plaintext-totp.json",
+            )
+            mailbox._log_fn = logs.append
+            account = mailbox.get_email()
+            response = mock.Mock(status_code=200, text="654321\n")
+
+            with mock.patch("requests.get", return_value=response) as request_get:
+                code = mailbox.get_totp_code(account)
+
+            self.assertEqual(code, "654321")
+            self.assertEqual(request_get.call_args.args[0], totp_url)
+            response.json.assert_not_called()
+            rendered_logs = "\n".join(logs)
+            self.assertNotIn("JBSWY3DPEHPK3PXP", rendered_logs)
+            self.assertNotIn("654321", rendered_logs)
+
+    def test_remote_totp_rejects_html_containing_six_digits(self):
+        mail_url = (
+            "https://mail.example.test/messages/MAIL_SECRET/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"user@example.com----password----{mail_url}----{totp_url}",
+                pool_dir=tmp_dir,
+                filename="html-totp.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="html-totp.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(
+                status_code=200,
+                text="<html>code 654321</html>",
+            )
+            response.json.side_effect = ValueError
+
+            with mock.patch("requests.get", return_value=response):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "远程 2FA 获取失败",
+                ) as ctx:
+                    mailbox.get_totp_code(account)
+
+            self.assertNotIn("JBSWY3DPEHPK3PXP", str(ctx.exception))
+            self.assertNotIn("654321", str(ctx.exception))
+
+    def test_remote_totp_rejects_non_ascii_digits(self):
+        mail_url = (
+            "https://mail.example.test/messages/MAIL_SECRET/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"user@example.com----password----{mail_url}----{totp_url}",
+                pool_dir=tmp_dir,
+                filename="non-ascii-totp.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="non-ascii-totp.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(status_code=200, text="１２３４５６")
+            response.json.side_effect = ValueError
+
+            with mock.patch("requests.get", return_value=response):
+                with self.assertRaisesRegex(RuntimeError, "远程 2FA 获取失败"):
+                    mailbox.get_totp_code(account)
+
+    def test_remote_totp_timeout_traceback_is_redacted(self):
+        mail_url = (
+            "https://mail.example.test/messages/MAIL_SECRET/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"user@example.com----password----{mail_url}----{totp_url}",
+                pool_dir=tmp_dir,
+                filename="timeout-totp.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="timeout-totp.json",
+            )
+            account = mailbox.get_email()
+            timeout = requests.exceptions.Timeout(f"timeout for {totp_url}")
+
+            with mock.patch("requests.get", side_effect=timeout):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "远程 2FA 获取失败",
+                ) as ctx:
+                    mailbox.get_totp_code(account)
+
+            rendered_traceback = "".join(traceback.format_exception(
+                type(ctx.exception),
+                ctx.exception,
+                ctx.exception.__traceback__,
+            ))
+            self.assertNotIn(totp_url, rendered_traceback)
+            self.assertNotIn("JBSWY3DPEHPK3PXP", rendered_traceback)
+
+    def test_remote_totp_runtime_fallback_supports_reversed_opaque_urls(self):
+        mail_url = (
+            "https://mail.example.test/messages/MAIL_SECRET/"
+            "user%40example.com"
+        )
+        totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps({
+                    "email": "user@example.com",
+                    "password": "password",
+                    "mail_api_url": totp_url,
+                    "totp_url": mail_url,
+                    "account_type": "chatgpt_password_url_otp",
+                }),
+                pool_dir=tmp_dir,
+                filename="reversed-opaque-totp.json",
+            )
+            logs = []
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="reversed-opaque-totp.json",
+            )
+            mailbox._log_fn = logs.append
+            account = mailbox.get_email()
+            mail_response = mock.Mock(
+                status_code=200,
+                text="<html>mail response</html>",
+            )
+            mail_response.json.side_effect = ValueError
+            totp_response = mock.Mock(status_code=200, text="654321\n")
+            totp_response.json.side_effect = ValueError
+
+            with mock.patch(
+                "requests.get",
+                side_effect=[mail_response, totp_response],
+            ) as request_get:
+                code = mailbox.get_totp_code(account)
+
+            self.assertEqual(code, "654321")
+            self.assertEqual(
+                [call.args[0] for call in request_get.call_args_list],
+                [mail_url, totp_url],
+            )
+            self.assertEqual(account.extra["totp_url"], totp_url)
+            self.assertEqual(account.extra["mail_api_url"], mail_url)
+            self.assertEqual(account.extra["mailapi_url"], mail_url)
+            totp_response.json.assert_not_called()
+            rendered_logs = "\n".join(logs)
+            self.assertIn("自动识别反向 URL 字段顺序", rendered_logs)
+            self.assertNotIn("MAIL_SECRET", rendered_logs)
+            self.assertNotIn("JBSWY3DPEHPK3PXP", rendered_logs)
+            self.assertNotIn("654321", rendered_logs)
 
     def test_url_credentials_use_mail_api_and_remote_totp_without_leaking_tokens(self):
         mail_url = "https://mail.example.test/mail?token=MAIL_SECRET"

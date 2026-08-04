@@ -998,7 +998,7 @@ class AppleMailMailbox(BaseMailbox):
             if candidate and candidate not in source_urls:
                 source_urls.append(candidate)
 
-        def build_api_url(source_url: str) -> str:
+        def build_request_url(source_url: str) -> str:
             try:
                 parsed = urlsplit(source_url)
                 if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -1007,7 +1007,7 @@ class AppleMailMailbox(BaseMailbox):
                 if path.endswith("/view"):
                     path = f"{path[:-5]}/api/v1/2fa"
                 elif not path.endswith("/api/v1/2fa"):
-                    path = "/api/v1/2fa"
+                    return source_url
                 query = dict(parse_qsl(parsed.query, keep_blank_values=True))
                 query.setdefault("email", str(account.email or "").strip())
                 return urlunsplit(
@@ -1019,14 +1019,20 @@ class AppleMailMailbox(BaseMailbox):
         def fetch_once(source_url: str) -> tuple[str, float | None]:
             try:
                 response = requests.get(
-                    build_api_url(source_url),
-                    headers={"accept": "application/json"},
+                    build_request_url(source_url),
+                    headers={"accept": "application/json, text/plain;q=0.9"},
                     proxies=self.proxy,
                     timeout=15,
                 )
                 if int(response.status_code or 0) >= 400:
                     raise RuntimeError(f"HTTP {response.status_code}")
-                payload = response.json()
+                response_text = str(getattr(response, "text", "") or "").strip()
+                if re.fullmatch(r"[0-9]{6}", response_text):
+                    return response_text, None
+                try:
+                    payload = response.json()
+                except Exception:
+                    raise RuntimeError("响应格式无效") from None
                 if not isinstance(payload, dict) or payload.get("ok") is False:
                     raise RuntimeError("响应状态无效")
                 response_email = str(payload.get("email") or "").strip().lower()
@@ -1043,7 +1049,8 @@ class AppleMailMailbox(BaseMailbox):
             except Exception as exc:
                 status_match = re.fullmatch(r"HTTP (\d{3})", str(exc))
                 suffix = f": {status_match.group(0)}" if status_match else ""
-                raise RuntimeError(f"远程 2FA 获取失败{suffix}") from exc
+                failure_message = f"远程 2FA 获取失败{suffix}"
+            raise RuntimeError(failure_message)
 
         failures = []
         selected_source_url = ""
