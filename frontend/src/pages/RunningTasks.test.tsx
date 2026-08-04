@@ -92,7 +92,10 @@ describe('RunningTasks lightweight summaries', () => {
     render(<RunningTasks />)
 
     expect(await screen.findByText('自动认证')).toBeTruthy()
-    expect(apiFetch).toHaveBeenCalledWith('/tasks/summary')
+    expect(apiFetch).toHaveBeenCalledWith(
+      '/tasks/summary',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
     expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/tasks')).toBe(false)
     expect(screen.getByText('✓ 成功 53')).toBeTruthy()
     expect(screen.getByText('✗ 失败 2')).toBeTruthy()
@@ -159,6 +162,8 @@ describe('RunningTasks lightweight summaries', () => {
       await Promise.resolve()
     })
     expect(apiFetch).toHaveBeenCalledTimes(1)
+    expect(screen.getByText('任务列表加载失败，正在自动重试')).toBeTruthy()
+    expect(screen.queryByText('暂无任务记录')).toBeNull()
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(2_500)
@@ -166,6 +171,68 @@ describe('RunningTasks lightweight summaries', () => {
 
     expect(apiFetch).toHaveBeenCalledTimes(2)
     expect(screen.getByText('自动认证')).toBeTruthy()
+    expect(screen.queryByText('任务列表加载失败，正在自动重试')).toBeNull()
+  })
+
+  it('times out a permanently pending request and retries on the next poll', async () => {
+    vi.useFakeTimers()
+    let resolveRetry!: (value: unknown) => void
+    const retryRequest = new Promise((resolve) => {
+      resolveRetry = resolve
+    })
+    vi.mocked(apiFetch)
+      .mockReset()
+      .mockReturnValueOnce(new Promise(() => {}))
+      .mockReturnValueOnce(retryRequest)
+
+    render(<RunningTasks />)
+    expect(apiFetch).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(15_000)
+    })
+    expect(screen.getByText('任务列表加载失败，正在自动重试')).toBeTruthy()
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_500)
+    })
+
+    expect(apiFetch).toHaveBeenCalledTimes(2)
+    await act(async () => {
+      resolveRetry([automaticSummary()])
+      await Promise.resolve()
+    })
+    expect(screen.getByText('自动认证')).toBeTruthy()
+    expect(screen.queryByText('任务列表加载失败，正在自动重试')).toBeNull()
+  })
+
+  it('aborts the current request on unmount without updating state afterward', async () => {
+    let resolveRequest!: (value: unknown) => void
+    const pendingRequest = new Promise((resolve) => {
+      resolveRequest = resolve
+    })
+    vi.mocked(apiFetch).mockReset().mockReturnValueOnce(pendingRequest)
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+
+    const { unmount } = render(<RunningTasks />)
+    const requestOptions = vi.mocked(apiFetch).mock.calls[0][1]
+    const signal = requestOptions?.signal
+    expect(signal).toBeInstanceOf(AbortSignal)
+    expect(signal?.aborted).toBe(false)
+
+    unmount()
+    expect(signal?.aborted).toBe(true)
+
+    await act(async () => {
+      resolveRequest([automaticSummary()])
+      await Promise.resolve()
+    })
+    const unmountedWarnings = consoleError.mock.calls
+      .flat()
+      .map(String)
+      .filter((message) => /unmounted|state update/i.test(message))
+    expect(unmountedWarnings).toEqual([])
+    consoleError.mockRestore()
   })
 
   it('loads the full task snapshot only after opening the log drawer', async () => {

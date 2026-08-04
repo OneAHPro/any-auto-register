@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import {
+  Alert,
   Badge,
   Button,
   Card,
@@ -24,6 +25,7 @@ import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 
 const { Text, Title } = Typography
+const TASK_SUMMARY_REQUEST_TIMEOUT_MS = 15_000
 
 interface TaskSnapshot {
   id: string
@@ -103,17 +105,31 @@ function formatDuration(startTs: unknown, endTs?: unknown): string {
 export default function RunningTasks() {
   const [tasks, setTasks] = useState<TaskSnapshot[]>([])
   const [loading, setLoading] = useState(false)
+  const [loadFailed, setLoadFailed] = useState(false)
   const [logTaskId, setLogTaskId] = useState<string | null>(null)
   const [now, setNow] = useState(() => Date.now() / 1000)
   const requestInFlightRef = useRef(false)
+  const requestControllerRef = useRef<AbortController | null>(null)
   const mountedRef = useRef(false)
 
   const load = useCallback(async () => {
     if (requestInFlightRef.current) return
     requestInFlightRef.current = true
+    const controller = new AbortController()
+    requestControllerRef.current = controller
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
     if (mountedRef.current) setLoading(true)
     try {
-      const data = (await apiFetch('/tasks/summary')) as TaskSnapshot[]
+      const timeout = new Promise<never>((_resolve, reject) => {
+        timeoutId = setTimeout(() => {
+          controller.abort()
+          reject(new Error('task summary request timed out'))
+        }, TASK_SUMMARY_REQUEST_TIMEOUT_MS)
+      })
+      const data = (await Promise.race([
+        apiFetch('/tasks/summary', { signal: controller.signal }),
+        timeout,
+      ])) as TaskSnapshot[]
       // sort: running first, then pending, then finished (newest first)
       const sorted = [...(data || [])].sort((a, b) => {
         const oa = a.status === 'running' ? 0 : a.status === 'pending' ? 1 : 2
@@ -123,10 +139,17 @@ export default function RunningTasks() {
         const tb = toUnixSeconds(b.created_at) ?? 0
         return tb - ta
       })
-      if (mountedRef.current) setTasks(sorted)
+      if (mountedRef.current) {
+        setTasks(sorted)
+        setLoadFailed(false)
+      }
     } catch {
-      // Keep the last successful snapshot; the next poll can recover.
+      if (mountedRef.current) setLoadFailed(true)
     } finally {
+      if (timeoutId !== undefined) clearTimeout(timeoutId)
+      if (requestControllerRef.current === controller) {
+        requestControllerRef.current = null
+      }
       requestInFlightRef.current = false
       if (mountedRef.current) setLoading(false)
     }
@@ -143,6 +166,7 @@ export default function RunningTasks() {
     const tick = setInterval(() => setNow(Date.now() / 1000), 1000)
     return () => {
       mountedRef.current = false
+      requestControllerRef.current?.abort()
       clearInterval(poll)
       clearInterval(tick)
     }
@@ -323,6 +347,15 @@ export default function RunningTasks() {
         </Button>
       </div>
 
+      {loadFailed && (
+        <Alert
+          type="warning"
+          showIcon
+          message="任务列表加载失败，正在自动重试"
+          style={{ marginBottom: 16 }}
+        />
+      )}
+
       {/* Active tasks */}
       {activeTasks.length > 0 && (
         <div style={{ marginBottom: 24 }}>
@@ -349,7 +382,7 @@ export default function RunningTasks() {
         </div>
       )}
 
-      {tasks.length === 0 && !loading && (
+      {tasks.length === 0 && !loading && !loadFailed && (
         <Empty description="暂无任务记录" style={{ marginTop: 60 }} />
       )}
 
