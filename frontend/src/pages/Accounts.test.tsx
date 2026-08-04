@@ -556,6 +556,60 @@ describe('Accounts ChatGPT staged login integration', () => {
     success.mockRestore()
   })
 
+  it('clears all selections for a legacy response whose counts prove every request completed', async () => {
+    const success = vi.spyOn(message, 'success').mockReturnValue(createMessageResult())
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return { deleted: 2, not_found: [], total_requested: 2 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.queryByText(/已选 \d+ 个/)).toBeNull())
+    expect(success).toHaveBeenCalledWith('批量删除完成：删除 2 个')
+    success.mockRestore()
+  })
+
+  it('clears only the explicit top-level not-found account when other outcomes are unknown', async () => {
+    const error = vi.spyOn(message, 'error').mockReturnValue(createMessageResult())
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return {
+          deleted: 0,
+          failed: 1,
+          not_found: [17],
+          total_requested: 2,
+          items: [],
+        }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.getByText('已选 1 个')).toBeTruthy())
+    const notFoundRow = screen.getByText('eligible@example.com').closest('tr')
+    const unknownRow = screen.getByText('complete@example.com').closest('tr')
+    expect((within(notFoundRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
+    expect((within(unknownRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
+    expect(error).toHaveBeenCalledWith('批量删除失败：失败 1 个')
+    error.mockRestore()
+  })
+
   it('does not clear selections when a failed batch response has no trustworthy item IDs', async () => {
     const warning = vi.spyOn(message, 'warning').mockReturnValue(createMessageResult())
     vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
@@ -583,6 +637,28 @@ describe('Accounts ChatGPT staged login integration', () => {
     await waitFor(() => expect(screen.getByText('已选 2 个')).toBeTruthy())
     expect(warning).toHaveBeenCalledWith('批量删除部分完成：删除 1 个，失败 1 个')
     warning.mockRestore()
+  })
+
+  it('does not clear unknown selections when legacy completion counts are incomplete', async () => {
+    const success = vi.spyOn(message, 'success').mockReturnValue(createMessageResult())
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/batch-delete' && options?.method === 'POST') {
+        return { deleted: 1, not_found: [], total_requested: 2 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await selectAccount(user, 'eligible@example.com')
+    await selectAccount(user, 'complete@example.com')
+    await confirmBatchDelete(user, 2)
+
+    await waitFor(() => expect(screen.getByText('已选 2 个')).toBeTruthy())
+    expect(success).toHaveBeenCalledWith('批量删除完成：删除 1 个')
+    success.mockRestore()
   })
 
   it('keeps every selected account after a fully failed batch deletion', async () => {

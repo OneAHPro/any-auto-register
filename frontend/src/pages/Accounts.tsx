@@ -109,13 +109,22 @@ interface BatchDeleteItem {
 interface BatchDeleteResponse {
   total_requested?: number
   total_unique?: number
-  deleted?: number
-  failed?: number
-  not_found?: number[]
+  deleted?: number | string | null
+  failed?: number | string | null
+  not_found?: Array<number | string>
   remote_deleted?: number
   remote_already_absent?: number
   remote_skipped?: number
   items?: BatchDeleteItem[]
+}
+
+function normalizeBatchDeleteCount(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  const text = String(value).trim()
+  if (!text) return null
+  const parsed = Number(text)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return null
+  return parsed
 }
 
 function deletionErrorDetail(error: unknown, fallback: string): string {
@@ -864,19 +873,38 @@ export default function Accounts() {
         body: JSON.stringify({ ids: requestedKeys }),
       }) as BatchDeleteResponse
       const items: BatchDeleteItem[] = Array.isArray(result.items) ? result.items : []
+      const requestedIds = new Set(requestedKeys.map((key) => String(key)))
       const completedIds = new Set<string>()
       for (const item of items) {
         if (item?.ok === true || String(item?.status ?? '') === 'not_found') {
           completedIds.add(String(item.account_id))
         }
       }
+      const topLevelNotFoundIds = new Set<string>()
+      if (Array.isArray(result.not_found)) {
+        for (const accountId of result.not_found) {
+          const normalizedId = String(accountId).trim()
+          if (!requestedIds.has(normalizedId)) continue
+          topLevelNotFoundIds.add(normalizedId)
+          completedIds.add(normalizedId)
+        }
+      }
+
+      const normalizedDeleted = normalizeBatchDeleteCount(result.deleted)
+      const normalizedFailed = normalizeBatchDeleteCount(result.failed)
+      const failedCountMissing = result.failed === undefined || result.failed === null
+      const legacyResponseProvesCompletion =
+        items.length === 0
+        && (failedCountMissing || normalizedFailed === 0)
+        && (normalizedDeleted ?? 0) + topLevelNotFoundIds.size >= requestedIds.size
+      if (legacyResponseProvesCompletion) {
+        for (const requestedId of requestedIds) completedIds.add(requestedId)
+      }
       setSelectedRowKeys((current) => current.filter((key) => !completedIds.has(String(key))))
 
-      const deleted = typeof result.deleted === 'number' && Number.isFinite(result.deleted)
-        ? Math.max(0, Math.trunc(result.deleted))
-        : 0
-      const failed = typeof result.failed === 'number' && Number.isFinite(result.failed)
-        ? Math.max(0, Math.trunc(result.failed))
+      const deleted = normalizedDeleted ?? 0
+      const failed = normalizedFailed !== null
+        ? normalizedFailed
         : items.filter((item) => item.ok !== true && String(item.status ?? '') !== 'not_found').length
       const detail = batchFailureDetails(items)
       if (failed === 0) {
