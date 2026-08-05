@@ -2,6 +2,7 @@ import threading
 import time
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
@@ -750,6 +751,132 @@ class ChatGPTReloginTests(unittest.TestCase):
         )
 
         self.assertFalse(service.supports_totp_code())
+
+    def test_persisted_email_service_yields_slot_and_uses_one_total_budget(self):
+        from services.chatgpt_relogin import _PersistedEmailService
+
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox.wait_for_code.side_effect = TimeoutError("mailbox wait expired")
+        mailbox.pause_active_slot_for_mailbox_wait.return_value = nullcontext(True)
+        logs = []
+        service = _PersistedEmailService(
+            mailbox=mailbox,
+            mailbox_account=MailboxAccount(
+                email="slow@example.com",
+                account_id="slow@example.com",
+                extra={},
+            ),
+            mailbox_context={},
+            provider="fixture",
+            log_fn=logs.append,
+            otp_timeout_seconds=90,
+        )
+        service.create_email()
+        self.assertTrue(service._baseline_ready.wait(timeout=1))
+
+        with self.assertRaises(TimeoutError):
+            service.get_verification_code(timeout=30)
+        with self.assertRaises(TimeoutError):
+            service.get_verification_code(timeout=30)
+
+        self.assertEqual(
+            [call.kwargs["timeout"] for call in mailbox.wait_for_code.call_args_list],
+            [20, 70],
+        )
+        self.assertEqual(
+            [
+                call.kwargs["poll_interval"]
+                for call in mailbox.wait_for_code.call_args_list
+            ],
+            [3, 10],
+        )
+        mailbox.pause_active_slot_for_mailbox_wait.assert_called_once_with()
+        self.assertTrue(any("后台等待" in message for message in logs))
+
+    def test_url_mailbox_service_binds_task_control_and_timeout_budget(self):
+        saved = {
+            "email": "url@example.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "url@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_url_otp",
+                    "password": "saved-password",
+                    "mail_api_url": "https://mail.example.test/messages/token",
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        task_control = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ):
+            service = _build_email_service(
+                saved,
+                {"mailbox_otp_timeout_seconds": 75},
+                log_fn=None,
+                task_control=task_control,
+                attempt_id=42,
+            )
+
+        self.assertIs(mailbox._task_control, task_control)
+        self.assertEqual(mailbox._task_attempt_token, 42)
+        self.assertEqual(service._otp_remaining_seconds, 75.0)
+
+    def test_saved_login_uses_mailbox_timeout_as_all_outer_otp_budgets(self):
+        saved = {
+            "email": "demo@example.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "fixture",
+                "email": "demo@example.com",
+                "extra": {},
+            },
+        }
+        email_service = mock.Mock()
+        email_service.get_mailbox_metadata.return_value = saved["mailbox_context"]
+        adapter = mock.Mock()
+        adapter.run.return_value = SimpleNamespace(
+            success=True,
+            error_message="",
+            access_token="new-at",
+            refresh_token="new-rt",
+            id_token="new-id",
+            session_token="new-session",
+            workspace_id="workspace-1",
+            account_id="new-user",
+            metadata={},
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={
+                "mailbox_otp_timeout_seconds": 75,
+                "chatgpt_register_otp_wait_seconds": 600,
+            },
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=email_service,
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ) as build_adapter:
+            _login_with_saved_credentials(saved)
+
+        adapter_config = build_adapter.call_args.args[0]
+        for key in (
+            "chatgpt_oauth_otp_wait_seconds",
+            "chatgpt_otp_wait_seconds",
+            "chatgpt_register_otp_wait_seconds",
+            "chatgpt_register_otp_resend_wait_seconds",
+        ):
+            self.assertEqual(adapter_config[key], 75)
 
     def test_legacy_reset_url_credentials_use_saved_account_password(self):
         saved = {

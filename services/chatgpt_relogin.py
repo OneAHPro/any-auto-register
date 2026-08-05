@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping
 
@@ -53,6 +55,33 @@ def _emit_observer(log_fn: LogFn | None, message: str) -> None:
 def _checkpoint_task(task_control, attempt_id: int | None) -> None:
     if task_control is not None:
         task_control.checkpoint(attempt_id=attempt_id)
+
+
+def _resolve_mailbox_otp_timeout(config: Mapping[str, Any]) -> int:
+    for value in (
+        config.get("mailbox_otp_timeout_seconds"),
+        config.get("email_otp_timeout_seconds"),
+    ):
+        if value in (None, ""):
+            continue
+        try:
+            seconds = int(value)
+        except (TypeError, ValueError):
+            continue
+        if seconds > 0:
+            return max(30, min(seconds, 3600))
+    return 180
+
+
+def _bind_mailbox_task_control(
+    mailbox,
+    task_control,
+    attempt_id: int | None,
+) -> None:
+    if task_control is None:
+        return
+    setattr(mailbox, "_task_control", task_control)
+    setattr(mailbox, "_task_attempt_token", attempt_id)
 
 
 def _mailbox_context_from_outlook(
@@ -596,6 +625,7 @@ class _PersistedEmailService:
         mailbox_context: dict[str, Any],
         provider: str,
         log_fn: LogFn | None,
+        otp_timeout_seconds: int = 180,
     ) -> None:
         self.service_type = type("ServiceType", (), {"value": provider})()
         self._mailbox = mailbox
@@ -605,6 +635,9 @@ class _PersistedEmailService:
         self._before_ids: set[Any] = set()
         self._baseline_ready = threading.Event()
         self._baseline_started = False
+        self._otp_remaining_seconds = float(
+            max(30, min(int(otp_timeout_seconds or 180), 3600))
+        )
 
     def _load_baseline(self) -> None:
         try:
@@ -689,17 +722,110 @@ class _PersistedEmailService:
     ):
         del email, email_id
         requested_timeout = max(int(timeout or 120), 1)
-        started_at = time.monotonic()
-        self._baseline_ready.wait(timeout=min(requested_timeout, 30))
-        elapsed = int(max(time.monotonic() - started_at, 0))
-        return self._mailbox.wait_for_code(
-            self._account,
-            keyword="",
-            timeout=max(requested_timeout - elapsed, 1),
-            before_ids=set(self._before_ids),
-            code_pattern=pattern,
-            otp_sent_at=otp_sent_at,
-            exclude_codes=exclude_codes,
+        if self._otp_remaining_seconds <= 0:
+            raise TimeoutError(
+                f"等待邮箱新验证码超时 ({requested_timeout}s)"
+            )
+
+        baseline_started_at = time.monotonic()
+        baseline_wait = min(
+            max(int(math.ceil(self._otp_remaining_seconds)), 1),
+            30,
+        )
+        if not self._baseline_ready.wait(timeout=baseline_wait):
+            _emit(
+                self._log_fn,
+                "邮箱旧邮件基线仍未返回，先开始轮询新验证码",
+            )
+        baseline_elapsed = max(0.0, time.monotonic() - baseline_started_at)
+        self._otp_remaining_seconds = max(
+            0.0,
+            self._otp_remaining_seconds - baseline_elapsed,
+        )
+        if self._otp_remaining_seconds <= 0:
+            raise TimeoutError(
+                f"等待邮箱新验证码超时 ({requested_timeout}s)"
+            )
+
+        foreground_budget = max(0.0, 20.0 - baseline_elapsed)
+        foreground_timeout = min(
+            int(math.ceil(foreground_budget)),
+            int(math.ceil(self._otp_remaining_seconds)),
+        )
+
+        def _wait(wait_seconds: int, poll_interval: int):
+            phase_started_at = time.monotonic()
+            timed_out = False
+            code = None
+            try:
+                code = self._mailbox.wait_for_code(
+                    self._account,
+                    keyword="",
+                    timeout=wait_seconds,
+                    before_ids=set(self._before_ids),
+                    code_pattern=pattern,
+                    otp_sent_at=otp_sent_at,
+                    exclude_codes=exclude_codes,
+                    poll_interval=poll_interval,
+                )
+                return code
+            except TimeoutError:
+                timed_out = True
+                raise
+            finally:
+                phase_elapsed = max(
+                    0.0,
+                    time.monotonic() - phase_started_at,
+                )
+                if timed_out or not code:
+                    phase_elapsed = max(phase_elapsed, float(wait_seconds))
+                self._otp_remaining_seconds = max(
+                    0.0,
+                    self._otp_remaining_seconds - phase_elapsed,
+                )
+
+        code = None
+        if foreground_timeout > 0:
+            try:
+                code = _wait(foreground_timeout, 3)
+            except TimeoutError:
+                code = None
+        if code:
+            return code
+
+        background_timeout = max(
+            0,
+            int(math.ceil(self._otp_remaining_seconds)),
+        )
+        if background_timeout <= 0:
+            raise TimeoutError(
+                f"等待邮箱新验证码超时 ({requested_timeout}s)"
+            )
+
+        pause_slot = getattr(
+            self._mailbox,
+            "pause_active_slot_for_mailbox_wait",
+            None,
+        )
+        wait_scope = pause_slot() if callable(pause_slot) else nullcontext(False)
+        try:
+            with wait_scope as released:
+                slot_message = (
+                    "已释放账号并发槽" if released else "继续低频轮询"
+                )
+                _emit(
+                    self._log_fn,
+                    f"前台等待 {foreground_timeout}s 未收到新验证码，"
+                    f"转入后台等待（剩余 {background_timeout}s），"
+                    f"{slot_message}",
+                )
+                code = _wait(background_timeout, 10)
+        except TimeoutError:
+            code = None
+        if code:
+            return code
+        raise TimeoutError(
+            f"等待邮箱新验证码超时 ({requested_timeout}s)"
         )
 
     def get_mailbox_metadata(self):
@@ -772,6 +898,7 @@ def _build_email_service(
         proxy = _text(saved["extra"].get("proxy_used")) or None
         mailbox = create_mailbox("applemail", extra=mailbox_config, proxy=proxy)
         setattr(mailbox, "_log_fn", log_fn)
+        _bind_mailbox_task_control(mailbox, task_control, attempt_id)
         if credentials["pool_file"]:
             mailbox_account = mailbox.get_email_by_address(credentials["email"])
         else:
@@ -816,6 +943,7 @@ def _build_email_service(
             mailbox_context=mailbox_context,
             provider="chatgpt_credentials",
             log_fn=log_fn,
+            otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
         )
     if provider == "chatgpt_credentials" or account_type == "chatgpt_password_totp":
         credentials = _recover_password_totp_credentials(
@@ -839,9 +967,7 @@ def _build_email_service(
     mailbox_config.update(context_extra)
     mailbox = create_mailbox(provider, extra=mailbox_config, proxy=proxy)
     setattr(mailbox, "_log_fn", log_fn)
-    if task_control is not None:
-        setattr(mailbox, "_task_control", task_control)
-        setattr(mailbox, "_task_attempt_token", attempt_id)
+    _bind_mailbox_task_control(mailbox, task_control, attempt_id)
     mailbox_account = MailboxAccount(
         email=_text(mailbox_context.get("email")) or saved["email"],
         account_id=_text(mailbox_context.get("account_id")),
@@ -853,6 +979,7 @@ def _build_email_service(
         mailbox_context=mailbox_context,
         provider=provider,
         log_fn=log_fn,
+        otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
     )
 
 
@@ -896,6 +1023,15 @@ def _login_with_saved_credentials(
             f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
         )
     config = dict(config_store.get_all() or {})
+    mailbox_timeout = _resolve_mailbox_otp_timeout(config)
+    config["mailbox_otp_timeout_seconds"] = mailbox_timeout
+    for timeout_key in (
+        "chatgpt_oauth_otp_wait_seconds",
+        "chatgpt_otp_wait_seconds",
+        "chatgpt_register_otp_wait_seconds",
+        "chatgpt_register_otp_resend_wait_seconds",
+    ):
+        config[timeout_key] = mailbox_timeout
     email_service = _build_email_service(
         saved,
         config,
