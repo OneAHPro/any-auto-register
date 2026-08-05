@@ -42,7 +42,7 @@
 
 - [ ] **Step 1: Write a failing concurrency-one test** with a login candidate before a healthy account in input order; assert the healthy result is logged before the login service is called.
 - [ ] **Step 2: Run the focused test and confirm it fails because input ordering starts the login first.**
-- [ ] **Step 3: Partition automatic account IDs into probe-only and login-candidate groups, order probe-only IDs first, and gate login candidates on an event set only after every probe-only outcome is counted. The gate wait must checkpoint task stop/skip state without acquiring an active login slot.**
+- [ ] **Step 3: Partition automatic account IDs into probe-only and login-candidate groups, order probe-only IDs first, and keep login-candidate jobs unsubmitted until every probe-only outcome is counted. This boundary must consume neither executor workers nor active login slots.**
 - [ ] **Step 4: Run the focused test and the complete relogin-task module.**
 
 ### Task 4: Verify and deploy

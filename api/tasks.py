@@ -1585,6 +1585,8 @@ def _run_chatgpt_relogin_task_inner(
         )
         return
     remote_health: dict[int, dict[str, object]] = {}
+    probe_only_account_ids: list[int] = []
+    login_candidate_account_ids: list[int] = []
     if automation:
         from services.chatgpt_codex2api_health import (
             confirm_codex2api_auth_failure,
@@ -1599,6 +1601,25 @@ def _run_chatgpt_relogin_task_inner(
                 "未派发账号处理",
             )
             return
+        login_states = {"auth_failed", "remote_missing"}
+        probe_only_account_ids = [
+            account_id
+            for account_id in account_ids
+            if str(
+                (remote_health.get(account_id) or {}).get("state") or ""
+            ).strip().lower()
+            not in login_states
+        ]
+        probe_only_account_id_set = set(probe_only_account_ids)
+        login_candidate_account_ids = [
+            account_id
+            for account_id in account_ids
+            if account_id not in probe_only_account_id_set
+        ]
+        account_ids = [
+            *probe_only_account_ids,
+            *login_candidate_account_ids,
+        ]
     task_label = "Codex2API 鉴权巡检" if automation else "重登"
     total = len(account_ids)
     max_workers = min(
@@ -1660,12 +1681,22 @@ def _run_chatgpt_relogin_task_inner(
             invalid_rt_count=invalid_rt_count,
             relogin_failed_count=0,
             deleted_account_count=0,
+            phase="probe_results",
+            probe_only_count=len(probe_only_account_ids),
+            login_candidate_count=len(login_candidate_account_ids),
         )
     _persist_task_snapshot_best_effort(task_id)
     _log(
         task_id,
         f"开始{task_label}，共 {total} 个账号，并发 {max_workers}",
     )
+    if automation:
+        _log(
+            task_id,
+            "Codex2API 全量探针已完成："
+            f"无需登录 {len(probe_only_account_ids)} 个，"
+            f"需登录 {len(login_candidate_account_ids)} 个",
+        )
 
     def _do_one(index: int, account_id: int) -> AttemptResult:
         attempt_id: int | None = None
@@ -1718,6 +1749,7 @@ def _run_chatgpt_relogin_task_inner(
                         codex2api_delete_on_account_remove_enabled=(
                             delete_linked_credential
                         ),
+                        remove_on_mailbox_otp_timeout=True,
                     )
                     if isinstance(result, dict):
                         result = {
@@ -1747,6 +1779,7 @@ def _run_chatgpt_relogin_task_inner(
                     task_control=control,
                     attempt_id=attempt_id,
                     codex2api_delete_on_account_remove_enabled=None,
+                    remove_on_mailbox_otp_timeout=False,
                 )
             if not isinstance(result, dict):
                 raise RuntimeError("重登服务返回了无效结果")
@@ -1794,7 +1827,7 @@ def _run_chatgpt_relogin_task_inner(
                 if account_removed:
                     _log(
                         task_id,
-                        f"[REMOVE] 账号已被删除或停用，本地记录已移除: "
+                        f"[REMOVE] 本地记录已移除: "
                         f"{account_label}（{detail_message}）",
                     )
                     failure_label = ""
@@ -1824,6 +1857,9 @@ def _run_chatgpt_relogin_task_inner(
                         "stage": stage or "relogin",
                         "relogin_ok": relogin_ok,
                         "account_removed": account_removed,
+                        "removal_reason": str(
+                            result.get("removal_reason") or ""
+                        ).strip(),
                     },
                 )
                 if account_removed:
@@ -1845,14 +1881,48 @@ def _run_chatgpt_relogin_task_inner(
             control.finish_attempt(attempt_id)
 
     with ThreadPoolExecutor(max_workers=executor_workers) as pool:
-        jobs = iter(enumerate(account_ids, start=1))
+        jobs = list(enumerate(account_ids, start=1))
+        next_job_offset = 0
         pending = {}
+        probe_only_id_set = set(probe_only_account_ids)
+        login_candidate_id_set = set(login_candidate_account_ids)
+        probe_phase_processed = 0
+        login_phase_started = not automation or not probe_only_account_ids
+
+        def _start_login_phase() -> None:
+            nonlocal login_phase_started
+            if login_phase_started:
+                return
+            login_phase_started = True
+            _task_store.update_meta(task_id, phase="relogin")
+            if login_candidate_account_ids:
+                _log(
+                    task_id,
+                    "全量探针结果已处理完成，开始处理 "
+                    f"{len(login_candidate_account_ids)} 个需重登账号",
+                )
+            else:
+                _log(
+                    task_id,
+                    "全量探针结果已处理完成，本轮没有需重登账号",
+                )
+
+        if automation and not probe_only_account_ids:
+            _task_store.update_meta(task_id, phase="relogin")
+            _log(
+                task_id,
+                "全量探针结果已处理完成，开始处理 "
+                f"{len(login_candidate_account_ids)} 个需重登账号",
+            )
 
         def _submit_next() -> bool:
-            try:
-                index, account_id = next(jobs)
-            except StopIteration:
+            nonlocal next_job_offset
+            if next_job_offset >= len(jobs):
                 return False
+            index, account_id = jobs[next_job_offset]
+            if account_id in login_candidate_id_set and not login_phase_started:
+                return False
+            next_job_offset += 1
             future = pool.submit(_do_one, index, account_id)
             pending[future] = (index, account_id)
             return True
@@ -1869,7 +1939,10 @@ def _run_chatgpt_relogin_task_inner(
                     return_when=FIRST_COMPLETED,
                 )
                 for future in completed:
-                    pending.pop(future, None)
+                    _index, completed_account_id = pending.pop(
+                        future,
+                        (0, 0),
+                    )
                     try:
                         outcome = future.result()
                     except CancelledError:
@@ -1895,6 +1968,13 @@ def _run_chatgpt_relogin_task_inner(
                         errors.append(outcome.message)
                         processed += 1
 
+                    if (
+                        automation
+                        and completed_account_id in probe_only_id_set
+                        and outcome.outcome != AttemptOutcome.STOPPED
+                    ):
+                        probe_phase_processed += 1
+
                     _task_store.set_progress(task_id, f"{processed}/{total}")
                     _task_store.update_counters(
                         task_id,
@@ -1902,6 +1982,13 @@ def _run_chatgpt_relogin_task_inner(
                         registered=processed,
                     )
                     _persist_task_snapshot_best_effort(task_id)
+
+                if (
+                    automation
+                    and not stopped
+                    and probe_phase_processed >= len(probe_only_account_ids)
+                ):
+                    _start_login_phase()
 
                 if stopped or control.is_stop_requested():
                     first_stop_observation = not stopped

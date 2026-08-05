@@ -17,6 +17,7 @@ from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.utils import FlowState
 from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
 from services.chatgpt_relogin import (
+    ChatGPTMailboxOTPTimeoutError,
     _build_email_service,
     _login_with_saved_credentials,
     _recover_url_login_credentials,
@@ -878,6 +879,113 @@ class ChatGPTReloginTests(unittest.TestCase):
         ):
             self.assertEqual(adapter_config[key], 75)
 
+    def test_saved_login_classifies_zero_code_otp_failure_after_full_budget(self):
+        saved = {
+            "email": "demo@example.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "fixture",
+                "email": "demo@example.com",
+                "extra": {},
+            },
+        }
+        adapter = mock.Mock()
+        adapter.run.return_value = SimpleNamespace(
+            success=False,
+            error_message=(
+                "[stage=otp] OAuth 阶段 OTP 验证失败，"
+                "已尝试 0 个验证码，等待窗口 180s"
+            ),
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"mailbox_otp_timeout_seconds": 180},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=mock.Mock(),
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ), mock.patch(
+            "services.chatgpt_relogin.time.monotonic",
+            side_effect=[100.0, 280.0],
+        ):
+            with self.assertRaises(Exception) as raised:
+                _login_with_saved_credentials(saved)
+
+        self.assertEqual(
+            type(raised.exception).__name__,
+            "ChatGPTMailboxOTPTimeoutError",
+        )
+        self.assertEqual(raised.exception.wait_seconds, 180)
+        self.assertGreaterEqual(raised.exception.elapsed_seconds, 180)
+
+    def test_saved_login_keeps_short_or_nonempty_otp_failure_as_runtime_error(self):
+        saved = {
+            "email": "demo@example.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "fixture",
+                "email": "demo@example.com",
+                "extra": {},
+            },
+        }
+        cases = (
+            (
+                180,
+                179.0,
+                "[stage=otp] OAuth 阶段 OTP 验证失败，"
+                "已尝试 0 个验证码，等待窗口 180s",
+            ),
+            (
+                180,
+                180.0,
+                "[stage=otp] OAuth 阶段 OTP 验证失败，"
+                "已尝试 1 个验证码，等待窗口 180s",
+            ),
+            (180, 180.0, "[stage=mfa] 远程 2FA 获取失败: HTTP 404"),
+            (
+                75,
+                75.0,
+                "[stage=otp] OAuth 阶段 OTP 验证失败，"
+                "已尝试 0 个验证码，等待窗口 75s",
+            ),
+        )
+        for wait_seconds, elapsed, detail in cases:
+            with self.subTest(
+                wait_seconds=wait_seconds,
+                elapsed=elapsed,
+                detail=detail,
+            ):
+                adapter = mock.Mock()
+                adapter.run.return_value = SimpleNamespace(
+                    success=False,
+                    error_message=detail,
+                )
+                with mock.patch(
+                    "services.chatgpt_relogin.config_store.get_all",
+                    return_value={
+                        "mailbox_otp_timeout_seconds": wait_seconds,
+                    },
+                ), mock.patch(
+                    "services.chatgpt_relogin._build_email_service",
+                    return_value=mock.Mock(),
+                ), mock.patch(
+                    "services.chatgpt_relogin."
+                    "build_chatgpt_registration_mode_adapter",
+                    return_value=adapter,
+                ), mock.patch(
+                    "services.chatgpt_relogin.time.monotonic",
+                    side_effect=[100.0, 100.0 + elapsed],
+                ):
+                    with self.assertRaises(RuntimeError) as raised:
+                        _login_with_saved_credentials(saved)
+
+                self.assertEqual(type(raised.exception), RuntimeError)
+
     def test_legacy_reset_url_credentials_use_saved_account_password(self):
         saved = {
             "email": "legacy-reset@example.com",
@@ -1407,6 +1515,61 @@ class ChatGPTReloginTests(unittest.TestCase):
         sync.assert_not_called()
         with Session(self.engine) as session:
             self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_automatic_otp_timeout_removes_local_account(self):
+        sync = mock.Mock()
+        timeout_error = ChatGPTMailboxOTPTimeoutError(
+            "[stage=otp] OAuth 阶段 OTP 验证失败，"
+            "已尝试 0 个验证码，等待窗口 180s",
+            wait_seconds=180,
+            elapsed_seconds=180.0,
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=timeout_error,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            try:
+                result = relogin_chatgpt_account(
+                    self.account_id,
+                    remove_on_mailbox_otp_timeout=True,
+                    codex2api_delete_on_account_remove_enabled=False,
+                )
+            except TypeError as exc:
+                self.fail(f"missing timeout cleanup API: {exc}")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["account_removed"])
+        self.assertEqual(result["stage"], "account_removed")
+        self.assertEqual(result["removal_reason"], "mailbox_otp_timeout")
+        self.assertIn("180", result["message"])
+        self.assertIn("自动移除", result["message"])
+        sync.assert_not_called()
+        with Session(self.engine) as session:
+            self.assertIsNone(session.get(AccountModel, self.account_id))
+
+    def test_manual_otp_timeout_keeps_local_account(self):
+        timeout_error = ChatGPTMailboxOTPTimeoutError(
+            "[stage=otp] OAuth 阶段 OTP 验证失败，"
+            "已尝试 0 个验证码，等待窗口 180s",
+            wait_seconds=180,
+            elapsed_seconds=180.0,
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=timeout_error,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertNotIn("account_removed", result)
+        with Session(self.engine) as session:
+            self.assertIsNotNone(session.get(AccountModel, self.account_id))
 
     def test_ordinary_invalid_otp_log_does_not_delete_account(self):
         sync = mock.Mock()

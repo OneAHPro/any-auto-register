@@ -33,7 +33,7 @@ The Codex2API service already completes one global `wham_only` probe before any 
 1. Process every `healthy`, `deferred`, `ambiguous`, and locally missing probe result first. These accounts update task progress without starting a browser login.
 2. Only after every probe-only result is counted may `auth_failed` and `remote_missing` accounts enter confirmation and full login.
 
-Probe-only account IDs are ordered ahead of login candidates. A task-local event gates login candidates without consuming an active login slot; stop and skip checkpoints remain responsive while a candidate waits for the phase boundary. This makes task progress reflect the global probe before slow mailboxes begin.
+Probe-only account IDs are ordered ahead of login candidates. The task scheduler does not submit any login-candidate future until every probe-only outcome has been collected, so waiting login work consumes neither an executor worker nor an active login slot. This makes task progress reflect the global probe before slow mailboxes begin.
 
 ## Observability
 

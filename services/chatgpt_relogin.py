@@ -35,6 +35,23 @@ from services.external_sync import sync_codex2api_account
 
 
 LogFn = Callable[[str], None]
+
+
+class ChatGPTMailboxOTPTimeoutError(RuntimeError):
+    """The email OTP stage exhausted its full budget without any code."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        wait_seconds: int,
+        elapsed_seconds: float,
+    ) -> None:
+        super().__init__(message)
+        self.wait_seconds = int(wait_seconds)
+        self.elapsed_seconds = float(elapsed_seconds)
+
+
 def _text(value: Any) -> str:
     return str(value or "").strip()
 
@@ -71,6 +88,23 @@ def _resolve_mailbox_otp_timeout(config: Mapping[str, Any]) -> int:
         if seconds > 0:
             return max(30, min(seconds, 3600))
     return 180
+
+
+def _is_exhausted_mailbox_otp_failure(
+    detail: str,
+    *,
+    wait_seconds: int,
+    elapsed_seconds: float,
+) -> bool:
+    message = _text(detail)
+    return (
+        int(wait_seconds) >= 180
+        and float(elapsed_seconds) >= float(wait_seconds)
+        and "[stage=otp]" in message
+        and "OAuth 阶段 OTP 验证失败" in message
+        and "已尝试 0 个验证码" in message
+        and f"等待窗口 {int(wait_seconds)}s" in message
+    )
 
 
 def _bind_mailbox_task_control(
@@ -1068,6 +1102,7 @@ def _login_with_saved_credentials(
             extra_config=extra_config,
         ))
 
+    login_started_at = time.monotonic()
     result = run_login(
         email_service,
         password=str(saved.get("password") or ""),
@@ -1097,6 +1132,20 @@ def _login_with_saved_credentials(
                 _text(getattr(result, "error_message", ""))
                 or "认证服务未返回成功状态"
             )
+            elapsed_seconds = max(
+                0.0,
+                time.monotonic() - login_started_at,
+            )
+            if _is_exhausted_mailbox_otp_failure(
+                detail,
+                wait_seconds=mailbox_timeout,
+                elapsed_seconds=elapsed_seconds,
+            ):
+                raise ChatGPTMailboxOTPTimeoutError(
+                    detail,
+                    wait_seconds=mailbox_timeout,
+                    elapsed_seconds=elapsed_seconds,
+                )
             raise RuntimeError(detail)
 
     tokens = {
@@ -1234,12 +1283,16 @@ def _persist_fresh_tokens(
         return snapshot
 
 
-def _remove_deactivated_local_account(
+def _remove_local_account_after_terminal_login_failure(
     account_id: int,
     *,
     email: str,
     created_at: datetime,
     updated_at: datetime,
+    failure_context: str,
+    removed_message: str,
+    absent_message: str,
+    removal_reason: str,
     log_fn: LogFn | None,
     task_control=None,
     attempt_id: int | None = None,
@@ -1278,12 +1331,13 @@ def _remove_deactivated_local_account(
             if error_code in {"database_error", "local_delete_conflict"}
             else "账号删除联动失败"
         )
-        message = f"检测到账号已被删除或停用，但{failure_label}: {detail}"
+        message = f"{failure_context}，但{failure_label}: {detail}"
         _emit_observer(log_fn, message)
         return {
             "ok": False,
             "relogin_ok": False,
             "account_removed": False,
+            "removal_reason": removal_reason,
             "stage": "account_remove_failed",
             "error_code": error_code,
             "account_id": int(account_id),
@@ -1291,21 +1345,86 @@ def _remove_deactivated_local_account(
             "message": message,
         }
 
-    message = (
-        "账号已被删除或停用，本地记录已自动删除"
-        if removal_status == "deleted"
-        else "账号已被删除或停用，本地记录已不存在"
-    )
+    message = removed_message if removal_status == "deleted" else absent_message
     _emit_observer(log_fn, message)
     return {
         "ok": False,
         "relogin_ok": False,
         "account_removed": True,
+        "removal_reason": removal_reason,
         "stage": "account_removed",
         "account_id": int(account_id),
         "email": email,
         "message": message,
     }
+
+
+def _remove_deactivated_local_account(
+    account_id: int,
+    *,
+    email: str,
+    created_at: datetime,
+    updated_at: datetime,
+    log_fn: LogFn | None,
+    task_control=None,
+    attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
+) -> dict[str, Any]:
+    return _remove_local_account_after_terminal_login_failure(
+        account_id,
+        email=email,
+        created_at=created_at,
+        updated_at=updated_at,
+        failure_context="检测到账号已被删除或停用",
+        removed_message="账号已被删除或停用，本地记录已自动删除",
+        absent_message="账号已被删除或停用，本地记录已不存在",
+        removal_reason="account_deactivated",
+        log_fn=log_fn,
+        task_control=task_control,
+        attempt_id=attempt_id,
+        codex2api_delete_on_account_remove_enabled=(
+            codex2api_delete_on_account_remove_enabled
+        ),
+    )
+
+
+def _remove_mailbox_otp_timed_out_account(
+    account_id: int,
+    *,
+    email: str,
+    created_at: datetime,
+    updated_at: datetime,
+    wait_seconds: int,
+    log_fn: LogFn | None,
+    task_control=None,
+    attempt_id: int | None = None,
+    codex2api_delete_on_account_remove_enabled: bool | None = None,
+) -> dict[str, Any]:
+    wait_seconds = max(int(wait_seconds), 180)
+    return _remove_local_account_after_terminal_login_failure(
+        account_id,
+        email=email,
+        created_at=created_at,
+        updated_at=updated_at,
+        failure_context=(
+            f"邮箱 OTP 等待已达到 {wait_seconds} 秒且未取得验证码"
+        ),
+        removed_message=(
+            f"邮箱 OTP 等待满 {wait_seconds} 秒仍未收到，"
+            "本地账号记录已自动移除"
+        ),
+        absent_message=(
+            f"邮箱 OTP 等待满 {wait_seconds} 秒仍未收到，"
+            "本地账号记录已不存在"
+        ),
+        removal_reason="mailbox_otp_timeout",
+        log_fn=log_fn,
+        task_control=task_control,
+        attempt_id=attempt_id,
+        codex2api_delete_on_account_remove_enabled=(
+            codex2api_delete_on_account_remove_enabled
+        ),
+    )
 
 
 def _relogin_chatgpt_account_locked(
@@ -1315,6 +1434,7 @@ def _relogin_chatgpt_account_locked(
     task_control=None,
     attempt_id: int | None = None,
     codex2api_delete_on_account_remove_enabled: bool | None = None,
+    remove_on_mailbox_otp_timeout: bool = False,
 ) -> dict[str, Any]:
     """Perform a real credential login, persist fresh tokens, then replace Codex2API."""
     email = ""
@@ -1356,6 +1476,32 @@ def _relogin_chatgpt_account_locked(
                 codex2api_delete_on_account_remove_enabled
             ),
         )
+    except ChatGPTMailboxOTPTimeoutError as exc:
+        if remove_on_mailbox_otp_timeout:
+            if saved is None:
+                raise RuntimeError("邮箱 OTP 超时信号缺少对应的本地账号快照")
+            return _remove_mailbox_otp_timed_out_account(
+                saved["id"],
+                email=email,
+                created_at=saved["created_at"],
+                updated_at=saved["updated_at"],
+                wait_seconds=exc.wait_seconds,
+                log_fn=log_fn,
+                task_control=task_control,
+                attempt_id=attempt_id,
+                codex2api_delete_on_account_remove_enabled=(
+                    codex2api_delete_on_account_remove_enabled
+                ),
+            )
+        message = _text(exc) or type(exc).__name__
+        return {
+            "ok": False,
+            "relogin_ok": False,
+            "stage": "relogin",
+            "account_id": int(account_id) if str(account_id).isdigit() else account_id,
+            "email": email,
+            "message": f"重登失败: {message}",
+        }
     except TaskInterruption:
         raise
     except Exception as exc:
@@ -1693,6 +1839,7 @@ def relogin_chatgpt_account(
     task_control=None,
     attempt_id: int | None = None,
     codex2api_delete_on_account_remove_enabled: bool | None = None,
+    remove_on_mailbox_otp_timeout: bool = False,
 ) -> dict[str, Any]:
     """Run one account at a time so local and remote credentials cannot cross."""
     with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
@@ -1713,4 +1860,5 @@ def relogin_chatgpt_account(
             codex2api_delete_on_account_remove_enabled=(
                 codex2api_delete_on_account_remove_enabled
             ),
+            remove_on_mailbox_otp_timeout=remove_on_mailbox_otp_timeout,
         )
