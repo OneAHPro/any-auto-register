@@ -1067,6 +1067,130 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(code, "246810")
 
     @mock.patch("requests.get")
+    def test_mailapi_html_rejects_old_latest_card(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text="""
+            <html><body>
+              <article class="mail-card">
+                <details>
+                  <summary>
+                    <span class="subject">Your temporary ChatGPT login code</span>
+                    <span class="date">2026-08-05 19:25:00</span>
+                  </summary>
+                  <pre class="body">Your verification code is 246810</pre>
+                </details>
+              </article>
+              <article class="mail-card">
+                <details>
+                  <summary>
+                    <span class="subject">Your temporary ChatGPT login code</span>
+                    <span class="date">2026-08-05 19:00:00</span>
+                  </summary>
+                  <pre class="body">Your verification code is 135790</pre>
+                </details>
+              </article>
+            </body></html>
+            """,
+        )
+        before_ids = mailbox.get_current_ids(account)
+        otp_sent_at = datetime.fromisoformat("2026-08-05T19:25:30").timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=before_ids,
+                otp_sent_at=otp_sent_at,
+            )
+
+        self.assertEqual(len(before_ids), 1)
+        self.assertTrue(next(iter(before_ids)).startswith("mailapi_message:"))
+        self.assertIsNone(code)
+
+    @mock.patch("requests.get")
+    def test_mailapi_html_accepts_new_card_with_second_precision(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        old_html = """
+        <html><body>
+          <article class="mail-card">
+            <details>
+              <summary>
+                <span class="subject">Your temporary ChatGPT login code</span>
+                <span class="date">2026-08-05 19:25:00</span>
+              </summary>
+              <pre class="body">Your verification code is 246810</pre>
+            </details>
+          </article>
+        </body></html>
+        """
+        new_html = """
+        <html><body>
+          <article class="mail-card">
+            <details>
+              <summary>
+                <span class="subject">Your temporary ChatGPT login code</span>
+                <span class="date">2026-08-05 19:25:44</span>
+              </summary>
+              <pre class="body">Your verification code is 975310</pre>
+            </details>
+          </article>
+          <article class="mail-card">
+            <details>
+              <summary>
+                <span class="subject">Your temporary ChatGPT login code</span>
+                <span class="date">2026-08-05 19:25:00</span>
+              </summary>
+              <pre class="body">Your verification code is 246810</pre>
+            </details>
+          </article>
+        </body></html>
+        """
+        mock_get.side_effect = [
+            _FakeResponse(200, text=old_html),
+            _FakeResponse(200, text=new_html),
+        ]
+        before_ids = mailbox.get_current_ids(account)
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-05T19:25:44.900"
+        ).timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=before_ids,
+                otp_sent_at=otp_sent_at,
+            )
+
+        self.assertEqual(code, "975310")
+        self.assertEqual(len(before_ids), 1)
+        self.assertTrue(next(iter(before_ids)).startswith("mailapi_message:"))
+
+    @mock.patch("requests.get")
     def test_mailapi_html_does_not_permanently_suppress_raced_baseline_code(
         self,
         mock_get,

@@ -3991,6 +3991,75 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return text
 
     @classmethod
+    def _parse_mailapi_html_message(cls, raw_text: str) -> Optional[dict[str, Any]]:
+        import hashlib
+        import re
+
+        raw = str(raw_text or "")
+        for article_match in re.finditer(
+            r"<article\b([^>]*)>(.*?)</article\s*>",
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            article_attrs, article_body = article_match.groups()
+            class_match = re.search(
+                r"\bclass\s*=\s*(['\"])(.*?)\1",
+                article_attrs,
+                re.IGNORECASE | re.DOTALL,
+            )
+            class_names = {
+                name.lower()
+                for name in re.split(
+                    r"\s+",
+                    class_match.group(2).strip() if class_match else "",
+                )
+                if name
+            }
+            if "mail-card" not in class_names:
+                continue
+
+            card_html = article_match.group(0)
+            received_text = ""
+            for date_match in re.finditer(
+                r"<(?:span|time)\b([^>]*)>(.*?)</(?:span|time)\s*>",
+                article_body,
+                re.IGNORECASE | re.DOTALL,
+            ):
+                date_attrs, date_body = date_match.groups()
+                date_class_match = re.search(
+                    r"\bclass\s*=\s*(['\"])(.*?)\1",
+                    date_attrs,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                date_classes = {
+                    name.lower()
+                    for name in re.split(
+                        r"\s+",
+                        date_class_match.group(2).strip()
+                        if date_class_match
+                        else "",
+                    )
+                    if name
+                }
+                if "date" not in date_classes:
+                    continue
+                received_text = cls._mailapi_visible_text(date_body)
+                break
+
+            visible_card = cls._mailapi_visible_text(card_html)
+            identity = f"{received_text}|{visible_card}"
+            message_id = "mailapi_message:" + hashlib.sha256(
+                identity.encode("utf-8", errors="ignore")
+            ).hexdigest()
+            return {
+                "content": card_html,
+                "received_at": cls._parse_timestamp(received_text),
+                "message_id": message_id,
+                "status": None,
+            }
+        return None
+
+    @classmethod
     def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
         import json
 
@@ -4001,6 +4070,9 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             payload = None
 
         if not isinstance(payload, dict):
+            html_message = cls._parse_mailapi_html_message(raw_text)
+            if html_message is not None:
+                return html_message
             return {
                 "content": raw_text,
                 "received_at": None,
@@ -4562,7 +4634,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 self.mailbox._log(f"[MailAPI] 跳过已尝试验证码: {code}")
                 return None
             received_at = message.get("received_at")
-            if otp_sent_at and received_at and float(received_at) < otp_sent_at:
+            if (
+                otp_sent_at
+                and received_at
+                and float(received_at) < otp_sent_at - 5.0
+            ):
                 self.mailbox._log("[MailAPI] 跳过发送验证码之前收到的旧邮件")
                 return None
             code_key = self._code_key(code)
