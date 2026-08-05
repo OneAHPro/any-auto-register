@@ -31,6 +31,7 @@ import {
   SyncOutlined,
   LoginOutlined,
   RedoOutlined,
+  ThunderboltOutlined,
 } from '@ant-design/icons'
 import { ChatGPTExistingAccountLoginModal } from '@/components/ChatGPTExistingAccountLoginModal'
 import {
@@ -680,15 +681,20 @@ export default function Accounts() {
   const [autoReloginStatus, setAutoReloginStatus] =
     useState<ChatGPTAutoReloginStatus | null>(null)
   const [autoReloginNow, setAutoReloginNow] = useState(() => Date.now())
+  const [autoReloginRunNowLoading, setAutoReloginRunNowLoading] = useState(false)
+  const autoReloginRunNowEpochRef = useRef(0)
 
   useEffect(() => {
     reloginRequestEpochRef.current += 1
+    autoReloginRunNowEpochRef.current += 1
     setCurrentPlatform(platform || 'chatgpt')
     setSelectedRowKeys([])
     setReloginStartError('')
     setReloginTaskId(null)
     setReloginLoading(false)
     setReloginConcurrency(1)
+    setAutoReloginStatus(null)
+    setAutoReloginRunNowLoading(false)
   }, [platform])
 
   useEffect(() => {
@@ -731,6 +737,31 @@ export default function Accounts() {
       .then((data) => setPlatformActions(data.actions || []))
       .catch(() => setPlatformActions([]))
   }, [currentPlatform])
+
+  const handleAutoReloginRunNow = async () => {
+    if (currentPlatform !== 'chatgpt' || autoReloginRunNowLoading) return
+    const requestEpoch = ++autoReloginRunNowEpochRef.current
+    setAutoReloginRunNowLoading(true)
+    try {
+      const result = await apiFetch('/automations/chatgpt-relogin/run-now', {
+        method: 'POST',
+      })
+      if (requestEpoch !== autoReloginRunNowEpochRef.current) return
+      if (result?.status) {
+        setAutoReloginStatus(result.status as ChatGPTAutoReloginStatus)
+      }
+      setAutoReloginNow(Date.now())
+      message.success('自动化流程已立即启动')
+    } catch (error: unknown) {
+      if (requestEpoch !== autoReloginRunNowEpochRef.current) return
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      message.error(`立即执行失败：${detail}`)
+    } finally {
+      if (requestEpoch === autoReloginRunNowEpochRef.current) {
+        setAutoReloginRunNowLoading(false)
+      }
+    }
+  }
 
   useEffect(() => {
     if (currentPlatform !== 'chatgpt') {
@@ -1717,6 +1748,23 @@ export default function Accounts() {
             <Text type="secondary">
               下次执行：{formatAutoReloginCountdown(autoReloginStatus, autoReloginNow)}
             </Text>
+          )}
+          {currentPlatform === 'chatgpt' && (
+            <Button
+              size="small"
+              icon={<ThunderboltOutlined />}
+              loading={autoReloginRunNowLoading}
+              disabled={
+                autoReloginRunNowLoading
+                || !autoReloginStatus
+                || !autoReloginStatus.enabled
+                || ['running', 'stopping'].includes(autoReloginStatus.state)
+                || Number(autoReloginStatus.eligible_accounts || 0) <= 0
+              }
+              onClick={handleAutoReloginRunNow}
+            >
+              立即执行
+            </Button>
           )}
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>

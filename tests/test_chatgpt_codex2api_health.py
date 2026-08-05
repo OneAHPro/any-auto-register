@@ -110,7 +110,10 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
         "message": "Codex2API 本轮 wham 探针明确标记账号鉴权失效",
     }
     assert snapshot[4]["state"] == "deferred"
-    assert snapshot[5]["state"] == "missing"
+    assert snapshot[5]["state"] == "remote_missing"
+    assert snapshot[5]["message"] == (
+        "Codex2API 未找到同邮箱账号，将执行一次完整登录确认"
+    )
     assert snapshot[6]["state"] == "ambiguous"
     assert snapshot[7]["state"] == "deferred"
     assert request.call_count == 3

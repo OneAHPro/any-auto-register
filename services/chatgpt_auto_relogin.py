@@ -246,6 +246,116 @@ def _persist_tick_transition(
     return _status_from_snapshot(merged)
 
 
+def trigger_chatgpt_auto_relogin_now(
+    *,
+    store: ConfigStoreLike | None = None,
+    list_eligible: Callable[[], Iterable[int]] | None = None,
+    try_enqueue: (
+        Callable[[Iterable[int], int], Mapping[str, object]] | None
+    ) = None,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    """Immediately enqueue one scheduler-owned relogin cycle when idle."""
+
+    with _STATUS_TRANSITION_LOCK:
+        resolved_store = store or _get_config_store()
+        snapshot = dict(resolved_store.get_all())
+        settings = _settings_from_snapshot(snapshot)
+        current_status = _status_from_snapshot(snapshot)
+
+        if not settings.enabled:
+            return {
+                "accepted": False,
+                "task_id": None,
+                "reason": "disabled_by_config",
+                "status": current_status,
+            }
+
+        active_task_id = _optional_text(
+            snapshot.get(_STATUS_KEY_BY_FIELD["active_task_id"], "")
+        )
+        current_state = _optional_text(
+            snapshot.get(_STATUS_KEY_BY_FIELD["state"], "")
+        )
+        if active_task_id is not None or current_state in {"running", "stopping"}:
+            return {
+                "accepted": False,
+                "task_id": None,
+                "reason": "task_busy",
+                "status": current_status,
+            }
+
+        if list_eligible is None:
+            from services.chatgpt_relogin import list_auto_maintenance_account_ids
+
+            list_eligible = list_auto_maintenance_account_ids
+        eligible_ids = _ordered_account_ids(list_eligible())
+        if not eligible_ids:
+            paused_status = _persist_tick_transition(
+                resolved_store,
+                snapshot,
+                state="paused_no_accounts",
+                reason="no_eligible_accounts",
+                eligible_accounts=0,
+                active_task_id=None,
+                next_run_at=None,
+                scheduled_interval_minutes=None,
+            )
+            return {
+                "accepted": False,
+                "task_id": None,
+                "reason": "no_eligible_accounts",
+                "status": paused_status,
+            }
+
+        if try_enqueue is None:
+            from api.tasks import try_enqueue_scheduled_chatgpt_relogin
+
+            try_enqueue = try_enqueue_scheduled_chatgpt_relogin
+        try:
+            decision = dict(try_enqueue(eligible_ids, settings.concurrency))
+        except Exception:
+            return {
+                "accepted": False,
+                "task_id": None,
+                "reason": "enqueue_failed",
+                "status": current_status,
+            }
+
+        task_id = _optional_text(decision.get("task_id"))
+        accepted = bool(decision.get("accepted")) and task_id is not None
+        if not accepted:
+            reason = _optional_text(decision.get("reason")) or "task_busy"
+            if bool(decision.get("accepted")):
+                reason = "enqueue_failed"
+            return {
+                "accepted": False,
+                "task_id": None,
+                "reason": reason,
+                "status": current_status,
+            }
+
+        wall_now = _aware_utc(now)
+        running_status = _persist_tick_transition(
+            resolved_store,
+            snapshot,
+            state="running",
+            reason="task_running",
+            eligible_accounts=len(eligible_ids),
+            active_task_id=task_id,
+            last_task_id=task_id,
+            last_started_at=_utc_iso(wall_now),
+            next_run_at=None,
+            scheduled_interval_minutes=settings.interval_minutes,
+        )
+        return {
+            "accepted": True,
+            "task_id": task_id,
+            "reason": "enqueued",
+            "status": running_status,
+        }
+
+
 def tick_chatgpt_auto_relogin(
     *,
     store: ConfigStoreLike | None = None,

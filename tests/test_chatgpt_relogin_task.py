@@ -476,6 +476,167 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             any("无需重登" in line for line in snapshot["logs"])
         )
 
+    def test_automatic_task_full_logins_when_remote_credential_is_missing(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [117],
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            117: {
+                "account_id": 117,
+                "email": "remote-missing@example.com",
+                "state": "remote_missing",
+                "message": "Codex2API 未找到同邮箱账号，将执行一次完整登录确认",
+            }
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+        ) as confirm_remote, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": True,
+                "relogin_ok": True,
+                "stage": "completed",
+                "account_id": 117,
+                "email": "remote-missing@example.com",
+                "message": "完整登录并同步成功",
+            },
+        ) as full_login, mock.patch(
+            "api.tasks._save_task_log"
+        ) as save_task_log:
+            _run_chatgpt_relogin_task(task_id, [117])
+
+        confirm_remote.assert_not_called()
+        full_login.assert_called_once()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(snapshot["meta"]["invalid_rt_count"], 0)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 0)
+        self.assertEqual(
+            save_task_log.call_args.kwargs["detail"]["mode"],
+            "full_login",
+        )
+
+    def test_remote_missing_login_confirmation_removes_deactivated_account(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [118],
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            118: {
+                "account_id": 118,
+                "email": "removed@example.com",
+                "state": "remote_missing",
+            }
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": False,
+                "relogin_ok": False,
+                "account_removed": True,
+                "stage": "account_removed",
+                "account_id": 118,
+                "email": "removed@example.com",
+                "message": "账号已被删除或停用，本地记录已自动删除",
+            },
+        ) as full_login, mock.patch(
+            "api.tasks._save_task_log"
+        ) as save_task_log:
+            _run_chatgpt_relogin_task(task_id, [118])
+
+        full_login.assert_called_once()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["errors"], [])
+        self.assertEqual(snapshot["meta"]["invalid_rt_count"], 0)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 1)
+        self.assertEqual(snapshot["meta"]["deleted_account_count"], 1)
+        self.assertEqual(save_task_log.call_args.args[2], "removed")
+
+    def test_remote_missing_transient_login_failure_keeps_local_account(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [119],
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            119: {
+                "account_id": 119,
+                "email": "retry@example.com",
+                "state": "remote_missing",
+            }
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value=health,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": False,
+                "relogin_ok": False,
+                "account_removed": False,
+                "stage": "relogin",
+                "account_id": 119,
+                "email": "retry@example.com",
+                "message": "邮箱验证码暂时未收到",
+            },
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [119])
+
+        full_login.assert_called_once()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertEqual(snapshot["meta"]["invalid_rt_count"], 0)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 1)
+        self.assertEqual(snapshot["meta"]["deleted_account_count"], 0)
+
+    def test_local_missing_record_does_not_attempt_a_remote_missing_login(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [120],
+            source="schedule",
+            automation=True,
+        )
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value={
+                120: {
+                    "account_id": 120,
+                    "email": "",
+                    "state": "missing",
+                    "message": "本地 ChatGPT 账号记录已不存在",
+                }
+            },
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [120])
+
+        full_login.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 0)
+
     def test_automatic_task_stopped_during_probe_dispatches_no_accounts(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(

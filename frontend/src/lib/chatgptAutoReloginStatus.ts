@@ -2,6 +2,10 @@ export interface ChatGPTAutoReloginStatus {
   enabled: boolean
   state: string
   reason?: string | null
+  eligible_accounts?: number
+  active_task_id?: string | null
+  interval_minutes?: number
+  concurrency?: number
   next_run_at?: string | null
 }
 

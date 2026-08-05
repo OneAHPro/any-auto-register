@@ -1693,8 +1693,9 @@ def _run_chatgpt_relogin_task_inner(
                         "remote_status": health.get("remote_status"),
                         "message": healthy_message,
                     }
-                elif health_state == "auth_failed":
-                    _record_confirmed_auth_failure()
+                elif health_state in {"auth_failed", "remote_missing"}:
+                    if health_state == "auth_failed":
+                        _record_confirmed_auth_failure()
                     result = relogin_chatgpt_account(
                         account_id,
                         log_fn=_service_log,
@@ -1708,7 +1709,7 @@ def _run_chatgpt_relogin_task_inner(
                         result = {
                             **result,
                             "mode": "full_login",
-                            "remote_auth_state": "auth_failed",
+                            "remote_auth_state": health_state,
                             "remote_status": health.get("remote_status"),
                         }
                 else:

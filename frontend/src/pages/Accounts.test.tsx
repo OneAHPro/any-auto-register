@@ -244,6 +244,118 @@ describe('Accounts ChatGPT staged login integration', () => {
     ).toBeTruthy()
   })
 
+  it('runs the automatic authentication immediately once and reflects the running status', async () => {
+    let resolveRunNow!: (value: Record<string, unknown>) => void
+    const pendingRunNow = new Promise<Record<string, unknown>>((resolve) => {
+      resolveRunNow = resolve
+    })
+    const success = vi.spyOn(message, 'success').mockReturnValue(createMessageResult())
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 64 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/automations/chatgpt-relogin') {
+        return {
+          enabled: true,
+          state: 'idle',
+          reason: 'scheduled',
+          eligible_accounts: 64,
+          next_run_at: '2099-08-03T00:10:00Z',
+          interval_minutes: 10,
+        }
+      }
+      if (path === '/automations/chatgpt-relogin/run-now' && options?.method === 'POST') {
+        return pendingRunNow
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    const runNow = await screen.findByRole('button', { name: /立即执行/ })
+    expect((runNow as HTMLButtonElement).disabled).toBe(false)
+    await user.click(runNow)
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith('/automations/chatgpt-relogin/run-now', {
+        method: 'POST',
+      })
+    })
+    expect((runNow as HTMLButtonElement).disabled).toBe(true)
+    await user.click(runNow)
+    expect(
+      vi.mocked(apiFetch).mock.calls.filter(
+        ([path]) => path === '/automations/chatgpt-relogin/run-now',
+      ),
+    ).toHaveLength(1)
+
+    resolveRunNow({
+      accepted: true,
+      task_id: 'task-auto-now',
+      status: {
+        enabled: true,
+        state: 'running',
+        reason: 'task_running',
+        eligible_accounts: 64,
+        active_task_id: 'task-auto-now',
+        next_run_at: null,
+      },
+    })
+    await waitFor(() => {
+      expect(screen.getByText('下次执行：当前轮运行中')).toBeTruthy()
+      expect(success).toHaveBeenCalledWith('自动化流程已立即启动')
+    })
+    expect(
+      (screen.getByRole('button', { name: /立即执行/ }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+    success.mockRestore()
+  })
+
+  it.each([
+    [{ enabled: false, state: 'disabled', eligible_accounts: 64 }, 'disabled'],
+    [{ enabled: true, state: 'running', eligible_accounts: 64 }, 'running'],
+    [{ enabled: true, state: 'idle', eligible_accounts: 0 }, 'no accounts'],
+  ])('disables immediate execution while automation is %s', async (status) => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/automations/chatgpt-relogin') return status
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    expect(
+      (await screen.findByRole('button', { name: /立即执行/ }) as HTMLButtonElement).disabled,
+    ).toBe(true)
+  })
+
+  it('reports a bounded immediate-execution error and restores the button', async () => {
+    const error = vi.spyOn(message, 'error').mockReturnValue(createMessageResult())
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/automations/chatgpt-relogin') {
+        return { enabled: true, state: 'idle', eligible_accounts: 1 }
+      }
+      if (path === '/automations/chatgpt-relogin/run-now' && options?.method === 'POST') {
+        throw new Error('当前已有 ChatGPT 自动化任务正在运行')
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    const runNow = await screen.findByRole('button', { name: /立即执行/ })
+    await user.click(runNow)
+
+    await waitFor(() => {
+      expect(error).toHaveBeenCalledWith(
+        '立即执行失败：当前已有 ChatGPT 自动化任务正在运行',
+      )
+      expect((runNow as HTMLButtonElement).disabled).toBe(false)
+    })
+    error.mockRestore()
+  })
+
   it('does not show ChatGPT staged-login actions on another platform', async () => {
     routeState.platform = 'kiro'
     render(<Accounts />)
@@ -251,6 +363,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     await screen.findByText('eligible@example.com')
     expect(screen.queryByRole('button', { name: /登录$/ })).toBeNull()
     expect(screen.queryByRole('button', { name: '接码' })).toBeNull()
+    expect(screen.queryByRole('button', { name: /立即执行/ })).toBeNull()
   })
 
   it('does not offer phone verification for a legacy AT-only account without mailbox credentials', async () => {

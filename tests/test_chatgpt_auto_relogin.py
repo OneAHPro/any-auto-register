@@ -448,6 +448,75 @@ def test_status_endpoint_has_a_coherent_disabled_response(monkeypatch):
     }
 
 
+def test_run_now_endpoint_returns_the_started_automation_status(monkeypatch):
+    automations = _automations_module()
+    result = {
+        "accepted": True,
+        "task_id": "task-now",
+        "reason": "enqueued",
+        "status": {
+            "enabled": True,
+            "state": "running",
+            "reason": "task_running",
+            "active_task_id": "task-now",
+        },
+    }
+    monkeypatch.setattr(
+        automations,
+        "trigger_chatgpt_auto_relogin_now",
+        lambda: result,
+        raising=False,
+    )
+    app = FastAPI()
+    app.include_router(automations.router, prefix="/api")
+
+    response = TestClient(app).post(
+        "/api/automations/chatgpt-relogin/run-now"
+    )
+
+    assert response.status_code == 200
+    assert response.json() == result
+
+
+@pytest.mark.parametrize(
+    ("reason", "status_code", "detail"),
+    [
+        ("disabled_by_config", 409, "自动重登已关闭，请先在设置中开启"),
+        ("no_eligible_accounts", 409, "当前没有可执行自动认证的账号"),
+        ("foreground_busy", 409, "当前有手工 ChatGPT 任务正在等待或运行"),
+        ("task_busy", 409, "当前已有 ChatGPT 自动化任务正在运行"),
+        ("enqueue_failed", 503, "自动化任务启动失败，请稍后重试"),
+    ],
+)
+def test_run_now_endpoint_maps_rejections_to_bounded_errors(
+    monkeypatch,
+    reason,
+    status_code,
+    detail,
+):
+    automations = _automations_module()
+    monkeypatch.setattr(
+        automations,
+        "trigger_chatgpt_auto_relogin_now",
+        lambda: {
+            "accepted": False,
+            "task_id": None,
+            "reason": reason,
+            "status": {"enabled": True, "state": "idle"},
+        },
+        raising=False,
+    )
+    app = FastAPI()
+    app.include_router(automations.router, prefix="/api")
+
+    response = TestClient(app).post(
+        "/api/automations/chatgpt-relogin/run-now"
+    )
+
+    assert response.status_code == status_code
+    assert response.json() == {"detail": detail}
+
+
 def test_main_includes_automations_router_under_api():
     main = importlib.import_module("main")
     automations = _automations_module()
@@ -463,6 +532,23 @@ def test_main_includes_automations_router_under_api():
     assert route.name == "get_chatgpt_relogin_automation_status"
     assert "get" in main.app.openapi()["paths"][
         "/api/automations/chatgpt-relogin"
+    ]
+
+
+def test_main_includes_run_now_automation_route_under_api():
+    main = importlib.import_module("main")
+    automations = _automations_module()
+
+    route = next(
+        route
+        for route in automations.router.routes
+        if route.path == "/automations/chatgpt-relogin/run-now"
+    )
+
+    assert route.methods == {"POST"}
+    assert route.endpoint is automations.run_chatgpt_relogin_now
+    assert "post" in main.app.openapi()["paths"][
+        "/api/automations/chatgpt-relogin/run-now"
     ]
 
 
@@ -669,6 +755,212 @@ def _accepted(task_id: str = "task-scheduled") -> dict[str, object]:
 
 def _busy(reason: str = "task_busy") -> dict[str, object]:
     return {"accepted": False, "task_id": None, "reason": reason}
+
+
+def test_run_now_enqueues_immediately_and_tracks_the_automation_task():
+    service = _service_module()
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="idle",
+        chatgpt_auto_relogin_status_reason="scheduled",
+        chatgpt_auto_relogin_status_next_run_at="2026-08-02T12:30:00Z",
+    )
+    now = datetime(2026, 8, 2, 12, 5, tzinfo=timezone.utc)
+    enqueues = []
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        now=now,
+        list_eligible=lambda: [3, 1, 2, 1],
+        try_enqueue=lambda ids, concurrency: (
+            enqueues.append((list(ids), concurrency)) or _accepted("task-now")
+        ),
+    )
+
+    assert enqueues == [([1, 2, 3], 10)]
+    assert result["accepted"] is True
+    assert result["task_id"] == "task-now"
+    assert result["reason"] == "enqueued"
+    assert result["status"]["state"] == "running"
+    assert result["status"]["reason"] == "task_running"
+    assert result["status"]["eligible_accounts"] == 3
+    assert result["status"]["active_task_id"] == "task-now"
+    assert result["status"]["last_task_id"] == "task-now"
+    assert result["status"]["last_started_at"] == "2026-08-02T12:05:00Z"
+    assert result["status"]["next_run_at"] is None
+
+
+def test_run_now_rejects_disabled_before_querying_accounts():
+    service = _service_module()
+    store = FakeConfigStore({"chatgpt_auto_relogin_enabled": "0"})
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        list_eligible=lambda: pytest.fail("disabled trigger queried accounts"),
+        try_enqueue=lambda *_: pytest.fail("disabled trigger enqueued"),
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "disabled_by_config"
+    assert result["task_id"] is None
+    assert result["status"]["state"] == "disabled"
+
+
+def test_run_now_pauses_when_no_accounts_are_eligible():
+    service = _service_module()
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="idle",
+        chatgpt_auto_relogin_status_next_run_at="2026-08-02T12:30:00Z",
+    )
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        list_eligible=lambda: [],
+        try_enqueue=lambda *_: pytest.fail("empty trigger enqueued"),
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "no_eligible_accounts"
+    assert result["status"]["state"] == "paused_no_accounts"
+    assert result["status"]["active_task_id"] is None
+    assert result["status"]["next_run_at"] is None
+
+
+def test_run_now_rejects_a_persisted_active_task_without_enqueuing():
+    service = _service_module()
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="running",
+        chatgpt_auto_relogin_status_reason="task_running",
+        chatgpt_auto_relogin_status_active_task_id="task-active",
+    )
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        list_eligible=lambda: [1],
+        try_enqueue=lambda *_: pytest.fail("overlapping trigger enqueued"),
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "task_busy"
+    assert result["status"]["active_task_id"] == "task-active"
+
+
+@pytest.mark.parametrize("reason", ["foreground_busy", "task_busy"])
+def test_run_now_busy_decision_preserves_the_existing_deadline(reason):
+    service = _service_module()
+    deadline = "2026-08-02T12:30:00Z"
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="idle",
+        chatgpt_auto_relogin_status_reason="scheduled",
+        chatgpt_auto_relogin_status_next_run_at=deadline,
+    )
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        list_eligible=lambda: [1, 2],
+        try_enqueue=lambda *_: _busy(reason),
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"] == reason
+    assert result["status"]["state"] == "idle"
+    assert result["status"]["next_run_at"] == deadline
+
+
+def test_run_now_enqueue_exception_is_redacted_and_preserves_the_deadline():
+    service = _service_module()
+    deadline = "2026-08-02T12:30:00Z"
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="idle",
+        chatgpt_auto_relogin_status_reason="scheduled",
+        chatgpt_auto_relogin_status_next_run_at=deadline,
+    )
+
+    def fail_enqueue(*_):
+        raise RuntimeError("secret queue detail")
+
+    result = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        list_eligible=lambda: [1],
+        try_enqueue=fail_enqueue,
+    )
+
+    assert result["accepted"] is False
+    assert result["reason"] == "enqueue_failed"
+    assert result["status"]["next_run_at"] == deadline
+    assert "secret" not in str(result)
+
+
+def test_concurrent_run_now_calls_enqueue_only_one_task():
+    service = _service_module()
+    store = _enabled_store(
+        chatgpt_auto_relogin_status_state="idle",
+        chatgpt_auto_relogin_status_next_run_at="2026-08-02T12:30:00Z",
+    )
+    enqueue_started = threading.Event()
+    release_enqueue = threading.Event()
+    results = []
+    enqueues = []
+
+    def enqueue(account_ids, concurrency):
+        enqueues.append((list(account_ids), concurrency))
+        enqueue_started.set()
+        release_enqueue.wait(timeout=2)
+        return _accepted("task-only")
+
+    def run_now():
+        results.append(
+            service.trigger_chatgpt_auto_relogin_now(
+                store=store,
+                list_eligible=lambda: [1],
+                try_enqueue=enqueue,
+            )
+        )
+
+    first = threading.Thread(target=run_now)
+    second = threading.Thread(target=run_now)
+    first.start()
+    assert enqueue_started.wait(timeout=2)
+    second.start()
+    release_enqueue.set()
+    first.join(timeout=2)
+    second.join(timeout=2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert enqueues == [([1], 10)]
+    assert sorted(result["accepted"] for result in results) == [False, True]
+    assert {result["reason"] for result in results} == {"enqueued", "task_busy"}
+
+
+def test_run_now_completion_restarts_the_interval_from_completed_at():
+    service = _service_module()
+    t0 = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+    store = _enabled_store(chatgpt_auto_relogin_interval_minutes="30")
+    started = service.trigger_chatgpt_auto_relogin_now(
+        store=store,
+        now=t0,
+        list_eligible=lambda: [1],
+        try_enqueue=lambda *_: _accepted("task-now"),
+    )
+    assert started["accepted"] is True
+
+    status = service.tick_chatgpt_auto_relogin(
+        store=store,
+        now=t0 + timedelta(minutes=6),
+        list_eligible=lambda: [1],
+        try_enqueue=lambda *_: pytest.fail("completed task enqueued early"),
+        observe=lambda _: {
+            "status": "done",
+            "completed_at": t0 + timedelta(minutes=5),
+            "updated_at": t0 + timedelta(minutes=6),
+            "live": False,
+            "orphaned": False,
+        },
+    )
+
+    assert status["state"] == "idle"
+    assert status["active_task_id"] is None
+    assert status["next_run_at"] == "2026-08-02T12:35:00Z"
 
 
 def test_tick_waits_a_full_interval_then_enqueues_all_accounts_at_concurrency_ten():

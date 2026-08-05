@@ -524,8 +524,8 @@ def inspect_codex2api_account_health(
             result[account_id] = _record(
                 account_id=account_id,
                 email=email,
-                state="missing",
-                message="Codex2API 未找到同邮箱账号，未触发自动重登",
+                state="remote_missing",
+                message="Codex2API 未找到同邮箱账号，将执行一次完整登录确认",
             )
             continue
         if len(matches) > 1:
