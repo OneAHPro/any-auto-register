@@ -8,6 +8,7 @@ import threading
 import time
 
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Optional, Any, Callable
 from .proxy_utils import build_requests_proxy_config
@@ -65,6 +66,18 @@ class BaseMailbox(ABC):
             chunk = min(0.25, remaining)
             time.sleep(chunk)
             remaining -= chunk
+
+    @contextmanager
+    def pause_active_slot_for_mailbox_wait(self):
+        """Yield the task's foreground slot while preserving mailbox state."""
+        task_control = getattr(self, "_task_control", None)
+        pause_slot = getattr(task_control, "pause_active_slot", None)
+        attempt_id = getattr(self, "_task_attempt_token", None)
+        if not callable(pause_slot) or attempt_id is None:
+            yield False
+            return
+        with pause_slot(attempt_id) as released:
+            yield released
 
     def _run_polling_wait(
         self,
@@ -4518,6 +4531,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             otp_sent_at = float(kwargs.get("otp_sent_at") or 0)
         except (TypeError, ValueError):
             otp_sent_at = 0.0
+        try:
+            poll_interval = float(kwargs.get("poll_interval") or 3)
+        except (TypeError, ValueError):
+            poll_interval = 3.0
+        poll_interval = min(max(poll_interval, 1.0), 30.0)
 
         def poll_once() -> Optional[str]:
             try:
@@ -4572,7 +4590,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         return self.mailbox._run_polling_wait(
             timeout=timeout,
-            poll_interval=3,
+            poll_interval=poll_interval,
             poll_once=poll_once,
         )
 

@@ -42,6 +42,7 @@ CHATGPT_SMS_POOL_ITEM_IDS_KEY = "chatgpt_sms_pool_item_ids"
 CHATGPT_RETRY_BINDINGS_KEY = "chatgpt_retry_bindings"
 CHATGPT_MAIL_PROVIDER_PLAN_KEY = "chatgpt_existing_account_mail_provider_plan"
 CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
+CHATGPT_BACKGROUND_WAIT_MAX_WORKERS = 64
 CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS = 45.0
 MAX_PERSISTED_TASK_LOG_ENTRIES = 500
 MAX_PERSISTED_TASK_LOG_BYTES = 256 * 1024
@@ -79,6 +80,17 @@ _automation_runner_active_tasks: set[str] = set()
 _automation_stop_watchdog_tasks: dict[str, threading.Event] = {}
 _sms_pool_quarantine_lock = threading.Lock()
 _sms_pool_quarantine_item_ids_by_task: dict[str, set[int]] = {}
+
+
+def _chatgpt_executor_worker_count(total: int, active_workers: int) -> int:
+    """Allow bounded sleeping OTP attempts without raising active concurrency."""
+    resolved_total = max(int(total or 0), 0)
+    if resolved_total == 0:
+        return 0
+    return min(
+        resolved_total,
+        max(int(active_workers or 1), CHATGPT_BACKGROUND_WAIT_MAX_WORKERS),
+    )
 
 
 def _automation_force_stop_seconds() -> float:
@@ -1594,6 +1606,8 @@ def _run_chatgpt_relogin_task_inner(
         CHATGPT_RELOGIN_MAX_CONCURRENCY,
         total,
     )
+    control.configure_active_slots(max_workers)
+    executor_workers = _chatgpt_executor_worker_count(total, max_workers)
     success = 0
     processed = 0
     skipped = 0
@@ -1830,7 +1844,7 @@ def _run_chatgpt_relogin_task_inner(
         finally:
             control.finish_attempt(attempt_id)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+    with ThreadPoolExecutor(max_workers=executor_workers) as pool:
         jobs = iter(enumerate(account_ids, start=1))
         pending = {}
 
@@ -1844,7 +1858,7 @@ def _run_chatgpt_relogin_task_inner(
             return True
 
         try:
-            for _ in range(max_workers):
+            for _ in range(executor_workers):
                 if not _submit_next():
                     break
 
@@ -1902,7 +1916,7 @@ def _run_chatgpt_relogin_task_inner(
                             "正在等待当前步骤安全退出",
                         )
                 else:
-                    while len(pending) < max_workers and _submit_next():
+                    while len(pending) < executor_workers and _submit_next():
                         pass
         except Exception:
             control.request_stop()
@@ -3810,8 +3824,15 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed
 
         max_workers = min(req.concurrency, req.count)
+        executor_workers = max_workers
+        if req.platform == "chatgpt":
+            control.configure_active_slots(max_workers)
+            executor_workers = _chatgpt_executor_worker_count(
+                req.count,
+                max_workers,
+            )
         stopped = False
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        with ThreadPoolExecutor(max_workers=executor_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
             for f in as_completed(futures):
                 try:

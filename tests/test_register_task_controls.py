@@ -4,6 +4,7 @@ import uuid
 from unittest import mock
 from unittest.mock import patch
 
+import api.tasks as tasks_module
 from api.tasks import RegisterTaskRequest, _create_task_record, _run_register, _task_store
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
@@ -79,6 +80,43 @@ class _FakeChatGPTWorkspacePlatform(BasePlatform):
             email=f"user{index}@example.com",
             password=password or "pw",
             extra={"workspace_id": f"ws-{index}"},
+        )
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
+class _YieldingChatGPTPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+    _lock = threading.Lock()
+    _counter = 0
+    second_started = threading.Event()
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    @classmethod
+    def reset(cls):
+        with cls._lock:
+            cls._counter = 0
+        cls.second_started = threading.Event()
+
+    def register(self, email: str, password: str = None) -> Account:
+        with type(self)._lock:
+            type(self)._counter += 1
+            index = type(self)._counter
+        if index == 1:
+            with self.mailbox.pause_active_slot_for_mailbox_wait():
+                if not type(self).second_started.wait(timeout=1):
+                    raise RuntimeError("第二个账号未在后台等码期间启动")
+        else:
+            type(self).second_started.set()
+        return Account(
+            platform="chatgpt",
+            email=f"yield-{index}@example.com",
+            password=password or "pw",
         )
 
     def check_valid(self, account: Account) -> bool:
@@ -174,6 +212,34 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(snapshot["registered"], 2)
         self.assertEqual(snapshot["total"], 2)
+
+    def test_chatgpt_mailbox_wait_yields_active_concurrency_to_next_account(self):
+        task_id = "task-chatgpt-mailbox-background-wait"
+        req = self._build_request(platform="chatgpt", count=2, concurrency=1)
+        _create_task_record(task_id, req, "manual", None)
+        _YieldingChatGPTPlatform.reset()
+
+        with (
+            patch("core.registry.get", return_value=_YieldingChatGPTPlatform),
+            patch("core.base_mailbox.create_mailbox", side_effect=lambda **_kwargs: _FakeMailbox()),
+            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(snapshot["errors"], [])
+
+    def test_chatgpt_background_executor_is_bounded(self):
+        self.assertEqual(
+            tasks_module._chatgpt_executor_worker_count(28, 1),
+            28,
+        )
+        self.assertEqual(
+            tasks_module._chatgpt_executor_worker_count(100, 10),
+            64,
+        )
 
     def test_chatgpt_login_uses_each_imported_mail_provider_in_plan(self):
         task_id = "task-chatgpt-combined-mail-imports"

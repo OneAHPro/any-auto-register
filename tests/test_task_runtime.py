@@ -21,6 +21,57 @@ class AttemptResultTests(unittest.TestCase):
 
 
 class RegisterTaskControlTests(unittest.TestCase):
+    def test_paused_active_slot_allows_next_attempt_then_reacquires(self):
+        control = RegisterTaskControl()
+        control.configure_active_slots(1)
+        first_attempt = control.start_attempt()
+        second_started = threading.Event()
+        allow_second_finish = threading.Event()
+        second_finished = threading.Event()
+
+        def run_second_attempt() -> None:
+            second_attempt = control.start_attempt()
+            second_started.set()
+            allow_second_finish.wait(timeout=1)
+            control.finish_attempt(second_attempt)
+            second_finished.set()
+
+        worker = threading.Thread(target=run_second_attempt)
+        worker.start()
+        self.assertFalse(second_started.wait(timeout=0.05))
+
+        with control.pause_active_slot(first_attempt):
+            self.assertTrue(second_started.wait(timeout=1))
+            allow_second_finish.set()
+            self.assertTrue(second_finished.wait(timeout=1))
+
+        control.finish_attempt(first_attempt)
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
+    def test_stop_interrupts_attempt_waiting_for_active_slot(self):
+        control = RegisterTaskControl()
+        control.configure_active_slots(1)
+        first_attempt = control.start_attempt()
+        interrupted = threading.Event()
+
+        def wait_for_slot() -> None:
+            try:
+                control.start_attempt()
+            except StopTaskRequested:
+                interrupted.set()
+
+        worker = threading.Thread(target=wait_for_slot)
+        worker.start()
+        self.assertFalse(interrupted.wait(timeout=0.05))
+
+        control.request_stop()
+
+        self.assertTrue(interrupted.wait(timeout=1))
+        control.finish_attempt(first_attempt)
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive())
+
     def test_skip_request_is_consumed_only_once(self):
         control = RegisterTaskControl()
 

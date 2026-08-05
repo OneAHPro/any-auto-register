@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import threading
 import tempfile
 import unittest
@@ -55,6 +56,35 @@ class _DelayedBaselineMailbox(_TrackingMailbox):
         self.baseline_release.wait(timeout=1)
         self.baseline_finished.set()
         return {"mid-1"}
+
+
+class _SlowMailbox(_TrackingMailbox):
+    def __init__(self):
+        super().__init__()
+        self.timeouts = []
+        self.poll_intervals = []
+        self.background_entries = 0
+
+    def wait_for_code(self, *args, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
+        self.poll_intervals.append(kwargs.get("poll_interval"))
+        if len(self.timeouts) == 1:
+            raise TimeoutError("foreground mailbox wait expired")
+        return "123456"
+
+    @contextmanager
+    def pause_active_slot_for_mailbox_wait(self):
+        self.background_entries += 1
+        yield True
+
+
+class _RepeatedSlowMailbox(_SlowMailbox):
+    def wait_for_code(self, *args, **kwargs):
+        self.timeouts.append(kwargs.get("timeout"))
+        self.poll_intervals.append(kwargs.get("poll_interval"))
+        if len(self.timeouts) in {1, 3}:
+            raise TimeoutError("mailbox phase expired")
+        return "123456" if len(self.timeouts) == 2 else "654321"
 
 
 class _RequeueMailbox(_TrackingMailbox):
@@ -155,6 +185,7 @@ class _VerificationAdapter:
 
     def run(self, context):
         self.run_called = True
+        self.extra_config = dict(context.extra_config)
         context.email_service.create_email()
         self.mailbox_metadata = context.email_service.get_mailbox_metadata()
         code = context.email_service.get_verification_code(
@@ -167,6 +198,18 @@ class _VerificationAdapter:
 
     def build_account(self, result, fallback_password):
         return {"success": True, "password": fallback_password}
+
+
+class _RepeatedVerificationAdapter(_VerificationAdapter):
+    def run(self, context):
+        self.run_called = True
+        self.extra_config = dict(context.extra_config)
+        context.email_service.create_email()
+        self.codes = [
+            context.email_service.get_verification_code(timeout=30),
+            context.email_service.get_verification_code(timeout=30),
+        ]
+        return mock.Mock(success=True)
 
 
 class _AsyncBaselineAdapter(_VerificationAdapter):
@@ -442,7 +485,62 @@ class ChatGPTPluginTests(unittest.TestCase):
             platform.register()
 
         _, kwargs = mailbox.wait_call
-        self.assertEqual(kwargs.get("timeout"), 90)
+        self.assertEqual(kwargs.get("timeout"), 20)
+
+    def test_slow_mailbox_moves_to_background_after_foreground_window(self):
+        mailbox = _SlowMailbox()
+        logs = []
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={"chatgpt_registration_mode": "refresh_token"}
+            ),
+            mailbox=mailbox,
+        )
+        platform._log_fn = logs.append
+        adapter = _VerificationAdapter()
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            result = platform.register()
+
+        self.assertEqual(result["success"], True)
+        self.assertEqual(adapter.last_code, "123456")
+        self.assertEqual(mailbox.timeouts, [20, 160])
+        self.assertEqual(mailbox.poll_intervals, [3, 10])
+        self.assertEqual(mailbox.background_entries, 1)
+        self.assertEqual(
+            adapter.extra_config["mailbox_otp_timeout_seconds"],
+            180,
+        )
+        self.assertEqual(
+            adapter.extra_config["chatgpt_oauth_otp_wait_seconds"],
+            180,
+        )
+        self.assertTrue(any("后台等待" in line for line in logs))
+
+    def test_repeated_otp_reads_share_one_total_wait_budget(self):
+        mailbox = _RepeatedSlowMailbox()
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "mailbox_otp_timeout_seconds": 60,
+                }
+            ),
+            mailbox=mailbox,
+        )
+        adapter = _RepeatedVerificationAdapter()
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            platform.register()
+
+        self.assertEqual(adapter.codes, ["123456", "654321"])
+        self.assertEqual(mailbox.timeouts, [20, 40, 20, 20])
 
     def test_custom_provider_does_not_requeue_mailbox_account_on_failure(self):
         mailbox = _RequeueMailbox()

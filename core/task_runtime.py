@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 import threading
@@ -71,6 +72,78 @@ class RegisterTaskControl:
         self._next_attempt_id = 1
         self._active_attempt_ids: set[int] = set()
         self._skip_active_attempt_ids: set[int] = set()
+        self._active_slot_semaphore: threading.BoundedSemaphore | None = None
+        self._active_slot_limit = 0
+        self._slot_holding_attempt_ids: set[int] = set()
+
+    def configure_active_slots(self, limit: int) -> None:
+        """Limit foreground attempts while allowing mailbox waits to yield."""
+        resolved_limit = max(int(limit or 0), 1)
+        with self._lock:
+            if self._active_attempt_ids:
+                raise RuntimeError("活跃账号并发槽必须在任务开始前配置")
+            self._active_slot_limit = resolved_limit
+            self._active_slot_semaphore = threading.BoundedSemaphore(
+                resolved_limit
+            )
+            self._slot_holding_attempt_ids.clear()
+
+    def _acquire_new_attempt_slot(self) -> bool:
+        with self._lock:
+            semaphore = self._active_slot_semaphore
+        if semaphore is None:
+            return False
+
+        while True:
+            self.checkpoint(consume_skip=False)
+            if semaphore.acquire(timeout=0.1):
+                return True
+
+    def _resume_active_slot(self, attempt_id: int) -> None:
+        with self._lock:
+            semaphore = self._active_slot_semaphore
+        if semaphore is None:
+            return
+
+        while True:
+            self.checkpoint(attempt_id=attempt_id)
+            if semaphore.acquire(timeout=0.1):
+                break
+
+        try:
+            self.checkpoint(attempt_id=attempt_id)
+            with self._lock:
+                if attempt_id not in self._active_attempt_ids:
+                    return
+                self._slot_holding_attempt_ids.add(attempt_id)
+                semaphore = None
+        finally:
+            if semaphore is not None:
+                semaphore.release()
+
+    @contextmanager
+    def pause_active_slot(self, attempt_id: int | None):
+        """Temporarily yield one foreground slot during a mailbox wait."""
+        semaphore = None
+        if attempt_id is not None:
+            with self._lock:
+                if attempt_id in self._slot_holding_attempt_ids:
+                    self._slot_holding_attempt_ids.remove(attempt_id)
+                    semaphore = self._active_slot_semaphore
+        if semaphore is None:
+            yield False
+            return
+
+        semaphore.release()
+        interrupted = False
+        try:
+            yield True
+        except TaskInterruption:
+            interrupted = True
+            raise
+        finally:
+            if not interrupted:
+                self._resume_active_slot(attempt_id)
 
     def request_stop(self) -> None:
         self.request_stop_once()
@@ -90,18 +163,37 @@ class RegisterTaskControl:
                 self._pending_skip_requests += 1
 
     def start_attempt(self) -> int:
-        with self._lock:
-            attempt_id = self._next_attempt_id
-            self._next_attempt_id += 1
-            self._active_attempt_ids.add(attempt_id)
-            return attempt_id
+        acquired_slot = self._acquire_new_attempt_slot()
+        try:
+            with self._lock:
+                if self._stop_requested:
+                    raise StopTaskRequested()
+                attempt_id = self._next_attempt_id
+                self._next_attempt_id += 1
+                self._active_attempt_ids.add(attempt_id)
+                if acquired_slot:
+                    self._slot_holding_attempt_ids.add(attempt_id)
+                return attempt_id
+        except Exception:
+            if acquired_slot:
+                with self._lock:
+                    semaphore = self._active_slot_semaphore
+                if semaphore is not None:
+                    semaphore.release()
+            raise
 
     def finish_attempt(self, attempt_id: int | None) -> None:
         if attempt_id is None:
             return
+        semaphore = None
         with self._lock:
             self._active_attempt_ids.discard(attempt_id)
             self._skip_active_attempt_ids.discard(attempt_id)
+            if attempt_id in self._slot_holding_attempt_ids:
+                self._slot_holding_attempt_ids.remove(attempt_id)
+                semaphore = self._active_slot_semaphore
+        if semaphore is not None:
+            semaphore.release()
 
     def checkpoint(
         self,
@@ -134,6 +226,8 @@ class RegisterTaskControl:
                 "pending_skip_requests": self._pending_skip_requests,
                 "active_attempts": len(self._active_attempt_ids),
                 "targeted_skip_attempts": len(self._skip_active_attempt_ids),
+                "active_slot_limit": self._active_slot_limit,
+                "active_slots_in_use": len(self._slot_holding_attempt_ids),
             }
 
 
