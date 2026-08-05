@@ -87,7 +87,7 @@ def _resolve_mailbox_otp_timeout(config: Mapping[str, Any]) -> int:
             continue
         if seconds > 0:
             return max(30, min(seconds, 3600))
-    return 180
+    return 300
 
 
 def _is_exhausted_mailbox_otp_failure(
@@ -659,7 +659,7 @@ class _PersistedEmailService:
         mailbox_context: dict[str, Any],
         provider: str,
         log_fn: LogFn | None,
-        otp_timeout_seconds: int = 180,
+        otp_timeout_seconds: int = 300,
     ) -> None:
         self.service_type = type("ServiceType", (), {"value": provider})()
         self._mailbox = mailbox
@@ -670,8 +670,9 @@ class _PersistedEmailService:
         self._baseline_ready = threading.Event()
         self._baseline_started = False
         self._otp_remaining_seconds = float(
-            max(30, min(int(otp_timeout_seconds or 180), 3600))
+            max(30, min(int(otp_timeout_seconds or 300), 3600))
         )
+        self._foreground_remaining_seconds = 20.0
 
     def _load_baseline(self) -> None:
         try:
@@ -761,9 +762,13 @@ class _PersistedEmailService:
                 f"等待邮箱新验证码超时 ({requested_timeout}s)"
             )
 
+        call_remaining_seconds = min(
+            float(requested_timeout),
+            self._otp_remaining_seconds,
+        )
         baseline_started_at = time.monotonic()
         baseline_wait = min(
-            max(int(math.ceil(self._otp_remaining_seconds)), 1),
+            max(int(math.ceil(call_remaining_seconds)), 1),
             30,
         )
         if not self._baseline_ready.wait(timeout=baseline_wait):
@@ -776,18 +781,28 @@ class _PersistedEmailService:
             0.0,
             self._otp_remaining_seconds - baseline_elapsed,
         )
-        if self._otp_remaining_seconds <= 0:
+        call_remaining_seconds = max(
+            0.0,
+            call_remaining_seconds - baseline_elapsed,
+        )
+        if self._otp_remaining_seconds <= 0 or call_remaining_seconds <= 0:
             raise TimeoutError(
                 f"等待邮箱新验证码超时 ({requested_timeout}s)"
             )
 
-        foreground_budget = max(0.0, 20.0 - baseline_elapsed)
         foreground_timeout = min(
-            int(math.ceil(foreground_budget)),
+            int(math.ceil(self._foreground_remaining_seconds)),
+            int(math.ceil(call_remaining_seconds)),
             int(math.ceil(self._otp_remaining_seconds)),
         )
 
-        def _wait(wait_seconds: int, poll_interval: int):
+        def _wait(
+            wait_seconds: int,
+            poll_interval: int,
+            *,
+            foreground: bool = False,
+        ):
+            nonlocal call_remaining_seconds
             phase_started_at = time.monotonic()
             timed_out = False
             code = None
@@ -817,11 +832,20 @@ class _PersistedEmailService:
                     0.0,
                     self._otp_remaining_seconds - phase_elapsed,
                 )
+                call_remaining_seconds = max(
+                    0.0,
+                    call_remaining_seconds - phase_elapsed,
+                )
+                if foreground:
+                    self._foreground_remaining_seconds = max(
+                        0.0,
+                        self._foreground_remaining_seconds - phase_elapsed,
+                    )
 
         code = None
         if foreground_timeout > 0:
             try:
-                code = _wait(foreground_timeout, 3)
+                code = _wait(foreground_timeout, 3, foreground=True)
             except TimeoutError:
                 code = None
         if code:
@@ -829,7 +853,10 @@ class _PersistedEmailService:
 
         background_timeout = max(
             0,
-            int(math.ceil(self._otp_remaining_seconds)),
+            min(
+                int(math.ceil(call_remaining_seconds)),
+                int(math.ceil(self._otp_remaining_seconds)),
+            ),
         )
         if background_timeout <= 0:
             raise TimeoutError(

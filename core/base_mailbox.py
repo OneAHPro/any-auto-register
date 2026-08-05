@@ -4134,12 +4134,12 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         return re.sub(r"\\([\\/'\"])", r"\1", text)
 
     @classmethod
-    def _find_legacy_mailapi_detail_url(
+    def _find_legacy_mailapi_detail_urls(
         cls,
         page_text: str,
         source_url: str,
-    ) -> Optional[str]:
-        """Resolve the newest message URL from a MailAPI HTML list page."""
+    ) -> list[str]:
+        """Resolve ordered message URLs from a legacy MailAPI HTML list page."""
         import re
         from html import unescape
         from urllib.parse import quote, urljoin
@@ -4166,7 +4166,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             or not detail_suffix_match
             or detail_base_match.start() <= list_marker_match.end()
         ):
-            return None
+            return []
 
         list_region = raw[list_marker_match.end() : detail_base_match.start()]
         items: list[tuple[str, str]] = []
@@ -4200,37 +4200,55 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 continue
             items.append((data_id_match.group(2), anchor_match.group(2)))
         if not items:
-            return None
+            return []
 
         verification_subject = re.compile(
             r"(?is)\b(?:verification|login|security)\b.{0,32}\bcode\b|"
             r"\b(?:temporary|one[-\s]*time)\b.{0,32}"
             r"\b(?:code|password)\b|\botp\b|"
-            r"验证码|校验码|动态码|認証コード|認證碼|驗證碼"
+            r"验证码|校验码|动态码|登录代码|登錄代碼|登入代碼|"
+            r"認証コード|認證碼|驗證碼"
         )
-        selected_item = next(
-            (
-                item
-                for item in items
-                if verification_subject.search(
-                    unescape(re.sub(r"<[^>]+>", " ", item[1]))
-                )
-            ),
-            items[0],
-        )
-        message_id = unescape(str(selected_item[0] or "")).strip()
         detail_base = cls._decode_mailapi_script_string(detail_base_match.group(2))
         detail_suffix = cls._decode_mailapi_script_string(
             detail_suffix_match.group(2)
         )
-        if not message_id or not detail_base:
-            return None
+        if not detail_base:
+            return []
 
-        detail_path = (
-            f"{detail_base.rstrip('/')}/{quote(message_id, safe='')}"
-            f"{detail_suffix}"
+        preferred = [
+            item
+            for item in items
+            if verification_subject.search(
+                unescape(re.sub(r"<[^>]+>", " ", item[1]))
+            )
+        ]
+        ordered = [*preferred, *(item for item in items if item not in preferred)]
+        urls: list[str] = []
+        for message_id, _body in ordered:
+            normalized_id = unescape(str(message_id or "")).strip()
+            if not normalized_id:
+                continue
+            detail_path = (
+                f"{detail_base.rstrip('/')}/{quote(normalized_id, safe='')}"
+                f"{detail_suffix}"
+            )
+            resolved = urljoin(str(source_url or ""), detail_path)
+            if resolved not in urls:
+                urls.append(resolved)
+        return urls
+
+    @classmethod
+    def _find_legacy_mailapi_detail_url(
+        cls,
+        page_text: str,
+        source_url: str,
+    ) -> Optional[str]:
+        """Retain the historical singular resolver for compatibility."""
+        return next(
+            iter(cls._find_legacy_mailapi_detail_urls(page_text, source_url)),
+            None,
         )
-        return urljoin(str(source_url or ""), detail_path)
 
     @staticmethod
     def _mailapi_visible_text(value: Any) -> str:
@@ -4365,9 +4383,10 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         # Preserve the proven yangyang-style resolver as the highest-confidence
         # candidate, while allowing all other providers to use generic links.
-        legacy_url = cls._find_legacy_mailapi_detail_url(raw, source_url)
-        if legacy_url:
-            add(legacy_url, score=1000)
+        for index, legacy_url in enumerate(
+            cls._find_legacy_mailapi_detail_urls(raw, source_url)
+        ):
+            add(legacy_url, score=1000 - index)
 
         try:
             payload = json.loads(raw)
@@ -4565,11 +4584,31 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         raw_text: str,
         code_pattern: str | None,
     ) -> str:
+        import re
+
         content = str(message.get("content") or "")
         code = self._extract_code(content, code_pattern)
-        if code or content == str(raw_text or ""):
-            return code
-        return self._extract_code(str(raw_text or ""), code_pattern)
+        if not code and content != str(raw_text or ""):
+            code = self._extract_code(str(raw_text or ""), code_pattern)
+        if not code:
+            return ""
+
+        visible = self.mailbox._decode_raw_content(content) or content
+        raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(
+            raw_text or ""
+        )
+        normalized = " ".join(f"{visible} {raw_visible}".split())
+        semantic_otp = re.search(
+            r"(?is)\b(?:verification|login|security)\s+code\b|"
+            r"\b(?:temporary|one[-\s]*time)\b.{0,32}\b(?:code|password)\b|"
+            r"\botp\b|验证码|校验码|动态码|登录代码|登錄代碼|登入代碼|"
+            r"認証コード|認證碼|驗證碼",
+            normalized,
+        )
+        isolated_code = re.fullmatch(r"\D{0,20}\d{6}\D{0,20}", normalized)
+        if not semantic_otp and not isolated_code:
+            return ""
+        return code
 
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:

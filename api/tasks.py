@@ -1749,7 +1749,7 @@ def _run_chatgpt_relogin_task_inner(
                         codex2api_delete_on_account_remove_enabled=(
                             delete_linked_credential
                         ),
-                        remove_on_mailbox_otp_timeout=True,
+                        remove_on_mailbox_otp_timeout=False,
                     )
                     if isinstance(result, dict):
                         result = {

@@ -768,6 +768,106 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(mock_get.call_args_list[1].kwargs["timeout"], 5)
 
     @mock.patch("requests.get")
+    def test_mailapi_legacy_list_checks_chinese_login_code_after_newer_notice(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/messages/TOKEN/EMAIL",
+            },
+        )
+        list_html = """
+        <div id="message-list">
+          <a class="item active" href="#mail-notice" data-id="notice">
+            <div class="subject">New sign-in to your OpenAI account</div>
+          </a>
+          <a class="item" href="#mail-otp" data-id="otp">
+            <div class="subject">你的临时 ChatGPT 登录代码</div>
+          </a>
+        </div>
+        <script>
+          var detailBase='/message/';
+          var detailSuffix='/DETAIL_TOKEN/EMAIL';
+        </script>
+        """
+
+        def fake_get(url, **_kwargs):
+            if url == account.extra["mailapi_url"]:
+                return _FakeResponse(200, text=list_html)
+            if "/message/notice/" in url:
+                return _FakeResponse(
+                    200,
+                    text=json.dumps(
+                        {
+                            "subject": "New sign-in to your OpenAI account",
+                            "body": "A new sign-in was detected.",
+                        }
+                    ),
+                )
+            if "/message/otp/" in url:
+                return _FakeResponse(
+                    200,
+                    text=json.dumps(
+                        {
+                            "subject": "你的临时 ChatGPT 登录代码",
+                            "body": "输入此临时验证码以继续：975310",
+                        }
+                    ),
+                )
+            raise AssertionError(f"unexpected URL: {url}")
+
+        mock_get.side_effect = fake_get
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertEqual(code, "975310")
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
+    def test_mailapi_html_notice_does_not_extract_six_digits_from_markup(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text="""
+            <html><body>
+              <article class="mail-card" data-message-id="654321">
+                <span class="subject">New sign-in to your OpenAI account</span>
+                <span class="date">2026-08-06 03:14:56</span>
+                <p>A new sign-in was detected on your account. Reference 654321.</p>
+              </article>
+            </body></html>
+            """,
+        )
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertIsNone(code)
+
+    @mock.patch("requests.get")
     def test_mailapi_list_poll_limits_slow_detail_fanout(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(

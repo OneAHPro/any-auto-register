@@ -669,10 +669,10 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["invalid_rt_count"], 0)
         self.assertEqual(snapshot["meta"]["relogin_failed_count"], 1)
         self.assertEqual(snapshot["meta"]["deleted_account_count"], 0)
-        self.assertTrue(
+        self.assertFalse(
             full_login.call_args.kwargs.get(
                 "remove_on_mailbox_otp_timeout",
-                False,
+                True,
             )
         )
 

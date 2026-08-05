@@ -753,7 +753,7 @@ class ChatGPTReloginTests(unittest.TestCase):
 
         self.assertFalse(service.supports_totp_code())
 
-    def test_persisted_email_service_yields_slot_and_uses_one_total_budget(self):
+    def test_persisted_email_service_limits_each_call_without_spending_total_budget(self):
         from services.chatgpt_relogin import _PersistedEmailService
 
         mailbox = mock.Mock()
@@ -771,7 +771,7 @@ class ChatGPTReloginTests(unittest.TestCase):
             mailbox_context={},
             provider="fixture",
             log_fn=logs.append,
-            otp_timeout_seconds=90,
+            otp_timeout_seconds=300,
         )
         service.create_email()
         self.assertTrue(service._baseline_ready.wait(timeout=1))
@@ -783,16 +783,19 @@ class ChatGPTReloginTests(unittest.TestCase):
 
         self.assertEqual(
             [call.kwargs["timeout"] for call in mailbox.wait_for_code.call_args_list],
-            [20, 70],
+            [20, 10, 30],
         )
         self.assertEqual(
             [
                 call.kwargs["poll_interval"]
                 for call in mailbox.wait_for_code.call_args_list
             ],
-            [3, 10],
+            [3, 10, 10],
         )
-        mailbox.pause_active_slot_for_mailbox_wait.assert_called_once_with()
+        self.assertEqual(
+            mailbox.pause_active_slot_for_mailbox_wait.call_count,
+            2,
+        )
         self.assertTrue(any("后台等待" in message for message in logs))
 
     def test_url_mailbox_service_binds_task_control_and_timeout_budget(self):
