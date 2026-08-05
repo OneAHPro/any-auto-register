@@ -26,10 +26,19 @@ Three implementation locations were considered:
 
 The scheduled task passes an explicit cleanup flag to the relogin service. The relogin service catches the typed timeout, calls the existing ordered account-removal service, and returns the standard `account_removed` result with `removal_reason=mailbox_otp_timeout`. Existing Codex2API remote-deletion configuration remains authoritative.
 
+## Two-phase automatic dispatch
+
+The Codex2API service already completes one global `wham_only` probe before any local login. After that snapshot returns, the task must also preserve a strict dispatch boundary:
+
+1. Process every `healthy`, `deferred`, `ambiguous`, and locally missing probe result first. These accounts update task progress without starting a browser login.
+2. Only after every probe-only result is counted may `auth_failed` and `remote_missing` accounts enter confirmation and full login.
+
+Probe-only account IDs are ordered ahead of login candidates. A task-local event gates login candidates without consuming an active login slot; stop and skip checkpoints remain responsive while a candidate waits for the phase boundary. This makes task progress reflect the global probe before slow mailboxes begin.
+
 ## Observability
 
 The account result and task log state that the mailbox OTP wait reached its budget with zero codes and the local record was removed. The task records the item as `removed`, increments `deleted_account_count`, and does not add it to ordinary task errors.
 
 ## Verification
 
-Tests cover the strict timeout classifier, all non-triggering boundaries, local deletion inside the account lock, manual relogin preservation, automatic-task flag propagation, removed-item logging, and existing deactivation cleanup behavior.
+Tests cover the strict timeout classifier, all non-triggering boundaries, local deletion inside the account lock, manual relogin preservation, automatic-task flag propagation, removed-item logging, strict probe-before-login ordering, and existing deactivation cleanup behavior.

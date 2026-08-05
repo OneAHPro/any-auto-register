@@ -4,7 +4,7 @@
 
 **Goal:** Remove scheduled-maintenance accounts whose email OTP login exhausts a wait of at least 180 seconds without obtaining any candidate code.
 
-**Architecture:** Classify the exact exhausted OTP result in `services/chatgpt_relogin.py`, represent it with a typed exception, and handle it inside the existing account-operation lock. `api/tasks.py` opts scheduled automation into cleanup and consumes the existing standard removed-account result.
+**Architecture:** Classify the exact exhausted OTP result in `services/chatgpt_relogin.py`, represent it with a typed exception, and handle it inside the existing account-operation lock. `api/tasks.py` first completes and records every probe-only result, then releases login candidates as a separate phase; scheduled login candidates opt into timeout cleanup and consume the existing standard removed-account result.
 
 **Tech Stack:** Python 3.10+, SQLModel/SQLite, FastAPI task runner, `unittest`.
 
@@ -34,7 +34,18 @@
 - [ ] **Step 3: Add the opt-in flag through the public and locked relogin functions, reuse the existing ordered removal service, return `removal_reason=mailbox_otp_timeout`, and make the task removal log generic enough for both deactivation and OTP timeout cleanup.**
 - [ ] **Step 4: Run focused and module tests and confirm they pass.**
 
-### Task 3: Verify and deploy
+### Task 3: Enforce probe-before-login dispatch
+
+**Files:**
+- Modify: `api/tasks.py`
+- Test: `tests/test_chatgpt_relogin_task.py`
+
+- [ ] **Step 1: Write a failing concurrency-one test** with a login candidate before a healthy account in input order; assert the healthy result is logged before the login service is called.
+- [ ] **Step 2: Run the focused test and confirm it fails because input ordering starts the login first.**
+- [ ] **Step 3: Partition automatic account IDs into probe-only and login-candidate groups, order probe-only IDs first, and gate login candidates on an event set only after every probe-only outcome is counted. The gate wait must checkpoint task stop/skip state without acquiring an active login slot.**
+- [ ] **Step 4: Run the focused test and the complete relogin-task module.**
+
+### Task 4: Verify and deploy
 
 **Files:**
 - Verify all files above plus the existing mailbox/task runtime tests.
