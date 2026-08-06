@@ -113,6 +113,32 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
             "sentinel-token",
         )
 
+    def test_password_reset_failure_keeps_sanitized_response_detail(self):
+        self.client.session.post.return_value = _response(
+            {},
+            url="https://auth.openai.com/api/accounts/password/reset",
+            status_code=409,
+            text='{"error":{"message":"SESSION_STATE_DETAIL"}}',
+        )
+        state = FlowState(
+            page_type="reset_password_new_password",
+            current_url="https://auth.openai.com/reset-password/new-password",
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="sentinel-token",
+        ):
+            result = self.client._submit_password_reset_new_password(
+                state,
+                new_password="Fresh-Password-123!",
+                device_id="device-id",
+            )
+
+        self.assertIsNone(result)
+        self.assertIn("HTTP 409", self.client.last_error)
+        self.assertIn("SESSION_STATE_DETAIL", self.client.last_error)
+
     def test_remote_totp_provider_is_used_without_base32_secret(self):
         issue = _response(
             {
