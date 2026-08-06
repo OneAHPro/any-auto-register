@@ -3199,6 +3199,30 @@ class OAuthClient:
                 state = next_state
                 continue
 
+            if (
+                force_password_login
+                and str(password or "")
+                and self._state_is_email_otp(state)
+            ):
+                self._log(
+                    "服务端默认返回邮箱 OTP，按强制密码登录策略直接提交密码验证"
+                )
+                next_state = self._submit_password_verify(
+                    password,
+                    device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    referer=state.current_url or state.continue_url or referer,
+                )
+                if not next_state:
+                    if not self.last_error:
+                        self._set_error("强制密码验证后未进入下一步 OAuth 状态")
+                    return None
+                referer = state.current_url or referer
+                state = next_state
+                continue
+
             if self._state_is_mfa_challenge(state):
                 next_state = self._submit_mfa_challenge(
                     state,

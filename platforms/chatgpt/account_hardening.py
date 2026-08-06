@@ -137,11 +137,24 @@ class ChatGPTMFAClient:
     def get_inventory(self) -> MFAInventory:
         data = self._request("GET", MFA_INFO_URL)
         raw_factors = data.get("factors")
-        factors = tuple(
-            dict(item)
-            for item in (raw_factors if isinstance(raw_factors, list) else [])
-            if isinstance(item, dict)
-        )
+        factor_items: list[dict[str, Any]] = []
+        if isinstance(raw_factors, list):
+            factor_items.extend(
+                dict(item) for item in raw_factors if isinstance(item, dict)
+            )
+        elif isinstance(raw_factors, dict):
+            for grouped_type, grouped_items in raw_factors.items():
+                if isinstance(grouped_items, dict):
+                    grouped_items = [grouped_items]
+                if not isinstance(grouped_items, list):
+                    continue
+                for item in grouped_items:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized = dict(item)
+                    normalized.setdefault("factor_type", str(grouped_type or ""))
+                    factor_items.append(normalized)
+        factors = tuple(factor_items)
         has_totp = any(
             str(
                 factor.get("factor_type")

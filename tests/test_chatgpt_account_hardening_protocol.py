@@ -89,6 +89,44 @@ class ChatGPTAccountHardeningProtocolTests(unittest.TestCase):
             },
         )
 
+    def test_reads_current_grouped_factor_inventory(self):
+        from platforms.chatgpt.account_hardening import ChatGPTMFAClient
+
+        transport = FakeTransport(
+            [
+                FakeResponse(
+                    payload={
+                        "mfa_enabled": True,
+                        "mfa_enabled_v2": True,
+                        "native_default_factor_id": "factor-totp",
+                        "factors": {
+                            "passkeys": [],
+                            "push_auth": None,
+                            "sms": [],
+                            "totp": [
+                                {
+                                    "id": "factor-totp",
+                                    "factor_type": "totp",
+                                    "is_recovery": False,
+                                    "metadata": {},
+                                }
+                            ],
+                        },
+                    }
+                )
+            ]
+        )
+        inventory = ChatGPTMFAClient(
+            access_token="access-token",
+            transport=transport,
+        ).get_inventory()
+
+        self.assertTrue(inventory.enabled)
+        self.assertTrue(inventory.has_totp)
+        self.assertEqual(inventory.default_factor_id, "factor-totp")
+        self.assertEqual(len(inventory.factors), 1)
+        self.assertEqual(inventory.factors[0]["factor_type"], "totp")
+
     def test_enrolls_and_activates_totp_with_current_contract(self):
         from platforms.chatgpt.account_hardening import ChatGPTMFAClient
 

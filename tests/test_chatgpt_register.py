@@ -378,6 +378,81 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         )
         follow_state.assert_not_called()
 
+    def test_forced_password_login_bypasses_default_email_otp_state(self):
+        client = self._make_client()
+        mailbox = mock.Mock()
+        email_otp_state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        mfa_state = FlowState(
+            page_type="mfa_challenge",
+            continue_url="https://auth.openai.com/mfa-challenge/factor-1",
+            current_url="https://auth.openai.com/mfa-challenge/factor-1",
+            payload={
+                "factors": [
+                    {"id": "factor-1", "factor_type": "totp"},
+                ]
+            },
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            return_value=email_otp_state,
+        ), mock.patch.object(
+            client,
+            "_submit_password_verify",
+            return_value=mfa_state,
+        ) as submit_password, mock.patch.object(
+            client,
+            "_submit_mfa_challenge",
+            return_value=consent_state,
+        ) as submit_mfa, mock.patch.object(
+            client,
+            "_handle_otp_verification",
+        ) as handle_email_otp, mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ), mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at", "refresh_token": "rt"},
+        ):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                skymail_client=mailbox,
+                prefer_passwordless_login=False,
+                force_password_login=True,
+                totp_secret="JBSWY3DPEHPK3PXP",
+                allow_phone_verification=False,
+            )
+
+        self.assertEqual(tokens["refresh_token"], "rt")
+        submit_password.assert_called_once()
+        self.assertEqual(
+            submit_password.call_args.kwargs["referer"],
+            email_otp_state.current_url,
+        )
+        submit_mfa.assert_called_once()
+        handle_email_otp.assert_not_called()
+
     def test_submit_mfa_prefers_supplied_totp_over_email_factor(self):
         client = self._make_client()
         expected_state = FlowState(page_type="consent")
