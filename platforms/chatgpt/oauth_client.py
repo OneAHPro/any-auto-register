@@ -142,6 +142,7 @@ class OAuthClient:
         self.sec_ch_ua = ""
         self.impersonate = ""
         self.last_prepared_oauth_context = None
+        self._oauth_session_expired = False
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -212,6 +213,35 @@ class OAuthClient:
             self.last_error = raw_message
         if self.last_error:
             self._log(self.last_error)
+
+    @staticmethod
+    def _is_invalid_authorization_session_response(response) -> bool:
+        try:
+            status_code = int(getattr(response, "status_code", 0) or 0)
+        except Exception:
+            status_code = 0
+        if status_code not in {400, 409}:
+            return False
+
+        response_text = str(getattr(response, "text", "") or "")
+        normalized = response_text.lower()
+        markers = (
+            "授权步骤无效",
+            "invalid authorization step",
+            "authorization step is invalid",
+            "sign-in session is no longer valid",
+            "login session is no longer valid",
+            "invalid_state",
+            "invalid state",
+        )
+        return any(marker in normalized for marker in markers)
+
+    def _mark_invalid_authorization_session(self, response) -> bool:
+        if not self._is_invalid_authorization_session_response(response):
+            return False
+        self._oauth_session_expired = True
+        self._set_error("OAuth 登录会话已失效，准备重新建立")
+        return True
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -2252,6 +2282,8 @@ class OAuthClient:
             self._log(f"/passwordless/send-otp -> {r.status_code}")
 
             if r.status_code != 200:
+                if self._mark_invalid_authorization_session(r):
+                    return None
                 self._set_error(f"触发 passwordless OTP 失败: {r.status_code} - {r.text[:180]}")
                 return None
 
@@ -2944,6 +2976,7 @@ class OAuthClient:
         prepared_oauth_context=None,
         _continue_depth=0,
         _password_reset_depth=0,
+        _oauth_restart_depth=0,
     ):
         """
         完整的 OAuth 登录流程，获取 tokens
@@ -2977,6 +3010,7 @@ class OAuthClient:
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_prepared_oauth_context = None
+        self._oauth_session_expired = False
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -3204,6 +3238,46 @@ class OAuthClient:
             )
             return prepared_context is not None
 
+        def _restart_after_expired_oauth_session():
+            if not self._oauth_session_expired:
+                return False, None
+            if int(_oauth_restart_depth or 0) >= 1:
+                self._set_error("新的 OAuth 登录会话仍然失效，已停止自动重试")
+                return False, None
+
+            self._log("检测到授权步骤失效：丢弃旧 Cookie，并重新建立 OAuth 登录会话")
+            tokens = self.login_and_get_tokens(
+                email,
+                password,
+                device_id="",
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                skymail_client=skymail_client,
+                prefer_passwordless_login=prefer_passwordless_login,
+                allow_phone_verification=allow_phone_verification,
+                force_new_browser=True,
+                resume_authenticated_session=False,
+                force_password_login=force_password_login,
+                totp_secret=totp_secret,
+                password_reset_required=password_reset_required,
+                on_password_reset=on_password_reset,
+                post_login_add_password=post_login_add_password,
+                force_chatgpt_entry=force_chatgpt_entry,
+                screen_hint=screen_hint,
+                complete_about_you_if_needed=complete_about_you_if_needed,
+                first_name=first_name,
+                last_name=last_name,
+                birthdate=birthdate,
+                login_source=login_source,
+                stop_after_login=stop_after_login,
+                prepared_oauth_context=None,
+                _continue_depth=0,
+                _password_reset_depth=_password_reset_depth,
+                _oauth_restart_depth=int(_oauth_restart_depth or 0) + 1,
+            )
+            return True, tokens
+
         for step in range(20):
             self.last_state = state
             self._log(f"状态步进[{step + 1}/20]: {describe_flow_state(state)}")
@@ -3346,6 +3420,9 @@ class OAuthClient:
                     referer=state.current_url or state.continue_url or referer,
                 )
                 if not next_state:
+                    restarted, retry_tokens = _restart_after_expired_oauth_session()
+                    if restarted:
+                        return retry_tokens
                     if not self.last_error:
                         self._set_error("passwordless OTP 触发后未进入邮箱验证码状态")
                     return None
@@ -3492,6 +3569,9 @@ class OAuthClient:
                     allow_cached_code_retry=_continue_depth > 0,
                 )
                 if not next_state:
+                    restarted, retry_tokens = _restart_after_expired_oauth_session()
+                    if restarted:
+                        return retry_tokens
                     if not self.last_error:
                         self._set_error("邮箱 OTP 验证后未进入下一步 OAuth 状态")
                     return None
@@ -4767,6 +4847,9 @@ class OAuthClient:
                 if resp.status_code == 200:
                     self._log("已触发 email-otp 重发")
                     return True
+                if self._mark_invalid_authorization_session(resp):
+                    self._log("email-otp/send 授权事务已失效，将重新建立登录会话")
+                    return False
                 self._log(f"email-otp/send 重发失败: {resp.text[:120]}")
             except Exception as e:
                 self._log(f"email-otp/send 重发异常: {e}")

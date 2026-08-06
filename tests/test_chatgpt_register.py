@@ -953,6 +953,64 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         mailbox.wait_for_verification_code.assert_called_once()
         self.assertNotIn("暂未收到新的 OTP", "\n".join(logs))
 
+    def test_email_otp_resend_marks_invalid_authorization_session(self):
+        client = OAuthClient(
+            {"chatgpt_oauth_otp_wait_seconds": 30},
+            proxy="http://127.0.0.1:7890",
+            verbose=False,
+        )
+        mailbox = mock.Mock()
+        mailbox.wait_for_verification_code.return_value = None
+        passwordless_response = mock.Mock(status_code=409, text="conflict")
+        email_otp_response = mock.Mock(
+            status_code=400,
+            text=(
+                '{"error":{"message":"授权步骤无效。",'
+                '"type":"invalid_request_error","param":null}}'
+            ),
+        )
+        client.session.post = mock.Mock(return_value=passwordless_response)
+        client.session.get = mock.Mock(return_value=email_otp_response)
+
+        now = 100.0
+
+        def fake_time():
+            nonlocal now
+            now += 0.25
+            return now
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.build_sentinel_token",
+            return_value="",
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            return_value="",
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.time.time",
+            side_effect=fake_time,
+        ):
+            state = client._handle_otp_verification(
+                "user@example.com",
+                "device-fixed",
+                "UA",
+                '"Chromium";v="136"',
+                "chrome136",
+                mailbox,
+                FlowState(
+                    page_type="email_otp_verification",
+                    continue_url="https://auth.openai.com/email-verification",
+                    current_url="https://auth.openai.com/email-verification",
+                ),
+                prefer_passwordless_login=True,
+                allow_cached_code_retry=False,
+            )
+
+        self.assertIsNone(state)
+        self.assertTrue(client._oauth_session_expired)
+        self.assertIn("OAuth 登录会话已失效", client.last_error)
+        self.assertEqual(client.session.post.call_count, 1)
+        self.assertEqual(client.session.get.call_count, 1)
+
     def test_submit_choose_account_session_selects_matching_authenticated_account(self):
         client = self._make_client()
         choose_url = "https://auth.openai.com/choose-an-account"
@@ -1178,6 +1236,98 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         kwargs = client.session.post.call_args.kwargs
         self.assertNotIn("json", kwargs)
         self.assertNotIn("data", kwargs)
+
+    def test_send_passwordless_login_otp_marks_invalid_authorization_session(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=400,
+            text=(
+                '{"error":{"message":"授权步骤无效。",'
+                '"type":"invalid_request_error","param":null}}'
+            ),
+        )
+        client.session.post = mock.Mock(return_value=response)
+
+        state = client._send_passwordless_login_otp(
+            "user@example.com",
+            "device-fixed",
+        )
+
+        self.assertIsNone(state)
+        self.assertTrue(client._oauth_session_expired)
+        self.assertIn("OAuth 登录会话已失效", client.last_error)
+
+    def test_login_restarts_once_when_oauth_authorization_session_expires(self):
+        client = self._make_client()
+        login_password_state = FlowState(
+            page_type="login_password",
+            continue_url="https://auth.openai.com/log-in/password",
+            current_url="https://auth.openai.com/log-in/password",
+        )
+        email_otp_state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+
+        passwordless_attempts = 0
+
+        def send_passwordless(*args, **kwargs):
+            nonlocal passwordless_attempts
+            passwordless_attempts += 1
+            if passwordless_attempts == 1:
+                client._oauth_session_expired = True
+                client._set_error("OAuth 登录会话已失效，准备重新建立")
+                return None
+            return email_otp_state
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ) as bootstrap, mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            return_value=login_password_state,
+        ) as submit_continue, mock.patch.object(
+            client,
+            "_send_passwordless_login_otp",
+            side_effect=send_passwordless,
+        ) as send_otp, mock.patch.object(
+            client,
+            "_handle_otp_verification",
+            return_value=consent_state,
+        ), mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ), mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at"},
+        ), mock.patch.object(client, "_recreate_session") as recreate_session:
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                skymail_client=mock.Mock(),
+                prefer_passwordless_login=True,
+                allow_phone_verification=False,
+            )
+
+        self.assertEqual(tokens, {"access_token": "at"})
+        self.assertEqual(bootstrap.call_count, 2)
+        self.assertEqual(submit_continue.call_count, 2)
+        self.assertEqual(send_otp.call_count, 2)
+        recreate_session.assert_called_once()
 
     def test_login_and_get_tokens_submits_about_you_when_configured(self):
         client = self._make_client()
