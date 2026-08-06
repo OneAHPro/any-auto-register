@@ -122,6 +122,14 @@ class OAuthClient:
         self.oauth_redirect_uri = self.config.get(
             "oauth_redirect_uri", "http://localhost:1455/auth/callback"
         )
+        self.chatgpt_web_oauth_client_id = self.config.get(
+            "chatgpt_web_oauth_client_id",
+            "app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+        )
+        self.chatgpt_web_oauth_redirect_uri = self.config.get(
+            "chatgpt_web_oauth_redirect_uri",
+            "https://chatgpt.com/api/auth/callback/openai",
+        )
         self.proxy = proxy
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
@@ -3003,13 +3011,28 @@ class OAuthClient:
             oauth_state = secrets.token_urlsafe(32)
             authorize_params = {
                 "response_type": "code",
-                "client_id": self.oauth_client_id,
-                "redirect_uri": self.oauth_redirect_uri,
-                "scope": "openid profile email offline_access",
+                "client_id": (
+                    self.chatgpt_web_oauth_client_id
+                    if post_login_add_password
+                    else self.oauth_client_id
+                ),
+                "redirect_uri": (
+                    self.chatgpt_web_oauth_redirect_uri
+                    if post_login_add_password
+                    else self.oauth_redirect_uri
+                ),
+                "scope": (
+                    "openid profile email offline_access model.read "
+                    "model.request organization.read organization.write"
+                    if post_login_add_password
+                    else "openid profile email offline_access"
+                ),
                 "code_challenge": code_challenge,
                 "code_challenge_method": "S256",
                 "state": oauth_state,
             }
+            if post_login_add_password:
+                authorize_params["post_login_add_password"] = "true"
             authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
             seed_oai_device_cookie(self.session, device_id)
@@ -3031,44 +3054,33 @@ class OAuthClient:
                         None,
                     )
 
-                self.last_error = ""
-                if post_login_add_password:
-                    self._log(
-                        "步骤1: 通过 ChatGPT Web 重新认证入口设置远端密码"
-                    )
-                    authorize_final_url = self._bootstrap_chatgpt_entry(
+                if force_chatgpt_entry:
+                    self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
+                    _ = self._bootstrap_chatgpt_entry(
                         email,
                         device_id,
                         user_agent=user_agent,
                         sec_ch_ua=sec_ch_ua,
                         impersonate=impersonate,
-                        authorization_params={
-                            "post_login_add_password": "true",
-                        },
                     )
-                    if not authorize_final_url:
-                        entry_error = "ChatGPT Web 重新认证入口未建立有效会话"
-                        continue
-                else:
-                    if force_chatgpt_entry:
-                        self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
-                        _ = self._bootstrap_chatgpt_entry(
-                            email,
-                            device_id,
-                            user_agent=user_agent,
-                            sec_ch_ua=sec_ch_ua,
-                            impersonate=impersonate,
-                        )
 
-                    self._log("步骤1: Bootstrap OAuth session...")
-                    authorize_final_url = self._bootstrap_oauth_session(
-                        authorize_url,
-                        authorize_params,
-                        device_id=device_id,
-                        user_agent=user_agent,
-                        sec_ch_ua=sec_ch_ua,
-                        impersonate=impersonate,
+                self.last_error = ""
+                self._log(
+                    "步骤1: Bootstrap "
+                    + (
+                        "ChatGPT Web password reauth session..."
+                        if post_login_add_password
+                        else "OAuth session..."
                     )
+                )
+                authorize_final_url = self._bootstrap_oauth_session(
+                    authorize_url,
+                    authorize_params,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
                 if not authorize_final_url:
                     if resume_authenticated_session:
                         self._set_error(
@@ -3078,9 +3090,6 @@ class OAuthClient:
                         return None
                     entry_error = "OpenAI OAuth bootstrap 未建立有效 login_session"
                     continue
-
-                if force_chatgpt_entry and not post_login_add_password:
-                    self._log("ChatGPT 首页预热完成，继续 Codex OAuth")
 
                 continue_referer = (
                     authorize_final_url

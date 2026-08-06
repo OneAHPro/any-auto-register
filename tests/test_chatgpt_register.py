@@ -528,12 +528,11 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
 
         with mock.patch.object(
             client,
-            "_bootstrap_chatgpt_entry",
-            return_value="https://auth.openai.com/log-in",
-        ) as bootstrap_chatgpt, mock.patch.object(
-            client,
             "_bootstrap_oauth_session",
-            return_value="https://auth.openai.com/log-in",
+            side_effect=[
+                "https://auth.openai.com/log-in",
+                "https://auth.openai.com/log-in",
+            ],
         ) as bootstrap, mock.patch.object(
             client,
             "_submit_authorize_continue",
@@ -579,15 +578,21 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertEqual(tokens["refresh_token"], "rt")
-        bootstrap_chatgpt.assert_called_once()
+        self.assertEqual(bootstrap.call_count, 2)
+        first_authorize_params = bootstrap.call_args_list[0].args[1]
+        second_authorize_params = bootstrap.call_args_list[1].args[1]
         self.assertEqual(
-            bootstrap_chatgpt.call_args.kwargs["authorization_params"],
-            {"post_login_add_password": "true"},
+            first_authorize_params["client_id"],
+            "app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
         )
-        bootstrap.assert_called_once()
+        self.assertEqual(
+            first_authorize_params["redirect_uri"],
+            "https://chatgpt.com/api/auth/callback/openai",
+        )
+        self.assertEqual(first_authorize_params["post_login_add_password"], "true")
         self.assertNotIn(
             "post_login_add_password",
-            bootstrap.call_args.args[1],
+            second_authorize_params,
         )
         submit_new_password.assert_called_once()
         self.assertEqual(
