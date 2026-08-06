@@ -22,6 +22,9 @@ MFA_ENROLL_URL = "https://chatgpt.com/backend-api/accounts/mfa/enroll"
 MFA_ACTIVATE_URL = (
     "https://chatgpt.com/backend-api/accounts/mfa/user/activate_enrollment"
 )
+MFA_DISABLE_URL = (
+    "https://chatgpt.com/backend-api/accounts/mfa/user/disable_in_house"
+)
 
 
 class ChatGPTMFAError(RuntimeError):
@@ -204,4 +207,17 @@ class ChatGPTMFAClient:
         )
         if data.get("success") is False:
             raise ChatGPTMFAError("ChatGPT MFA activation was rejected")
+        return True
+
+    def disable_factor(self, factor_id: str) -> bool:
+        normalized_factor_id = str(factor_id or "").strip()
+        if not normalized_factor_id:
+            raise ValueError("MFA factor ID is required")
+        data = self._request(
+            "POST",
+            MFA_DISABLE_URL,
+            {"factor_id": normalized_factor_id},
+        )
+        if data.get("success") is False:
+            raise ChatGPTMFAError("ChatGPT MFA factor reset was rejected")
         return True

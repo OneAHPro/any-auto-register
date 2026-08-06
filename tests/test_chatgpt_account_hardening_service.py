@@ -21,6 +21,7 @@ class FakeMFAClient:
         self.secret = secret
         self.enroll_calls = 0
         self.activate_calls = []
+        self.disable_calls = []
 
     def get_inventory(self):
         return self.inventory
@@ -33,6 +34,11 @@ class FakeMFAClient:
         self.activate_calls.append((session_id, code))
         if self.activate_hook:
             return self.activate_hook(session_id, code)
+        return True
+
+    def disable_factor(self, factor_id):
+        self.disable_calls.append(factor_id)
+        self.inventory = MFAInventory(False, False, "", ())
         return True
 
 
@@ -265,6 +271,38 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
             "missing_mfa_material",
         )
         self.assertEqual(client.enroll_calls, 0)
+        self.assertEqual(client.disable_calls, [])
+
+    def test_verified_email_fallback_resets_old_factor_then_enrolls_new_totp(self):
+        account_id = self._create_account(
+            extra={
+                "mfa_reenrollment_required": True,
+                "mfa_email_fallback_verified_at": "2026-08-06T00:00:00+00:00",
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "user@example.com",
+                    "extra": {"refresh_token": "mail-refresh"},
+                },
+            }
+        )
+        inventory = MFAInventory(
+            True,
+            True,
+            "factor-old",
+            ({"id": "factor-old", "factor_type": "totp"},),
+        )
+        client = FakeMFAClient(inventory=inventory)
+
+        result = self._service(client).harden_saved_account(account_id)
+
+        self.assertEqual(result.status, "ready")
+        self.assertEqual(client.disable_calls, ["factor-old"])
+        self.assertEqual(client.enroll_calls, 1)
+        current = self._load(account_id)
+        extra = current.get_extra()
+        self.assertEqual(extra["totp_secret"], SECRET)
+        self.assertNotIn("mfa_reenrollment_required", extra)
+        self.assertNotIn("mfa_email_fallback_verified_at", extra)
 
     def test_dry_run_classifies_without_claim_or_mutation(self):
         account_id = self._create_account(password="")

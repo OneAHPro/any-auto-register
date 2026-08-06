@@ -202,6 +202,24 @@ class ChatGPTAccountHardeningProtocolTests(unittest.TestCase):
                 transport=transport,
             ).start_totp_enrollment()
 
+    def test_disables_only_the_selected_factor(self):
+        from platforms.chatgpt.account_hardening import ChatGPTMFAClient
+
+        transport = FakeTransport([FakeResponse(payload={"success": True})])
+        client = ChatGPTMFAClient(
+            access_token="access-token",
+            transport=transport,
+        )
+
+        self.assertTrue(client.disable_factor("factor-1"))
+        method, url, kwargs = transport.calls[0]
+        self.assertEqual(method, "POST")
+        self.assertEqual(
+            url,
+            "https://chatgpt.com/backend-api/accounts/mfa/user/disable_in_house",
+        )
+        self.assertEqual(kwargs["json"], {"factor_id": "factor-1"})
+
 
 if __name__ == "__main__":
     unittest.main()

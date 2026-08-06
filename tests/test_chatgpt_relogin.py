@@ -164,6 +164,221 @@ class ChatGPTReloginTests(unittest.TestCase):
         )
         self.assertEqual(context["extra"]["totp_secret"], "JBSWY3DPEHPK3PXP")
 
+    def test_failed_local_totp_login_falls_back_to_email_otp(self):
+        local_totp_service = mock.Mock()
+        fallback_email_service = mock.Mock()
+        fallback_email_service.get_mailbox_metadata.return_value = {
+            "provider": "microsoft",
+            "email": "demo@example.com",
+            "account_id": "mailbox-1",
+            "extra": {"refresh_token": "mail-refresh"},
+        }
+        adapter = mock.Mock()
+        adapter.run.side_effect = [
+            SimpleNamespace(success=False, error_message="invalid TOTP code"),
+            SimpleNamespace(
+                success=True,
+                access_token="fresh-at",
+                refresh_token="fresh-rt",
+                id_token="",
+                session_token="",
+                workspace_id="",
+                account_id="account-123",
+                source="existing_account_web_login",
+                metadata={},
+            ),
+        ]
+        saved = {
+            "id": self.account_id,
+            "email": "demo@example.com",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "password": "password",
+            "user_id": "account-123",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "demo@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_totp",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            },
+            "fallback_mailbox_context": {
+                "provider": "microsoft",
+                "email": "demo@example.com",
+                "account_id": "mailbox-1",
+                "extra": {"refresh_token": "mail-refresh"},
+            },
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            side_effect=[local_totp_service, fallback_email_service],
+        ) as build_service, mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            tokens = _login_with_saved_credentials(saved)
+
+        self.assertEqual(adapter.run.call_count, 2)
+        first_context = adapter.run.call_args_list[0].args[0]
+        second_context = adapter.run.call_args_list[1].args[0]
+        self.assertEqual(first_context.password, "password")
+        self.assertEqual(second_context.password, "")
+        self.assertEqual(build_service.call_count, 2)
+        self.assertTrue(tokens["metadata"]["mfa_email_fallback_verified"])
+        self.assertEqual(
+            tokens["metadata"]["mailbox_login_context"]["provider"],
+            "microsoft",
+        )
+
+    def test_verified_email_fallback_persistence_invalidates_old_local_totp(self):
+        from services.chatgpt_relogin import _persist_fresh_tokens
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            extra = account.get_extra()
+            extra.update(
+                {
+                    "account_type": "chatgpt_password_totp",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_hardening_status": "ready",
+                }
+            )
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            created_at = account.created_at
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            persisted = _persist_fresh_tokens(
+                self.account_id,
+                {
+                    "access_token": "fallback-at",
+                    "refresh_token": "fallback-rt",
+                    "source": "existing_account_web_login",
+                    "metadata": {
+                        "mfa_email_fallback_verified": True,
+                        "mailbox_login_context": {
+                            "provider": "microsoft",
+                            "email": "demo@example.com",
+                            "account_id": "mailbox-1",
+                            "extra": {"refresh_token": "mail-refresh"},
+                        },
+                    },
+                },
+                expected_email="demo@example.com",
+                expected_created_at=created_at,
+            )
+
+        extra = persisted.get_extra()
+        self.assertEqual(persisted.token, "fallback-at")
+        self.assertNotIn("totp_secret", extra)
+        self.assertNotIn("account_type", extra)
+        self.assertTrue(extra["mfa_reenrollment_required"])
+        self.assertEqual(extra["mfa_hardening_status"], "replacement_candidate")
+        self.assertEqual(extra["mailbox_login_context"]["provider"], "microsoft")
+
+    def test_ready_totp_keeps_original_mailbox_as_failure_fallback(self):
+        from services.chatgpt_relogin import _load_saved_account
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            extra = account.get_extra()
+            extra.update(
+                {
+                    "account_type": "chatgpt_password_totp",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_hardening_status": "ready",
+                }
+            )
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(self.account_id)
+
+        self.assertEqual(saved["mailbox_context"]["provider"], "chatgpt_credentials")
+        self.assertEqual(
+            saved["fallback_mailbox_context"]["provider"],
+            "microsoft",
+        )
+
+    def test_missing_password_email_login_forces_password_reset_and_returns_password(self):
+        base_email_service = mock.Mock()
+        base_email_service.service_type = SimpleNamespace(value="microsoft")
+        base_email_service.create_email.return_value = {
+            "email": "demo@example.com",
+            "service_id": "mailbox-1",
+            "token": "",
+        }
+        base_email_service.get_mailbox_metadata.return_value = {
+            "provider": "microsoft",
+            "email": "demo@example.com",
+            "account_id": "mailbox-1",
+            "extra": {"refresh_token": "mail-refresh"},
+        }
+        adapter = mock.Mock()
+
+        def run(context):
+            email_info = context.email_service.create_email()
+            self.assertEqual(
+                email_info["account_type"],
+                "chatgpt_password_reset_url_mail",
+            )
+            self.assertTrue(email_info["password_reset_required"])
+            self.assertGreaterEqual(len(email_info["new_password"]), 20)
+            self.assertEqual(context.password, "")
+            return SimpleNamespace(
+                success=True,
+                access_token="fresh-at",
+                refresh_token="fresh-rt",
+                id_token="",
+                session_token="",
+                workspace_id="",
+                account_id="account-123",
+                source="existing_account_web_login",
+                metadata={},
+            )
+
+        adapter.run.side_effect = run
+        saved = {
+            "id": self.account_id,
+            "email": "demo@example.com",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "password": "",
+            "user_id": "account-123",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "microsoft",
+                "email": "demo@example.com",
+                "account_id": "mailbox-1",
+                "extra": {"refresh_token": "mail-refresh"},
+            },
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=base_email_service,
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            tokens = _login_with_saved_credentials(saved)
+
+        self.assertGreaterEqual(len(tokens["password"]), 20)
+        base_email_service.commit_password_reset.assert_not_called()
+
     def _add_eligibility_account(
         self,
         email: str,

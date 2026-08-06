@@ -395,6 +395,8 @@ def promote_chatgpt_mfa_secret(
             "mfa_pending_secret",
             "mfa_hardening_error",
             "mfa_hardening_session_id",
+            "mfa_reenrollment_required",
+            "mfa_email_fallback_verified_at",
         ),
         release_owner=True,
         database_engine=database_engine,

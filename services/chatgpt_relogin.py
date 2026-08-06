@@ -454,7 +454,16 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
         if not email:
             raise RuntimeError("ChatGPT 账号邮箱未填写")
         extra = dict(account.get_extra() or {})
-        mailbox_context = extra.get("mailbox_login_context")
+        original_mailbox_context = extra.get("mailbox_login_context")
+        if not isinstance(original_mailbox_context, dict) or not original_mailbox_context:
+            original_mailbox_context = _mailbox_context_from_outlook(session, email)
+            if original_mailbox_context:
+                extra["mailbox_login_context"] = original_mailbox_context
+                account.set_extra(extra)
+                account.updated_at = datetime.now(timezone.utc)
+                session.add(account)
+                session.commit()
+        mailbox_context = original_mailbox_context
         if (
             _text(account.password)
             and _text(extra.get("account_type")).lower()
@@ -474,14 +483,6 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
                     "totp_secret": _text(extra.get("totp_secret")),
                 },
             }
-        if not isinstance(mailbox_context, dict) or not mailbox_context:
-            mailbox_context = _mailbox_context_from_outlook(session, email)
-            if mailbox_context:
-                extra["mailbox_login_context"] = mailbox_context
-                account.set_extra(extra)
-                account.updated_at = datetime.now(timezone.utc)
-                session.add(account)
-                session.commit()
         return {
             "id": normalized_id,
             "email": email,
@@ -491,6 +492,13 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             "user_id": _text(account.user_id),
             "extra": extra,
             "mailbox_context": mailbox_context,
+            "fallback_mailbox_context": (
+                original_mailbox_context
+                if mailbox_context is not original_mailbox_context
+                and isinstance(original_mailbox_context, dict)
+                and original_mailbox_context
+                else None
+            ),
         }
 
 
@@ -965,6 +973,46 @@ class _PersistedEmailService:
         return bool(_text(account_extra.get("totp_url")))
 
 
+class _ForcedPasswordResetEmailService:
+    """Make a normal mailbox drive the existing forgot-password state machine."""
+
+    def __init__(self, base_service, *, email: str, new_password: str) -> None:
+        self._base_service = base_service
+        self._email = _text(email)
+        self.new_password = str(new_password or "")
+        self.service_type = getattr(
+            base_service,
+            "service_type",
+            type("ServiceType", (), {"value": "mailbox"})(),
+        )
+
+    def __getattr__(self, name: str):
+        return getattr(self._base_service, name)
+
+    def create_email(self, config=None):
+        payload = self._base_service.create_email(config)
+        result = dict(payload or {})
+        result.setdefault("email", self._email)
+        result.update(
+            {
+                "account_type": "chatgpt_password_reset_url_mail",
+                "password": "",
+                "password_reset_required": True,
+                "new_password": self.new_password,
+            }
+        )
+        return result
+
+    def commit_password_reset(self, new_password=""):
+        if str(new_password or "") != self.new_password:
+            raise RuntimeError("password-reset result did not match staged password")
+        return True
+
+    def get_mailbox_metadata(self):
+        getter = getattr(self._base_service, "get_mailbox_metadata", None)
+        return getter() if callable(getter) else {}
+
+
 def _build_email_service(
     saved: dict[str, Any],
     config: dict[str, Any],
@@ -1153,6 +1201,25 @@ def _login_with_saved_credentials(
         task_control=task_control,
         attempt_id=attempt_id,
     )
+    forced_reset_password = ""
+    initial_context_extra = (
+        dict(mailbox_context.get("extra") or {})
+        if isinstance(mailbox_context, dict)
+        else {}
+    )
+    if (
+        not _text(saved.get("password"))
+        and _text(initial_context_extra.get("account_type")).lower()
+        != "chatgpt_password_reset_url_mail"
+    ):
+        from services.chatgpt_account_hardening import generate_account_password
+
+        forced_reset_password = generate_account_password()
+        email_service = _ForcedPasswordResetEmailService(
+            email_service,
+            email=saved["email"],
+            new_password=forced_reset_password,
+        )
     extra_config = dict(config)
     extra_config.update(
         {
@@ -1187,10 +1254,47 @@ def _login_with_saved_credentials(
         email_service,
         password=str(saved.get("password") or ""),
     )
+    email_fallback_verified = False
     if not bool(getattr(result, "success", False)):
         detail = _text(getattr(result, "error_message", "")) or "认证服务未返回成功状态"
+        effective_context_extra = (
+            dict(mailbox_context.get("extra") or {})
+            if isinstance(mailbox_context, dict)
+            else {}
+        )
+        fallback_mailbox_context = saved.get("fallback_mailbox_context")
+        should_fallback_to_email = bool(
+            _text(effective_context_extra.get("account_type")).lower()
+            == "chatgpt_password_totp"
+            and isinstance(fallback_mailbox_context, dict)
+            and fallback_mailbox_context
+        )
+        if should_fallback_to_email:
+            _checkpoint_task(task_control, attempt_id)
+            _emit(
+                log_fn,
+                "本地 TOTP 登录失败，立即切换原邮箱验证码重新认证",
+            )
+            fallback_saved = dict(saved)
+            fallback_saved["mailbox_context"] = dict(fallback_mailbox_context)
+            email_service = _build_email_service(
+                fallback_saved,
+                config,
+                log_fn=log_fn,
+                task_control=task_control,
+                attempt_id=attempt_id,
+            )
+            result = run_login(email_service, password="")
+            email_fallback_verified = bool(getattr(result, "success", False))
+            if email_fallback_verified:
+                _emit(
+                    log_fn,
+                    "邮箱验证码认证成功，将重置旧 TOTP 并绑定新密钥",
+                )
+                detail = ""
         if (
-            _saved_account_supports_password_reset(saved)
+            not bool(getattr(result, "success", False))
+            and _saved_account_supports_password_reset(saved)
             and _is_explicit_saved_password_rejection(detail)
         ):
             _checkpoint_task(task_control, attempt_id)
@@ -1239,8 +1343,12 @@ def _login_with_saved_credentials(
     }
     if not tokens["access_token"] or not tokens["refresh_token"]:
         raise RuntimeError("重登完成，但认证服务未返回完整的 Access Token 和 Refresh Token")
+    if forced_reset_password:
+        tokens["password"] = forced_reset_password
     result_metadata = getattr(result, "metadata", None)
     metadata = dict(result_metadata) if isinstance(result_metadata, dict) else {}
+    if email_fallback_verified:
+        metadata["mfa_email_fallback_verified"] = True
     metadata_getter = getattr(email_service, "get_mailbox_metadata", None)
     if callable(metadata_getter):
         try:
@@ -1327,6 +1435,14 @@ def _persist_fresh_tokens(
             mailbox_context = metadata.get("mailbox_login_context")
             if isinstance(mailbox_context, dict) and mailbox_context:
                 extra["mailbox_login_context"] = mailbox_context
+            if bool(metadata.get("mfa_email_fallback_verified")):
+                extra.pop("totp_secret", None)
+                extra.pop("account_type", None)
+                extra["mfa_reenrollment_required"] = True
+                extra["mfa_email_fallback_verified_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+                extra["mfa_hardening_status"] = "replacement_candidate"
 
         snapshot.token = _text(tokens.get("access_token"))
         snapshot.user_id = _text(tokens.get("account_id"))

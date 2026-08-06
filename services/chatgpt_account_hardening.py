@@ -116,6 +116,8 @@ class ChatGPTAccountHardeningService:
         supports_safe_replacement: bool = False,
     ) -> str:
         extra = dict(account.get_extra() or {})
+        if bool(extra.get("mfa_reenrollment_required")):
+            return "replacement_candidate"
         if (
             _text(account.password)
             and _text(extra.get("totp_secret"))
@@ -466,6 +468,44 @@ class ChatGPTAccountHardeningService:
             inventory = client.get_inventory()
             extra = dict(account.get_extra() or {})
             pending_secret = _text(extra.get("mfa_pending_secret"))
+            reset_requested = bool(extra.get("mfa_reenrollment_required"))
+            email_fallback_verified = bool(
+                _text(extra.get("mfa_email_fallback_verified_at"))
+            )
+            if inventory.has_totp and reset_requested and email_fallback_verified:
+                factor_id = _text(inventory.default_factor_id)
+                if not factor_id:
+                    factor_id = next(
+                        (
+                            _text(factor.get("id"))
+                            for factor in inventory.factors
+                            if _text(
+                                factor.get("factor_type")
+                                or factor.get("type")
+                            ).lower()
+                            == "totp"
+                        ),
+                        "",
+                    )
+                if not factor_id:
+                    raise RuntimeError("verified MFA reset has no TOTP factor ID")
+                client.disable_factor(factor_id)
+                reset_state = update_chatgpt_account_hardening(
+                    int(account.id or 0),
+                    expected_email=account.email,
+                    expected_created_at=account.created_at,
+                    expected_updated_at=account.updated_at,
+                    owner=claim_owner,
+                    extra_updates={"mfa_hardening_status": "needs_mfa"},
+                    extra_removals=("totp_secret", "account_type"),
+                    database_engine=self._engine,
+                )
+                if reset_state is None:
+                    raise RuntimeError("account changed during verified MFA reset")
+                account = reset_state
+                extra = dict(account.get_extra() or {})
+                pending_secret = _text(extra.get("mfa_pending_secret"))
+                inventory = MFAInventory(False, False, "", ())
             if inventory.has_totp:
                 candidates = self.discover_candidate_secrets(account)
                 verified = ""
