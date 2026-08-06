@@ -93,6 +93,7 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
                 "account_type": "chatgpt_password_totp",
                 "totp_secret": SECRET,
                 "mfa_hardening_status": "ready",
+                "password_remote_verified_at": "2026-08-06T00:00:00+00:00",
             }
         )
 
@@ -100,6 +101,32 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ready")
         self.assertEqual(result.outcome, "ready_before")
+
+    def test_legacy_ready_without_remote_password_marker_is_revalidated(self):
+        account_id = self._create_account(
+            extra={
+                "account_type": "chatgpt_password_totp",
+                "totp_secret": SECRET,
+                "mfa_hardening_status": "ready",
+            }
+        )
+        inventory = MFAInventory(
+            True,
+            True,
+            "factor-1",
+            ({"id": "factor-1", "factor_type": "totp"},),
+        )
+
+        result = self._service(
+            FakeMFAClient(inventory=inventory),
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
+        ).harden_saved_account(account_id)
+
+        self.assertEqual(result.outcome, "recovered_secret")
+        self.assertIn(
+            "password_remote_verified_at",
+            self._load(account_id).get_extra(),
+        )
 
     def test_missing_password_is_persisted_only_after_reset_succeeds(self):
         account_id = self._create_account(password="")
@@ -114,6 +141,7 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
         result = self._service(
             client,
             password_reset_callback=reset_password,
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
         ).harden_saved_account(account_id)
 
         self.assertEqual(observed_passwords, [""])
@@ -150,12 +178,32 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
             return True
 
         client = FakeMFAClient(activate_hook=assert_staged)
-        result = self._service(client).harden_saved_account(account_id)
+        result = self._service(
+            client,
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
+        ).harden_saved_account(account_id)
 
         self.assertEqual(result.outcome, "hardened")
         current = self._load(account_id)
         self.assertEqual(current.get_extra()["totp_secret"], SECRET)
         self.assertNotIn("mfa_pending_secret", current.get_extra())
+        self.assertIn("password_remote_verified_at", current.get_extra())
+
+    def test_new_enrollment_is_not_promoted_until_password_totp_login_validates(self):
+        account_id = self._create_account()
+        client = FakeMFAClient()
+
+        result = self._service(
+            client,
+            candidate_validator=lambda _account, _candidate: False,
+        ).harden_saved_account(account_id)
+
+        self.assertEqual(result.status, "confirming")
+        current = self._load(account_id)
+        extra = current.get_extra()
+        self.assertEqual(extra["mfa_pending_secret"], SECRET)
+        self.assertNotIn("totp_secret", extra)
+        self.assertNotIn("password_remote_verified_at", extra)
 
     def test_pending_secret_is_recovered_after_activation_crash(self):
         account_id = self._create_account()
@@ -325,7 +373,10 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
         )
         client = FakeMFAClient(inventory=inventory)
 
-        result = self._service(client).harden_saved_account(account_id)
+        result = self._service(
+            client,
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
+        ).harden_saved_account(account_id)
 
         self.assertEqual(result.status, "missing_mfa_material")
         current = self._load(account_id)
@@ -358,7 +409,10 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
         )
         client = FakeMFAClient(inventory=inventory)
 
-        result = self._service(client).harden_saved_account(account_id)
+        result = self._service(
+            client,
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
+        ).harden_saved_account(account_id)
 
         self.assertEqual(result.status, "ready")
         self.assertEqual(client.disable_calls, ["factor-old"])

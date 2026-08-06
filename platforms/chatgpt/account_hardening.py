@@ -166,7 +166,11 @@ class ChatGPTMFAClient:
             for factor in factors
         )
         return MFAInventory(
-            enabled=bool(data.get("mfa_enabled_v2") or data.get("enabled")),
+            enabled=bool(
+                data.get("mfa_enabled_v2")
+                or data.get("mfa_enabled")
+                or data.get("enabled")
+            ),
             has_totp=has_totp,
             default_factor_id=str(
                 data.get("native_default_factor_id") or ""

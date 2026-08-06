@@ -123,6 +123,7 @@ class ChatGPTAccountHardeningService:
             _text(account.password)
             and _text(extra.get("totp_secret"))
             and _text(extra.get("mfa_hardening_status")) == "ready"
+            and _text(extra.get("password_remote_verified_at"))
         ):
             return "ready"
         if not _text(account.password):
@@ -572,6 +573,11 @@ class ChatGPTAccountHardeningService:
                 session_id,
                 generate_totp(enrollment_secret),
             )
+            validator = self._candidate_validator or self._default_candidate_validator
+            if not validator(account, enrollment_secret):
+                raise RuntimeError(
+                    "new TOTP enrollment could not complete password/TOTP login validation"
+                )
             promoted = promote_chatgpt_mfa_secret(
                 int(account.id or 0),
                 expected_email=account.email,

@@ -97,7 +97,6 @@ class ChatGPTAccountHardeningProtocolTests(unittest.TestCase):
                 FakeResponse(
                     payload={
                         "mfa_enabled": True,
-                        "mfa_enabled_v2": True,
                         "native_default_factor_id": "factor-totp",
                         "factors": {
                             "passkeys": [],

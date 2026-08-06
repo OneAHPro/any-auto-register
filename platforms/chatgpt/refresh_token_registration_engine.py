@@ -199,6 +199,7 @@ class RefreshTokenRegistrationEngine:
         self.password: Optional[str] = None
         self.totp_secret: Optional[str] = None
         self.password_reset_required = False
+        self.post_login_add_password = False
         self.email_info: Optional[Dict[str, Any]] = None
         self._email_error_message = ""
         self._email_error_code = ""
@@ -317,6 +318,9 @@ class RefreshTokenRegistrationEngine:
                     self.password = password
                     self.totp_secret = ""
                     self.password_reset_required = reset_required
+                    self.post_login_add_password = bool(
+                        self.email_info.get("post_login_add_password", False)
+                    )
                     if reset_required:
                         self._log(
                             "已识别忘记密码记录；将自动邮箱取码、设置新密码并继续登录"
@@ -344,6 +348,7 @@ class RefreshTokenRegistrationEngine:
             return False
         self.password = str(new_password or "")
         self.password_reset_required = False
+        self.post_login_add_password = False
         if isinstance(self.email_info, dict):
             self.email_info["password"] = self.password
             self.email_info["password_reset_required"] = False
@@ -671,6 +676,7 @@ class RefreshTokenRegistrationEngine:
             self._existing_account_phone_verification_enabled()
         )
         password_login = bool(self.password)
+        post_login_add_password = bool(self.post_login_add_password)
         tokens = oauth_client.login_and_get_tokens(
             result.email,
             self.password or "",
@@ -679,18 +685,23 @@ class RefreshTokenRegistrationEngine:
             sec_ch_ua=None,
             impersonate=None,
             skymail_client=email_adapter,
-            prefer_passwordless_login=not password_login,
+            prefer_passwordless_login=(
+                post_login_add_password or not password_login
+            ),
             allow_phone_verification=allow_phone_verification,
             force_new_browser=True,
             force_chatgpt_entry=False,
             screen_hint="login",
-            force_password_login=password_login,
+            force_password_login=(
+                password_login and not post_login_add_password
+            ),
             totp_secret=self.totp_secret or "",
             password_reset_required=self.password_reset_required,
             on_password_reset=lambda new_password: self._commit_password_reset(
                 email_adapter,
                 new_password,
             ),
+            post_login_add_password=post_login_add_password,
             complete_about_you_if_needed=False,
             login_source="existing_account_login_only",
         )

@@ -167,6 +167,9 @@ class ChatGPTReloginTests(unittest.TestCase):
     def test_failed_local_totp_login_falls_back_to_email_otp(self):
         local_totp_service = mock.Mock()
         fallback_email_service = mock.Mock()
+        fallback_email_service.create_email.return_value = {
+            "email": "demo@example.com",
+        }
         fallback_email_service.get_mailbox_metadata.return_value = {
             "provider": "microsoft",
             "email": "demo@example.com",
@@ -174,9 +177,21 @@ class ChatGPTReloginTests(unittest.TestCase):
             "extra": {"refresh_token": "mail-refresh"},
         }
         adapter = mock.Mock()
-        adapter.run.side_effect = [
-            SimpleNamespace(success=False, error_message="invalid TOTP code"),
-            SimpleNamespace(
+        adapter_calls = []
+
+        def run(context):
+            adapter_calls.append(context)
+            if len(adapter_calls) == 1:
+                return SimpleNamespace(
+                    success=False,
+                    error_message="invalid TOTP code",
+                )
+            email_info = context.email_service.create_email()
+            self.assertTrue(email_info["post_login_add_password"])
+            context.email_service.commit_password_reset(
+                email_info["new_password"]
+            )
+            return SimpleNamespace(
                 success=True,
                 access_token="fresh-at",
                 refresh_token="fresh-rt",
@@ -186,8 +201,9 @@ class ChatGPTReloginTests(unittest.TestCase):
                 account_id="account-123",
                 source="existing_account_web_login",
                 metadata={},
-            ),
-        ]
+            )
+
+        adapter.run.side_effect = run
         saved = {
             "id": self.account_id,
             "email": "demo@example.com",
@@ -231,6 +247,9 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(second_context.password, "")
         self.assertEqual(build_service.call_count, 2)
         self.assertTrue(tokens["metadata"]["mfa_email_fallback_verified"])
+        self.assertTrue(tokens["metadata"]["password_remote_verified"])
+        self.assertNotEqual(tokens["password"], "password")
+        self.assertGreaterEqual(len(tokens["password"]), 20)
         self.assertEqual(
             tokens["metadata"]["mailbox_login_context"]["provider"],
             "microsoft",
@@ -264,6 +283,7 @@ class ChatGPTReloginTests(unittest.TestCase):
                     "source": "existing_account_web_login",
                     "metadata": {
                         "mfa_email_fallback_verified": True,
+                        "password_remote_verified": True,
                         "mailbox_login_context": {
                             "provider": "microsoft",
                             "email": "demo@example.com",
@@ -282,6 +302,7 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertNotIn("account_type", extra)
         self.assertTrue(extra["mfa_reenrollment_required"])
         self.assertEqual(extra["mfa_hardening_status"], "replacement_candidate")
+        self.assertIn("password_remote_verified_at", extra)
         self.assertEqual(extra["mailbox_login_context"]["provider"], "microsoft")
 
     def test_ready_totp_keeps_original_mailbox_as_failure_fallback(self):
@@ -333,8 +354,12 @@ class ChatGPTReloginTests(unittest.TestCase):
                 "chatgpt_password_reset_url_mail",
             )
             self.assertTrue(email_info["password_reset_required"])
+            self.assertTrue(email_info["post_login_add_password"])
             self.assertGreaterEqual(len(email_info["new_password"]), 20)
             self.assertEqual(context.password, "")
+            context.email_service.commit_password_reset(
+                email_info["new_password"]
+            )
             return SimpleNamespace(
                 success=True,
                 access_token="fresh-at",
@@ -377,7 +402,57 @@ class ChatGPTReloginTests(unittest.TestCase):
             tokens = _login_with_saved_credentials(saved)
 
         self.assertGreaterEqual(len(tokens["password"]), 20)
+        self.assertTrue(tokens["metadata"]["password_remote_verified"])
         base_email_service.commit_password_reset.assert_not_called()
+
+    def test_missing_password_is_not_persisted_when_remote_commit_never_happens(self):
+        base_email_service = mock.Mock()
+        base_email_service.service_type = SimpleNamespace(value="microsoft")
+        base_email_service.create_email.return_value = {
+            "email": "demo@example.com",
+            "service_id": "mailbox-1",
+            "token": "",
+        }
+        adapter = mock.Mock()
+        adapter.run.return_value = SimpleNamespace(
+            success=True,
+            access_token="fresh-at",
+            refresh_token="fresh-rt",
+            id_token="",
+            session_token="",
+            workspace_id="",
+            account_id="account-123",
+            source="existing_account_web_login",
+            metadata={},
+        )
+        saved = {
+            "id": self.account_id,
+            "email": "demo@example.com",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "password": "",
+            "user_id": "account-123",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "microsoft",
+                "email": "demo@example.com",
+                "account_id": "mailbox-1",
+                "extra": {"refresh_token": "mail-refresh"},
+            },
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=base_email_service,
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "远端密码"):
+                _login_with_saved_credentials(saved)
 
     def _add_eligibility_account(
         self,

@@ -304,6 +304,67 @@ class ChatGPTAccountHardeningTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["hardened"], 1)
         self.assertEqual(snapshot["meta"]["failed"], 0)
 
+    def test_missing_mfa_material_with_original_mailbox_relogin_then_retries(self):
+        from api.tasks import (
+            _create_chatgpt_hardening_task_record,
+            _run_chatgpt_hardening_task,
+            _task_store,
+        )
+
+        account_id = self.account_ids[0]
+        missing = SimpleNamespace(
+            status="missing_mfa_material",
+            outcome="missing_mfa_material",
+            email="first@example.com",
+            message="",
+        )
+        ready = SimpleNamespace(
+            status="ready",
+            outcome="hardened",
+            email="first@example.com",
+            message="",
+        )
+        service = mock.Mock()
+        service.harden_saved_account.side_effect = [missing, ready]
+        task_id = self._task_id()
+        with mock.patch("api.tasks._persist_task_snapshot"):
+            _create_chatgpt_hardening_task_record(
+                task_id,
+                [account_id],
+                concurrency=1,
+                dry_run=False,
+            )
+        with mock.patch(
+            "services.chatgpt_account_hardening.ChatGPTAccountHardeningService",
+            return_value=service,
+        ), mock.patch(
+            "services.chatgpt_relogin.is_saved_chatgpt_account_relogin_eligible",
+            return_value=True,
+        ) as eligible, mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={"ok": True, "relogin_ok": True},
+        ) as relogin, mock.patch(
+            "api.tasks.engine",
+            self.engine,
+        ), mock.patch(
+            "api.tasks._persist_task_snapshot_best_effort",
+        ), mock.patch(
+            "api.tasks._save_task_log",
+        ):
+            _run_chatgpt_hardening_task(
+                task_id,
+                [account_id],
+                concurrency=1,
+                dry_run=False,
+            )
+
+        eligible.assert_called_once_with(account_id, database_engine=self.engine)
+        relogin.assert_called_once()
+        self.assertEqual(service.harden_saved_account.call_count, 2)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["meta"]["hardened"], 1)
+        self.assertEqual(snapshot["meta"]["missing_mfa_material"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

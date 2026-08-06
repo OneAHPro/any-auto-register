@@ -412,6 +412,14 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             return_value=email_otp_state,
         ), mock.patch.object(
             client,
+            "_switch_to_password_login",
+            return_value=FlowState(
+                page_type="login_password",
+                continue_url="https://auth.openai.com/log-in/password",
+                current_url="https://auth.openai.com/log-in/password",
+            ),
+        ) as switch_to_password, mock.patch.object(
+            client,
             "_submit_password_verify",
             return_value=mfa_state,
         ) as submit_password, mock.patch.object(
@@ -445,13 +453,128 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertEqual(tokens["refresh_token"], "rt")
+        switch_to_password.assert_called_once()
         submit_password.assert_called_once()
         self.assertEqual(
             submit_password.call_args.kwargs["referer"],
-            email_otp_state.current_url,
+            "https://auth.openai.com/log-in/password",
         )
         submit_mfa.assert_called_once()
         handle_email_otp.assert_not_called()
+
+    def test_post_login_add_password_persists_remote_then_restarts_password_login(self):
+        client = self._make_client()
+        mailbox = mock.Mock()
+        email_otp_state = FlowState(
+            page_type="email_otp_verification",
+            continue_url="https://auth.openai.com/email-verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+        new_password_state = FlowState(
+            page_type="reset_password_new_password",
+            continue_url="https://auth.openai.com/reset-password/new-password",
+            current_url="https://auth.openai.com/reset-password/new-password",
+        )
+        reset_success_state = FlowState(
+            page_type="reset_password_success",
+            continue_url="https://auth.openai.com/reset-password/success",
+            current_url="https://auth.openai.com/reset-password/success",
+        )
+        login_password_state = FlowState(
+            page_type="login_password",
+            continue_url="https://auth.openai.com/log-in/password",
+            current_url="https://auth.openai.com/log-in/password",
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+        )
+        committed = []
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            side_effect=[
+                "https://auth.openai.com/log-in",
+                "https://auth.openai.com/log-in",
+            ],
+        ) as bootstrap, mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            side_effect=[email_otp_state, email_otp_state],
+        ), mock.patch.object(
+            client,
+            "_handle_otp_verification",
+            return_value=new_password_state,
+        ), mock.patch.object(
+            client,
+            "_submit_password_reset_new_password",
+            return_value=reset_success_state,
+        ) as submit_new_password, mock.patch.object(
+            client,
+            "_switch_to_password_login",
+            return_value=login_password_state,
+        ) as switch_to_password, mock.patch.object(
+            client,
+            "_submit_password_verify",
+            return_value=consent_state,
+        ), mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ), mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at", "refresh_token": "rt"},
+        ):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "New-Remote-Password-123!",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                skymail_client=mailbox,
+                prefer_passwordless_login=True,
+                force_password_login=False,
+                allow_phone_verification=False,
+                post_login_add_password=True,
+                on_password_reset=lambda value: committed.append(value) or True,
+            )
+
+        self.assertEqual(tokens["refresh_token"], "rt")
+        first_authorize_params = bootstrap.call_args_list[0].args[1]
+        second_authorize_params = bootstrap.call_args_list[1].args[1]
+        self.assertEqual(first_authorize_params["post_login_add_password"], "true")
+        self.assertNotIn("post_login_add_password", second_authorize_params)
+        submit_new_password.assert_called_once()
+        self.assertEqual(
+            submit_new_password.call_args.kwargs["new_password"],
+            "New-Remote-Password-123!",
+        )
+        self.assertEqual(committed, ["New-Remote-Password-123!"])
+        switch_to_password.assert_called_once()
+
+    def test_switch_to_password_login_rejects_unavailable_remote_password_route(self):
+        client = self._make_client()
+        response = mock.Mock()
+        response.status_code = 400
+        response.url = "https://auth.openai.com/log-in/password"
+        response.text = ""
+        with mock.patch.object(client.session, "get", return_value=response):
+            state = client._switch_to_password_login(
+                FlowState(
+                    page_type="email_otp_verification",
+                    continue_url="https://auth.openai.com/email-verification",
+                    current_url="https://auth.openai.com/email-verification",
+                ),
+                user_agent="UA",
+                impersonate="chrome136",
+            )
+
+        self.assertIsNone(state)
+        self.assertIn("未开放密码登录", client.last_error)
 
     def test_submit_mfa_prefers_supplied_totp_over_email_factor(self):
         client = self._make_client()

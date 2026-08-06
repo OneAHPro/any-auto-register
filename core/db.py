@@ -390,6 +390,7 @@ def promote_chatgpt_mfa_secret(
             "account_type": "chatgpt_password_totp",
             "mfa_hardening_status": "ready",
             "mfa_enabled_at": _utcnow().isoformat(),
+            "password_remote_verified_at": _utcnow().isoformat(),
         },
         extra_removals=(
             "mfa_pending_secret",

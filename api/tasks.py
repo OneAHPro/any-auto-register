@@ -1551,10 +1551,23 @@ def _run_chatgpt_hardening_task_inner(
             )
             result_outcome = str(getattr(result, "outcome", "") or "")
             result_status = str(getattr(result, "status", "") or "")
+            missing_material_can_relogin = False
+            if not dry_run and result_outcome == "missing_mfa_material":
+                from services.chatgpt_relogin import (
+                    is_saved_chatgpt_account_relogin_eligible,
+                )
+
+                missing_material_can_relogin = (
+                    is_saved_chatgpt_account_relogin_eligible(
+                        account_id,
+                        database_engine=engine,
+                    )
+                )
             should_refresh_login = bool(
                 not dry_run
                 and (
                     result_outcome == "pending_password"
+                    or missing_material_can_relogin
                     or (result_outcome == "failed" and result_status == "failed")
                 )
             )
@@ -1565,6 +1578,12 @@ def _run_chatgpt_hardening_task_inner(
                     _log(
                         task_id,
                         f"  [账号 {account_id}] 缺少可用密码，先通过原邮箱验证码登录并设置密码",
+                    )
+                elif result_outcome == "missing_mfa_material":
+                    _log(
+                        task_id,
+                        f"  [账号 {account_id}] 本地缺少可验证 MFA 密钥，"
+                        "先通过原邮箱重新认证并换绑 MFA",
                     )
                 else:
                     _log(

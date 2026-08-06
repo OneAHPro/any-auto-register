@@ -1521,6 +1521,59 @@ class OAuthClient:
             self._set_error(f"密码验证异常: {e}")
             return None
 
+    def _switch_to_password_login(
+        self,
+        state: FlowState,
+        *,
+        user_agent=None,
+        impersonate=None,
+    ):
+        """Enter the server-offered password route before password/verify."""
+        request_url = f"{self.oauth_issuer}/log-in/password"
+        referer = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/email-verification"
+        )
+        headers = self._headers(
+            request_url,
+            user_agent=user_agent,
+            accept=(
+                "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                "*/*;q=0.8"
+            ),
+            referer=referer,
+            navigation=True,
+        )
+        kwargs = {
+            "headers": headers,
+            "allow_redirects": False,
+            "timeout": 30,
+        }
+        if impersonate:
+            kwargs["impersonate"] = impersonate
+        try:
+            self._browser_pause(0.12, 0.3)
+            response = self.session.get(request_url, **kwargs)
+            self._log(f"/log-in/password -> {response.status_code}")
+            if response.status_code != 200:
+                self._set_error("认证服务未开放密码登录，需通过邮箱重新验证")
+                return None
+            next_state = self._state_from_url(
+                str(response.url) or request_url
+            )
+            if not self._state_is_login_password(next_state):
+                self._set_error("认证服务未进入密码登录页面，需通过邮箱重新验证")
+                return None
+            return next_state
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(
+                f"切换密码登录异常: {type(exc).__name__}"
+            )
+            return None
+
     def _request_password_reset_otp(
         self,
         state: FlowState,
@@ -2818,6 +2871,7 @@ class OAuthClient:
         totp_secret="",
         password_reset_required=False,
         on_password_reset=None,
+        post_login_add_password=False,
         force_chatgpt_entry=False,
         screen_hint="login",
         complete_about_you_if_needed=False,
@@ -2846,6 +2900,7 @@ class OAuthClient:
             resume_authenticated_session: 已进入认证后状态时跳过再次提交邮箱
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
             totp_secret: ChatGPT TOTP MFA 秘钥；仅在服务端要求 MFA 时使用
+            post_login_add_password: 邮箱认证后进入官方添加密码流程
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
@@ -2872,6 +2927,7 @@ class OAuthClient:
             f"complete_about_you_if_needed={'on' if complete_about_you_if_needed else 'off'}, "
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
+            f"post_login_add_password={'on' if post_login_add_password else 'off'}, "
             f"totp_mfa={'on' if str(totp_secret or '').strip() else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
@@ -2940,6 +2996,8 @@ class OAuthClient:
                 "code_challenge_method": "S256",
                 "state": oauth_state,
             }
+            if post_login_add_password:
+                authorize_params["post_login_add_password"] = "true"
             authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
             seed_oai_device_cookie(self.session, device_id)
@@ -3133,6 +3191,70 @@ class OAuthClient:
                     _password_reset_depth=int(_password_reset_depth or 0) + 1,
                 )
 
+            if (
+                post_login_add_password
+                and self._state_is_password_reset_new_password(state)
+            ):
+                if int(_password_reset_depth or 0) >= 1:
+                    self._set_error("添加密码后仍返回设置新密码页面，已停止循环")
+                    return None
+                success_state = self._submit_password_reset_new_password(
+                    state,
+                    new_password=password,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                if not success_state or not self._state_is_password_reset_success(
+                    success_state
+                ):
+                    if not self.last_error:
+                        self._set_error("远端添加密码后未收到成功状态")
+                    return None
+                if callable(on_password_reset):
+                    try:
+                        committed = on_password_reset(str(password or ""))
+                    except Exception as exc:
+                        self._set_error(
+                            "远端密码已设置，但本地凭据确认失败"
+                            f"（{type(exc).__name__}）"
+                        )
+                        return None
+                    if committed is False:
+                        self._set_error("远端密码已设置，但本地凭据确认失败")
+                        return None
+                self._log("远端密码设置成功，重新开始密码登录验证")
+                return self.login_and_get_tokens(
+                    email,
+                    password,
+                    device_id="",
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    skymail_client=skymail_client,
+                    prefer_passwordless_login=False,
+                    allow_phone_verification=allow_phone_verification,
+                    force_new_browser=True,
+                    resume_authenticated_session=False,
+                    force_password_login=True,
+                    totp_secret=totp_secret,
+                    password_reset_required=False,
+                    on_password_reset=on_password_reset,
+                    post_login_add_password=False,
+                    force_chatgpt_entry=force_chatgpt_entry,
+                    screen_hint=screen_hint,
+                    complete_about_you_if_needed=complete_about_you_if_needed,
+                    first_name=first_name,
+                    last_name=last_name,
+                    birthdate=birthdate,
+                    login_source=login_source,
+                    stop_after_login=stop_after_login,
+                    prepared_oauth_context=None,
+                    _continue_depth=0,
+                    _password_reset_depth=int(_password_reset_depth or 0) + 1,
+                )
+
             if prefer_passwordless_login and (not force_password_login) and self._state_is_login_password(state):
                 next_state = self._send_passwordless_login_otp(
                     email,
@@ -3205,19 +3327,16 @@ class OAuthClient:
                 and self._state_is_email_otp(state)
             ):
                 self._log(
-                    "服务端默认返回邮箱 OTP，按强制密码登录策略直接提交密码验证"
+                    "服务端默认返回邮箱 OTP，先切换到认证服务提供的密码登录页"
                 )
-                next_state = self._submit_password_verify(
-                    password,
-                    device_id,
+                next_state = self._switch_to_password_login(
+                    state,
                     user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
-                    referer=state.current_url or state.continue_url or referer,
                 )
                 if not next_state:
                     if not self.last_error:
-                        self._set_error("强制密码验证后未进入下一步 OAuth 状态")
+                        self._set_error("认证服务未提供可用的密码登录入口")
                     return None
                 referer = state.current_url or referer
                 state = next_state

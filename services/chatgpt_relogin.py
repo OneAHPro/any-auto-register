@@ -980,6 +980,7 @@ class _ForcedPasswordResetEmailService:
         self._base_service = base_service
         self._email = _text(email)
         self.new_password = str(new_password or "")
+        self.password_reset_committed = False
         self.service_type = getattr(
             base_service,
             "service_type",
@@ -998,6 +999,7 @@ class _ForcedPasswordResetEmailService:
                 "account_type": "chatgpt_password_reset_url_mail",
                 "password": "",
                 "password_reset_required": True,
+                "post_login_add_password": True,
                 "new_password": self.new_password,
             }
         )
@@ -1006,6 +1008,7 @@ class _ForcedPasswordResetEmailService:
     def commit_password_reset(self, new_password=""):
         if str(new_password or "") != self.new_password:
             raise RuntimeError("password-reset result did not match staged password")
+        self.password_reset_committed = True
         return True
 
     def get_mailbox_metadata(self):
@@ -1255,6 +1258,11 @@ def _login_with_saved_credentials(
         password=str(saved.get("password") or ""),
     )
     email_fallback_verified = False
+    password_remote_verified = bool(
+        getattr(result, "success", False)
+        and _text(initial_context_extra.get("account_type")).lower()
+        == "chatgpt_password_totp"
+    )
     if not bool(getattr(result, "success", False)):
         detail = _text(getattr(result, "error_message", "")) or "认证服务未返回成功状态"
         effective_context_extra = (
@@ -1283,6 +1291,14 @@ def _login_with_saved_credentials(
                 log_fn=log_fn,
                 task_control=task_control,
                 attempt_id=attempt_id,
+            )
+            from services.chatgpt_account_hardening import generate_account_password
+
+            forced_reset_password = generate_account_password()
+            email_service = _ForcedPasswordResetEmailService(
+                email_service,
+                email=saved["email"],
+                new_password=forced_reset_password,
             )
             result = run_login(email_service, password="")
             email_fallback_verified = bool(getattr(result, "success", False))
@@ -1332,6 +1348,13 @@ def _login_with_saved_credentials(
                 )
             raise RuntimeError(detail)
 
+    if forced_reset_password and not bool(
+        getattr(email_service, "password_reset_committed", False)
+    ):
+        raise RuntimeError("登录流程返回成功，但远端密码设置未确认")
+    if forced_reset_password:
+        password_remote_verified = True
+
     tokens = {
         "access_token": _text(getattr(result, "access_token", "")),
         "refresh_token": _text(getattr(result, "refresh_token", "")),
@@ -1349,6 +1372,8 @@ def _login_with_saved_credentials(
     metadata = dict(result_metadata) if isinstance(result_metadata, dict) else {}
     if email_fallback_verified:
         metadata["mfa_email_fallback_verified"] = True
+    if password_remote_verified:
+        metadata["password_remote_verified"] = True
     metadata_getter = getattr(email_service, "get_mailbox_metadata", None)
     if callable(metadata_getter):
         try:
@@ -1443,6 +1468,10 @@ def _persist_fresh_tokens(
                     datetime.now(timezone.utc).isoformat()
                 )
                 extra["mfa_hardening_status"] = "replacement_candidate"
+            if bool(metadata.get("password_remote_verified")):
+                extra["password_remote_verified_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
 
         snapshot.token = _text(tokens.get("access_token"))
         snapshot.user_id = _text(tokens.get("account_id"))
