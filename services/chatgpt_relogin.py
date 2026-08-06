@@ -455,6 +455,25 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             raise RuntimeError("ChatGPT 账号邮箱未填写")
         extra = dict(account.get_extra() or {})
         mailbox_context = extra.get("mailbox_login_context")
+        if (
+            _text(account.password)
+            and _text(extra.get("account_type")).lower()
+            == "chatgpt_password_totp"
+            and _text(extra.get("totp_secret"))
+        ):
+            # A locally promoted hardening secret is the preferred login
+            # context even when the original mailbox has disappeared.
+            mailbox_context = {
+                "provider": "chatgpt_credentials",
+                "email": email,
+                "account_id": email,
+                "extra": {
+                    "provider": "chatgpt_credentials",
+                    "account_type": "chatgpt_password_totp",
+                    "password": str(account.password or ""),
+                    "totp_secret": _text(extra.get("totp_secret")),
+                },
+            }
         if not isinstance(mailbox_context, dict) or not mailbox_context:
             mailbox_context = _mailbox_context_from_outlook(session, email)
             if mailbox_context:
@@ -473,6 +492,40 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             "extra": extra,
             "mailbox_context": mailbox_context,
         }
+
+
+def _harden_persisted_chatgpt_account(
+    account: AccountModel,
+    *,
+    log_fn: LogFn | None = None,
+) -> str:
+    """Best-effort post-login hardening; fresh tokens remain authoritative."""
+    try:
+        from services.chatgpt_account_hardening import (
+            ChatGPTAccountHardeningService,
+        )
+
+        result = ChatGPTAccountHardeningService(
+            database_engine=engine,
+        ).harden_authenticated_account(int(account.id or 0))
+        status = _text(getattr(result, "status", ""))
+        if status == "ready":
+            _emit_observer(log_fn, "账号密码与本地 TOTP MFA 已就绪")
+            return "ready"
+        if status == "missing_mfa_material":
+            _emit_observer(
+                log_fn,
+                "远端已开启 MFA，但本地缺少可验证密钥；账号与令牌已保留",
+            )
+            return "missing_mfa_material"
+        _emit_observer(log_fn, "账号登录已更新，密码/MFA 将在后续批次继续处理")
+        return "hardening_pending"
+    except Exception as exc:
+        _emit_observer(
+            log_fn,
+            f"账号登录已更新，加固稍后重试（{type(exc).__name__}）",
+        )
+        return "hardening_pending"
 
 
 def _recover_password_totp_credentials(
@@ -1488,6 +1541,10 @@ def _relogin_chatgpt_account_locked(
             expected_created_at=saved["created_at"],
         )
         _emit_observer(log_fn, "已获取并保存全新的 Access Token / Refresh Token")
+        hardening_status = _harden_persisted_chatgpt_account(
+            account,
+            log_fn=log_fn,
+        )
     except ChatGPTAccountDeactivatedError:
         if saved is None:
             raise RuntimeError("停用信号缺少对应的本地账号快照")
@@ -1567,6 +1624,7 @@ def _relogin_chatgpt_account_locked(
             "account_id": int(account.id or account_id),
             "email": _text(account.email) or email,
             "message": f"重登成功，但 Codex2API 覆盖更新失败: {detail}",
+            "hardening_status": hardening_status,
             "sync": sync_result,
         }
 
@@ -1577,6 +1635,7 @@ def _relogin_chatgpt_account_locked(
         "account_id": int(account.id or account_id),
         "email": _text(account.email) or email,
         "message": "重登并同步 Codex2API 成功",
+        "hardening_status": hardening_status,
         "sync": sync_result,
     }
 

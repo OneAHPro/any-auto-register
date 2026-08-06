@@ -1,5 +1,6 @@
 import unittest
 import inspect
+from types import SimpleNamespace
 from unittest import mock
 
 from sqlalchemy.pool import StaticPool
@@ -20,6 +21,46 @@ class ChatGPTAccountPersistenceTests(unittest.TestCase):
         )
         SQLModel.metadata.create_all(test_engine)
         return test_engine
+
+    def test_post_persistence_hardening_hook_is_best_effort_and_secret_free(self):
+        from api.tasks import _harden_saved_chatgpt_account_best_effort
+
+        saved = AccountModel(
+            id=17,
+            platform="chatgpt",
+            email="user@example.com",
+            password="password",
+            token="access-token",
+        )
+        service = mock.Mock()
+        service.harden_authenticated_account.return_value = SimpleNamespace(
+            status="ready",
+            outcome="hardened",
+            message="",
+        )
+        logs = []
+        with mock.patch(
+            "services.chatgpt_account_hardening.ChatGPTAccountHardeningService",
+            return_value=service,
+        ), mock.patch("api.tasks._log", side_effect=lambda _task, line: logs.append(line)):
+            status = _harden_saved_chatgpt_account_best_effort("task-1", saved)
+
+        self.assertEqual(status, "ready")
+        service.harden_authenticated_account.assert_called_once_with(17)
+        self.assertTrue(any("MFA" in line for line in logs))
+
+        service.harden_authenticated_account.side_effect = RuntimeError(
+            "secret=JBSWY3DPEHPK3PXP"
+        )
+        with mock.patch(
+            "services.chatgpt_account_hardening.ChatGPTAccountHardeningService",
+            return_value=service,
+        ), mock.patch("api.tasks._log") as log:
+            status = _harden_saved_chatgpt_account_best_effort("task-2", saved)
+
+        self.assertEqual(status, "hardening_pending")
+        rendered = " ".join(str(call) for call in log.call_args_list)
+        self.assertNotIn("JBSWY3DPEHPK3PXP", rendered)
 
     def test_at_only_login_preserves_existing_rt_and_account_metadata(self):
         test_engine = create_engine(

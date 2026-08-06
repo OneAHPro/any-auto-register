@@ -74,6 +74,96 @@ class ChatGPTReloginTests(unittest.TestCase):
             session.refresh(account)
             return int(account.id)
 
+    def test_successful_relogin_persists_tokens_before_hardening(self):
+        order = []
+        saved = {
+            "id": self.account_id,
+            "email": "demo@example.com",
+            "created_at": datetime.now(timezone.utc),
+            "updated_at": datetime.now(timezone.utc),
+            "password": "password",
+            "user_id": "account-123",
+            "extra": {},
+            "mailbox_context": {"provider": "fixture", "extra": {}},
+        }
+        persisted = AccountModel(
+            id=self.account_id,
+            platform="chatgpt",
+            email="demo@example.com",
+            password="password",
+            token="fresh-access-token",
+        )
+
+        def login(*_args, **_kwargs):
+            order.append("login")
+            return {
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+            }
+
+        def persist(*_args, **_kwargs):
+            order.append("persist")
+            return persisted
+
+        def harden(*_args, **_kwargs):
+            order.append("harden")
+            return "ready"
+
+        def sync(*_args, **_kwargs):
+            order.append("sync")
+            return {"ok": True, "msg": "ok"}
+
+        with mock.patch(
+            "services.chatgpt_relogin._load_saved_account",
+            return_value=saved,
+        ), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            side_effect=login,
+        ), mock.patch(
+            "services.chatgpt_relogin._persist_fresh_tokens",
+            side_effect=persist,
+        ), mock.patch(
+            "services.chatgpt_relogin._harden_persisted_chatgpt_account",
+            side_effect=harden,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            side_effect=sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["hardening_status"], "ready")
+        self.assertEqual(order, ["login", "persist", "harden", "sync"])
+
+    def test_ready_top_level_totp_becomes_effective_login_context(self):
+        from services.chatgpt_relogin import _load_saved_account
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            extra = account.get_extra()
+            extra.update(
+                {
+                    "account_type": "chatgpt_password_totp",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_hardening_status": "ready",
+                }
+            )
+            extra.pop("mailbox_login_context", None)
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(self.account_id)
+
+        context = saved["mailbox_context"]
+        self.assertEqual(context["provider"], "chatgpt_credentials")
+        self.assertEqual(
+            context["extra"]["account_type"],
+            "chatgpt_password_totp",
+        )
+        self.assertEqual(context["extra"]["totp_secret"], "JBSWY3DPEHPK3PXP")
+
     def _add_eligibility_account(
         self,
         email: str,

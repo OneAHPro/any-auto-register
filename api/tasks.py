@@ -1172,6 +1172,52 @@ def _append_task_log_best_effort(task_id: str, message: str) -> None:
             pass
 
 
+def _harden_saved_chatgpt_account_best_effort(
+    task_id: str,
+    saved_account: AccountModel,
+) -> str:
+    """Run post-login hardening without rolling back a successful login."""
+    if (
+        str(getattr(saved_account, "platform", "") or "").strip().lower()
+        != "chatgpt"
+        or not int(getattr(saved_account, "id", 0) or 0)
+    ):
+        return "hardening_pending"
+    try:
+        from services.chatgpt_account_hardening import (
+            ChatGPTAccountHardeningService,
+        )
+
+        result = ChatGPTAccountHardeningService().harden_authenticated_account(
+            int(saved_account.id)
+        )
+        status = str(getattr(result, "status", "") or "").strip()
+        outcome = str(getattr(result, "outcome", "") or "").strip()
+        if status == "ready":
+            _log(task_id, "  [账号加固] 密码与本地 TOTP MFA 已就绪")
+            return "ready"
+        if status == "missing_mfa_material":
+            _log(
+                task_id,
+                "  [账号加固] 远端已开启 MFA，但本地缺少可验证密钥；"
+                "账号和令牌已保留",
+            )
+            return "missing_mfa_material"
+        _log(
+            task_id,
+            "  [账号加固] 登录已保存，密码/MFA 后续批次继续处理"
+            f"（{outcome or status or 'pending'}）",
+        )
+        return "hardening_pending"
+    except Exception as exc:
+        _log(
+            task_id,
+            "  [账号加固] 登录已保存，加固稍后重试"
+            f"（{type(exc).__name__}）",
+        )
+        return "hardening_pending"
+
+
 def _terminalize_stopped_task(task_id: str, message: str) -> None:
     """Best-effort terminal state for a task stopped before business work."""
     snapshot = _task_store.snapshot_if_present(task_id)
@@ -3264,6 +3310,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             saved_account_extra_snapshot = raw_saved_extra
                 else:
                     saved_account = save_account(account)
+                    if req.platform == "chatgpt":
+                        _harden_saved_chatgpt_account_best_effort(
+                            task_id,
+                            saved_account,
+                        )
                 if _proxy:
                     _proxy_pool.report_success(_proxy)
 
@@ -3731,6 +3782,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     if phone_message:
                         _log(task_id, f"  [接码结果] {phone_message}")
                     phone_flow_completed = True
+                    _harden_saved_chatgpt_account_best_effort(
+                        task_id,
+                        final_account,
+                    )
                     _log(
                         task_id,
                         f"[OK] {success_action_name}成功: {account.email}",
