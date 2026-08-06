@@ -6,6 +6,7 @@ from sqlmodel import Session, select
 from typing import Optional
 from copy import deepcopy
 from datetime import datetime, timezone
+from pathlib import Path
 from weakref import WeakKeyDictionary
 import math
 import os
@@ -209,6 +210,12 @@ class ChatGPTReloginTaskRequest(BaseModel):
         ge=1,
         le=CHATGPT_RELOGIN_MAX_CONCURRENCY,
     )
+
+
+class ChatGPTHardeningTaskRequest(BaseModel):
+    account_ids: list[StrictInt] = Field(default_factory=list)
+    concurrency: StrictInt = Field(default=1, ge=1, le=2)
+    dry_run: bool = False
 
 
 class ChatGPTRetryFailedTaskRequest(BaseModel):
@@ -1393,6 +1400,382 @@ def _create_chatgpt_relogin_task_record(
         meta=task_meta,
     )
     _persist_task_snapshot(task_id)
+
+
+def _resolve_chatgpt_hardening_account_ids(
+    account_ids,
+    *,
+    database_engine=None,
+) -> list[int]:
+    """Resolve an explicit selection or every saved ChatGPT account."""
+    target_engine = database_engine or engine
+    if account_ids:
+        normalized = _normalize_chatgpt_relogin_account_ids(
+            account_ids,
+            max_accounts=None,
+        )
+        with Session(target_engine) as session:
+            existing = {
+                int(row.id)
+                for row in session.exec(
+                    select(AccountModel).where(
+                        AccountModel.id.in_(normalized),
+                        AccountModel.platform == "chatgpt",
+                    )
+                ).all()
+                if row.id is not None
+            }
+        missing = [account_id for account_id in normalized if account_id not in existing]
+        if missing:
+            raise HTTPException(404, f"ChatGPT 账号不存在: {missing[0]}")
+        return normalized
+    with Session(target_engine) as session:
+        return [
+            int(row_id)
+            for row_id in session.exec(
+                select(AccountModel.id)
+                .where(AccountModel.platform == "chatgpt")
+                .order_by(AccountModel.id.asc())
+            ).all()
+            if row_id is not None
+        ]
+
+
+def _create_chatgpt_hardening_task_record(
+    task_id: str,
+    account_ids: list[int],
+    *,
+    concurrency: int = 1,
+    dry_run: bool = False,
+) -> None:
+    effective_concurrency = min(max(int(concurrency or 1), 1), 2)
+    counters = {
+        "ready_before": 0,
+        "hardened": 0,
+        "recovered_secret": 0,
+        "pending_password": 0,
+        "missing_mfa_material": 0,
+        "failed": 0,
+    }
+    _task_store.create(
+        task_id,
+        platform="chatgpt",
+        total=len(account_ids),
+        source="account_hardening",
+        meta={
+            "mode": "account_hardening",
+            "account_ids": list(account_ids),
+            "completed_account_ids": [],
+            "concurrency": effective_concurrency,
+            "dry_run": bool(dry_run),
+            **counters,
+        },
+    )
+    _persist_task_snapshot(task_id)
+
+
+def _chatgpt_hardening_backup_paths() -> list[str]:
+    candidates: list[Path] = []
+    configured = str(os.getenv("CHATGPT_HARDENING_BACKUP_PATHS") or "").strip()
+    for item in configured.split(os.pathsep) if configured else ():
+        path = Path(item).expanduser()
+        if path.is_file():
+            candidates.append(path)
+        elif path.is_dir():
+            candidates.extend(sorted(path.glob("*.db*")))
+    for directory in (
+        Path("backups"),
+        Path("/www/any-auto-register/backups"),
+    ):
+        if directory.is_dir():
+            candidates.extend(sorted(directory.glob("*.db*")))
+    unique: list[str] = []
+    for path in candidates:
+        rendered = str(path.resolve())
+        if rendered not in unique:
+            unique.append(rendered)
+    return unique
+
+
+def _run_chatgpt_hardening_task_inner(
+    task_id: str,
+    account_ids: list[int],
+    *,
+    concurrency: int = 1,
+    dry_run: bool = False,
+) -> None:
+    from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+    from services.chatgpt_account_hardening import ChatGPTAccountHardeningService
+
+    control = _task_store.control_for(task_id)
+    if control.is_stop_requested():
+        _terminalize_stopped_task(task_id, "账号加固任务在派发前已停止")
+        return
+    total = len(account_ids)
+    worker_count = min(max(int(concurrency or 1), 1), 2, max(total, 1))
+    control.configure_active_slots(worker_count)
+    service = ChatGPTAccountHardeningService(
+        database_engine=engine,
+        backup_paths=_chatgpt_hardening_backup_paths(),
+    )
+    counters = {
+        "ready_before": 0,
+        "hardened": 0,
+        "recovered_secret": 0,
+        "pending_password": 0,
+        "missing_mfa_material": 0,
+        "failed": 0,
+    }
+    completed_ids: list[int] = []
+    errors: list[str] = []
+    processed = 0
+    success = 0
+    stopped = False
+    _task_store.mark_running(task_id)
+    _log(
+        task_id,
+        f"开始{'分类' if dry_run else '补齐'} ChatGPT 密码与 MFA，"
+        f"共 {total} 个账号，并发 {worker_count}",
+    )
+
+    def _do_one(account_id: int):
+        attempt_id = None
+        try:
+            control.checkpoint()
+            attempt_id = control.start_attempt()
+            control.checkpoint(attempt_id=attempt_id)
+            result = service.harden_saved_account(
+                account_id,
+                dry_run=dry_run,
+                owner=f"{task_id}:{account_id}",
+            )
+            if (
+                not dry_run
+                and str(getattr(result, "outcome", "") or "")
+                == "pending_password"
+            ):
+                from services.chatgpt_relogin import relogin_chatgpt_account
+
+                _log(
+                    task_id,
+                    f"  [账号 {account_id}] 缺少可用密码，先通过原邮箱验证码登录并设置密码",
+                )
+                relogin_result = relogin_chatgpt_account(
+                    account_id,
+                    log_fn=lambda message: _log(
+                        task_id,
+                        f"  [账号 {account_id}] "
+                        f"{sanitize_chatgpt_log_message(str(message or ''))}",
+                    ),
+                    task_control=control,
+                    attempt_id=attempt_id,
+                    remove_on_mailbox_otp_timeout=False,
+                )
+                if bool(
+                    (relogin_result or {}).get("ok")
+                    or (relogin_result or {}).get("relogin_ok")
+                ):
+                    result = service.harden_saved_account(
+                        account_id,
+                        dry_run=False,
+                        owner=f"{task_id}:{account_id}",
+                    )
+            return account_id, result, None
+        except StopTaskRequested as exc:
+            return account_id, None, exc
+        except Exception as exc:
+            return account_id, None, exc
+        finally:
+            control.finish_attempt(attempt_id)
+
+    jobs = iter(account_ids)
+    pending = {}
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        def _submit_next() -> bool:
+            if control.is_stop_requested():
+                return False
+            try:
+                account_id = next(jobs)
+            except StopIteration:
+                return False
+            pending[pool.submit(_do_one, account_id)] = account_id
+            return True
+
+        for _ in range(worker_count):
+            if not _submit_next():
+                break
+        while pending:
+            done, _ = wait(tuple(pending), return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.pop(future, None)
+                account_id, result, error = future.result()
+                if isinstance(error, StopTaskRequested):
+                    stopped = True
+                    continue
+                processed += 1
+                completed_ids.append(account_id)
+                if error is not None or result is None:
+                    counters["failed"] += 1
+                    error_type = type(error).__name__ if error is not None else "UnknownError"
+                    errors.append(f"账号 ID {account_id}: {error_type}")
+                    _log(task_id, f"[FAIL] 账号 ID {account_id} 加固失败（{error_type}）")
+                else:
+                    outcome = str(getattr(result, "outcome", "") or "failed")
+                    if outcome not in counters:
+                        outcome = "failed"
+                    counters[outcome] += 1
+                    email = str(getattr(result, "email", "") or f"账号 ID {account_id}")
+                    if outcome in {"ready_before", "hardened", "recovered_secret"}:
+                        success += 1
+                        _log(task_id, f"[OK] {email}: {outcome}")
+                    elif outcome == "missing_mfa_material":
+                        _log(task_id, f"[HOLD] {email}: 远端已有 MFA，本地缺少密钥")
+                    elif outcome == "pending_password":
+                        _log(task_id, f"[HOLD] {email}: 等待可用邮箱设置密码")
+                    else:
+                        errors.append(f"{email}: hardening failed")
+                        _log(task_id, f"[FAIL] {email}: hardening failed")
+                    _save_task_log(
+                        "chatgpt",
+                        email if "@" in email else "",
+                        "success" if outcome in {"ready_before", "hardened", "recovered_secret"} else "failed",
+                        detail={"account_id": account_id, "hardening_outcome": outcome},
+                    )
+                _task_store.set_progress(task_id, f"{processed}/{total}")
+                _task_store.update_counters(
+                    task_id,
+                    success=success,
+                    registered=processed,
+                )
+                _task_store.update_meta(
+                    task_id,
+                    completed_account_ids=list(completed_ids),
+                    **counters,
+                )
+                _persist_task_snapshot_best_effort(task_id)
+            if control.is_stop_requested():
+                stopped = True
+                for future in tuple(pending):
+                    future.cancel()
+            else:
+                while len(pending) < worker_count and _submit_next():
+                    pass
+
+    final_status = "stopped" if stopped or control.is_stop_requested() else "done"
+    _task_store.finish(
+        task_id,
+        status=final_status,
+        success=success,
+        registered=processed,
+        skipped=0,
+        errors=errors,
+    )
+    _task_store.update_meta(
+        task_id,
+        completed_account_ids=list(completed_ids),
+        **counters,
+    )
+    _persist_task_snapshot_best_effort(task_id)
+    _log(
+        task_id,
+        f"账号加固任务{'已停止' if final_status == 'stopped' else '完成'}："
+        f"就绪 {success}，待密码 {counters['pending_password']}，"
+        f"缺密钥 {counters['missing_mfa_material']}，失败 {counters['failed']}",
+    )
+    _persist_task_snapshot_best_effort(task_id)
+    _task_store.cleanup()
+
+
+def _run_chatgpt_hardening_task(
+    task_id: str,
+    account_ids: list[int],
+    *,
+    concurrency: int = 1,
+    dry_run: bool = False,
+) -> None:
+    _task_store.protect_from_cleanup(task_id)
+    lease = None
+    try:
+        control = _task_store.control_for(task_id)
+        lease = chatgpt_task_gate.enter_foreground(
+            on_wait=lambda: _log(
+                task_id,
+                "等待自动重登释放后开始账号加固",
+            ),
+            cancelled=control.is_stop_requested,
+        )
+        if lease is None:
+            _terminalize_stopped_task(task_id, "账号加固任务在等待期间已停止")
+            return
+        _run_chatgpt_hardening_task_inner(
+            task_id,
+            account_ids,
+            concurrency=concurrency,
+            dry_run=dry_run,
+        )
+    except Exception as exc:
+        if _task_store.exists(task_id):
+            snapshot = _task_store.snapshot(task_id)
+            if str(snapshot.get("status") or "") not in {"done", "failed", "stopped"}:
+                message = type(exc).__name__
+                errors = list(snapshot.get("errors") or [])
+                errors.append(f"账号加固任务异常终止: {message}")
+                _task_store.finish(
+                    task_id,
+                    status="failed",
+                    success=int(snapshot.get("success") or 0),
+                    registered=int(snapshot.get("registered") or 0),
+                    skipped=int(snapshot.get("skipped") or 0),
+                    errors=errors,
+                    error=message,
+                )
+                _persist_task_snapshot_best_effort(task_id)
+    finally:
+        if lease is not None:
+            chatgpt_task_gate.leave_foreground(lease)
+        _task_store.release_cleanup_protection(task_id)
+
+
+def enqueue_chatgpt_hardening_task(
+    account_ids,
+    *,
+    concurrency: int = 1,
+    dry_run: bool = False,
+    background_tasks: BackgroundTasks | None = None,
+) -> str:
+    with _chatgpt_task_enqueue_lock:
+        _finalize_orphan_tasks()
+        if _task_store.has_active(platform="chatgpt"):
+            raise HTTPException(409, "已有 ChatGPT 任务正在运行，请等待完成")
+        normalized_ids = _resolve_chatgpt_hardening_account_ids(account_ids)
+        if not normalized_ids:
+            raise HTTPException(400, "当前没有可处理的 ChatGPT 账号")
+        task_id = f"task_hardening_{uuid.uuid4().hex}"
+        _create_chatgpt_hardening_task_record(
+            task_id,
+            normalized_ids,
+            concurrency=concurrency,
+            dry_run=dry_run,
+        )
+        kwargs = {
+            "concurrency": min(max(int(concurrency or 1), 1), 2),
+            "dry_run": bool(dry_run),
+        }
+        if background_tasks is None:
+            threading.Thread(
+                target=_run_chatgpt_hardening_task,
+                args=(task_id, normalized_ids),
+                kwargs=kwargs,
+                daemon=True,
+            ).start()
+        else:
+            background_tasks.add_task(
+                _run_chatgpt_hardening_task,
+                task_id,
+                normalized_ids,
+                **kwargs,
+            )
+        return task_id
 
 
 def _terminalize_failed_chatgpt_relogin_enqueue(
@@ -4063,6 +4446,26 @@ def create_chatgpt_relogin_task(
         "task_id": task_id,
         "count": int(snapshot["total"]),
         "concurrency": int(snapshot["meta"]["concurrency"]),
+    }
+
+
+@router.post("/chatgpt-hardening")
+def create_chatgpt_hardening_task(
+    req: ChatGPTHardeningTaskRequest,
+    background_tasks: BackgroundTasks,
+):
+    task_id = enqueue_chatgpt_hardening_task(
+        req.account_ids,
+        concurrency=req.concurrency,
+        dry_run=req.dry_run,
+        background_tasks=background_tasks,
+    )
+    snapshot = _task_store.snapshot(task_id)
+    return {
+        "task_id": task_id,
+        "count": int(snapshot["total"]),
+        "concurrency": int(snapshot["meta"]["concurrency"]),
+        "dry_run": bool(snapshot["meta"]["dry_run"]),
     }
 
 
