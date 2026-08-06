@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 import os
 from typing import Optional
-from sqlalchemy import delete, event, func
+from sqlalchemy import delete, event, func, update
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -220,6 +220,185 @@ def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
     saved, _created = save_account_with_creation_state(account)
     return saved
+
+
+_HARDENING_PASSWORD_UNSET = object()
+
+
+def _matches_chatgpt_account_identity(
+    account: AccountModel | None,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+    expected_updated_at: datetime,
+) -> bool:
+    if account is None or str(account.platform or "").lower() != "chatgpt":
+        return False
+    return bool(
+        str(account.email or "").strip().lower()
+        == str(expected_email or "").strip().lower()
+        and account.created_at == expected_created_at
+        and account.updated_at == expected_updated_at
+    )
+
+
+def _guarded_chatgpt_hardening_update(
+    session: Session,
+    account: AccountModel,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+    expected_updated_at: datetime,
+    extra: dict,
+    password=_HARDENING_PASSWORD_UNSET,
+) -> AccountModel | None:
+    next_updated_at = _utcnow()
+    values = {
+        "extra_json": json.dumps(extra, ensure_ascii=False),
+        "updated_at": next_updated_at,
+    }
+    if password is not _HARDENING_PASSWORD_UNSET:
+        values["password"] = str(password or "")
+    result = session.exec(
+        update(AccountModel)
+        .where(AccountModel.id == int(account.id))
+        .where(AccountModel.platform == "chatgpt")
+        .where(
+            func.lower(AccountModel.email)
+            == str(expected_email or "").strip().lower()
+        )
+        .where(AccountModel.created_at == expected_created_at)
+        .where(AccountModel.updated_at == expected_updated_at)
+        .values(**values)
+    )
+    if int(getattr(result, "rowcount", 0) or 0) != 1:
+        session.rollback()
+        return None
+    session.commit()
+    refreshed = session.get(AccountModel, int(account.id))
+    if refreshed is None:
+        return None
+    return AccountModel(**refreshed.model_dump())
+
+
+def claim_chatgpt_account_hardening(
+    account_id: int,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+    expected_updated_at: datetime,
+    owner: str,
+    database_engine=None,
+) -> AccountModel | None:
+    """Atomically claim a specific ChatGPT row for one hardening worker."""
+    normalized_owner = str(owner or "").strip()
+    if not normalized_owner:
+        raise ValueError("hardening owner is required")
+    target_engine = database_engine or engine
+    with Session(target_engine) as session:
+        account = session.get(AccountModel, int(account_id))
+        if not _matches_chatgpt_account_identity(
+            account,
+            expected_email=expected_email,
+            expected_created_at=expected_created_at,
+            expected_updated_at=expected_updated_at,
+        ):
+            return None
+        extra = dict(account.get_extra() or {})
+        current_owner = str(extra.get("mfa_hardening_owner") or "").strip()
+        if current_owner and current_owner != normalized_owner:
+            return None
+        extra["mfa_hardening_owner"] = normalized_owner
+        extra["mfa_hardening_claimed_at"] = _utcnow().isoformat()
+        return _guarded_chatgpt_hardening_update(
+            session,
+            account,
+            expected_email=expected_email,
+            expected_created_at=expected_created_at,
+            expected_updated_at=expected_updated_at,
+            extra=extra,
+        )
+
+
+def update_chatgpt_account_hardening(
+    account_id: int,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+    expected_updated_at: datetime,
+    owner: str,
+    extra_updates: dict | None = None,
+    extra_removals: tuple[str, ...] | list[str] = (),
+    password=_HARDENING_PASSWORD_UNSET,
+    release_owner: bool = False,
+    database_engine=None,
+) -> AccountModel | None:
+    """CAS-update only the hardening fields owned by ``owner``."""
+    normalized_owner = str(owner or "").strip()
+    target_engine = database_engine or engine
+    with Session(target_engine) as session:
+        account = session.get(AccountModel, int(account_id))
+        if not _matches_chatgpt_account_identity(
+            account,
+            expected_email=expected_email,
+            expected_created_at=expected_created_at,
+            expected_updated_at=expected_updated_at,
+        ):
+            return None
+        extra = dict(account.get_extra() or {})
+        if str(extra.get("mfa_hardening_owner") or "").strip() != normalized_owner:
+            return None
+        extra.update(dict(extra_updates or {}))
+        for key in extra_removals or ():
+            extra.pop(str(key), None)
+        if release_owner:
+            extra.pop("mfa_hardening_owner", None)
+            extra.pop("mfa_hardening_claimed_at", None)
+        return _guarded_chatgpt_hardening_update(
+            session,
+            account,
+            expected_email=expected_email,
+            expected_created_at=expected_created_at,
+            expected_updated_at=expected_updated_at,
+            extra=extra,
+            password=password,
+        )
+
+
+def promote_chatgpt_mfa_secret(
+    account_id: int,
+    *,
+    expected_email: str,
+    expected_created_at: datetime,
+    expected_updated_at: datetime,
+    owner: str,
+    secret: str,
+    database_engine=None,
+) -> AccountModel | None:
+    """Promote a confirmed pending TOTP secret and release the worker claim."""
+    normalized_secret = str(secret or "").strip()
+    if not normalized_secret:
+        raise ValueError("confirmed TOTP secret is required")
+    return update_chatgpt_account_hardening(
+        account_id,
+        expected_email=expected_email,
+        expected_created_at=expected_created_at,
+        expected_updated_at=expected_updated_at,
+        owner=owner,
+        extra_updates={
+            "totp_secret": normalized_secret,
+            "account_type": "chatgpt_password_totp",
+            "mfa_hardening_status": "ready",
+            "mfa_enabled_at": _utcnow().isoformat(),
+        },
+        extra_removals=(
+            "mfa_pending_secret",
+            "mfa_hardening_error",
+            "mfa_hardening_session_id",
+        ),
+        release_owner=True,
+        database_engine=database_engine,
+    )
 
 
 def delete_incomplete_chatgpt_account(
