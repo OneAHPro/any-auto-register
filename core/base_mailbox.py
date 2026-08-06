@@ -616,6 +616,17 @@ class AppleMailMailbox(BaseMailbox):
         )
 
     @staticmethod
+    def _has_mailapi_url(account: MailboxAccount) -> bool:
+        extra = account.extra or {}
+        return bool(
+            str(
+                extra.get("mailapi_url")
+                or extra.get("mail_api_url")
+                or ""
+            ).strip()
+        )
+
+    @staticmethod
     def _is_chatgpt_url_mail_account(account: MailboxAccount) -> bool:
         extra = account.extra or {}
         return str(extra.get("account_type") or "").strip() in {
@@ -778,6 +789,10 @@ class AppleMailMailbox(BaseMailbox):
                 "totp_secret": record["totp_secret"],
                 "pool_file": pool_path.name,
             }
+            mail_api_url = str(record.get("mail_api_url") or "").strip()
+            if mail_api_url:
+                extra["mail_api_url"] = mail_api_url
+                extra["mailapi_url"] = mail_api_url
         elif direct_icloud:
             extra = {
                 "provider": "icloud",
@@ -908,7 +923,10 @@ class AppleMailMailbox(BaseMailbox):
         return committed
 
     def get_current_ids(self, account: MailboxAccount) -> set:
-        if self._is_chatgpt_url_mail_account(account):
+        if self._is_chatgpt_url_mail_account(account) or (
+            self._is_chatgpt_password_totp_account(account)
+            and self._has_mailapi_url(account)
+        ):
             return self._get_mailapi_backend().get_current_ids(account)
         if self._is_chatgpt_password_totp_account(account):
             return set()
@@ -937,7 +955,10 @@ class AppleMailMailbox(BaseMailbox):
         code_pattern: str = None,
         **kwargs,
     ) -> str:
-        if self._is_chatgpt_url_mail_account(account):
+        if self._is_chatgpt_url_mail_account(account) or (
+            self._is_chatgpt_password_totp_account(account)
+            and self._has_mailapi_url(account)
+        ):
             return self._get_mailapi_backend().wait_for_code(
                 account,
                 keyword=keyword,
@@ -4059,6 +4080,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             }
         return None
 
+    @staticmethod
+    def _is_openai_history_subject(value: Any) -> bool:
+        subject = " ".join(str(value or "").strip().lower().split())
+        return bool(
+            "openai" in subject
+            or "chatgpt" in subject
+            or subject == "your authentication code"
+        )
+
     @classmethod
     def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
         import json
@@ -4078,6 +4108,98 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "received_at": None,
                 "message_id": "",
                 "status": None,
+            }
+
+        messages = payload.get("messages")
+        if isinstance(messages, list):
+            candidates = []
+            for index, item in enumerate(messages):
+                if not isinstance(item, dict):
+                    continue
+                verification_code = str(
+                    item.get("verificationCode")
+                    or item.get("verification_code")
+                    or item.get("code")
+                    or ""
+                ).strip()
+                subject = str(item.get("subject") or "").strip()
+                if (
+                    not verification_code
+                    or not cls._is_openai_history_subject(subject)
+                ):
+                    continue
+                received_value = next(
+                    (
+                        item.get(key)
+                        for key in (
+                            "receivedAt",
+                            "received_at",
+                            "createdAt",
+                            "created_at",
+                            "timestamp",
+                            "date",
+                        )
+                        if item.get(key) not in (None, "")
+                    ),
+                    None,
+                )
+                received_at = cls._parse_timestamp(received_value)
+                if received_at is None:
+                    continue
+                candidates.append(
+                    (
+                        received_at if received_at is not None else float("-inf"),
+                        -index,
+                        item,
+                        verification_code,
+                        received_value,
+                        received_at,
+                    )
+                )
+            response_email = str(payload.get("email") or "").strip()
+            if candidates:
+                (
+                    _ranked_at,
+                    _ranked_index,
+                    newest,
+                    verification_code,
+                    received_value,
+                    received_at,
+                ) = max(candidates, key=lambda candidate: candidate[:2])
+                subject = str(newest.get("subject") or "").strip()
+                identity = "|".join(
+                    (
+                        response_email,
+                        str(received_value or "").strip(),
+                        verification_code,
+                    )
+                )
+                import hashlib
+
+                return {
+                    "content": " ".join(
+                        part
+                        for part in (
+                            subject,
+                            f"verification code {verification_code}",
+                        )
+                        if part
+                    ),
+                    "received_at": received_at,
+                    "message_id": "mailapi_message:" + hashlib.sha256(
+                        identity.encode("utf-8", errors="ignore")
+                    ).hexdigest(),
+                    "status": payload.get("ok", payload.get("status")),
+                    "response_email": response_email,
+                    "mailapi_history": True,
+                }
+            return {
+                "content": "",
+                "received_at": None,
+                "message_id": "",
+                "status": False,
+                "response_email": response_email,
+                "mailapi_history": True,
             }
 
         content_parts = []
@@ -4610,10 +4732,26 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return ""
         return code
 
+    @staticmethod
+    def _message_matches_account(
+        message: dict[str, Any],
+        account: MailboxAccount,
+    ) -> bool:
+        if not message.get("mailapi_history"):
+            return True
+        response_email = str(message.get("response_email") or "").strip().lower()
+        account_email = str(account.email or "").strip().lower()
+        return bool(response_email and account_email and response_email == account_email)
+
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
             text = self._fetch_mailapi_text(account)
             message = self._parse_mailapi_message(text)
+            if (
+                message.get("status") is False
+                or not self._message_matches_account(message, account)
+            ):
+                return set()
             code = self._extract_message_code(message, text, None)
             if not code:
                 return set()
@@ -4660,6 +4798,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             message = self._parse_mailapi_message(text)
             if message.get("status") is False:
                 return None
+            if not self._message_matches_account(message, account):
+                self.mailbox._log(
+                    "[MailAPI] 邮件历史响应邮箱与当前账号不一致，已忽略"
+                )
+                return None
             content = str(message.get("content") or "")
             searchable_content = (
                 content if content == str(text or "") else f"{content} {text}"
@@ -4682,19 +4825,22 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 return None
             code_key = self._code_key(code)
             message_id = str(message.get("message_id") or "").strip()
-            seen_before = code_key in seen or (message_id and message_id in seen)
+            code_seen_before = code_key in seen
+            message_seen_before = bool(message_id and message_id in seen)
             baseline_raced_with_new_message = bool(
                 otp_sent_at
                 and received_at
                 and float(received_at) >= otp_sent_at
             )
-            baseline_freshness_is_unverifiable = bool(
-                otp_sent_at and not received_at
-            )
             if (
-                seen_before
+                code_seen_before
                 and not baseline_raced_with_new_message
-                and not baseline_freshness_is_unverifiable
+            ):
+                return None
+            if (
+                message_seen_before
+                and received_at
+                and not baseline_raced_with_new_message
             ):
                 return None
             seen.add(code_key)

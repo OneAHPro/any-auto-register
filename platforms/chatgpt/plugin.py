@@ -165,6 +165,13 @@ class ChatGPTPlatform(BasePlatform):
                                 ),
                             }
                         )
+                        mail_api_url = str(
+                            account_extra.get("mail_api_url")
+                            or account_extra.get("mailapi_url")
+                            or ""
+                        ).strip()
+                        if mail_api_url:
+                            result["mail_api_url"] = mail_api_url
                     elif str(account_extra.get("account_type") or "").strip() in {
                         "chatgpt_password_url_otp",
                         "chatgpt_password_reset_url_mail",
@@ -218,6 +225,13 @@ class ChatGPTPlatform(BasePlatform):
                         str(account_extra.get("account_type") or "").strip()
                         == "chatgpt_password_totp"
                     )
+                    has_mail_api_url = bool(
+                        str(
+                            account_extra.get("mail_api_url")
+                            or account_extra.get("mailapi_url")
+                            or ""
+                        ).strip()
+                    )
                     generated_email = getattr(self._acct, "email", "")
                     if not self._email:
                         self._email = _resolve_email(generated_email)
@@ -238,7 +252,7 @@ class ChatGPTPlatform(BasePlatform):
                         except Exception as exc:
                             log_fn(f"保存邮箱与接码卡密绑定失败: {exc}")
                     get_current_ids = getattr(_mailbox, "get_current_ids", None)
-                    if is_chatgpt_credentials:
+                    if is_chatgpt_credentials and not has_mail_api_url:
                         self._before_ids = set()
                         self._baseline_ready.set()
                     elif callable(get_current_ids):
@@ -435,6 +449,13 @@ class ChatGPTPlatform(BasePlatform):
                                     ),
                                 }
                             )
+                            mail_api_url = str(
+                                account_extra.get("mail_api_url")
+                                or account_extra.get("mailapi_url")
+                                or ""
+                            ).strip()
+                            if mail_api_url:
+                                credential_snapshot["mail_api_url"] = mail_api_url
                         else:
                             credential_snapshot.update(
                                 {

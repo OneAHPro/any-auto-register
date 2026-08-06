@@ -440,6 +440,36 @@ class ChatGPTPluginTests(unittest.TestCase):
         _, kwargs = mailbox.wait_call
         self.assertEqual(kwargs.get("before_ids"), {"mid-1"})
 
+    def test_totp_credentials_with_mail_url_load_baseline_and_preserve_url(self):
+        mailbox = _TrackingMailbox()
+        mailbox.account.extra = {
+            "provider": "chatgpt_credentials",
+            "account_type": "chatgpt_password_totp",
+            "password": "chatgpt-password",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "mail_api_url": "https://mail.example.test/history?email=demo",
+            "mailapi_url": "https://mail.example.test/history?email=demo",
+            "pool_file": "credentials.json",
+        }
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(extra={"chatgpt_registration_mode": "refresh_token"}),
+            mailbox=mailbox,
+        )
+        adapter = _VerificationAdapter()
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            result = platform.register()
+
+        self.assertEqual(result["success"], True)
+        self.assertEqual(mailbox.current_ids_calls, [mailbox.account])
+        self.assertEqual(
+            adapter.mailbox_metadata["extra"]["mail_api_url"],
+            "https://mail.example.test/history?email=demo",
+        )
+
     def test_custom_provider_records_mailbox_binding_before_login_continues(self):
         mailbox = _TrackingMailbox()
         binding_callback = mock.Mock()

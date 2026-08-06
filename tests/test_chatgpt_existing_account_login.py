@@ -57,6 +57,25 @@ class PasswordTotpEmailService:
         }
 
 
+class PasswordTotpWithMailEmailService(PasswordTotpEmailService):
+    def __init__(self):
+        self.committed_password = ""
+
+    def create_email(self):
+        result = super().create_email()
+        result["mail_api_url"] = (
+            "https://mail.example.test/history?email=mfa-user%40icloud.com"
+        )
+        return result
+
+    def get_verification_code(self, **kwargs):
+        return "123456"
+
+    def commit_password_reset(self, new_password):
+        self.committed_password = str(new_password or "")
+        return True
+
+
 class UrlOtpEmailService:
     service_type = type("ServiceType", (), {"value": "chatgpt_credentials"})()
 
@@ -297,6 +316,47 @@ class ExistingAccountLoginTests(unittest.TestCase):
             ]
         )
 
+    def test_totp_with_mail_access_login_resets_rejected_password_and_keeps_totp(self):
+        email_service = PasswordTotpWithMailEmailService()
+        engine = self._make_engine(
+            email_service=email_service,
+            login_stage="access_token",
+        )
+        rejected_client = mock.Mock()
+        rejected_client.login_existing_account_and_get_session.return_value = (
+            False,
+            '密码验证失败: 401 - {"error":{"type":"invalid_request_error"}}',
+        )
+        reset_client = mock.Mock()
+
+        def finish_reset(*_args, **kwargs):
+            self.assertTrue(kwargs["password_reset_required"])
+            self.assertEqual(kwargs["totp_secret"], "JBSWY3DPEHPK3PXP")
+            self.assertTrue(kwargs["on_password_reset"](kwargs["password"]))
+            return True, {
+                "access_token": "access-token",
+                "session_token": "session-token",
+                "account_id": "account-1",
+            }
+
+        reset_client.login_existing_account_and_get_session.side_effect = finish_reset
+        engine._build_chatgpt_client = mock.Mock(
+            side_effect=[rejected_client, reset_client]
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
+            return_value="Replacement-Password-2026!",
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(
+            email_service.committed_password,
+            "Replacement-Password-2026!",
+        )
+        self.assertEqual(engine._build_chatgpt_client.call_count, 2)
+
     def test_url_otp_transient_login_failure_does_not_reset_password(self):
         email_service = UrlOtpEmailService()
         engine = self._make_engine(email_service=email_service)
@@ -311,6 +371,17 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(engine._build_oauth_client.call_count, 1)
         self.assertEqual(email_service.committed_password, "")
         self.assertFalse(any("忘记密码" in line for line in result.logs))
+
+    def test_non_401_invalid_credentials_does_not_reset_password(self):
+        engine = self._make_engine(
+            email_service=PasswordTotpWithMailEmailService(),
+        )
+
+        self.assertFalse(
+            engine._is_explicit_password_rejection(
+                '请求失败: 400 - {"error":{"code":"invalid_credentials"}}'
+            )
+        )
 
     def test_reset_url_credentials_pass_generated_password_and_commit_callback(self):
         email_service = PasswordResetUrlEmailService()

@@ -293,9 +293,15 @@ class RefreshTokenRegistrationEngine:
                     self.password = password
                     self.totp_secret = totp_secret
                     self.password_reset_required = False
-                    self._log(
-                        "已识别 ChatGPT 密码 + MFA 登录凭据；不会访问 Apple 邮箱"
-                    )
+                    if str(self.email_info.get("mail_api_url") or "").strip():
+                        self._log(
+                            "已识别 ChatGPT 密码 + MFA 登录凭据；"
+                            "认证要求邮箱 OTP 时将通过 MailAPI 自动取码"
+                        )
+                    else:
+                        self._log(
+                            "已识别 ChatGPT 密码 + MFA 登录凭据；不会访问 Apple 邮箱"
+                        )
                 elif account_type == "chatgpt_password_url_otp":
                     password = str(self.email_info.get("password") or "")
                     if not password:
@@ -386,6 +392,8 @@ class RefreshTokenRegistrationEngine:
     @staticmethod
     def _is_explicit_password_rejection(message: str) -> bool:
         text = str(message or "").strip().lower()
+        if "401" not in text:
+            return False
         if "invalid_credentials" in text:
             return True
         password_failure_markers = (
@@ -393,17 +401,17 @@ class RefreshTokenRegistrationEngine:
             "password verification failed",
             "invalid password",
         )
-        return "401" in text and any(
-            marker in text for marker in password_failure_markers
-        )
+        return any(marker in text for marker in password_failure_markers)
 
     def _can_reset_rejected_url_password(self, result: RegistrationResult) -> bool:
         email_info = self.email_info if isinstance(self.email_info, dict) else {}
         return bool(
             not result.success
             and self._is_explicit_password_rejection(result.error_message)
-            and str(email_info.get("account_type") or "").strip()
-            == "chatgpt_password_url_otp"
+            and str(email_info.get("account_type") or "").strip() in {
+                "chatgpt_password_totp",
+                "chatgpt_password_url_otp",
+            }
             and str(
                 email_info.get("mail_api_url")
                 or email_info.get("mailapi_url")

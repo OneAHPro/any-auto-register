@@ -19,7 +19,7 @@ from core.applemail_pool import (
     save_applemail_pool_json,
     take_next_applemail_record,
 )
-from core.base_mailbox import AppleMailMailbox
+from core.base_mailbox import AppleMailMailbox, MailApiUrlOtpBackend
 from core.icloud_mail import ICloudMailClient, generate_totp
 
 
@@ -827,6 +827,81 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
         self.assertEqual(records[0]["pool_state"], "used")
         self.assertFalse(records[0]["enabled"])
 
+    def test_chatgpt_totp_json_preserves_optional_mail_api_url(self):
+        mail_url = (
+            "https://redeem.example.test/api/internal/oauth/email-history"
+            "?email=demo%40icloud.com"
+        )
+        records = parse_applemail_pool_content(json.dumps({
+            "email": "demo@icloud.com",
+            "password": "chatgpt-password",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "account_type": "chatgpt_password_totp",
+            "mail_api_url": mail_url,
+        }))
+
+        self.assertEqual(records[0]["account_type"], "chatgpt_password_totp")
+        self.assertEqual(records[0]["mail_api_url"], mail_url)
+
+    def test_nn_provider_history_selects_newest_verification_message(self):
+        parsed = MailApiUrlOtpBackend._parse_mailapi_message(json.dumps({
+            "ok": True,
+            "email": "demo@icloud.com",
+            "messages": [
+                {
+                    "receivedAt": "2026-08-06T10:00:00Z",
+                    "subject": "Your ChatGPT verification code",
+                    "verificationCode": "111111",
+                },
+                {
+                    "receivedAt": "2026-08-06T10:01:00Z",
+                    "subject": "Your ChatGPT verification code",
+                    "verificationCode": "222222",
+                },
+            ],
+        }))
+
+        self.assertIn("222222", parsed["content"])
+        self.assertNotIn("111111", parsed["content"])
+        self.assertEqual(parsed["status"], True)
+        self.assertIsNotNone(parsed["received_at"])
+        self.assertTrue(parsed["message_id"].startswith("mailapi_message:"))
+
+    def test_nn_provider_history_ignores_newer_unrelated_verification_mail(self):
+        parsed = MailApiUrlOtpBackend._parse_mailapi_message(json.dumps({
+            "ok": True,
+            "email": "demo@icloud.com",
+            "messages": [
+                {
+                    "receivedAt": "2026-08-06T10:02:00Z",
+                    "subject": "Your bank verification code",
+                    "verificationCode": "333333",
+                },
+                {
+                    "receivedAt": "2026-08-06T10:01:00Z",
+                    "subject": "Your temporary ChatGPT verification code",
+                    "verificationCode": "222222",
+                },
+            ],
+        }))
+
+        self.assertIn("222222", parsed["content"])
+        self.assertNotIn("333333", parsed["content"])
+
+    def test_nn_provider_history_rejects_unparseable_received_at(self):
+        parsed = MailApiUrlOtpBackend._parse_mailapi_message(json.dumps({
+            "ok": True,
+            "email": "demo@icloud.com",
+            "messages": [{
+                "receivedAt": "not-a-timestamp",
+                "subject": "Your temporary ChatGPT verification code",
+                "verificationCode": "222222",
+            }],
+        }))
+
+        self.assertEqual(parsed["status"], False)
+        self.assertEqual(parsed["content"], "")
+
     def test_parses_merchant_totp_then_mail_url_order(self):
         totp_url = "https://totp.example.test/JBSWY3DPEHPK3PXP"
         mail_api_url = (
@@ -913,6 +988,95 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 Path(tmp_dir, "chatgpt_mfa.json").stat().st_mode & 0o777,
                 0o600,
             )
+
+    def test_chatgpt_login_credentials_with_mail_url_use_mailapi_backend(self):
+        mail_url = (
+            "https://redeem.example.test/api/internal/oauth/email-history"
+            "?email=demo%40icloud.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps({
+                    "email": "demo@icloud.com",
+                    "password": "chatgpt-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "account_type": "chatgpt_password_totp",
+                    "mail_api_url": mail_url,
+                }),
+                pool_dir=tmp_dir,
+                filename="chatgpt_mfa_with_mail.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="chatgpt_mfa_with_mail.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(
+                status_code=200,
+                text=json.dumps({
+                    "ok": True,
+                    "email": "demo@icloud.com",
+                    "messages": [{
+                        "receivedAt": "2026-08-06T10:01:00Z",
+                        "subject": "Your ChatGPT verification code",
+                        "verificationCode": "222222",
+                    }],
+                }),
+                url=mail_url,
+                history=[],
+                cookies=None,
+            )
+
+            with mock.patch("requests.get", return_value=response) as request_get:
+                current_ids = mailbox.get_current_ids(account)
+
+            self.assertTrue(current_ids)
+            self.assertEqual(account.extra["mail_api_url"], mail_url)
+            self.assertEqual(account.extra["mailapi_url"], mail_url)
+            request_get.assert_called_once()
+
+    def test_chatgpt_login_credentials_reject_mail_history_for_other_email(self):
+        mail_url = (
+            "https://redeem.example.test/api/internal/oauth/email-history"
+            "?email=demo%40icloud.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps({
+                    "email": "demo@icloud.com",
+                    "password": "chatgpt-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "account_type": "chatgpt_password_totp",
+                    "mail_api_url": mail_url,
+                }),
+                pool_dir=tmp_dir,
+                filename="chatgpt_mfa_wrong_mail.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="chatgpt_mfa_wrong_mail.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(
+                status_code=200,
+                text=json.dumps({
+                    "ok": True,
+                    "email": "other@icloud.com",
+                    "messages": [{
+                        "receivedAt": "2026-08-06T10:01:00Z",
+                        "subject": "Your temporary ChatGPT verification code",
+                        "verificationCode": "222222",
+                    }],
+                }),
+                url=mail_url,
+                history=[],
+                cookies=None,
+            )
+
+            with mock.patch("requests.get", return_value=response):
+                current_ids = mailbox.get_current_ids(account)
+
+            self.assertEqual(current_ids, set())
 
     def test_remote_totp_accepts_exact_plaintext_code_without_rewriting_url(self):
         mail_url = (
@@ -1288,6 +1452,40 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             )
             self.assertFalse(records[0].get("password_reset_required", False))
             self.assertEqual(records[0]["pool_state"], "used")
+
+    def test_totp_login_with_mail_url_can_persist_password_replaced_after_401(self):
+        mail_url = (
+            "https://mail.example.test/history?email=mfa%40example.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps({
+                    "email": "mfa@example.com",
+                    "password": "Old-Password-2026",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mail_api_url": mail_url,
+                    "account_type": "chatgpt_password_totp",
+                }),
+                pool_dir=tmp_dir,
+                filename="totp-password-replaced.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="totp-password-replaced.json",
+            )
+            account = mailbox.get_email()
+            replacement = "Replacement-Password-2026!"
+
+            self.assertTrue(mailbox.commit_password_reset(account, replacement))
+
+            _path, records = load_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="totp-password-replaced.json",
+            )
+            self.assertEqual(records[0]["password"], replacement)
+            self.assertEqual(records[0]["totp_secret"], "JBSWY3DPEHPK3PXP")
+            self.assertEqual(records[0]["mail_api_url"], mail_url)
+            self.assertEqual(records[0]["account_type"], "chatgpt_password_totp")
 
     def test_used_reset_url_account_can_persist_a_replacement_password(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

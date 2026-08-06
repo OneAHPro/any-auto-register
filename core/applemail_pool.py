@@ -328,13 +328,19 @@ def _normalize_record(entry: Any) -> dict[str, str]:
             "mailbox": mailbox,
         }, entry)
     if password and mfa_secret:
-        return _copy_pool_metadata({
+        record = {
             "email": email,
             "password": password,
             "totp_secret": _normalize_mfa_secret(mfa_secret),
             "account_type": "chatgpt_password_totp",
             "mailbox": mailbox,
-        }, entry)
+        }
+        if mail_api_url:
+            record["mail_api_url"] = _normalize_http_url(
+                mail_api_url,
+                "收件地址",
+            )
+        return _copy_pool_metadata(record, entry)
     if not client_id or not refresh_token:
         raise ValueError(
             f"{email} 缺少 client_id + refresh_token，"
@@ -825,6 +831,7 @@ def commit_applemail_password_reset(
         if record is None:
             return False
         if str(record.get("account_type") or "").strip() not in {
+            "chatgpt_password_totp",
             "chatgpt_password_url_otp",
             "chatgpt_password_reset_url_mail",
         }:
