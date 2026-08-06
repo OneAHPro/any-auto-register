@@ -122,14 +122,6 @@ class OAuthClient:
         self.oauth_redirect_uri = self.config.get(
             "oauth_redirect_uri", "http://localhost:1455/auth/callback"
         )
-        self.chatgpt_web_oauth_client_id = self.config.get(
-            "chatgpt_web_oauth_client_id",
-            "app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
-        )
-        self.chatgpt_web_oauth_redirect_uri = self.config.get(
-            "chatgpt_web_oauth_redirect_uri",
-            "https://chatgpt.com/api/auth/callback/openai",
-        )
         self.proxy = proxy
         self.verbose = verbose
         self.browser_mode = browser_mode or "protocol"
@@ -142,7 +134,6 @@ class OAuthClient:
         self.sec_ch_ua = ""
         self.impersonate = ""
         self.last_prepared_oauth_context = None
-        self._oauth_session_expired = False
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -213,35 +204,6 @@ class OAuthClient:
             self.last_error = raw_message
         if self.last_error:
             self._log(self.last_error)
-
-    @staticmethod
-    def _is_invalid_authorization_session_response(response) -> bool:
-        try:
-            status_code = int(getattr(response, "status_code", 0) or 0)
-        except Exception:
-            status_code = 0
-        if status_code not in {400, 409}:
-            return False
-
-        response_text = str(getattr(response, "text", "") or "")
-        normalized = response_text.lower()
-        markers = (
-            "授权步骤无效",
-            "invalid authorization step",
-            "authorization step is invalid",
-            "sign-in session is no longer valid",
-            "login session is no longer valid",
-            "invalid_state",
-            "invalid state",
-        )
-        return any(marker in normalized for marker in markers)
-
-    def _mark_invalid_authorization_session(self, response) -> bool:
-        if not self._is_invalid_authorization_session_response(response):
-            return False
-        self._oauth_session_expired = True
-        self._set_error("OAuth 登录会话已失效，准备重新建立")
-        return True
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -1170,7 +1132,6 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
-        authorization_params=None,
     ) -> str:
         """模拟注册链路一致的 ChatGPT 首页 -> CSRF -> signin/openai。"""
         homepage_url = "https://chatgpt.com/"
@@ -1228,13 +1189,6 @@ class OAuthClient:
                 "screen_hint": "login_or_signup",
                 "login_hint": email,
             }
-            params.update(
-                {
-                    str(key): str(value)
-                    for key, value in dict(authorization_params or {}).items()
-                    if str(key or "").strip() and value is not None
-                }
-            )
             form_data = {
                 "callbackUrl": "https://chatgpt.com/",
                 "csrfToken": csrf_token,
@@ -1567,59 +1521,6 @@ class OAuthClient:
             self._set_error(f"密码验证异常: {e}")
             return None
 
-    def _switch_to_password_login(
-        self,
-        state: FlowState,
-        *,
-        user_agent=None,
-        impersonate=None,
-    ):
-        """Enter the server-offered password route before password/verify."""
-        request_url = f"{self.oauth_issuer}/log-in/password"
-        referer = (
-            state.continue_url
-            or state.current_url
-            or f"{self.oauth_issuer}/email-verification"
-        )
-        headers = self._headers(
-            request_url,
-            user_agent=user_agent,
-            accept=(
-                "text/html,application/xhtml+xml,application/xml;q=0.9,"
-                "*/*;q=0.8"
-            ),
-            referer=referer,
-            navigation=True,
-        )
-        kwargs = {
-            "headers": headers,
-            "allow_redirects": False,
-            "timeout": 30,
-        }
-        if impersonate:
-            kwargs["impersonate"] = impersonate
-        try:
-            self._browser_pause(0.12, 0.3)
-            response = self.session.get(request_url, **kwargs)
-            self._log(f"/log-in/password -> {response.status_code}")
-            if response.status_code != 200:
-                self._set_error("认证服务未开放密码登录，需通过邮箱重新验证")
-                return None
-            next_state = self._state_from_url(
-                str(response.url) or request_url
-            )
-            if not self._state_is_login_password(next_state):
-                self._set_error("认证服务未进入密码登录页面，需通过邮箱重新验证")
-                return None
-            return next_state
-        except TaskInterruption:
-            raise
-        except Exception as exc:
-            self._set_error(
-                f"切换密码登录异常: {type(exc).__name__}"
-            )
-            return None
-
     def _request_password_reset_otp(
         self,
         state: FlowState,
@@ -1703,26 +1604,12 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/reset-password/new-password"
         )
-        request_url = f"{self.oauth_issuer}/api/accounts/password/reset"
-        browser_response = {}
         sentinel_token = get_sentinel_token_via_browser(
             flow="password_reset",
             proxy=self.proxy,
             page_url=page_url,
             headless=self.browser_mode != "headed",
             device_id=device_id,
-            user_agent=user_agent,
-            session_cookies=self.session.cookies,
-            browser_request={
-                "url": request_url,
-                "method": "POST",
-                "headers": {
-                    "content-type": "application/json",
-                    "oai-device-id": device_id,
-                },
-                "json": {"password": password},
-            },
-            browser_response_out=browser_response,
             log_fn=lambda msg: self._log(f"password_reset: {msg}"),
         )
         if not sentinel_token:
@@ -1738,34 +1625,7 @@ class OAuthClient:
             self._set_error("无法获取 sentinel token (password_reset)")
             return None
 
-        browser_status = int(browser_response.get("status_code") or 0)
-        if browser_status > 0:
-            self._log(f"/password/reset (browser) -> {browser_status}")
-            browser_text = str(browser_response.get("text") or "")
-            if browser_status != 200:
-                response_detail = sanitize_chatgpt_log_message(
-                    browser_text[:1000]
-                ).strip()
-                self._set_error(
-                    f"新密码保存失败: HTTP {browser_status}"
-                    + (f" - {response_detail}" if response_detail else "")
-                )
-                return None
-            try:
-                browser_payload = json.loads(browser_text)
-            except Exception:
-                self._set_error("新密码保存失败: 浏览器响应不是有效 JSON")
-                return None
-            next_state = self._state_from_payload(
-                browser_payload,
-                current_url=(
-                    str(browser_response.get("url") or "").strip()
-                    or request_url
-                ),
-            )
-            self._log(f"password reset {describe_flow_state(next_state)}")
-            return next_state
-
+        request_url = f"{self.oauth_issuer}/api/accounts/password/reset"
         headers = self._headers(
             request_url,
             user_agent=user_agent,
@@ -1794,12 +1654,8 @@ class OAuthClient:
             response = self.session.post(request_url, **kwargs)
             self._log(f"/password/reset -> {response.status_code}")
             if response.status_code != 200:
-                response_detail = sanitize_chatgpt_log_message(
-                    str(response.text or "")[:240]
-                ).strip()
                 self._set_error(
                     f"新密码保存失败: HTTP {response.status_code}"
-                    + (f" - {response_detail}" if response_detail else "")
                 )
                 return None
             next_state = self._state_from_payload(
@@ -2282,8 +2138,6 @@ class OAuthClient:
             self._log(f"/passwordless/send-otp -> {r.status_code}")
 
             if r.status_code != 200:
-                if self._mark_invalid_authorization_session(r):
-                    return None
                 self._set_error(f"触发 passwordless OTP 失败: {r.status_code} - {r.text[:180]}")
                 return None
 
@@ -2964,7 +2818,6 @@ class OAuthClient:
         totp_secret="",
         password_reset_required=False,
         on_password_reset=None,
-        post_login_add_password=False,
         force_chatgpt_entry=False,
         screen_hint="login",
         complete_about_you_if_needed=False,
@@ -2976,7 +2829,6 @@ class OAuthClient:
         prepared_oauth_context=None,
         _continue_depth=0,
         _password_reset_depth=0,
-        _oauth_restart_depth=0,
     ):
         """
         完整的 OAuth 登录流程，获取 tokens
@@ -2994,7 +2846,6 @@ class OAuthClient:
             resume_authenticated_session: 已进入认证后状态时跳过再次提交邮箱
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
             totp_secret: ChatGPT TOTP MFA 秘钥；仅在服务端要求 MFA 时使用
-            post_login_add_password: 邮箱认证后进入官方添加密码流程
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
@@ -3010,7 +2861,6 @@ class OAuthClient:
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_prepared_oauth_context = None
-        self._oauth_session_expired = False
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -3022,7 +2872,6 @@ class OAuthClient:
             f"complete_about_you_if_needed={'on' if complete_about_you_if_needed else 'off'}, "
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
-            f"post_login_add_password={'on' if post_login_add_password else 'off'}, "
             f"totp_mfa={'on' if str(totp_secret or '').strip() else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
@@ -3084,28 +2933,13 @@ class OAuthClient:
             oauth_state = secrets.token_urlsafe(32)
             authorize_params = {
                 "response_type": "code",
-                "client_id": (
-                    self.chatgpt_web_oauth_client_id
-                    if post_login_add_password
-                    else self.oauth_client_id
-                ),
-                "redirect_uri": (
-                    self.chatgpt_web_oauth_redirect_uri
-                    if post_login_add_password
-                    else self.oauth_redirect_uri
-                ),
-                "scope": (
-                    "openid profile email offline_access model.read "
-                    "model.request organization.read organization.write"
-                    if post_login_add_password
-                    else "openid profile email offline_access"
-                ),
+                "client_id": self.oauth_client_id,
+                "redirect_uri": self.oauth_redirect_uri,
+                "scope": "openid profile email offline_access",
                 "code_challenge": code_challenge,
                 "code_challenge_method": "S256",
                 "state": oauth_state,
             }
-            if post_login_add_password:
-                authorize_params["post_login_add_password"] = "true"
             authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
             seed_oai_device_cookie(self.session, device_id)
@@ -3138,14 +2972,7 @@ class OAuthClient:
                     )
 
                 self.last_error = ""
-                self._log(
-                    "步骤1: Bootstrap "
-                    + (
-                        "ChatGPT Web password reauth session..."
-                        if post_login_add_password
-                        else "OAuth session..."
-                    )
-                )
+                self._log("步骤1: Bootstrap OAuth session...")
                 authorize_final_url = self._bootstrap_oauth_session(
                     authorize_url,
                     authorize_params,
@@ -3238,46 +3065,6 @@ class OAuthClient:
             )
             return prepared_context is not None
 
-        def _restart_after_expired_oauth_session():
-            if not self._oauth_session_expired:
-                return False, None
-            if int(_oauth_restart_depth or 0) >= 1:
-                self._set_error("新的 OAuth 登录会话仍然失效，已停止自动重试")
-                return False, None
-
-            self._log("检测到授权步骤失效：丢弃旧 Cookie，并重新建立 OAuth 登录会话")
-            tokens = self.login_and_get_tokens(
-                email,
-                password,
-                device_id="",
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
-                skymail_client=skymail_client,
-                prefer_passwordless_login=prefer_passwordless_login,
-                allow_phone_verification=allow_phone_verification,
-                force_new_browser=True,
-                resume_authenticated_session=False,
-                force_password_login=force_password_login,
-                totp_secret=totp_secret,
-                password_reset_required=password_reset_required,
-                on_password_reset=on_password_reset,
-                post_login_add_password=post_login_add_password,
-                force_chatgpt_entry=force_chatgpt_entry,
-                screen_hint=screen_hint,
-                complete_about_you_if_needed=complete_about_you_if_needed,
-                first_name=first_name,
-                last_name=last_name,
-                birthdate=birthdate,
-                login_source=login_source,
-                stop_after_login=stop_after_login,
-                prepared_oauth_context=None,
-                _continue_depth=0,
-                _password_reset_depth=_password_reset_depth,
-                _oauth_restart_depth=int(_oauth_restart_depth or 0) + 1,
-            )
-            return True, tokens
-
         for step in range(20):
             self.last_state = state
             self._log(f"状态步进[{step + 1}/20]: {describe_flow_state(state)}")
@@ -3346,70 +3133,6 @@ class OAuthClient:
                     _password_reset_depth=int(_password_reset_depth or 0) + 1,
                 )
 
-            if (
-                post_login_add_password
-                and self._state_is_password_reset_new_password(state)
-            ):
-                if int(_password_reset_depth or 0) >= 1:
-                    self._set_error("添加密码后仍返回设置新密码页面，已停止循环")
-                    return None
-                success_state = self._submit_password_reset_new_password(
-                    state,
-                    new_password=password,
-                    device_id=device_id,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
-                if not success_state or not self._state_is_password_reset_success(
-                    success_state
-                ):
-                    if not self.last_error:
-                        self._set_error("远端添加密码后未收到成功状态")
-                    return None
-                if callable(on_password_reset):
-                    try:
-                        committed = on_password_reset(str(password or ""))
-                    except Exception as exc:
-                        self._set_error(
-                            "远端密码已设置，但本地凭据确认失败"
-                            f"（{type(exc).__name__}）"
-                        )
-                        return None
-                    if committed is False:
-                        self._set_error("远端密码已设置，但本地凭据确认失败")
-                        return None
-                self._log("远端密码设置成功，重新开始密码登录验证")
-                return self.login_and_get_tokens(
-                    email,
-                    password,
-                    device_id="",
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                    skymail_client=skymail_client,
-                    prefer_passwordless_login=False,
-                    allow_phone_verification=allow_phone_verification,
-                    force_new_browser=True,
-                    resume_authenticated_session=False,
-                    force_password_login=True,
-                    totp_secret=totp_secret,
-                    password_reset_required=False,
-                    on_password_reset=on_password_reset,
-                    post_login_add_password=False,
-                    force_chatgpt_entry=force_chatgpt_entry,
-                    screen_hint=screen_hint,
-                    complete_about_you_if_needed=complete_about_you_if_needed,
-                    first_name=first_name,
-                    last_name=last_name,
-                    birthdate=birthdate,
-                    login_source=login_source,
-                    stop_after_login=stop_after_login,
-                    prepared_oauth_context=None,
-                    _continue_depth=0,
-                    _password_reset_depth=int(_password_reset_depth or 0) + 1,
-                )
-
             if prefer_passwordless_login and (not force_password_login) and self._state_is_login_password(state):
                 next_state = self._send_passwordless_login_otp(
                     email,
@@ -3420,9 +3143,6 @@ class OAuthClient:
                     referer=state.current_url or state.continue_url or referer,
                 )
                 if not next_state:
-                    restarted, retry_tokens = _restart_after_expired_oauth_session()
-                    if restarted:
-                        return retry_tokens
                     if not self.last_error:
                         self._set_error("passwordless OTP 触发后未进入邮箱验证码状态")
                     return None
@@ -3474,27 +3194,6 @@ class OAuthClient:
                     )
                     self.last_state = next_state
                     self._set_error("登录链路已完成，按要求停止")
-                    return None
-                referer = state.current_url or referer
-                state = next_state
-                continue
-
-            if (
-                force_password_login
-                and str(password or "")
-                and self._state_is_email_otp(state)
-            ):
-                self._log(
-                    "服务端默认返回邮箱 OTP，先切换到认证服务提供的密码登录页"
-                )
-                next_state = self._switch_to_password_login(
-                    state,
-                    user_agent=user_agent,
-                    impersonate=impersonate,
-                )
-                if not next_state:
-                    if not self.last_error:
-                        self._set_error("认证服务未提供可用的密码登录入口")
                     return None
                 referer = state.current_url or referer
                 state = next_state
@@ -3569,9 +3268,6 @@ class OAuthClient:
                     allow_cached_code_retry=_continue_depth > 0,
                 )
                 if not next_state:
-                    restarted, retry_tokens = _restart_after_expired_oauth_session()
-                    if restarted:
-                        return retry_tokens
                     if not self.last_error:
                         self._set_error("邮箱 OTP 验证后未进入下一步 OAuth 状态")
                     return None
@@ -4847,9 +4543,6 @@ class OAuthClient:
                 if resp.status_code == 200:
                     self._log("已触发 email-otp 重发")
                     return True
-                if self._mark_invalid_authorization_session(resp):
-                    self._log("email-otp/send 授权事务已失效，将重新建立登录会话")
-                    return False
                 self._log(f"email-otp/send 重发失败: {resp.text[:120]}")
             except Exception as e:
                 self._log(f"email-otp/send 重发异常: {e}")

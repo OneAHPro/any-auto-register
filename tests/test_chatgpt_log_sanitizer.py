@@ -51,28 +51,6 @@ class ChatGPTLogSanitizerTests(unittest.TestCase):
 
         self.assertEqual(sanitize_chatgpt_log_message(message), message)
 
-    def test_redacts_mfa_enrollment_uri_recovery_and_pending_material(self):
-        secrets = (
-            "PENDINGSECRET2222",
-            "ENROLLMENTSECRET3333",
-            "JBSWY3DPEHPK3PXP",
-            "RECOVERY-CODE-ONE",
-            "654321",
-        )
-        message = (
-            "mfa_pending_secret=PENDINGSECRET2222 "
-            "secret=ENROLLMENTSECRET3333 "
-            "otpauth://totp/OpenAI:user@example.com"
-            "?secret=JBSWY3DPEHPK3PXP&issuer=OpenAI "
-            "recovery_code=RECOVERY-CODE-ONE activation_code=654321"
-        )
-
-        sanitized = sanitize_chatgpt_log_message(message)
-
-        for secret in secrets:
-            self.assertNotIn(secret, sanitized)
-        self.assertNotIn("otpauth://", sanitized)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -29,24 +29,6 @@ def _sanitize_account_extra_for_api(raw_extra: str) -> str:
     if not isinstance(extra, dict):
         extra = {}
 
-    extra["totp_configured"] = bool(
-        str(extra.get("totp_secret") or "").strip()
-    )
-    extra["mfa_enrollment_pending"] = bool(
-        str(extra.get("mfa_pending_secret") or "").strip()
-        or str(extra.get("mfa_hardening_session_id") or "").strip()
-    )
-    for sensitive_key in (
-        "totp_secret",
-        "mfa_pending_secret",
-        "mfa_hardening_session_id",
-        "otpauth_uri",
-        "otpauth_url",
-        "recovery_code",
-        "recovery_codes",
-    ):
-        extra.pop(sensitive_key, None)
-
     mailbox_context = extra.get("mailbox_login_context")
     if isinstance(mailbox_context, dict):
         extra["mailbox_login_context"] = {

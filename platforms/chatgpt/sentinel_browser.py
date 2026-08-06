@@ -7,7 +7,6 @@ import os
 import subprocess
 import tempfile
 import uuid
-from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -37,126 +36,6 @@ def _flow_page_url(flow: str) -> str:
         "oauth_create_account": "https://auth.openai.com/about-you",
     }
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
-
-
-def _playwright_cookies_from_session(cookie_jar: Any) -> list[dict[str, Any]]:
-    """Translate a requests-style cookie jar without exposing cookie values."""
-    try:
-        cookies = list(cookie_jar or ())
-    except Exception:
-        return []
-
-    translated: list[dict[str, Any]] = []
-    for cookie in cookies:
-        name = str(getattr(cookie, "name", "") or "").strip()
-        value = str(getattr(cookie, "value", "") or "")
-        if not name:
-            continue
-        domain = str(getattr(cookie, "domain", "") or "").strip()
-        path = str(getattr(cookie, "path", "") or "/").strip() or "/"
-        item: dict[str, Any] = {
-            "name": name,
-            "value": value,
-            "secure": bool(getattr(cookie, "secure", False)),
-        }
-        if domain:
-            item.update({"domain": domain, "path": path})
-        else:
-            item["url"] = "https://auth.openai.com/"
-
-        expires = getattr(cookie, "expires", None)
-        if isinstance(expires, (int, float)) and expires > 0:
-            item["expires"] = float(expires)
-        rest = getattr(cookie, "_rest", None)
-        if isinstance(rest, dict):
-            if any(str(key).lower() == "httponly" for key in rest):
-                item["httpOnly"] = True
-            same_site = next(
-                (
-                    str(value or "").strip().capitalize()
-                    for key, value in rest.items()
-                    if str(key).lower() == "samesite"
-                ),
-                "",
-            )
-            if same_site in {"Lax", "Strict", "None"}:
-                item["sameSite"] = same_site
-        translated.append(item)
-    return translated
-
-
-def _sync_session_cookies_from_browser(
-    cookie_jar: Any,
-    browser_cookies: Any,
-) -> int:
-    """Copy browser-issued cookies back to the active HTTP session.
-
-    Auth pages may rotate ``login_session`` while loading Sentinel.  Keeping
-    the original cookie in the HTTP client makes the subsequent password or
-    MFA request look like an expired sign-in transaction, even though the
-    browser just received the valid replacement.
-    """
-    if cookie_jar is None:
-        return 0
-    try:
-        cookies = list(browser_cookies or [])
-    except Exception:
-        return 0
-
-    synced = 0
-    for cookie in cookies:
-        if not isinstance(cookie, dict):
-            continue
-        name = str(cookie.get("name") or "").strip()
-        if not name:
-            continue
-        value = str(cookie.get("value") or "")
-        domain = str(cookie.get("domain") or "").strip()
-        path = str(cookie.get("path") or "/").strip() or "/"
-        try:
-            kwargs: dict[str, Any] = {
-                "path": path,
-                "secure": bool(cookie.get("secure", False)),
-            }
-            if domain:
-                kwargs["domain"] = domain
-            setter = getattr(cookie_jar, "set", None)
-            if callable(setter):
-                setter(name, value, **kwargs)
-            else:
-                set_cookie = getattr(cookie_jar, "set_cookie", None)
-                if not callable(set_cookie):
-                    continue
-                set_cookie(
-                    Cookie(
-                        version=0,
-                        name=name,
-                        value=value,
-                        port=None,
-                        port_specified=False,
-                        domain=domain,
-                        domain_specified=bool(domain),
-                        domain_initial_dot=domain.startswith("."),
-                        path=path,
-                        path_specified=True,
-                        secure=bool(cookie.get("secure", False)),
-                        expires=(
-                            int(cookie["expires"])
-                            if isinstance(cookie.get("expires"), (int, float))
-                            and cookie["expires"] > 0
-                            else None
-                        ),
-                        discard=False,
-                        comment=None,
-                        comment_url=None,
-                        rest={},
-                        rfc2109=False,
-                    )
-                )
-            synced += 1
-        except Exception:
-            continue
-    return synced
 
 
 def _quickjs_script_path() -> Path:
@@ -411,10 +290,6 @@ def get_sentinel_token_via_browser(
     page_url: Optional[str] = None,
     headless: bool = True,
     device_id: Optional[str] = None,
-    user_agent: Optional[str] = None,
-    session_cookies: Any = None,
-    browser_request: Optional[dict[str, Any]] = None,
-    browser_response_out: Optional[dict[str, Any]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -462,18 +337,12 @@ def get_sentinel_token_via_browser(
             context = browser.new_context(
                 viewport={"width": 1440, "height": 900},
                 user_agent=(
-                    str(user_agent or "").strip()
-                    or (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/136.0.7103.92 Safari/537.36"
-                    )
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.7103.92 Safari/537.36"
                 ),
                 ignore_https_errors=True,
             )
-            seeded_cookies = _playwright_cookies_from_session(session_cookies)
-            if seeded_cookies:
-                context.add_cookies(seeded_cookies)
             if device_id:
                 try:
                     context.add_cookies(
@@ -501,48 +370,10 @@ def get_sentinel_token_via_browser(
 
             result = page.evaluate(
                 """
-                async ({ flow, request }) => {
+                async ({ flow }) => {
                     try {
                         const token = await window.SentinelSDK.token(flow);
-                        let browserResponse = null;
-                        if (request && request.url) {
-                            try {
-                                const headers = {
-                                    ...(request.headers || {}),
-                                    "openai-sentinel-token": token,
-                                };
-                                const options = {
-                                    method: request.method || "GET",
-                                    headers,
-                                    credentials: "include",
-                                    redirect: "manual",
-                                };
-                                if (Object.prototype.hasOwnProperty.call(request, "json")) {
-                                    options.body = JSON.stringify(request.json);
-                                }
-                                const response = await window.fetch(request.url, options);
-                                browserResponse = {
-                                    status_code: response.status,
-                                    url: response.url || request.url,
-                                    text: await response.text(),
-                                };
-                            } catch (requestError) {
-                                browserResponse = {
-                                    status_code: 0,
-                                    url: request.url,
-                                    text: "",
-                                    error: (
-                                        requestError
-                                        && (requestError.message || String(requestError))
-                                    ) || "unknown",
-                                };
-                            }
-                        }
-                        return {
-                            success: true,
-                            token,
-                            browser_response: browserResponse,
-                        };
+                        return { success: true, token };
                     } catch (e) {
                         return {
                             success: false,
@@ -551,7 +382,7 @@ def get_sentinel_token_via_browser(
                     }
                 }
                 """,
-                {"flow": flow, "request": browser_request},
+                {"flow": flow},
             )
 
             if not result or not result.get("success") or not result.get("token"):
@@ -565,29 +396,6 @@ def get_sentinel_token_via_browser(
             if not token:
                 logger("Sentinel Browser 返回空 token")
                 return None
-
-            if session_cookies is not None:
-                try:
-                    synced = _sync_session_cookies_from_browser(
-                        session_cookies,
-                        context.cookies(),
-                    )
-                    if synced:
-                        logger(f"Sentinel Browser 同步认证 Cookie: {synced} 个")
-                except Exception as exc:
-                    logger(f"Sentinel Browser 同步 Cookie 异常: {type(exc).__name__}")
-
-            browser_response = result.get("browser_response")
-            if (
-                isinstance(browser_response_out, dict)
-                and isinstance(browser_response, dict)
-            ):
-                browser_response_out.clear()
-                browser_response_out.update(browser_response)
-                logger(
-                    "Sentinel Browser 同源请求完成: "
-                    f"HTTP {int(browser_response.get('status_code') or 0)}"
-                )
 
             try:
                 parsed = json.loads(token)

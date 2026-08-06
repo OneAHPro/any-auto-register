@@ -6,44 +6,6 @@ from core.db import AccountModel
 
 
 class AccountApiSanitizationTests(unittest.TestCase):
-    def test_hides_hardening_totp_and_pending_enrollment_material(self):
-        account = AccountModel(
-            platform="chatgpt",
-            email="demo@example.com",
-            password="chatgpt-password",
-            token="access-token",
-        )
-        account.set_extra(
-            {
-                "totp_secret": "JBSWY3DPEHPK3PXP",
-                "mfa_pending_secret": "PENDINGSECRET2222",
-                "mfa_hardening_session_id": "enrollment-session-secret",
-                "otpauth_uri": (
-                    "otpauth://totp/OpenAI:demo@example.com"
-                    "?secret=JBSWY3DPEHPK3PXP&issuer=OpenAI"
-                ),
-                "recovery_codes": ["RECOVERY-ONE", "RECOVERY-TWO"],
-                "mfa_hardening_status": "confirming",
-            }
-        )
-
-        payload = accounts_api._account_for_response(account)
-        serialized = json.dumps(payload, ensure_ascii=False, default=str)
-        extra = json.loads(payload["extra_json"])
-
-        for secret in (
-            "JBSWY3DPEHPK3PXP",
-            "PENDINGSECRET2222",
-            "enrollment-session-secret",
-            "otpauth://",
-            "RECOVERY-ONE",
-            "RECOVERY-TWO",
-        ):
-            self.assertNotIn(secret, serialized)
-        self.assertTrue(extra["totp_configured"])
-        self.assertTrue(extra["mfa_enrollment_pending"])
-        self.assertEqual(extra["mfa_hardening_status"], "confirming")
-
     def test_hides_mailbox_credentials_and_oauth_cookies(self):
         account = AccountModel(
             platform="chatgpt",

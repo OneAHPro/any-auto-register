@@ -15,55 +15,13 @@ from api.tasks import (
     _build_chatgpt_retry_request,
     get_retryable_task_bindings,
     retry_failed_task_bindings,
-    _restore_chatgpt_retry_mailboxes,
     _retryable_chatgpt_bindings,
     _upsert_chatgpt_attempt_binding,
 )
-from core.db import (
-    ChatGPTAttemptBindingModel,
-    OutlookAccountModel,
-    _recover_chatgpt_attempt_bindings,
-)
+from core.db import ChatGPTAttemptBindingModel, _recover_chatgpt_attempt_bindings
 
 
 class ChatGPTRetryBindingTests(unittest.TestCase):
-    def test_retry_restores_popped_microsoft_mailbox_from_saved_context(self):
-        test_engine = create_engine(
-            "sqlite://",
-            connect_args={"check_same_thread": False},
-            poolclass=StaticPool,
-        )
-        SQLModel.metadata.create_all(test_engine)
-        with Session(test_engine) as session:
-            binding = ChatGPTAttemptBindingModel(
-                task_id="task-failed",
-                attempt_index=0,
-                email="bound@example.com",
-                leadbee_code="bei-sms-BOUND",
-                status="failed",
-                mailbox_context_json=(
-                    '{"provider":"microsoft","email":"bound@example.com",'
-                    '"extra":{"password":"mail-password",'
-                    '"client_id":"mail-client","refresh_token":"mail-rt",'
-                    '"account_type":"microsoft_oauth"}}'
-                ),
-            )
-            session.add(binding)
-            session.commit()
-            session.refresh(binding)
-
-        with mock.patch("api.tasks.engine", test_engine):
-            restored = _restore_chatgpt_retry_mailboxes([binding])
-
-        self.assertEqual(restored, 1)
-        with Session(test_engine) as session:
-            mailbox = session.exec(select(OutlookAccountModel)).one()
-            self.assertEqual(mailbox.email, "bound@example.com")
-            self.assertEqual(mailbox.password, "mail-password")
-            self.assertEqual(mailbox.client_id, "mail-client")
-            self.assertEqual(mailbox.refresh_token, "mail-rt")
-            self.assertTrue(mailbox.enabled)
-
     def test_build_retry_request_preserves_email_card_order(self):
         bindings = [
             {
