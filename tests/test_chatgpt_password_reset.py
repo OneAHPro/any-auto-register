@@ -1,8 +1,10 @@
 import types
 import unittest
+from http.cookiejar import Cookie, CookieJar
 from unittest import mock
 
 from platforms.chatgpt.oauth_client import OAuthClient
+from platforms.chatgpt.sentinel_browser import _playwright_cookies_from_session
 from platforms.chatgpt.utils import FlowState
 
 
@@ -19,6 +21,40 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
     def setUp(self):
         self.client = OAuthClient({}, verbose=False)
         self.client.session = mock.Mock()
+
+    def test_sentinel_browser_reuses_auth_session_cookie_attributes(self):
+        jar = CookieJar()
+        jar.set_cookie(
+            Cookie(
+                version=0,
+                name="login_session",
+                value="session-fixture",
+                port=None,
+                port_specified=False,
+                domain=".auth.openai.com",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={"HttpOnly": None, "SameSite": "lax"},
+                rfc2109=False,
+            )
+        )
+
+        cookies = _playwright_cookies_from_session(jar)
+
+        self.assertEqual(len(cookies), 1)
+        self.assertEqual(cookies[0]["name"], "login_session")
+        self.assertEqual(cookies[0]["domain"], ".auth.openai.com")
+        self.assertEqual(cookies[0]["path"], "/")
+        self.assertTrue(cookies[0]["secure"])
+        self.assertTrue(cookies[0]["httpOnly"])
+        self.assertEqual(cookies[0]["sameSite"], "Lax")
 
     def test_password_reset_send_otp_enters_email_verification(self):
         self.client.session.post.return_value = _response(
@@ -91,7 +127,7 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         with mock.patch(
             "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
             return_value="sentinel-token",
-        ):
+        ) as get_sentinel:
             result = self.client._submit_password_reset_new_password(
                 state,
                 new_password="Fresh-Password-123!",
@@ -112,6 +148,11 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
             call.kwargs["headers"]["openai-sentinel-token"],
             "sentinel-token",
         )
+        self.assertIs(
+            get_sentinel.call_args.kwargs["session_cookies"],
+            self.client.session.cookies,
+        )
+        self.assertEqual(get_sentinel.call_args.kwargs["user_agent"], "ua")
 
     def test_password_reset_failure_keeps_sanitized_response_detail(self):
         self.client.session.post.return_value = _response(

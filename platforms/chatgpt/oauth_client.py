@@ -1663,6 +1663,8 @@ class OAuthClient:
             page_url=page_url,
             headless=self.browser_mode != "headed",
             device_id=device_id,
+            user_agent=user_agent,
+            session_cookies=self.session.cookies,
             log_fn=lambda msg: self._log(f"password_reset: {msg}"),
         )
         if not sentinel_token:

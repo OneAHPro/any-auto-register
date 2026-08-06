@@ -38,6 +38,52 @@ def _flow_page_url(flow: str) -> str:
     return mapping.get(flow_name, "https://auth.openai.com/about-you")
 
 
+def _playwright_cookies_from_session(cookie_jar: Any) -> list[dict[str, Any]]:
+    """Translate a requests-style cookie jar without exposing cookie values."""
+    try:
+        cookies = list(cookie_jar or ())
+    except Exception:
+        return []
+
+    translated: list[dict[str, Any]] = []
+    for cookie in cookies:
+        name = str(getattr(cookie, "name", "") or "").strip()
+        value = str(getattr(cookie, "value", "") or "")
+        if not name:
+            continue
+        domain = str(getattr(cookie, "domain", "") or "").strip()
+        path = str(getattr(cookie, "path", "") or "/").strip() or "/"
+        item: dict[str, Any] = {
+            "name": name,
+            "value": value,
+            "secure": bool(getattr(cookie, "secure", False)),
+        }
+        if domain:
+            item.update({"domain": domain, "path": path})
+        else:
+            item["url"] = "https://auth.openai.com/"
+
+        expires = getattr(cookie, "expires", None)
+        if isinstance(expires, (int, float)) and expires > 0:
+            item["expires"] = float(expires)
+        rest = getattr(cookie, "_rest", None)
+        if isinstance(rest, dict):
+            if any(str(key).lower() == "httponly" for key in rest):
+                item["httpOnly"] = True
+            same_site = next(
+                (
+                    str(value or "").strip().capitalize()
+                    for key, value in rest.items()
+                    if str(key).lower() == "samesite"
+                ),
+                "",
+            )
+            if same_site in {"Lax", "Strict", "None"}:
+                item["sameSite"] = same_site
+        translated.append(item)
+    return translated
+
+
 def _quickjs_script_path() -> Path:
     return (
         Path(__file__).resolve().parents[2]
@@ -290,6 +336,8 @@ def get_sentinel_token_via_browser(
     page_url: Optional[str] = None,
     headless: bool = True,
     device_id: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    session_cookies: Any = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -337,12 +385,18 @@ def get_sentinel_token_via_browser(
             context = browser.new_context(
                 viewport={"width": 1440, "height": 900},
                 user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/136.0.7103.92 Safari/537.36"
+                    str(user_agent or "").strip()
+                    or (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/136.0.7103.92 Safari/537.36"
+                    )
                 ),
                 ignore_https_errors=True,
             )
+            seeded_cookies = _playwright_cookies_from_session(session_cookies)
+            if seeded_cookies:
+                context.add_cookies(seeded_cookies)
             if device_id:
                 try:
                     context.add_cookies(
