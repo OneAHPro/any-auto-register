@@ -1132,6 +1132,7 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
+        authorization_params=None,
     ) -> str:
         """模拟注册链路一致的 ChatGPT 首页 -> CSRF -> signin/openai。"""
         homepage_url = "https://chatgpt.com/"
@@ -1189,6 +1190,13 @@ class OAuthClient:
                 "screen_hint": "login_or_signup",
                 "login_hint": email,
             }
+            params.update(
+                {
+                    str(key): str(value)
+                    for key, value in dict(authorization_params or {}).items()
+                    if str(key or "").strip() and value is not None
+                }
+            )
             form_data = {
                 "callbackUrl": "https://chatgpt.com/",
                 "csrfToken": csrf_token,
@@ -3002,8 +3010,6 @@ class OAuthClient:
                 "code_challenge_method": "S256",
                 "state": oauth_state,
             }
-            if post_login_add_password:
-                authorize_params["post_login_add_password"] = "true"
             authorize_url = f"{self.oauth_issuer}/oauth/authorize"
 
             seed_oai_device_cookie(self.session, device_id)
@@ -3025,26 +3031,44 @@ class OAuthClient:
                         None,
                     )
 
-                if force_chatgpt_entry:
-                    self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
-                    _ = self._bootstrap_chatgpt_entry(
+                self.last_error = ""
+                if post_login_add_password:
+                    self._log(
+                        "步骤1: 通过 ChatGPT Web 重新认证入口设置远端密码"
+                    )
+                    authorize_final_url = self._bootstrap_chatgpt_entry(
                         email,
                         device_id,
                         user_agent=user_agent,
                         sec_ch_ua=sec_ch_ua,
                         impersonate=impersonate,
+                        authorization_params={
+                            "post_login_add_password": "true",
+                        },
                     )
+                    if not authorize_final_url:
+                        entry_error = "ChatGPT Web 重新认证入口未建立有效会话"
+                        continue
+                else:
+                    if force_chatgpt_entry:
+                        self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")
+                        _ = self._bootstrap_chatgpt_entry(
+                            email,
+                            device_id,
+                            user_agent=user_agent,
+                            sec_ch_ua=sec_ch_ua,
+                            impersonate=impersonate,
+                        )
 
-                self.last_error = ""
-                self._log("步骤1: Bootstrap OAuth session...")
-                authorize_final_url = self._bootstrap_oauth_session(
-                    authorize_url,
-                    authorize_params,
-                    device_id=device_id,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    impersonate=impersonate,
-                )
+                    self._log("步骤1: Bootstrap OAuth session...")
+                    authorize_final_url = self._bootstrap_oauth_session(
+                        authorize_url,
+                        authorize_params,
+                        device_id=device_id,
+                        user_agent=user_agent,
+                        sec_ch_ua=sec_ch_ua,
+                        impersonate=impersonate,
+                    )
                 if not authorize_final_url:
                     if resume_authenticated_session:
                         self._set_error(
@@ -3054,6 +3078,9 @@ class OAuthClient:
                         return None
                     entry_error = "OpenAI OAuth bootstrap 未建立有效 login_session"
                     continue
+
+                if force_chatgpt_entry and not post_login_add_password:
+                    self._log("ChatGPT 首页预热完成，继续 Codex OAuth")
 
                 continue_referer = (
                     authorize_final_url
