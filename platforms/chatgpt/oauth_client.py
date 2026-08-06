@@ -1673,6 +1673,8 @@ class OAuthClient:
             or state.continue_url
             or f"{self.oauth_issuer}/reset-password/new-password"
         )
+        request_url = f"{self.oauth_issuer}/api/accounts/password/reset"
+        browser_response = {}
         sentinel_token = get_sentinel_token_via_browser(
             flow="password_reset",
             proxy=self.proxy,
@@ -1681,6 +1683,16 @@ class OAuthClient:
             device_id=device_id,
             user_agent=user_agent,
             session_cookies=self.session.cookies,
+            browser_request={
+                "url": request_url,
+                "method": "POST",
+                "headers": {
+                    "content-type": "application/json",
+                    "oai-device-id": device_id,
+                },
+                "json": {"password": password},
+            },
+            browser_response_out=browser_response,
             log_fn=lambda msg: self._log(f"password_reset: {msg}"),
         )
         if not sentinel_token:
@@ -1696,7 +1708,34 @@ class OAuthClient:
             self._set_error("无法获取 sentinel token (password_reset)")
             return None
 
-        request_url = f"{self.oauth_issuer}/api/accounts/password/reset"
+        browser_status = int(browser_response.get("status_code") or 0)
+        if browser_status > 0:
+            self._log(f"/password/reset (browser) -> {browser_status}")
+            browser_text = str(browser_response.get("text") or "")
+            if browser_status != 200:
+                response_detail = sanitize_chatgpt_log_message(
+                    browser_text[:1000]
+                ).strip()
+                self._set_error(
+                    f"新密码保存失败: HTTP {browser_status}"
+                    + (f" - {response_detail}" if response_detail else "")
+                )
+                return None
+            try:
+                browser_payload = json.loads(browser_text)
+            except Exception:
+                self._set_error("新密码保存失败: 浏览器响应不是有效 JSON")
+                return None
+            next_state = self._state_from_payload(
+                browser_payload,
+                current_url=(
+                    str(browser_response.get("url") or "").strip()
+                    or request_url
+                ),
+            )
+            self._log(f"password reset {describe_flow_state(next_state)}")
+            return next_state
+
         headers = self._headers(
             request_url,
             user_agent=user_agent,

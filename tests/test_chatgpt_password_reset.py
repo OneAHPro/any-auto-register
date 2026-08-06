@@ -210,6 +210,51 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         )
         self.assertEqual(get_sentinel.call_args.kwargs["user_agent"], "ua")
 
+    def test_password_reset_prefers_same_browser_submission_response(self):
+        state = FlowState(
+            page_type="reset_password_new_password",
+            current_url="https://auth.openai.com/reset-password/new-password",
+        )
+
+        def submit_in_browser(**kwargs):
+            kwargs["browser_response_out"].update(
+                {
+                    "status_code": 200,
+                    "url": "https://auth.openai.com/api/accounts/password/reset",
+                    "text": (
+                        '{"page":{"type":"reset_password_success",'
+                        '"payload":{"url":"/reset-password/success"}}}'
+                    ),
+                }
+            )
+            return "sentinel-token"
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.get_sentinel_token_via_browser",
+            side_effect=submit_in_browser,
+        ) as get_sentinel:
+            result = self.client._submit_password_reset_new_password(
+                state,
+                new_password="Fresh-Password-123!",
+                device_id="device-id",
+                user_agent="ua",
+            )
+
+        self.assertEqual(result.page_type, "reset_password_success")
+        self.client.session.post.assert_not_called()
+        self.assertEqual(
+            get_sentinel.call_args.kwargs["browser_request"],
+            {
+                "url": "https://auth.openai.com/api/accounts/password/reset",
+                "method": "POST",
+                "headers": {
+                    "content-type": "application/json",
+                    "oai-device-id": "device-id",
+                },
+                "json": {"password": "Fresh-Password-123!"},
+            },
+        )
+
     def test_password_reset_failure_keeps_sanitized_response_detail(self):
         self.client.session.post.return_value = _response(
             {},

@@ -413,6 +413,8 @@ def get_sentinel_token_via_browser(
     device_id: Optional[str] = None,
     user_agent: Optional[str] = None,
     session_cookies: Any = None,
+    browser_request: Optional[dict[str, Any]] = None,
+    browser_response_out: Optional[dict[str, Any]] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ) -> Optional[str]:
     """通过浏览器直接调用 SentinelSDK.token(flow) 获取完整 token。"""
@@ -499,10 +501,48 @@ def get_sentinel_token_via_browser(
 
             result = page.evaluate(
                 """
-                async ({ flow }) => {
+                async ({ flow, request }) => {
                     try {
                         const token = await window.SentinelSDK.token(flow);
-                        return { success: true, token };
+                        let browserResponse = null;
+                        if (request && request.url) {
+                            try {
+                                const headers = {
+                                    ...(request.headers || {}),
+                                    "openai-sentinel-token": token,
+                                };
+                                const options = {
+                                    method: request.method || "GET",
+                                    headers,
+                                    credentials: "include",
+                                    redirect: "manual",
+                                };
+                                if (Object.prototype.hasOwnProperty.call(request, "json")) {
+                                    options.body = JSON.stringify(request.json);
+                                }
+                                const response = await window.fetch(request.url, options);
+                                browserResponse = {
+                                    status_code: response.status,
+                                    url: response.url || request.url,
+                                    text: await response.text(),
+                                };
+                            } catch (requestError) {
+                                browserResponse = {
+                                    status_code: 0,
+                                    url: request.url,
+                                    text: "",
+                                    error: (
+                                        requestError
+                                        && (requestError.message || String(requestError))
+                                    ) || "unknown",
+                                };
+                            }
+                        }
+                        return {
+                            success: true,
+                            token,
+                            browser_response: browserResponse,
+                        };
                     } catch (e) {
                         return {
                             success: false,
@@ -511,7 +551,7 @@ def get_sentinel_token_via_browser(
                     }
                 }
                 """,
-                {"flow": flow},
+                {"flow": flow, "request": browser_request},
             )
 
             if not result or not result.get("success") or not result.get("token"):
@@ -536,6 +576,18 @@ def get_sentinel_token_via_browser(
                         logger(f"Sentinel Browser 同步认证 Cookie: {synced} 个")
                 except Exception as exc:
                     logger(f"Sentinel Browser 同步 Cookie 异常: {type(exc).__name__}")
+
+            browser_response = result.get("browser_response")
+            if (
+                isinstance(browser_response_out, dict)
+                and isinstance(browser_response, dict)
+            ):
+                browser_response_out.clear()
+                browser_response_out.update(browser_response)
+                logger(
+                    "Sentinel Browser 同源请求完成: "
+                    f"HTTP {int(browser_response.get('status_code') or 0)}"
+                )
 
             try:
                 parsed = json.loads(token)
