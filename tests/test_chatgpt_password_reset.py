@@ -4,7 +4,10 @@ from http.cookiejar import Cookie, CookieJar
 from unittest import mock
 
 from platforms.chatgpt.oauth_client import OAuthClient
-from platforms.chatgpt.sentinel_browser import _playwright_cookies_from_session
+from platforms.chatgpt.sentinel_browser import (
+    _playwright_cookies_from_session,
+    _sync_session_cookies_from_browser,
+)
 from platforms.chatgpt.utils import FlowState
 
 
@@ -55,6 +58,59 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         self.assertTrue(cookies[0]["secure"])
         self.assertTrue(cookies[0]["httpOnly"])
         self.assertEqual(cookies[0]["sameSite"], "Lax")
+
+    def test_sentinel_browser_syncs_rotated_auth_session_cookie_back(self):
+        jar = CookieJar()
+        jar.set_cookie(
+            Cookie(
+                version=0,
+                name="login_session",
+                value="old-session",
+                port=None,
+                port_specified=False,
+                domain=".auth.openai.com",
+                domain_specified=True,
+                domain_initial_dot=True,
+                path="/",
+                path_specified=True,
+                secure=True,
+                expires=None,
+                discard=True,
+                comment=None,
+                comment_url=None,
+                rest={},
+                rfc2109=False,
+            )
+        )
+
+        synced = _sync_session_cookies_from_browser(
+            jar,
+            [
+                {
+                    "name": "login_session",
+                    "value": "rotated-session",
+                    "domain": ".auth.openai.com",
+                    "path": "/",
+                    "secure": True,
+                },
+                {
+                    "name": "sentinel_cookie",
+                    "value": "sentinel-value",
+                    "domain": ".sentinel.openai.com",
+                    "path": "/",
+                    "secure": True,
+                },
+            ],
+        )
+
+        self.assertEqual(synced, 2)
+        values = {
+            cookie.name: cookie.value
+            for cookie in jar
+            if cookie.name in {"login_session", "sentinel_cookie"}
+        }
+        self.assertEqual(values["login_session"], "rotated-session")
+        self.assertEqual(values["sentinel_cookie"], "sentinel-value")
 
     def test_password_reset_send_otp_enters_email_verification(self):
         self.client.session.post.return_value = _response(

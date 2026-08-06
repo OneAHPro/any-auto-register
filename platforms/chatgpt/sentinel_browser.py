@@ -7,6 +7,7 @@ import os
 import subprocess
 import tempfile
 import uuid
+from http.cookiejar import Cookie
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -82,6 +83,80 @@ def _playwright_cookies_from_session(cookie_jar: Any) -> list[dict[str, Any]]:
                 item["sameSite"] = same_site
         translated.append(item)
     return translated
+
+
+def _sync_session_cookies_from_browser(
+    cookie_jar: Any,
+    browser_cookies: Any,
+) -> int:
+    """Copy browser-issued cookies back to the active HTTP session.
+
+    Auth pages may rotate ``login_session`` while loading Sentinel.  Keeping
+    the original cookie in the HTTP client makes the subsequent password or
+    MFA request look like an expired sign-in transaction, even though the
+    browser just received the valid replacement.
+    """
+    if cookie_jar is None:
+        return 0
+    try:
+        cookies = list(browser_cookies or [])
+    except Exception:
+        return 0
+
+    synced = 0
+    for cookie in cookies:
+        if not isinstance(cookie, dict):
+            continue
+        name = str(cookie.get("name") or "").strip()
+        if not name:
+            continue
+        value = str(cookie.get("value") or "")
+        domain = str(cookie.get("domain") or "").strip()
+        path = str(cookie.get("path") or "/").strip() or "/"
+        try:
+            kwargs: dict[str, Any] = {
+                "path": path,
+                "secure": bool(cookie.get("secure", False)),
+            }
+            if domain:
+                kwargs["domain"] = domain
+            setter = getattr(cookie_jar, "set", None)
+            if callable(setter):
+                setter(name, value, **kwargs)
+            else:
+                set_cookie = getattr(cookie_jar, "set_cookie", None)
+                if not callable(set_cookie):
+                    continue
+                set_cookie(
+                    Cookie(
+                        version=0,
+                        name=name,
+                        value=value,
+                        port=None,
+                        port_specified=False,
+                        domain=domain,
+                        domain_specified=bool(domain),
+                        domain_initial_dot=domain.startswith("."),
+                        path=path,
+                        path_specified=True,
+                        secure=bool(cookie.get("secure", False)),
+                        expires=(
+                            int(cookie["expires"])
+                            if isinstance(cookie.get("expires"), (int, float))
+                            and cookie["expires"] > 0
+                            else None
+                        ),
+                        discard=False,
+                        comment=None,
+                        comment_url=None,
+                        rest={},
+                        rfc2109=False,
+                    )
+                )
+            synced += 1
+        except Exception:
+            continue
+    return synced
 
 
 def _quickjs_script_path() -> Path:
@@ -450,6 +525,17 @@ def get_sentinel_token_via_browser(
             if not token:
                 logger("Sentinel Browser 返回空 token")
                 return None
+
+            if session_cookies is not None:
+                try:
+                    synced = _sync_session_cookies_from_browser(
+                        session_cookies,
+                        context.cookies(),
+                    )
+                    if synced:
+                        logger(f"Sentinel Browser 同步认证 Cookie: {synced} 个")
+                except Exception as exc:
+                    logger(f"Sentinel Browser 同步 Cookie 异常: {type(exc).__name__}")
 
             try:
                 parsed = json.loads(token)
