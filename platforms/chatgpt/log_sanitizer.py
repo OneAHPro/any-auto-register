@@ -8,6 +8,7 @@ import re
 _BEARER_RE = re.compile(
     r"(?i)(\bBearer\s+)([A-Za-z0-9._~+/=-]+)",
 )
+_OTPAUTH_URI_RE = re.compile(r"(?i)otpauth://[^\s,，;]+")
 _SECRET_ASSIGNMENT_RE = re.compile(
     r"""(?ix)
     (?P<prefix>
@@ -23,6 +24,10 @@ _SECRET_ASSIGNMENT_RE = re.compile(
             | passwd
             | client[_\s-]?secret
             | totp[_\s-]?secret
+            | mfa[_\s-]?pending[_\s-]?secret
+            | recovery[_\s-]?codes?
+            | activation[_\s-]?code
+            | secret
         )
         ["']?\s*[:=]\s*
     )
@@ -85,6 +90,7 @@ def sanitize_chatgpt_log_message(message) -> str:
     """Return log-safe text while preserving non-secret diagnostic context."""
     text = str(message or "")
     text = _BEARER_RE.sub(r"\1[令牌已隐藏]", text)
+    text = _OTPAUTH_URI_RE.sub("[MFA配置已隐藏]", text)
     text = _SECRET_ASSIGNMENT_RE.sub(_replace_assignment, text)
     text = _QUERY_CODE_RE.sub(
         lambda match: match.group("prefix")
