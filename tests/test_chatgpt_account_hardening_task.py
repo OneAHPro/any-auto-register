@@ -247,6 +247,63 @@ class ChatGPTAccountHardeningTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["meta"]["hardened"], 1)
         self.assertEqual(snapshot["meta"]["pending_password"], 0)
 
+    def test_expired_access_token_relogin_then_retries_hardening(self):
+        from api.tasks import (
+            _create_chatgpt_hardening_task_record,
+            _run_chatgpt_hardening_task,
+            _task_store,
+        )
+
+        account_id = self.account_ids[0]
+        expired = SimpleNamespace(
+            status="failed",
+            outcome="failed",
+            email="first@example.com",
+            message="ChatGPTMFAError",
+        )
+        ready = SimpleNamespace(
+            status="ready",
+            outcome="hardened",
+            email="first@example.com",
+            message="",
+        )
+        service = mock.Mock()
+        service.harden_saved_account.side_effect = [expired, ready]
+        task_id = self._task_id()
+        with mock.patch("api.tasks._persist_task_snapshot"):
+            _create_chatgpt_hardening_task_record(
+                task_id,
+                [account_id],
+                concurrency=1,
+                dry_run=False,
+            )
+        with mock.patch(
+            "services.chatgpt_account_hardening.ChatGPTAccountHardeningService",
+            return_value=service,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={"ok": True, "relogin_ok": True},
+        ) as relogin, mock.patch(
+            "api.tasks.engine",
+            self.engine,
+        ), mock.patch(
+            "api.tasks._persist_task_snapshot_best_effort",
+        ), mock.patch(
+            "api.tasks._save_task_log",
+        ):
+            _run_chatgpt_hardening_task(
+                task_id,
+                [account_id],
+                concurrency=1,
+                dry_run=False,
+            )
+
+        relogin.assert_called_once()
+        self.assertEqual(service.harden_saved_account.call_count, 2)
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["meta"]["hardened"], 1)
+        self.assertEqual(snapshot["meta"]["failed"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

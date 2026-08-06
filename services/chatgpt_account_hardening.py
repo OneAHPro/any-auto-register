@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from sqlalchemy import func
 from sqlmodel import Session, select
 
 from core.db import (
@@ -200,7 +201,7 @@ class ChatGPTAccountHardeningService:
             with Session(self._engine) as session:
                 rows = session.exec(
                     select(ChatGPTAttemptBindingModel).where(
-                        ChatGPTAttemptBindingModel.email == account.email
+                        func.lower(ChatGPTAttemptBindingModel.email) == email
                     )
                 ).all()
         except Exception:
@@ -509,17 +510,11 @@ class ChatGPTAccountHardeningService:
             if inventory.has_totp:
                 candidates = self.discover_candidate_secrets(account)
                 verified = ""
-                if pending_secret:
-                    try:
-                        verified = normalize_totp_secret(pending_secret)
-                    except ValueError:
-                        verified = ""
                 validator = self._candidate_validator or self._default_candidate_validator
-                if not verified:
-                    for candidate in candidates:
-                        if validator(account, candidate):
-                            verified = candidate
-                            break
+                for candidate in candidates:
+                    if validator(account, candidate):
+                        verified = candidate
+                        break
                 if not verified:
                     account = self._release(
                         account,

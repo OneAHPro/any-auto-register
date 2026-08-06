@@ -7,7 +7,7 @@ from pathlib import Path
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from core.db import AccountModel
+from core.db import AccountModel, ChatGPTAttemptBindingModel
 from platforms.chatgpt.account_hardening import MFAEnrollment, MFAInventory
 
 
@@ -178,10 +178,42 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
             ({"id": "factor-1", "factor_type": "totp"},),
         )
         second_client = FakeMFAClient(inventory=enabled_inventory)
-        second = self._service(second_client).harden_saved_account(account_id)
+        validated = []
+        second = self._service(
+            second_client,
+            candidate_validator=lambda _account, candidate: (
+                validated.append(candidate) or candidate == SECRET
+            ),
+        ).harden_saved_account(account_id)
 
         self.assertEqual(second.outcome, "recovered_secret")
+        self.assertEqual(validated, [SECRET])
         self.assertEqual(self._load(account_id).get_extra()["totp_secret"], SECRET)
+
+    def test_pending_secret_is_not_promoted_when_login_validation_rejects_it(self):
+        account_id = self._create_account(
+            extra={
+                "mfa_pending_secret": SECRET,
+                "mfa_hardening_session_id": "session-1",
+                "mfa_hardening_status": "confirming",
+            }
+        )
+        enabled_inventory = MFAInventory(
+            True,
+            True,
+            "factor-1",
+            ({"id": "factor-1", "factor_type": "totp"},),
+        )
+
+        result = self._service(
+            FakeMFAClient(inventory=enabled_inventory),
+            candidate_validator=lambda _account, _candidate: False,
+        ).harden_saved_account(account_id)
+
+        self.assertEqual(result.outcome, "missing_mfa_material")
+        extra = self._load(account_id).get_extra()
+        self.assertNotIn("totp_secret", extra)
+        self.assertEqual(extra["mfa_pending_secret"], SECRET)
 
     def test_existing_remote_mfa_recovers_candidate_from_mailbox_context(self):
         account_id = self._create_account(
@@ -246,6 +278,39 @@ class ChatGPTAccountHardeningServiceTests(unittest.TestCase):
                 candidate_validator=lambda _account, candidate: candidate == SECRET,
                 backup_paths=[str(backup)],
             ).harden_saved_account(account_id)
+
+        self.assertEqual(result.outcome, "recovered_secret")
+        self.assertEqual(self._load(account_id).get_extra()["totp_secret"], SECRET)
+
+    def test_existing_remote_mfa_recovers_case_insensitive_attempt_binding(self):
+        account_id = self._create_account(extra={"mailbox_login_context": {}})
+        with Session(self.engine) as session:
+            session.add(
+                ChatGPTAttemptBindingModel(
+                    task_id="old-task",
+                    attempt_index=1,
+                    email="USER@EXAMPLE.COM",
+                    account_id=account_id,
+                    mailbox_context_json=json.dumps(
+                        {
+                            "email": "USER@EXAMPLE.COM",
+                            "extra": {"mfa_secret": SECRET},
+                        }
+                    ),
+                )
+            )
+            session.commit()
+        inventory = MFAInventory(
+            True,
+            True,
+            "factor-1",
+            ({"id": "factor-1", "factor_type": "totp"},),
+        )
+
+        result = self._service(
+            FakeMFAClient(inventory=inventory),
+            candidate_validator=lambda _account, candidate: candidate == SECRET,
+        ).harden_saved_account(account_id)
 
         self.assertEqual(result.outcome, "recovered_secret")
         self.assertEqual(self._load(account_id).get_extra()["totp_secret"], SECRET)

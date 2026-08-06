@@ -1549,17 +1549,28 @@ def _run_chatgpt_hardening_task_inner(
                 dry_run=dry_run,
                 owner=f"{task_id}:{account_id}",
             )
-            if (
+            result_outcome = str(getattr(result, "outcome", "") or "")
+            result_status = str(getattr(result, "status", "") or "")
+            should_refresh_login = bool(
                 not dry_run
-                and str(getattr(result, "outcome", "") or "")
-                == "pending_password"
-            ):
+                and (
+                    result_outcome == "pending_password"
+                    or (result_outcome == "failed" and result_status == "failed")
+                )
+            )
+            if should_refresh_login:
                 from services.chatgpt_relogin import relogin_chatgpt_account
 
-                _log(
-                    task_id,
-                    f"  [账号 {account_id}] 缺少可用密码，先通过原邮箱验证码登录并设置密码",
-                )
+                if result_outcome == "pending_password":
+                    _log(
+                        task_id,
+                        f"  [账号 {account_id}] 缺少可用密码，先通过原邮箱验证码登录并设置密码",
+                    )
+                else:
+                    _log(
+                        task_id,
+                        f"  [账号 {account_id}] 当前登录令牌不可用于加固，先重登刷新后重试",
+                    )
                 relogin_result = relogin_chatgpt_account(
                     account_id,
                     log_fn=lambda message: _log(
