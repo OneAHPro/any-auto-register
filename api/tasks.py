@@ -14,6 +14,7 @@ import uuid
 from core.db import (
     AccountModel,
     ChatGPTAttemptBindingModel,
+    OutlookAccountModel,
     TaskLog,
     TaskRunModel,
     engine,
@@ -371,6 +372,88 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
             item["mail_provider"] = mail_provider
         normalized.append(item)
     return normalized
+
+
+def _restore_chatgpt_retry_mailboxes(bindings) -> int:
+    """Requeue Microsoft mailboxes popped by an interrupted login attempt."""
+    restored = 0
+    seen_emails: set[str] = set()
+    with Session(engine) as session:
+        for raw in bindings or []:
+            if isinstance(raw, ChatGPTAttemptBindingModel):
+                binding_email = str(raw.email or "").strip()
+                context = _json_loads(raw.mailbox_context_json, {})
+            elif isinstance(raw, dict):
+                binding_email = str(raw.get("email") or "").strip()
+                context = raw.get("mailbox_context") or {}
+            else:
+                continue
+            if not isinstance(context, dict):
+                continue
+            context_extra = context.get("extra")
+            if not isinstance(context_extra, dict):
+                context_extra = {}
+            provider = str(
+                context.get("provider") or context_extra.get("provider") or ""
+            ).strip().lower()
+            if provider != "microsoft":
+                continue
+            email = str(context.get("email") or binding_email).strip()
+            email_key = email.lower()
+            if not email or email_key in seen_emails:
+                continue
+
+            password = str(context_extra.get("password") or "")
+            client_id = str(context_extra.get("client_id") or "")
+            refresh_token = str(context_extra.get("refresh_token") or "")
+            mailapi_url = str(context_extra.get("mailapi_url") or "").strip()
+            account_type = str(
+                context_extra.get("account_type")
+                or ("mailapi_url" if mailapi_url else "microsoft_oauth")
+            ).strip()
+            if not (
+                mailapi_url
+                or password
+                or (client_id and refresh_token)
+            ):
+                continue
+
+            existing = session.exec(
+                select(OutlookAccountModel).where(
+                    func.lower(OutlookAccountModel.email) == email_key
+                )
+            ).first()
+            if existing is None:
+                existing = OutlookAccountModel(
+                    email=email,
+                    password=password,
+                    client_id=client_id,
+                    refresh_token=refresh_token,
+                    account_type=account_type,
+                    mailapi_url=mailapi_url,
+                    enabled=True,
+                    created_at=_utcnow(),
+                    updated_at=_utcnow(),
+                )
+            else:
+                if password:
+                    existing.password = password
+                if client_id:
+                    existing.client_id = client_id
+                if refresh_token:
+                    existing.refresh_token = refresh_token
+                if account_type:
+                    existing.account_type = account_type
+                if mailapi_url:
+                    existing.mailapi_url = mailapi_url
+                existing.enabled = True
+                existing.updated_at = _utcnow()
+            session.add(existing)
+            restored += 1
+            seen_emails.add(email_key)
+        if restored:
+            session.commit()
+    return restored
 
 
 def _normalize_chatgpt_mail_provider_plan(value) -> list[str]:
@@ -4531,6 +4614,7 @@ def retry_failed_task_bindings(
             rows,
             concurrency=req.concurrency if req is not None else 1,
         )
+        _restore_chatgpt_retry_mailboxes(rows)
         row_ids = [int(row.id) for row in rows if row.id is not None]
         with Session(engine) as s:
             for row_id in row_ids:
