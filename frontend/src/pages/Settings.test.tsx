@@ -48,6 +48,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
       chatgpt_auto_relogin_interval_minutes: '45',
       chatgpt_auto_relogin_concurrency: '3',
       chatgpt_auto_relogin_alert_threshold: '5',
+      chatgpt_auto_relogin_quota_alert_threshold_usd: '1200.50',
       smtp_host: 'smtp.example.com',
       smtp_port: '587',
       smtp_username: 'notify@example.com',
@@ -71,7 +72,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
 
   afterEach(() => cleanup())
 
-  it('rehydrates string config and saves the three normalized automation values', async () => {
+  it('rehydrates string config and saves all normalized automation values', async () => {
     const user = userEvent.setup()
     render(<Settings />)
 
@@ -79,9 +80,11 @@ describe('Settings ChatGPT automatic relogin config', () => {
     const interval = await screen.findByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
     const threshold = screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement
+    const quotaThreshold = screen.getByRole('spinbutton', { name: 'Codex2API 剩余额度告警阈值（美元）' }) as HTMLInputElement
     expect(interval.value).toBe('45')
     expect(concurrency.value).toBe('3')
     expect(threshold.value).toBe('5')
+    expect(quotaThreshold.value).toBe('1200.50')
     expect(screen.getByRole('switch', { name: '启用 ChatGPT 自动重登' }).getAttribute('aria-checked')).toBe('false')
 
     await user.click(screen.getByRole('button', { name: /保存配置/ }))
@@ -96,6 +99,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
       chatgpt_auto_relogin_interval_minutes: 45,
       chatgpt_auto_relogin_concurrency: 3,
       chatgpt_auto_relogin_alert_threshold: 5,
+      chatgpt_auto_relogin_quota_alert_threshold_usd: 1200.5,
       smtp_host: 'smtp.example.com',
       smtp_recipient_email: 'owner@example.com',
     })

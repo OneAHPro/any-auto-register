@@ -75,6 +75,7 @@ describe('ChatGPTAutoReloginSection', () => {
     const interval = screen.getByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
     const threshold = screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement
+    const quotaThreshold = screen.getByRole('spinbutton', { name: 'Codex2API 剩余额度告警阈值（美元）' }) as HTMLInputElement
     expect(interval.value).toBe('2')
     expect(interval.getAttribute('aria-valuemin')).toBe('2')
     expect(interval.getAttribute('aria-valuemax')).toBe('1440')
@@ -84,7 +85,11 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(threshold.value).toBe('20')
     expect(threshold.getAttribute('aria-valuemin')).toBe('1')
     expect(threshold.getAttribute('aria-valuemax')).toBe('10000')
+    expect(quotaThreshold.value).toBe('0.00')
+    expect(quotaThreshold.getAttribute('aria-valuemin')).toBe('0')
+    expect(quotaThreshold.getAttribute('aria-valuemax')).toBe('10000000')
     expect(screen.getByText('每轮自动鉴权完成后，重登失败账号数达到或超过此值时发送一封提醒；鉴权失败数仅展示，不触发告警。')).toBeTruthy()
+    expect(screen.getByText(/额度低于此值都会发送一封邮件/)).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()

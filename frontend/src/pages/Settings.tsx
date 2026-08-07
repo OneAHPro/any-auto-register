@@ -551,6 +551,22 @@ function normalizeBoundedInteger(value: unknown, fallback: number, min: number, 
   return Math.min(max, Math.max(min, parsed))
 }
 
+function normalizeBoundedDecimal(
+  value: unknown,
+  fallback: number,
+  min: number,
+  max: number,
+  precision: number,
+): number {
+  const normalized = String(value ?? '').trim()
+  if (!normalized) return fallback
+  const parsed = typeof value === 'number' ? value : Number(normalized)
+  if (!Number.isFinite(parsed)) return fallback
+  const factor = 10 ** precision
+  const rounded = Math.round(parsed * factor) / factor
+  return Math.min(max, Math.max(min, rounded))
+}
+
 function errorDetail(error: unknown, fallback: string): string {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   if (typeof error === 'object' && error !== null) {
@@ -1901,6 +1917,13 @@ export default function Settings() {
         1,
         10000,
       )
+      data.chatgpt_auto_relogin_quota_alert_threshold_usd = normalizeBoundedDecimal(
+        data.chatgpt_auto_relogin_quota_alert_threshold_usd,
+        0,
+        0,
+        10000000,
+        2,
+      )
       data.smtp_port = normalizeBoundedInteger(data.smtp_port, 587, 1, 65535)
       data.smtp_use_ssl = parseBooleanConfigValue(data.smtp_use_ssl)
       data.smtp_force_auth_login = parseBooleanConfigValue(data.smtp_force_auth_login)
@@ -2014,6 +2037,13 @@ export default function Settings() {
         1,
         10000,
       )
+      values.chatgpt_auto_relogin_quota_alert_threshold_usd = normalizeBoundedDecimal(
+        values.chatgpt_auto_relogin_quota_alert_threshold_usd,
+        0,
+        0,
+        10000000,
+        2,
+      )
       values.smtp_port = normalizeBoundedInteger(values.smtp_port, 587, 1, 65535)
       values.smtp_use_ssl = parseBooleanConfigValue(values.smtp_use_ssl)
       values.smtp_force_auth_login = parseBooleanConfigValue(values.smtp_force_auth_login)
@@ -2046,6 +2076,7 @@ export default function Settings() {
         chatgpt_auto_relogin_interval_minutes: values.chatgpt_auto_relogin_interval_minutes,
         chatgpt_auto_relogin_concurrency: values.chatgpt_auto_relogin_concurrency,
         chatgpt_auto_relogin_alert_threshold: values.chatgpt_auto_relogin_alert_threshold,
+        chatgpt_auto_relogin_quota_alert_threshold_usd: values.chatgpt_auto_relogin_quota_alert_threshold_usd,
         smtp_port: values.smtp_port,
         smtp_use_ssl: values.smtp_use_ssl,
         smtp_force_auth_login: values.smtp_force_auth_login,

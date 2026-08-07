@@ -155,6 +155,22 @@ export default function ChatGPTAutoReloginSection() {
       >
         <InputNumber aria-label="重登失败告警阈值（账号数）" min={1} max={10000} precision={0} style={{ width: '100%' }} />
       </Form.Item>
+      <Form.Item
+        name="chatgpt_auto_relogin_quota_alert_threshold_usd"
+        label="Codex2API 剩余额度告警阈值（美元）"
+        initialValue={0}
+        extra="设置为 0 时关闭额度不足告警；每轮自动鉴权结束后，额度低于此值都会发送一封邮件。"
+      >
+        <InputNumber
+          aria-label="Codex2API 剩余额度告警阈值（美元）"
+          min={0}
+          max={10000000}
+          precision={2}
+          step={0.01}
+          prefix="$"
+          style={{ width: '100%' }}
+        />
+      </Form.Item>
       <Form.Item name="smtp_host" label="SMTP 服务器地址">
         <Input aria-label="SMTP 服务器地址" placeholder="smtp.example.com" />
       </Form.Item>
