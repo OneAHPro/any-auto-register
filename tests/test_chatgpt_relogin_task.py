@@ -466,7 +466,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         ) as save_task_log:
             _run_chatgpt_relogin_task(task_id, [17])
 
-        inspect_remote.assert_called_once_with([17])
+        inspect_remote.assert_called_once_with([17], quota_accounts=[])
         refresh_first.assert_not_called()
         full_login.assert_not_called()
         save_task_log.assert_not_called()
@@ -759,7 +759,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             automation=True,
         )
 
-        def stop_during_probe(account_ids):
+        def stop_during_probe(account_ids, **_kwargs):
             _task_store.control_for(task_id).request_stop()
             return {
                 account_ids[0]: {
@@ -959,10 +959,143 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             invalid_rt_count=3,
             relogin_failed_count=1,
             deleted_account_count=0,
+            quota_eligible_failure_count=0,
+            quota_exhausted_failure_count=0,
+            quota_accounts=[],
         )
         self.assertTrue(
             any(
                 "[ALERT] 本轮重登失败告警邮件已发送" in line
+                for line in snapshot["logs"]
+            )
+        )
+
+    def test_automatic_task_counts_quota_available_and_exhausted_failures(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        account_ids = list(range(261, 267))
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            account_ids,
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            account_id: {
+                "account_id": account_id,
+                "email": f"account-{account_id}@example.com",
+                "state": "auth_failed",
+                "remote_id": account_id + 1000,
+                "remote_status": "unauthorized",
+                "usage_percent_7d": 100 if index < 3 else 50,
+                "billed_7d": 50.0,
+            }
+            for index, account_id in enumerate(account_ids)
+        }
+
+        def inspect_health(_account_ids, *, quota_accounts=None, **_kwargs):
+            if quota_accounts is not None:
+                quota_accounts.extend(health.values())
+            return health
+
+        self.alert_sender.return_value = {
+            "sent": False,
+            "reason": "below_threshold",
+            "threshold": 5,
+        }
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            side_effect=inspect_health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=[
+                {
+                    "ok": False,
+                    "relogin_ok": False,
+                    "stage": "relogin",
+                    "account_id": account_id,
+                    "email": f"account-{account_id}@example.com",
+                    "message": "验证码登录失败",
+                }
+                for account_id in account_ids
+            ],
+        ):
+            _run_chatgpt_relogin_task(task_id, account_ids, concurrency=1)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 6)
+        self.assertEqual(snapshot["meta"]["quota_eligible_failure_count"], 3)
+        self.assertEqual(snapshot["meta"]["quota_exhausted_failure_count"], 3)
+        self.alert_sender.assert_called_once_with(
+            task_id=task_id,
+            total_accounts=6,
+            successful_accounts=0,
+            invalid_rt_count=6,
+            relogin_failed_count=6,
+            deleted_account_count=0,
+            quota_eligible_failure_count=3,
+            quota_exhausted_failure_count=3,
+            quota_accounts=list(health.values()),
+        )
+
+    def test_automatic_task_keeps_all_exhausted_failures_below_alert_threshold(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        account_ids = list(range(271, 277))
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            account_ids,
+            source="schedule",
+            automation=True,
+        )
+        health = {
+            account_id: {
+                "account_id": account_id,
+                "email": f"account-{account_id}@example.com",
+                "state": "auth_failed",
+                "remote_status": "unauthorized",
+                "usage_percent_7d": 100,
+                "billed_7d": 50.0,
+            }
+            for account_id in account_ids
+        }
+
+        def inspect_health(_account_ids, *, quota_accounts=None, **_kwargs):
+            if quota_accounts is not None:
+                quota_accounts.extend(health.values())
+            return health
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            side_effect=inspect_health,
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=[
+                {
+                    "ok": False,
+                    "relogin_ok": False,
+                    "stage": "relogin",
+                    "account_id": account_id,
+                    "email": f"account-{account_id}@example.com",
+                    "message": "验证码登录失败",
+                }
+                for account_id in account_ids
+            ],
+        ):
+            _run_chatgpt_relogin_task(task_id, account_ids, concurrency=1)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["meta"]["relogin_failed_count"], 6)
+        self.assertEqual(snapshot["meta"]["quota_eligible_failure_count"], 0)
+        self.assertEqual(snapshot["meta"]["quota_exhausted_failure_count"], 6)
+        self.assertFalse(snapshot["meta"]["alert_sent"])
+        self.assertTrue(
+            any(
+                "仍有额度的重登失败数未达到配置阈值" in line
                 for line in snapshot["logs"]
             )
         )
@@ -1055,6 +1188,9 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             invalid_rt_count=20,
             relogin_failed_count=20,
             deleted_account_count=17,
+            quota_eligible_failure_count=0,
+            quota_exhausted_failure_count=0,
+            quota_accounts=[],
         )
 
     def test_cleanup_failure_counts_as_relogin_failure_but_not_deleted(self):
@@ -1187,7 +1323,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertTrue(
             any(
-                "邮件告警未触发：本轮重登失败数未达到配置阈值" in line
+                "邮件告警未触发：本轮仍有额度的重登失败数未达到配置阈值" in line
                 for line in snapshot["logs"]
             )
         )

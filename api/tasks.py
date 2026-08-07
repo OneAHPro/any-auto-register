@@ -52,6 +52,8 @@ TASK_SUMMARY_META_KEYS = (
     "invalid_rt_count",
     "relogin_failed_count",
     "deleted_account_count",
+    "quota_eligible_failure_count",
+    "quota_exhausted_failure_count",
     "alert_sent",
     "alert_reason",
 )
@@ -1332,6 +1334,8 @@ def _create_chatgpt_relogin_task_record(
                 "invalid_rt_count": 0,
                 "relogin_failed_count": 0,
                 "deleted_account_count": 0,
+                "quota_eligible_failure_count": 0,
+                "quota_exhausted_failure_count": 0,
                 "codex2api_delete_on_account_remove_enabled": (
                     delete_linked_credential
                 ),
@@ -1585,6 +1589,7 @@ def _run_chatgpt_relogin_task_inner(
         )
         return
     remote_health: dict[int, dict[str, object]] = {}
+    remote_quota_accounts: list[dict[str, object]] = []
     probe_only_account_ids: list[int] = []
     login_candidate_account_ids: list[int] = []
     if automation:
@@ -1593,7 +1598,10 @@ def _run_chatgpt_relogin_task_inner(
             inspect_codex2api_account_health,
         )
 
-        remote_health = inspect_codex2api_account_health(account_ids)
+        remote_health = inspect_codex2api_account_health(
+            account_ids,
+            quota_accounts=remote_quota_accounts,
+        )
         if control.is_stop_requested():
             _terminalize_stopped_task(
                 task_id,
@@ -1638,6 +1646,8 @@ def _run_chatgpt_relogin_task_inner(
     invalid_rt_count = 0
     relogin_failed_count = 0
     deleted_account_count = 0
+    quota_eligible_failure_count = 0
+    quota_exhausted_failure_count = 0
 
     def _record_confirmed_auth_failure() -> None:
         nonlocal invalid_rt_count
@@ -1648,10 +1658,13 @@ def _run_chatgpt_relogin_task_inner(
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
                 deleted_account_count=deleted_account_count,
+                quota_eligible_failure_count=quota_eligible_failure_count,
+                quota_exhausted_failure_count=quota_exhausted_failure_count,
             )
 
-    def _record_automatic_result(result: dict) -> None:
+    def _record_automatic_result(account_id: int, result: dict) -> None:
         nonlocal relogin_failed_count, deleted_account_count
+        nonlocal quota_eligible_failure_count, quota_exhausted_failure_count
         if not automation:
             return
         full_relogin_failed = (
@@ -1661,9 +1674,22 @@ def _run_chatgpt_relogin_task_inner(
         account_removed = bool(result.get("account_removed")) or (
             str(result.get("stage") or "").strip() == "account_removed"
         )
+        quota_state = ""
+        if full_relogin_failed:
+            from services.chatgpt_codex2api_quota import (
+                estimate_account_quota,
+            )
+
+            quota_state = estimate_account_quota(
+                remote_health.get(account_id) or {}
+            ).state
         with cycle_counts_lock:
             if full_relogin_failed:
                 relogin_failed_count += 1
+                if quota_state == "available":
+                    quota_eligible_failure_count += 1
+                elif quota_state == "exhausted":
+                    quota_exhausted_failure_count += 1
             if account_removed:
                 deleted_account_count += 1
             _task_store.update_meta(
@@ -1671,6 +1697,8 @@ def _run_chatgpt_relogin_task_inner(
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
                 deleted_account_count=deleted_account_count,
+                quota_eligible_failure_count=quota_eligible_failure_count,
+                quota_exhausted_failure_count=quota_exhausted_failure_count,
             )
 
     _task_store.mark_running(task_id)
@@ -1681,6 +1709,8 @@ def _run_chatgpt_relogin_task_inner(
             invalid_rt_count=invalid_rt_count,
             relogin_failed_count=0,
             deleted_account_count=0,
+            quota_eligible_failure_count=0,
+            quota_exhausted_failure_count=0,
             phase="probe_results",
             probe_only_count=len(probe_only_account_ids),
             login_candidate_count=len(login_candidate_account_ids),
@@ -1793,7 +1823,7 @@ def _run_chatgpt_relogin_task_inner(
             )
             relogin_ok = bool(result.get("relogin_ok"))
             account_removed = bool(result.get("account_removed")) or stage == "account_removed"
-            _record_automatic_result(result)
+            _record_automatic_result(account_id, result)
 
             if bool(result.get("ok")):
                 detail_message = message or "重登并同步成功"
@@ -2042,6 +2072,8 @@ def _run_chatgpt_relogin_task_inner(
         summary += (
             f"，Codex2API 鉴权失效 {invalid_rt_count} 个，"
             f"完整重登失败 {relogin_failed_count} 个，"
+            f"仍有额度失败 {quota_eligible_failure_count} 个，"
+            f"额度已用完失败 {quota_exhausted_failure_count} 个，"
             f"已删除账号 {deleted_account_count} 个"
         )
     _log(task_id, summary)
@@ -2059,6 +2091,9 @@ def _run_chatgpt_relogin_task_inner(
                 invalid_rt_count=invalid_rt_count,
                 relogin_failed_count=relogin_failed_count,
                 deleted_account_count=deleted_account_count,
+                quota_eligible_failure_count=quota_eligible_failure_count,
+                quota_exhausted_failure_count=quota_exhausted_failure_count,
+                quota_accounts=remote_quota_accounts,
             )
             if not isinstance(alert_result, dict):
                 raise RuntimeError("invalid alert result")
@@ -2083,9 +2118,16 @@ def _run_chatgpt_relogin_task_inner(
         if alert_meta["alert_sent"]:
             _log(task_id, "[ALERT] 本轮重登失败告警邮件已发送")
         elif alert_reason == "below_threshold":
-            _log(task_id, "邮件告警未触发：本轮重登失败数未达到配置阈值")
+            _log(
+                task_id,
+                "邮件告警未触发：本轮仍有额度的重登失败数未达到配置阈值",
+            )
         elif alert_reason == "smtp_not_configured":
-            _log(task_id, "[ALERT] 本轮重登失败数已达到阈值，但 SMTP 配置不完整")
+            _log(
+                task_id,
+                "[ALERT] 本轮仍有额度的重登失败数已达到阈值，"
+                "但 SMTP 配置不完整",
+            )
         else:
             error_type = str(alert_meta.get("alert_error_type") or "UnknownError")
             _log(task_id, f"[ALERT] 重登失败告警邮件发送失败（{error_type}）")
