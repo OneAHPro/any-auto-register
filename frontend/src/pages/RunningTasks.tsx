@@ -44,6 +44,7 @@ interface TaskSnapshot {
     invalid_rt_count?: number
     relogin_failed_count?: number
     deleted_account_count?: number
+    estimated_remaining_usd?: string | number
     alert_sent?: boolean
     alert_reason?: string
   }
@@ -100,6 +101,13 @@ function formatDuration(startTs: unknown, endTs?: unknown): string {
   const h = Math.floor(seconds / 3600)
   const m = Math.floor((seconds % 3600) / 60)
   return `${h}h ${m}m`
+}
+
+function formatRemainingQuota(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  if (typeof value === 'string' && !value.trim()) return null
+  const amount = Number(value)
+  return Number.isFinite(amount) && amount >= 0 ? `$${amount.toFixed(2)}` : null
 }
 
 export default function RunningTasks() {
@@ -202,6 +210,7 @@ export default function RunningTasks() {
     const invalidRtCount = Math.max(0, Number(task.meta?.invalid_rt_count) || 0)
     const reloginFailedCount = Math.max(0, Number(task.meta?.relogin_failed_count) || 0)
     const deletedAccountCount = Math.max(0, Number(task.meta?.deleted_account_count) || 0)
+    const remainingQuota = formatRemainingQuota(task.meta?.estimated_remaining_usd)
 
     const duration = isActive(task)
       ? formatDuration(task.created_at, now)
@@ -215,12 +224,29 @@ export default function RunningTasks() {
         bodyStyle={{ padding: '12px 16px' }}
       >
         <Row gutter={[12, 8]} align="middle" wrap>
-          {/* Task ID + platform */}
+          {/* Probe quota + platform */}
           <Col flex="220px">
             <Space direction="vertical" size={2}>
-              <Text code style={{ fontSize: 11 }}>
-                {task.id}
-              </Text>
+              {isAutomaticAuthentication ? (
+                isActive(task) ? (
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    本次探针额度统计中
+                  </Text>
+                ) : task.status === 'done' && remainingQuota ? (
+                  <Space size={4}>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      本次探针剩余可用额度
+                    </Text>
+                    <Text strong style={{ fontSize: 13, color: '#10b981' }}>
+                      {remainingQuota}
+                    </Text>
+                  </Space>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    本次探针额度未生成
+                  </Text>
+                )
+              ) : null}
               <Space size={4}>
                 <Tag color="blue" style={{ margin: 0 }}>
                   {PLATFORM_LABELS[task.platform] || task.platform}
@@ -392,11 +418,6 @@ export default function RunningTasks() {
           <Space>
             <FileTextOutlined />
             <span>任务日志</span>
-            {logTaskId && (
-              <Text code style={{ fontSize: 11 }}>
-                {logTaskId}
-              </Text>
-            )}
           </Space>
         }
         open={!!logTaskId}
