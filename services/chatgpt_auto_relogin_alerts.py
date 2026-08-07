@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from email.message import EmailMessage
 from html import escape
 import logging
@@ -12,6 +13,11 @@ import ssl
 from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
+from services.chatgpt_codex2api_quota import (
+    AvailableQuotaReport,
+    summarize_available_quota,
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +25,7 @@ DEFAULT_ALERT_THRESHOLD = 20
 DEFAULT_SMTP_PORT = 587
 SMTP_TIMEOUT_SECONDS = 20
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
+USD_CENT = Decimal("0.01")
 
 
 def _text(value: object) -> str:
@@ -76,6 +83,26 @@ def _get_config() -> dict[str, object]:
     return dict(config_store.get_all() or {})
 
 
+def _business_alert_subject(
+    quota_report: AvailableQuotaReport,
+    title: str,
+) -> str:
+    return (
+        f"${quota_report.estimated_remaining_usd:.2f}｜"
+        f"正常可用账号 {quota_report.account_count} 个｜{title}"
+    )
+
+
+def _quota_alert_threshold(value: object) -> Decimal:
+    try:
+        parsed = Decimal(_text(value) or "0")
+    except (InvalidOperation, ValueError):
+        return Decimal("0.00")
+    if not parsed.is_finite() or parsed <= 0:
+        return Decimal("0.00")
+    return parsed.quantize(USD_CENT, rounding=ROUND_HALF_UP)
+
+
 def _build_message(
     *,
     sender: str,
@@ -89,10 +116,8 @@ def _build_message(
     deleted_account_count: int = 0,
     quota_eligible_failure_count: int | None = None,
     quota_exhausted_failure_count: int = 0,
-    quota_report=None,
+    quota_report: AvailableQuotaReport | None = None,
 ) -> EmailMessage:
-    from services.chatgpt_codex2api_quota import AvailableQuotaReport
-
     if quota_eligible_failure_count is None:
         quota_eligible_failure_count = relogin_failed_count
     quota_report = quota_report or AvailableQuotaReport(
@@ -101,9 +126,9 @@ def _build_message(
         accounts=(),
     )
     message = EmailMessage()
-    message["Subject"] = (
-        "[Any Auto Register] ChatGPT 重登失败账号告警"
-        f"（{quota_eligible_failure_count} 个）"
+    message["Subject"] = _business_alert_subject(
+        quota_report,
+        "ChatGPT 重登失败账号告警",
     )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
@@ -119,38 +144,18 @@ def _build_message(
         f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
         f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
         f"正常可用账号：{quota_report.account_count}\n"
-        f"估算剩余额度合计：${quota_report.estimated_remaining_usd:.2f}\n"
+        f"Codex2API 账号总数：{quota_report.remote_account_count}\n"
+        f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
         "已删除或停用账号属于重登失败账号的子集。"
         "鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。"
         "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。\n\n"
-        "正常可用账号额度为按 7d 使用率和已用成本计算的估算值，金额单位为美元。\n"
-        "正常账号明细：\n"
-        + "".join(
-            f"- {row.email or ('账号 ' + str(row.remote_id or ''))}："
-            f"使用率 {_format_usage_percent(row.usage_percent)}%，"
-            f"已用 ${row.billed_usd:.2f}，估算剩余 ${row.remaining_usd:.2f}\n"
-            for row in quota_report.accounts
-        )
-        + "\n"
+        "正常可用账号额度为按 7 天用量百分比和已用成本计算的估算值，金额单位为美元。\n\n"
         "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。\n"
     )
     escaped_task_id = escape(task_id)
     escaped_occurred_at = escape(occurred_at)
-    html_quota_rows = "".join(
-        "<tr>"
-        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
-        f"{escape(row.email or ('账号 ' + str(row.remote_id or '')))}</td>"
-        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
-        f"{escape(_format_usage_percent(row.usage_percent))}%</td>"
-        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
-        f"${row.billed_usd:.2f}</td>"
-        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
-        f"${row.remaining_usd:.2f}</td>"
-        "</tr>"
-        for row in quota_report.accounts
-    )
     message.add_alternative(
         f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -185,17 +190,11 @@ def _build_message(
         <tr><td style="padding:0 20px 12px;">仍有额度的重登失败：{quota_eligible_failure_count}</td></tr>
         <tr><td style="padding:0 20px 12px;">额度已用完的重登失败：{quota_exhausted_failure_count}</td></tr>
         <tr><td style="padding:0 20px 12px;">正常可用账号：{quota_report.account_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;"><strong>估算剩余额度合计：${quota_report.estimated_remaining_usd:.2f}</strong>（美元）</td></tr>
-        <tr><td style="padding:0 20px 20px;">
-          <strong>正常账号额度明细</strong>
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:8px;border-collapse:collapse;">
-            <tr style="background:#f3f4f6;"><th align="left" style="padding:8px;">账号</th><th align="left" style="padding:8px;">7d 使用率</th><th align="left" style="padding:8px;">已用成本</th><th align="left" style="padding:8px;">估算剩余</th></tr>
-            {html_quota_rows or '<tr><td colspan="4" style="padding:8px;">本轮没有可计算的正常账号额度数据</td></tr>'}
-          </table>
-        </td></tr>
+        <tr><td style="padding:0 20px 12px;">Codex2API 账号总数：{quota_report.remote_account_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;"><strong>当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}</strong>（美元）</td></tr>
         <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
         <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
-        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。额度明细为按 7d 使用率和已用成本计算的美元估算值。</td></tr>
+        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。剩余额度为按 7 天用量百分比和已用成本计算的美元估算值。</td></tr>
         <tr><td style="padding:0 20px 24px;">请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。</td></tr>
       </table>
     </td></tr></table>
@@ -206,11 +205,68 @@ def _build_message(
     return message
 
 
-def _format_usage_percent(value) -> str:
-    text = format(value, "f")
-    if "." in text:
-        text = text.rstrip("0").rstrip(".")
-    return text or "0"
+def _build_quota_threshold_message(
+    *,
+    sender: str,
+    recipients: list[str],
+    task_id: str,
+    quota_report: AvailableQuotaReport,
+    threshold_usd: Decimal,
+    quota_eligible_failure_count: int,
+    quota_exhausted_failure_count: int,
+    relogin_failed_count: int,
+    deleted_account_count: int,
+) -> EmailMessage:
+    message = EmailMessage()
+    message["Subject"] = _business_alert_subject(
+        quota_report,
+        "Codex2API 剩余额度不足告警",
+    )
+    message["From"] = sender
+    message["To"] = ", ".join(recipients)
+    occurred_at = _format_beijing_time()
+    message.set_content(
+        "Codex2API 当前正常可用账号的估算剩余额度低于告警阈值。\n\n"
+        f"任务 ID：{task_id}\n"
+        f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
+        f"额度告警阈值：${threshold_usd:.2f}\n"
+        f"正常可用账号：{quota_report.account_count}\n"
+        f"Codex2API 账号总数：{quota_report.remote_account_count}\n"
+        f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
+        f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
+        f"重登失败：{relogin_failed_count}\n"
+        f"其中已删除或停用账号：{deleted_account_count}\n"
+        f"完成时间：{occurred_at}\n\n"
+        "剩余额度为按正常账号的 7 天用量百分比和已用成本计算的美元估算值。\n"
+        "自动化流程每次检测到低于阈值时都会发送本告警。\n"
+    )
+    message.add_alternative(
+        f"""<!DOCTYPE html>
+<html lang="zh-CN">
+  <head><meta charset="utf-8"></head>
+  <body style="margin:0;padding:0;color:#1f2937;font-family:Arial,'Microsoft YaHei',sans-serif;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center">
+      <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="max-width:640px;width:100%;">
+        <tr><td style="padding:24px 20px 12px;"><h2 style="margin:0;">Codex2API 剩余额度不足告警</h2></td></tr>
+        <tr><td style="padding:0 20px 20px;">当前正常可用账号的估算剩余额度低于告警阈值。</td></tr>
+        <tr><td style="padding:0 20px 12px;">任务 ID：{escape(task_id)}</td></tr>
+        <tr><td style="padding:0 20px 12px;"><strong>当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}</strong></td></tr>
+        <tr><td style="padding:0 20px 12px;">额度告警阈值：${threshold_usd:.2f}</td></tr>
+        <tr><td style="padding:0 20px 12px;">正常可用账号：{quota_report.account_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">Codex2API 账号总数：{quota_report.remote_account_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">仍有额度的重登失败：{quota_eligible_failure_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">额度已用完的重登失败：{quota_exhausted_failure_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">重登失败：{relogin_failed_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">其中已删除或停用账号：{deleted_account_count}</td></tr>
+        <tr><td style="padding:0 20px 20px;">完成时间：{escape(occurred_at)}</td></tr>
+        <tr><td style="padding:0 20px 24px;">剩余额度为按正常账号的 7 天用量百分比和已用成本计算的美元估算值。自动化流程每次检测到低于阈值时都会发送本告警。</td></tr>
+      </table>
+    </td></tr></table>
+  </body>
+</html>""",
+        subtype="html",
+    )
+    return message
 
 
 def _build_test_message(
@@ -327,6 +383,7 @@ def send_auto_relogin_alert(
     quota_eligible_failure_count: int | None = None,
     quota_exhausted_failure_count: int = 0,
     quota_accounts: Iterable[Mapping[str, object]] = (),
+    quota_report: AvailableQuotaReport | None = None,
     config: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Send one alert when relogin failures reach the configured threshold."""
@@ -371,9 +428,11 @@ def send_auto_relogin_alert(
             "threshold": threshold,
         }
 
-    from services.chatgpt_codex2api_quota import summarize_available_quota
-
-    quota_report = summarize_available_quota(quota_accounts)
+    resolved_quota_report = (
+        quota_report
+        if quota_report is not None
+        else summarize_available_quota(quota_accounts)
+    )
     message = _build_message(
         sender=sender,
         recipients=recipients,
@@ -384,7 +443,7 @@ def send_auto_relogin_alert(
         relogin_failed_count=failed_count,
         quota_eligible_failure_count=eligible_count,
         quota_exhausted_failure_count=exhausted_count,
-        quota_report=quota_report,
+        quota_report=resolved_quota_report,
         threshold=threshold,
         deleted_account_count=deleted_count,
     )
@@ -396,6 +455,84 @@ def send_auto_relogin_alert(
         recipients=recipients,
     )
     result["threshold"] = threshold
+    return result
+
+
+def send_quota_threshold_alert(
+    *,
+    task_id: str,
+    quota_report: AvailableQuotaReport,
+    quota_eligible_failure_count: int,
+    quota_exhausted_failure_count: int,
+    relogin_failed_count: int,
+    deleted_account_count: int = 0,
+    config: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    """Send a fresh quota alert whenever the configured threshold is crossed."""
+
+    snapshot = dict(config) if config is not None else _get_config()
+    threshold_usd = _quota_alert_threshold(
+        snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
+    )
+    estimated_remaining_usd = quota_report.estimated_remaining_usd.quantize(
+        USD_CENT,
+        rounding=ROUND_HALF_UP,
+    )
+    base_result = {
+        "threshold_usd": f"{threshold_usd:.2f}",
+        "estimated_remaining_usd": f"{estimated_remaining_usd:.2f}",
+    }
+    if threshold_usd <= 0:
+        return {
+            "sent": False,
+            "reason": "quota_alert_disabled",
+            **base_result,
+        }
+    if estimated_remaining_usd >= threshold_usd:
+        return {
+            "sent": False,
+            "reason": "quota_not_below_threshold",
+            **base_result,
+        }
+
+    host = _text(snapshot.get("smtp_host"))
+    username = _text(snapshot.get("smtp_username"))
+    sender = _text(snapshot.get("smtp_sender_email")) or username
+    recipients = _mailboxes(snapshot.get("smtp_recipient_email"))
+    if not recipients:
+        recipients = _mailboxes(username or sender)
+    if not host or not sender or not recipients:
+        return {
+            "sent": False,
+            "reason": "smtp_not_configured",
+            **base_result,
+        }
+
+    failed_count = _non_negative_int(relogin_failed_count)
+    eligible_count = _non_negative_int(quota_eligible_failure_count)
+    exhausted_count = min(
+        _non_negative_int(quota_exhausted_failure_count),
+        failed_count,
+    )
+    deleted_count = min(_non_negative_int(deleted_account_count), failed_count)
+    message = _build_quota_threshold_message(
+        sender=sender,
+        recipients=recipients,
+        task_id=_text(task_id),
+        quota_report=quota_report,
+        threshold_usd=threshold_usd,
+        quota_eligible_failure_count=eligible_count,
+        quota_exhausted_failure_count=exhausted_count,
+        relogin_failed_count=failed_count,
+        deleted_account_count=deleted_count,
+    )
+    result = _send_message(
+        snapshot=snapshot,
+        message=message,
+        sender=sender,
+        recipients=recipients,
+    )
+    result.update(base_result)
     return result
 
 
@@ -430,4 +567,8 @@ def send_smtp_test_email(
     return result
 
 
-__all__ = ["send_auto_relogin_alert", "send_smtp_test_email"]
+__all__ = [
+    "send_auto_relogin_alert",
+    "send_quota_threshold_alert",
+    "send_smtp_test_email",
+]

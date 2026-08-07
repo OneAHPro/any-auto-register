@@ -18,6 +18,21 @@ BASE_CONFIG = {
     "smtp_force_auth_login": "0",
 }
 
+QUOTA_ROWS = [
+    {
+        "email": "a@example.com",
+        "remote_status": "active",
+        "usage_percent_7d": 53,
+        "billed_7d": 68.26,
+    },
+    {
+        "email": "b@example.com",
+        "remote_status": "rate_limited",
+        "usage_percent_7d": 68,
+        "billed_7d": 81.42,
+    },
+]
+
 
 class FakeSMTP:
     instances: list["FakeSMTP"] = []
@@ -126,20 +141,7 @@ def test_available_failure_alert_contains_remaining_usd(monkeypatch):
         deleted_account_count=3,
         quota_eligible_failure_count=5,
         quota_exhausted_failure_count=3,
-        quota_accounts=[
-            {
-                "email": "a@example.com",
-                "remote_status": "active",
-                "usage_percent_7d": 53,
-                "billed_7d": 68.26,
-            },
-            {
-                "email": "b@example.com",
-                "remote_status": "rate_limited",
-                "usage_percent_7d": 68,
-                "billed_7d": 81.42,
-            },
-        ],
+        quota_accounts=QUOTA_ROWS,
         config={**BASE_CONFIG, "chatgpt_auto_relogin_alert_threshold": "5"},
     )
 
@@ -150,10 +152,102 @@ def test_available_failure_alert_contains_remaining_usd(monkeypatch):
     assert "仍有额度的重登失败：5" in plain
     assert "额度已用完的重登失败：3" in plain
     assert "正常可用账号：2" in plain
-    assert "估算剩余额度合计：$98.85" in plain
-    assert "a@example.com" in html
-    assert "$60.53" in html
+    assert "Codex2API 账号总数：2" in plain
+    assert "当前估算剩余额度：$98.85" in plain
+    assert message["Subject"] == (
+        "$98.85｜正常可用账号 2 个｜ChatGPT 重登失败账号告警"
+    )
+    for account_detail in (
+        "a@example.com",
+        "b@example.com",
+        "正常账号明细",
+        "正常账号额度明细",
+        "7d 使用率",
+        "$60.53",
+    ):
+        assert account_detail not in plain
+        assert account_detail not in html
     assert "重置时间" not in message.as_string()
+
+
+def test_quota_threshold_alert_sends_below_threshold_every_call(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota(QUOTA_ROWS)
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+    config = {
+        **BASE_CONFIG,
+        "chatgpt_auto_relogin_quota_alert_threshold_usd": "120.00",
+    }
+
+    results = [
+        alerts.send_quota_threshold_alert(
+            task_id=f"task-{index}",
+            quota_report=report,
+            quota_eligible_failure_count=0,
+            quota_exhausted_failure_count=0,
+            relogin_failed_count=0,
+            deleted_account_count=0,
+            config=config,
+        )
+        for index in (1, 2)
+    ]
+
+    assert [result["sent"] for result in results] == [True, True]
+    assert [result["reason"] for result in results] == ["sent", "sent"]
+    assert len(FakeSMTP.instances) == 2
+    message = FakeSMTP.instances[0].message
+    assert message["Subject"] == (
+        "$98.85｜正常可用账号 2 个｜Codex2API 剩余额度不足告警"
+    )
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert "额度告警阈值：$120.00" in plain
+    assert "当前估算剩余额度：$98.85" in plain
+    assert "Codex2API 账号总数：2" in plain
+    assert "a@example.com" not in plain
+    assert "a@example.com" not in html
+
+
+@pytest.mark.parametrize(
+    ("threshold", "expected_reason"),
+    [
+        ("0.00", "quota_alert_disabled"),
+        ("98.85", "quota_not_below_threshold"),
+        ("90.00", "quota_not_below_threshold"),
+    ],
+)
+def test_quota_threshold_alert_skips_disabled_equal_or_above_remaining(
+    monkeypatch,
+    threshold,
+    expected_reason,
+):
+    from services import chatgpt_auto_relogin_alerts as alerts
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota(QUOTA_ROWS)
+    monkeypatch.setattr(alerts.smtplib, "SMTP", pytest.fail)
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", pytest.fail)
+
+    result = alerts.send_quota_threshold_alert(
+        task_id="task-no-quota-alert",
+        quota_report=report,
+        quota_eligible_failure_count=0,
+        quota_exhausted_failure_count=0,
+        relogin_failed_count=0,
+        config={
+            **BASE_CONFIG,
+            "chatgpt_auto_relogin_quota_alert_threshold_usd": threshold,
+        },
+    )
+
+    assert result == {
+        "sent": False,
+        "reason": expected_reason,
+        "threshold_usd": threshold,
+        "estimated_remaining_usd": "98.85",
+    }
 
 
 @pytest.mark.parametrize("configured_threshold", ["", "not-a-number", "0", "-1"])
@@ -436,7 +530,9 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     message = FakeSMTP.instances[0].message
     plain = message.get_body(preferencelist=("plain",)).get_content()
     html = message.get_body(preferencelist=("html",)).get_content()
-    assert message["Subject"] == "[Any Auto Register] ChatGPT 重登失败账号告警（20 个）"
+    assert message["Subject"] == (
+        "$0.00｜正常可用账号 0 个｜ChatGPT 重登失败账号告警"
+    )
     assert plain.index("账号总数：0") < plain.index("成功账号：0")
     assert plain.index("成功账号：0") < plain.index("鉴权失败：0")
     assert plain.index("鉴权失败：0") < plain.index("重登失败：20")
