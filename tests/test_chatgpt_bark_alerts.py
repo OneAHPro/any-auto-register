@@ -37,8 +37,10 @@ class FakeResponse:
     def __exit__(self, exc_type, exc, traceback):
         return False
 
-    def read(self) -> bytes:
-        return self._body
+    def read(self, limit: int = -1) -> bytes:
+        if limit < 0:
+            return self._body
+        return self._body[:limit]
 
 
 def _success_urlopen(calls: list[tuple[object, float]]):
@@ -51,7 +53,7 @@ def _success_urlopen(calls: list[tuple[object, float]]):
 
 def test_relogin_alert_posts_critical_call_payload(monkeypatch):
     calls: list[tuple[object, float]] = []
-    monkeypatch.setattr(alerts.request, "urlopen", _success_urlopen(calls))
+    monkeypatch.setattr(alerts, "_open_bark_request", _success_urlopen(calls))
 
     result = alerts.send_bark_relogin_alert(
         task_id="task-relogin-1",
@@ -89,7 +91,7 @@ def test_relogin_alert_posts_critical_call_payload(monkeypatch):
 
 
 def test_relogin_alert_skips_when_below_threshold(monkeypatch):
-    monkeypatch.setattr(alerts.request, "urlopen", pytest.fail)
+    monkeypatch.setattr(alerts, "_open_bark_request", pytest.fail)
 
     result = alerts.send_bark_relogin_alert(
         task_id="task-relogin-2",
@@ -110,6 +112,16 @@ def test_relogin_alert_skips_when_below_threshold(monkeypatch):
         ({"bark_enabled": "0"}, "bark_disabled"),
         ({"bark_endpoint": ""}, "bark_not_configured"),
         ({"bark_endpoint": "file:///tmp/device"}, "invalid_bark_endpoint"),
+        ({"bark_endpoint": "http://127.0.0.1/device"}, "invalid_bark_endpoint"),
+        ({"bark_endpoint": "https://localhost/device"}, "invalid_bark_endpoint"),
+        ({"bark_endpoint": "https://10.0.0.1/device"}, "invalid_bark_endpoint"),
+        (
+            {"bark_endpoint": "https://169.254.169.254/latest/meta-data"},
+            "invalid_bark_endpoint",
+        ),
+        ({"bark_endpoint": "https://[::1]/device"}, "invalid_bark_endpoint"),
+        ({"bark_endpoint": "https://evil.example/device"}, "invalid_bark_endpoint"),
+        ({"bark_endpoint": "https://[::1"}, "invalid_bark_endpoint"),
     ],
 )
 def test_relogin_alert_reports_disabled_missing_and_invalid_config(
@@ -117,7 +129,7 @@ def test_relogin_alert_reports_disabled_missing_and_invalid_config(
     overrides,
     reason,
 ):
-    monkeypatch.setattr(alerts.request, "urlopen", pytest.fail)
+    monkeypatch.setattr(alerts, "_open_bark_request", pytest.fail)
     config = {**BASE_CONFIG, **overrides}
 
     result = alerts.send_bark_relogin_alert(
@@ -135,7 +147,7 @@ def test_relogin_alert_reports_disabled_missing_and_invalid_config(
 
 def test_quota_alert_posts_every_time_remaining_is_below_threshold(monkeypatch):
     calls: list[tuple[object, float]] = []
-    monkeypatch.setattr(alerts.request, "urlopen", _success_urlopen(calls))
+    monkeypatch.setattr(alerts, "_open_bark_request", _success_urlopen(calls))
 
     first = alerts.send_bark_quota_threshold_alert(
         task_id="task-quota-1",
@@ -169,7 +181,7 @@ def test_quota_alert_posts_every_time_remaining_is_below_threshold(monkeypatch):
 
 
 def test_quota_alert_skips_disabled_and_equal_threshold(monkeypatch):
-    monkeypatch.setattr(alerts.request, "urlopen", pytest.fail)
+    monkeypatch.setattr(alerts, "_open_bark_request", pytest.fail)
     equal_report = AvailableQuotaReport(
         account_count=2,
         remote_account_count=7,
@@ -199,7 +211,7 @@ def test_quota_alert_skips_disabled_and_equal_threshold(monkeypatch):
 
 def test_test_notification_uses_same_critical_delivery(monkeypatch):
     calls: list[tuple[object, float]] = []
-    monkeypatch.setattr(alerts.request, "urlopen", _success_urlopen(calls))
+    monkeypatch.setattr(alerts, "_open_bark_request", _success_urlopen(calls))
 
     result = alerts.send_bark_test_notification(config=BASE_CONFIG)
 
@@ -221,7 +233,7 @@ def test_test_notification_uses_same_critical_delivery(monkeypatch):
     ],
 )
 def test_transport_rejects_invalid_bark_responses(monkeypatch, response):
-    monkeypatch.setattr(alerts.request, "urlopen", lambda *args, **kwargs: response)
+    monkeypatch.setattr(alerts, "_open_bark_request", lambda *args, **kwargs: response)
 
     result = alerts.send_bark_test_notification(config=BASE_CONFIG)
 
@@ -233,11 +245,58 @@ def test_transport_rejects_invalid_bark_responses(monkeypatch, response):
     }
 
 
+def test_transport_uses_an_opener_that_rejects_redirects(monkeypatch):
+    handlers: list[object] = []
+
+    class FakeOpener:
+        def open(self, outbound, timeout):
+            return FakeResponse(b'{"code":200,"message":"success"}')
+
+    def build_opener(*args):
+        handlers.extend(args)
+        return FakeOpener()
+
+    monkeypatch.setattr(alerts.request, "build_opener", build_opener)
+    monkeypatch.setattr(alerts.request, "urlopen", pytest.fail)
+
+    result = alerts.send_bark_test_notification(config=BASE_CONFIG)
+
+    assert result == {"sent": True, "reason": "sent"}
+    assert any(
+        isinstance(handler, alerts._NoRedirectHandler)
+        for handler in handlers
+    )
+
+
+def test_redirect_handler_rejects_redirect_targets():
+    handler = alerts._NoRedirectHandler()
+
+    with pytest.raises(alerts.BarkResponseError):
+        handler.redirect_request(None, None, 302, "Found", {}, "https://evil.example")
+
+
+def test_transport_rejects_oversized_response(monkeypatch):
+    body = b'{"code":200,"padding":"' + (b"x" * 70_000) + b'"}'
+    monkeypatch.setattr(
+        alerts,
+        "_open_bark_request",
+        lambda *args, **kwargs: FakeResponse(body),
+    )
+
+    result = alerts.send_bark_test_notification(config=BASE_CONFIG)
+
+    assert result == {
+        "sent": False,
+        "reason": "send_failed",
+        "error_type": "BarkResponseError",
+    }
+
+
 def test_transport_failure_never_leaks_endpoint_or_payload(monkeypatch, caplog):
     def fail(*args, **kwargs):
         raise RuntimeError(f"failed {BARK_ENDPOINT} body-secret")
 
-    monkeypatch.setattr(alerts.request, "urlopen", fail)
+    monkeypatch.setattr(alerts, "_open_bark_request", fail)
 
     with caplog.at_level(logging.WARNING):
         result = alerts.send_bark_test_notification(config=BASE_CONFIG)

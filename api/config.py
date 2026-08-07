@@ -1,10 +1,10 @@
 import logging
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
-from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from core.config_store import config_store
+from services.chatgpt_bark_alerts import BarkEndpointError, normalize_bark_endpoint
 from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
 
 router = APIRouter(prefix="/config", tags=["config"])
@@ -13,6 +13,9 @@ logger = logging.getLogger(__name__)
 QUOTA_ALERT_MIN_USD = Decimal("0.00")
 QUOTA_ALERT_MAX_USD = Decimal("10000000.00")
 USD_CENT = Decimal("0.01")
+BARK_ENDPOINT_VALIDATION_MESSAGE = (
+    "Bark 推送地址必须使用 https://api.day.app/ 官方地址"
+)
 
 _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS = {
     "chatgpt_auto_relogin_enabled",
@@ -203,14 +206,13 @@ def _normalize_quota_alert_threshold(value: object) -> str:
 
 
 def _normalize_bark_endpoint(value: object) -> str:
-    endpoint = str(value or "").strip().rstrip("/")
-    parsed = urlsplit(endpoint)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    try:
+        return normalize_bark_endpoint(value)
+    except BarkEndpointError:
         raise HTTPException(
             status_code=400,
-            detail="Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址",
-        )
-    return endpoint
+            detail=BARK_ENDPOINT_VALIDATION_MESSAGE,
+        ) from None
 
 
 @router.get("")
@@ -457,7 +459,7 @@ def test_bark_config(body: SMTPTestRequest):
     if reason == "invalid_bark_endpoint":
         raise HTTPException(
             status_code=400,
-            detail="Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址",
+            detail=BARK_ENDPOINT_VALIDATION_MESSAGE,
         )
     error_type = str(result.get("error_type") or "BarkError")[:80]
     raise HTTPException(

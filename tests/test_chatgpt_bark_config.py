@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException
+from fastapi.testclient import TestClient
 import pytest
 
 from api import config as config_api
@@ -66,6 +67,16 @@ def test_update_config_normalizes_bark_and_preserves_empty_endpoint(monkeypatch)
         "file:///tmp/device",
         "api.day.app/device",
         "https:///missing-host",
+        "http://api.day.app/device",
+        "http://127.0.0.1/device",
+        "https://localhost/device",
+        "https://10.0.0.1/device",
+        "https://169.254.169.254/latest/meta-data",
+        "https://[::1]/device",
+        "https://user:pass@api.day.app/device",
+        "https://evil.example/device",
+        "https://api.day.app:bad/device",
+        "https://[::1",
     ],
 )
 def test_update_config_rejects_invalid_bark_endpoint_without_echoing_it(
@@ -80,8 +91,39 @@ def test_update_config_rejects_invalid_bark_endpoint_without_echoing_it(
         )
 
     assert caught.value.status_code == 400
-    assert caught.value.detail == "Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址"
+    assert caught.value.detail == "Bark 推送地址必须使用 https://api.day.app/ 官方地址"
     assert endpoint not in str(caught.value.detail)
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("put", "/config"),
+        ("post", "/config/bark/test"),
+    ],
+)
+def test_bark_routes_return_sanitized_400_for_malformed_url(
+    monkeypatch,
+    method,
+    path,
+):
+    secret = "https://[BARK_ENDPOINT_SECRET"
+    monkeypatch.setattr(config_api.config_store, "set_many", pytest.fail)
+    monkeypatch.setattr(config_api.config_store, "get_all", lambda: {})
+    app = FastAPI()
+    app.include_router(config_api.router)
+
+    with TestClient(app) as client:
+        response = getattr(client, method)(
+            path,
+            json={"data": {"bark_enabled": True, "bark_endpoint": secret}},
+        )
+
+    assert response.status_code == 400
+    assert response.json() == {
+        "detail": "Bark 推送地址必须使用 https://api.day.app/ 官方地址"
+    }
+    assert secret not in response.text
 
 
 def test_bark_test_uses_unsaved_form_values(monkeypatch):
@@ -166,7 +208,7 @@ def test_bark_test_empty_endpoint_uses_saved_secret(monkeypatch):
         (
             {"sent": False, "reason": "invalid_bark_endpoint"},
             400,
-            "Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址",
+            "Bark 推送地址必须使用 https://api.day.app/ 官方地址",
         ),
         (
             {

@@ -15,6 +15,8 @@ from services.chatgpt_codex2api_quota import AvailableQuotaReport
 logger = logging.getLogger(__name__)
 
 BARK_TIMEOUT_SECONDS = 20
+BARK_MAX_RESPONSE_BYTES = 64 * 1024
+BARK_OFFICIAL_HOST = "api.day.app"
 BARK_GROUP = "Any Auto Register · Codex"
 BARK_SOUND = "alarm"
 DEFAULT_ALERT_THRESHOLD = 20
@@ -23,6 +25,15 @@ USD_CENT = Decimal("0.01")
 
 class BarkResponseError(RuntimeError):
     """Bark returned a response that does not confirm delivery."""
+
+
+class BarkEndpointError(ValueError):
+    """The configured endpoint is not an official Bark device endpoint."""
+
+
+class _NoRedirectHandler(request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise BarkResponseError("redirect responses are not accepted")
 
 
 def _text(value: object) -> str:
@@ -79,12 +90,41 @@ def _business_alert_title(
     )
 
 
+def normalize_bark_endpoint(value: object) -> str:
+    """Validate and normalize an official Bark device endpoint."""
+
+    endpoint = _text(value).rstrip("/")
+    try:
+        parsed = urlsplit(endpoint)
+        hostname = (parsed.hostname or "").lower()
+        port = parsed.port
+    except (TypeError, ValueError, UnicodeError) as exc:
+        raise BarkEndpointError("invalid Bark endpoint") from exc
+
+    path_parts = [part for part in parsed.path.split("/") if part]
+    if (
+        not endpoint
+        or any(ord(character) <= 32 for character in endpoint)
+        or parsed.scheme.lower() != "https"
+        or hostname != BARK_OFFICIAL_HOST
+        or port not in {None, 443}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or len(path_parts) != 1
+    ):
+        raise BarkEndpointError("invalid Bark endpoint")
+    return endpoint
+
+
 def _resolve_endpoint(snapshot: Mapping[str, object]) -> tuple[str, str | None]:
-    endpoint = _text(snapshot.get("bark_endpoint")).rstrip("/")
-    if not endpoint:
+    value = snapshot.get("bark_endpoint")
+    if not _text(value):
         return "", "bark_not_configured"
-    parsed = urlsplit(endpoint)
-    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+    try:
+        endpoint = normalize_bark_endpoint(value)
+    except BarkEndpointError:
         return "", "invalid_bark_endpoint"
     return endpoint, None
 
@@ -100,32 +140,40 @@ def _critical_payload(*, title: str, body: str) -> dict[str, str]:
     }
 
 
+def _open_bark_request(outbound: request.Request, timeout: float):
+    opener = request.build_opener(_NoRedirectHandler())
+    return opener.open(outbound, timeout=timeout)
+
+
 def _send_bark(
     *,
     endpoint: str,
     title: str,
     body: str,
 ) -> dict[str, object]:
-    payload = _critical_payload(title=title, body=body)
-    outbound = request.Request(
-        endpoint,
-        data=json.dumps(
-            payload,
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with request.urlopen(
+        payload = _critical_payload(title=title, body=body)
+        outbound = request.Request(
+            endpoint,
+            data=json.dumps(
+                payload,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with _open_bark_request(
             outbound,
-            timeout=BARK_TIMEOUT_SECONDS,
+            BARK_TIMEOUT_SECONDS,
         ) as response:
             status = int(getattr(response, "status", 0) or 0)
             if not 200 <= status < 300:
                 raise BarkResponseError("unexpected HTTP status")
-            response_payload = json.loads(response.read().decode("utf-8"))
+            raw_response = response.read(BARK_MAX_RESPONSE_BYTES + 1)
+            if len(raw_response) > BARK_MAX_RESPONSE_BYTES:
+                raise BarkResponseError("response payload is too large")
+            response_payload = json.loads(raw_response.decode("utf-8"))
             if not isinstance(response_payload, dict):
                 raise BarkResponseError("invalid response payload")
             if response_payload.get("code") != 200:

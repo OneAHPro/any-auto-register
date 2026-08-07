@@ -18,7 +18,7 @@
 
 - [ ] **Step 1: Write failing transport and policy tests**
 
-Create tests with a `FakeResponse` context manager and monkeypatch `urllib.request.urlopen`. Assert the sent request uses JSON `POST`, a 20-second timeout, and exactly these critical fields:
+Create tests with a `FakeResponse` context manager and monkeypatch the Bark transport seam. Assert the sent request uses JSON `POST`, a 20-second timeout, and exactly these critical fields:
 
 ```python
 payload = json.loads(request.data.decode("utf-8"))
@@ -78,7 +78,7 @@ def send_bark_quota_threshold_alert(...) -> dict[str, object]: ...
 def send_bark_test_notification(...) -> dict[str, object]: ...
 ```
 
-Use a private `_send_bark` that validates `urlsplit(endpoint).scheme in {"http", "https"}` and `netloc`, removes trailing `/`, serializes UTF-8 JSON, sends a `urllib.request.Request(..., method="POST", headers={"Content-Type": "application/json"})`, and accepts only HTTP 2xx plus JSON `{"code": 200}`. Catch exceptions, log only `type(exc).__name__`, and return only the error type.
+Use a private `_send_bark` that accepts only normalized official `https://api.day.app/DEVICE_KEY` endpoints, serializes UTF-8 JSON, sends a `urllib.request.Request(..., method="POST", headers={"Content-Type": "application/json"})` through an opener that rejects redirects, bounds the response body to 64 KiB, and accepts only HTTP 2xx plus JSON `{"code": 200}`. Catch exceptions, log only `type(exc).__name__`, and return only the error type.
 
 The relogin title must be:
 
@@ -114,7 +114,7 @@ assert get_config()["bark_enabled"] == "0"
 assert get_config()["bark_endpoint"] == ""
 ```
 
-Update with `bark_enabled=True` and `bark_endpoint="https://api.day.app/BARK_DEVICE_SECRET"`; verify the store receives `"1"` and the full endpoint. Update again with `bark_endpoint=""`; verify the saved endpoint is preserved. Reject non-HTTP(S) values with HTTP 400 without echoing the value.
+Update with `bark_enabled=True` and `bark_endpoint="https://api.day.app/BARK_DEVICE_SECRET"`; verify the store receives `"1"` and the full endpoint. Update again with `bark_endpoint=""`; verify the saved endpoint is preserved. Reject non-official, non-HTTPS, private-network, user-info, malformed, and query-bearing values with HTTP 400 without echoing the value. Exercise both configuration routes through FastAPI's `TestClient`.
 
 Patch `send_bark_test_notification` for `/config/bark/test` and verify unsaved form values override saved values, while an empty form endpoint uses the saved endpoint. Success returns `测试 Bark 强提醒已发送`; disabled, missing, invalid, and transport failures return sanitized 400/502 errors.
 
@@ -135,7 +135,7 @@ In `api/config.py`, add:
 _BARK_CONFIG_KEYS = {"bark_enabled", "bark_endpoint"}
 ```
 
-Add both keys to `CONFIG_KEYS`. Default `bark_enabled` to `"0"`; always set the returned `bark_endpoint` to `""`. Normalize `bark_enabled` alongside other booleans. If an update contains an empty `bark_endpoint`, remove it from `safe`; otherwise validate its parsed URL without returning the endpoint in errors.
+Add both keys to `CONFIG_KEYS`. Default `bark_enabled` to `"0"`; always set the returned `bark_endpoint` to `""`. Normalize `bark_enabled` alongside other booleans. If an update contains an empty `bark_endpoint`, remove it from `safe`; otherwise accept only a normalized official `https://api.day.app/DEVICE_KEY` URL, without returning the endpoint in errors.
 
 Add `POST /config/bark/test` using the existing generic test request model. Merge stored and form Bark values, preserve the stored endpoint on an empty override, call `send_bark_test_notification`, and map result reasons to sanitized HTTP responses.
 

@@ -64,8 +64,12 @@ TASK_SUMMARY_META_KEYS = (
     "quota_alert_threshold_usd",
     "bark_alert_sent",
     "bark_alert_reason",
+    "bark_alert_error_type",
+    "bark_alert_threshold",
     "bark_quota_alert_sent",
     "bark_quota_alert_reason",
+    "bark_quota_alert_error_type",
+    "bark_quota_alert_threshold_usd",
 )
 _CHATGPT_LEADBEE_SECRET_KEYS = {
     CHATGPT_LEADBEE_CODES_KEY,
