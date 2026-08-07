@@ -15,6 +15,7 @@ PUBLIC_KEYS = {
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
     "chatgpt_auto_relogin_alert_threshold",
+    "chatgpt_auto_relogin_quota_alert_threshold_usd",
     "smtp_host",
     "smtp_port",
     "smtp_username",
@@ -82,6 +83,7 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert response["chatgpt_auto_relogin_interval_minutes"] == "2"
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
     assert response["chatgpt_auto_relogin_alert_threshold"] == "20"
+    assert response["chatgpt_auto_relogin_quota_alert_threshold_usd"] == "0.00"
     assert response["smtp_port"] == "587"
     assert response["smtp_use_ssl"] == "1"
     assert store.writes == []
@@ -302,6 +304,68 @@ def test_public_config_put_reports_relogin_alert_threshold_bounds(monkeypatch):
 
     assert error.value.status_code == 400
     assert error.value.detail == "重登失败告警阈值必须在 1 到 10000 之间"
+    assert store.writes == []
+
+
+@pytest.mark.parametrize(
+    ("submitted", "expected"),
+    [
+        (0, "0.00"),
+        (1200, "1200.00"),
+        (1200.5, "1200.50"),
+        ("1200.55", "1200.55"),
+    ],
+)
+def test_public_config_put_normalizes_quota_alert_threshold(
+    monkeypatch,
+    submitted,
+    expected,
+):
+    from api import config as config_api
+
+    store = FakeConfigStore()
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    result = config_api.update_config(
+        config_api.ConfigUpdate(
+            data={
+                "chatgpt_auto_relogin_quota_alert_threshold_usd": submitted
+            }
+        )
+    )
+
+    assert result == {
+        "ok": True,
+        "updated": ["chatgpt_auto_relogin_quota_alert_threshold_usd"],
+    }
+    assert store.writes == [
+        {"chatgpt_auto_relogin_quota_alert_threshold_usd": expected}
+    ]
+
+
+@pytest.mark.parametrize(
+    "submitted",
+    [-0.01, 10000000.01, 12.345, "NaN", "Infinity", "not-a-number"],
+)
+def test_public_config_put_rejects_invalid_quota_alert_threshold(
+    monkeypatch,
+    submitted,
+):
+    from api import config as config_api
+
+    store = FakeConfigStore()
+    monkeypatch.setattr(config_api, "config_store", store)
+
+    with pytest.raises(HTTPException) as error:
+        config_api.update_config(
+            config_api.ConfigUpdate(
+                data={
+                    "chatgpt_auto_relogin_quota_alert_threshold_usd": submitted
+                }
+            )
+        )
+
+    assert error.value.status_code == 400
     assert store.writes == []
 
 

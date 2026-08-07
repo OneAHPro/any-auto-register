@@ -1,4 +1,5 @@
 import logging
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -7,6 +8,10 @@ from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRe
 
 router = APIRouter(prefix="/config", tags=["config"])
 logger = logging.getLogger(__name__)
+
+QUOTA_ALERT_MIN_USD = Decimal("0.00")
+QUOTA_ALERT_MAX_USD = Decimal("10000000.00")
+USD_CENT = Decimal("0.01")
 
 _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS = {
     "chatgpt_auto_relogin_enabled",
@@ -117,6 +122,7 @@ CONFIG_KEYS = [
     "chatgpt_auto_relogin_interval_minutes",
     "chatgpt_auto_relogin_concurrency",
     "chatgpt_auto_relogin_alert_threshold",
+    "chatgpt_auto_relogin_quota_alert_threshold_usd",
     "smtp_host",
     "smtp_port",
     "smtp_username",
@@ -156,6 +162,37 @@ class AppleMailImportRequest(BaseModel):
     filename: str = ""
     pool_dir: str = ""
     bind_to_config: bool = True
+
+
+def _normalize_quota_alert_threshold(value: object) -> str:
+    text = str(value if value is not None else "").strip() or "0"
+    try:
+        parsed = Decimal(text)
+    except (InvalidOperation, ValueError):
+        raise HTTPException(
+            status_code=400,
+            detail="Codex2API 剩余额度告警阈值必须是有效美元金额",
+        ) from None
+    if not parsed.is_finite():
+        raise HTTPException(
+            status_code=400,
+            detail="Codex2API 剩余额度告警阈值必须是有效美元金额",
+        )
+    rounded = parsed.quantize(USD_CENT, rounding=ROUND_HALF_UP)
+    if parsed != rounded:
+        raise HTTPException(
+            status_code=400,
+            detail="Codex2API 剩余额度告警阈值最多保留两位小数",
+        )
+    if not QUOTA_ALERT_MIN_USD <= parsed <= QUOTA_ALERT_MAX_USD:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Codex2API 剩余额度告警阈值必须在 "
+                "0.00 到 10000000.00 美元之间"
+            ),
+        )
+    return f"{rounded:.2f}"
 
 
 @router.get("")
@@ -199,6 +236,11 @@ def get_config():
         all_cfg["chatgpt_auto_relogin_concurrency"] = "10"
     if not str(all_cfg.get("chatgpt_auto_relogin_alert_threshold", "") or "").strip():
         all_cfg["chatgpt_auto_relogin_alert_threshold"] = "20"
+    if not str(
+        all_cfg.get("chatgpt_auto_relogin_quota_alert_threshold_usd", "")
+        or ""
+    ).strip():
+        all_cfg["chatgpt_auto_relogin_quota_alert_threshold_usd"] = "0.00"
     if not str(
         all_cfg.get("codex2api_delete_on_account_remove_enabled", "") or ""
     ).strip():
@@ -250,6 +292,12 @@ def update_config(body: ConfigUpdate):
     if "smtp_password" in safe and not str(safe.get("smtp_password") or ""):
         # 前端留空表示保留现有凭证，避免读取配置后误清空。
         safe.pop("smtp_password", None)
+    if "chatgpt_auto_relogin_quota_alert_threshold_usd" in safe:
+        safe["chatgpt_auto_relogin_quota_alert_threshold_usd"] = (
+            _normalize_quota_alert_threshold(
+                safe.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
+            )
+        )
     for key, minimum, maximum, label in (
         ("chatgpt_auto_relogin_interval_minutes", 2, 1440, "鉴权巡检间隔"),
         ("chatgpt_auto_relogin_concurrency", 1, 10, "自动重登并发数"),
