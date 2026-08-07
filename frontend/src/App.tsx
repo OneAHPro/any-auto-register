@@ -258,7 +258,9 @@ function AppContent() {
           </div>
         </Sider>
         <Content
+          className="app-content"
           style={{
+            minWidth: 0,
             padding: 24,
             overflow: 'auto',
             background: currentTheme.token?.colorBgLayout,

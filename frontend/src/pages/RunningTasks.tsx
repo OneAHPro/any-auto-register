@@ -4,13 +4,11 @@ import {
   Badge,
   Button,
   Card,
-  Col,
   Drawer,
   Empty,
   message,
   Popconfirm,
   Progress,
-  Row,
   Space,
   Tag,
   Typography,
@@ -219,13 +217,14 @@ export default function RunningTasks() {
     return (
       <Card
         key={task.id}
+        className="running-task-card"
         size="small"
         style={{ marginBottom: 12 }}
-        bodyStyle={{ padding: '12px 16px' }}
+        styles={{ body: { padding: 'clamp(12px, 2.5vw, 16px)' } }}
       >
-        <Row gutter={[12, 8]} align="middle" wrap>
+        <div className="running-task-card__layout">
           {/* Probe quota + platform */}
-          <Col flex="220px">
+          <div className="running-task-card__identity">
             <Space direction="vertical" size={2}>
               {isAutomaticAuthentication ? (
                 isActive(task) ? (
@@ -233,21 +232,21 @@ export default function RunningTasks() {
                     本次探针额度统计中
                   </Text>
                 ) : task.status === 'done' && remainingQuota ? (
-                  <Space size={4}>
+                  <div className="running-task-card__quota">
                     <Text type="secondary" style={{ fontSize: 11 }}>
-                      本次探针剩余可用额度
+                      剩余可用额度
                     </Text>
                     <Text strong style={{ fontSize: 13, color: '#10b981' }}>
                       {remainingQuota}
                     </Text>
-                  </Space>
+                  </div>
                 ) : (
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     本次探针额度未生成
                   </Text>
                 )
               ) : null}
-              <Space size={4}>
+              <Space size={4} wrap>
                 <Tag color="blue" style={{ margin: 0 }}>
                   {PLATFORM_LABELS[task.platform] || task.platform}
                 </Tag>
@@ -258,26 +257,26 @@ export default function RunningTasks() {
                 </Text>
               </Space>
             </Space>
-          </Col>
+          </div>
 
           {/* Status */}
-          <Col flex="90px">
+          <div className="running-task-card__status">
             <Badge status={cfg.color as any} text={cfg.label} />
-          </Col>
+          </div>
 
           {/* Duration */}
-          <Col flex="70px">
+          <div className="running-task-card__duration">
             <Text type="secondary" style={{ fontSize: 12 }}>
               ⏱ {duration}
             </Text>
-          </Col>
+          </div>
 
           {/* Progress bar */}
-          <Col flex="1" style={{ minWidth: 160 }}>
+          <div className="running-task-card__progress">
             <Space direction="vertical" size={2} style={{ width: '100%' }}>
-                <Progress
-                  percent={pct}
-                  size="small"
+              <Progress
+                percent={pct}
+                size="small"
                 status={
                   task.status === 'failed'
                     ? 'exception'
@@ -289,17 +288,20 @@ export default function RunningTasks() {
                 }
                 format={() => `${done}/${total}`}
               />
-              <Space size={8}>
-                <Text style={{ fontSize: 11, color: '#10b981' }}>
+              <div
+                className="running-task-card__stats"
+                style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}
+              >
+                <Text style={{ fontSize: 11, color: '#10b981', whiteSpace: 'nowrap' }}>
                   ✓ 成功 {success}
                 </Text>
                 {failed > 0 && (
-                  <Text style={{ fontSize: 11, color: '#dc2626' }}>
+                  <Text style={{ fontSize: 11, color: '#dc2626', whiteSpace: 'nowrap' }}>
                     ✗ 失败 {failed}
                   </Text>
                 )}
                 {skipped > 0 && (
-                  <Text style={{ fontSize: 11, color: '#d97706' }}>
+                  <Text style={{ fontSize: 11, color: '#d97706', whiteSpace: 'nowrap' }}>
                     → 跳过 {skipped}
                   </Text>
                 )}
@@ -321,13 +323,13 @@ export default function RunningTasks() {
                     ) : null}
                   </>
                 )}
-              </Space>
+              </div>
             </Space>
-          </Col>
+          </div>
 
           {/* Log button */}
-          <Col>
-            <Space>
+          <div className="running-task-card__actions">
+            <Space wrap>
               <Button
                 size="small"
                 icon={<FileTextOutlined />}
@@ -349,14 +351,14 @@ export default function RunningTasks() {
                 </Popconfirm>
               )}
             </Space>
-          </Col>
-        </Row>
+          </div>
+        </div>
       </Card>
     )
   }
 
   return (
-    <div>
+    <div className="running-tasks-page">
       <div
         style={{
           display: 'flex',
@@ -422,9 +424,9 @@ export default function RunningTasks() {
         }
         open={!!logTaskId}
         onClose={() => setLogTaskId(null)}
-        width={720}
+        width="min(720px, 100vw)"
         destroyOnClose
-        bodyStyle={{ padding: 16 }}
+        styles={{ body: { padding: 16 } }}
       >
         {logTaskId && <TaskLogPanel taskId={logTaskId} />}
       </Drawer>

@@ -105,9 +105,26 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.getByText('鉴权失效 6')).toBeTruthy()
     expect(screen.getByText('重登失败 5')).toBeTruthy()
     expect(screen.getByText('邮件已提醒')).toBeTruthy()
-    expect(screen.getByText('本次探针剩余可用额度')).toBeTruthy()
+    expect(screen.getByText('剩余可用额度')).toBeTruthy()
     expect(screen.getByText('$98.85')).toBeTruthy()
+    expect(screen.queryByText('本次探针剩余可用额度')).toBeNull()
     expect(screen.queryByText('task-auto-history')).toBeNull()
+  })
+
+  it('uses responsive card regions and keeps compact metrics from breaking vertically', async () => {
+    render(<RunningTasks />)
+
+    const amount = await screen.findByText('$98.85')
+    const card = amount.closest('.running-task-card')
+    expect(card).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__layout')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__identity')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__progress')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__actions')).toBeTruthy()
+
+    const stats = card?.querySelector('.running-task-card__stats') as HTMLElement | null
+    expect(stats?.style.flexWrap).toBe('wrap')
+    expect((screen.getByText('✓ 成功 53') as HTMLElement).style.whiteSpace).toBe('nowrap')
   })
 
   it('shows a pending quota state while an automatic probe is still running', async () => {

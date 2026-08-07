@@ -18,7 +18,7 @@
 
 - [ ] **Step 1: Write failing rendering tests**
 
-Extend the automatic summary fixture with `estimated_remaining_usd: '98.85'`. Assert the completed card shows `本次探针剩余可用额度` and `$98.85`, and does not show `task-auto-history`. Open the log drawer and assert the ID remains absent. Add running and invalid-value cases that expect `本次探针额度统计中` and `本次探针额度未生成` respectively.
+Extend the automatic summary fixture with `estimated_remaining_usd: '98.85'`. Assert the completed card shows `剩余可用额度` and `$98.85`, and does not show `task-auto-history`. Open the log drawer and assert the ID remains absent. Add running and invalid-value cases that expect `本次探针额度统计中` and `本次探针额度未生成` respectively. Cover the responsive card regions, wrapping statistics, and shrinkable application content.
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
@@ -43,7 +43,7 @@ function formatRemainingQuota(value: unknown): string | null {
 }
 ```
 
-Remove the task-ID `<Text code>` from cards and drawer titles. For automatic tasks, render the completed amount, running copy, or unavailable copy according to the design. Keep `task.id` only in React keys, state, API paths, log loading, and deletion.
+Remove the task-ID `<Text code>` from cards and drawer titles. For automatic tasks, render the completed amount, running copy, or unavailable copy according to the design. Keep `task.id` only in React keys, state, API paths, log loading, and deletion. Replace the fixed Row/Col card with responsive CSS Grid regions, let statistics and actions wrap, and keep compact metrics on one line.
 
 - [ ] **Step 4: Run focused and full frontend verification**
 

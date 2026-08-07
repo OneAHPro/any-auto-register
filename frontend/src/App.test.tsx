@@ -78,4 +78,13 @@ describe('App primary navigation', () => {
     expect(sider.style.height).toBe('100vh')
     expect(within(sider).getAllByRole('menu')[0].style.overflowY).toBe('auto')
   })
+
+  it('allows the content pane to shrink beside the mobile sidebar', async () => {
+    render(<App />)
+
+    const content = await screen.findByRole('main')
+
+    expect(content.style.minWidth).toBe('0px')
+    expect(content.classList.contains('app-content')).toBe(true)
+  })
 })
