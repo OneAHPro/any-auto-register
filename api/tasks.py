@@ -54,8 +54,14 @@ TASK_SUMMARY_META_KEYS = (
     "deleted_account_count",
     "quota_eligible_failure_count",
     "quota_exhausted_failure_count",
+    "codex2api_account_count",
+    "available_quota_account_count",
+    "estimated_remaining_usd",
     "alert_sent",
     "alert_reason",
+    "quota_alert_sent",
+    "quota_alert_reason",
+    "quota_alert_threshold_usd",
 )
 _CHATGPT_LEADBEE_SECRET_KEYS = {
     CHATGPT_LEADBEE_CODES_KEY,
@@ -1336,11 +1342,17 @@ def _create_chatgpt_relogin_task_record(
                 "deleted_account_count": 0,
                 "quota_eligible_failure_count": 0,
                 "quota_exhausted_failure_count": 0,
+                "codex2api_account_count": 0,
+                "available_quota_account_count": 0,
+                "estimated_remaining_usd": "0.00",
                 "codex2api_delete_on_account_remove_enabled": (
                     delete_linked_credential
                 ),
                 "alert_sent": False,
                 "alert_reason": "pending",
+                "quota_alert_sent": False,
+                "quota_alert_reason": "pending",
+                "quota_alert_threshold_usd": "0.00",
             }
         )
     _task_store.create(
@@ -2079,6 +2091,45 @@ def _run_chatgpt_relogin_task_inner(
     _log(task_id, summary)
 
     if automation and final_status == "done":
+        from services.chatgpt_codex2api_quota import (
+            summarize_available_quota,
+        )
+
+        quota_query_succeeded = False
+        quota_query_error_type = ""
+        try:
+            from services.chatgpt_codex2api_health import (
+                fetch_codex2api_quota_accounts,
+            )
+
+            final_quota_accounts = fetch_codex2api_quota_accounts()
+            quota_report = summarize_available_quota(final_quota_accounts)
+            quota_query_succeeded = True
+        except Exception as exc:
+            quota_query_error_type = type(exc).__name__
+            quota_report = summarize_available_quota(remote_quota_accounts)
+
+        _task_store.update_meta(
+            task_id,
+            codex2api_account_count=quota_report.remote_account_count,
+            available_quota_account_count=quota_report.account_count,
+            estimated_remaining_usd=(
+                f"{quota_report.estimated_remaining_usd:.2f}"
+            ),
+        )
+        if not quota_query_succeeded:
+            _task_store.update_meta(
+                task_id,
+                quota_alert_sent=False,
+                quota_alert_reason="quota_query_failed",
+                quota_query_error_type=quota_query_error_type,
+            )
+            _log(
+                task_id,
+                "[ALERT] Codex2API 最新额度读取失败"
+                f"（{quota_query_error_type}），本轮跳过剩余额度告警",
+            )
+
         try:
             from services.chatgpt_auto_relogin_alerts import (
                 send_auto_relogin_alert,
@@ -2093,7 +2144,7 @@ def _run_chatgpt_relogin_task_inner(
                 deleted_account_count=deleted_account_count,
                 quota_eligible_failure_count=quota_eligible_failure_count,
                 quota_exhausted_failure_count=quota_exhausted_failure_count,
-                quota_accounts=remote_quota_accounts,
+                quota_report=quota_report,
             )
             if not isinstance(alert_result, dict):
                 raise RuntimeError("invalid alert result")
@@ -2131,11 +2182,82 @@ def _run_chatgpt_relogin_task_inner(
         else:
             error_type = str(alert_meta.get("alert_error_type") or "UnknownError")
             _log(task_id, f"[ALERT] 重登失败告警邮件发送失败（{error_type}）")
+
+        if quota_query_succeeded:
+            try:
+                from services.chatgpt_auto_relogin_alerts import (
+                    send_quota_threshold_alert,
+                )
+
+                quota_alert_result = send_quota_threshold_alert(
+                    task_id=task_id,
+                    quota_report=quota_report,
+                    quota_eligible_failure_count=(
+                        quota_eligible_failure_count
+                    ),
+                    quota_exhausted_failure_count=(
+                        quota_exhausted_failure_count
+                    ),
+                    relogin_failed_count=relogin_failed_count,
+                    deleted_account_count=deleted_account_count,
+                )
+                if not isinstance(quota_alert_result, dict):
+                    raise RuntimeError("invalid quota alert result")
+            except Exception as exc:
+                quota_alert_result = {
+                    "sent": False,
+                    "reason": "send_failed",
+                    "error_type": type(exc).__name__,
+                }
+
+            quota_alert_meta = {
+                "quota_alert_sent": bool(quota_alert_result.get("sent")),
+                "quota_alert_reason": str(
+                    quota_alert_result.get("reason") or "unknown"
+                ),
+            }
+            if quota_alert_result.get("threshold_usd") is not None:
+                quota_alert_meta["quota_alert_threshold_usd"] = str(
+                    quota_alert_result["threshold_usd"]
+                )
+            if quota_alert_result.get("error_type"):
+                quota_alert_meta["quota_alert_error_type"] = str(
+                    quota_alert_result["error_type"]
+                )
+            _task_store.update_meta(task_id, **quota_alert_meta)
+
+            quota_alert_reason = quota_alert_meta["quota_alert_reason"]
+            if quota_alert_meta["quota_alert_sent"]:
+                _log(task_id, "[ALERT] 本轮剩余额度不足告警邮件已发送")
+            elif quota_alert_reason == "quota_alert_disabled":
+                _log(task_id, "剩余额度告警未启用：告警阈值为 $0.00")
+            elif quota_alert_reason == "quota_not_below_threshold":
+                _log(
+                    task_id,
+                    "剩余额度告警未触发：当前估算剩余额度未低于配置阈值",
+                )
+            elif quota_alert_reason == "smtp_not_configured":
+                _log(
+                    task_id,
+                    "[ALERT] 当前估算剩余额度已低于阈值，"
+                    "但 SMTP 配置不完整",
+                )
+            else:
+                error_type = str(
+                    quota_alert_meta.get("quota_alert_error_type")
+                    or "UnknownError"
+                )
+                _log(
+                    task_id,
+                    f"[ALERT] 剩余额度不足告警邮件发送失败（{error_type}）",
+                )
     elif automation:
         _task_store.update_meta(
             task_id,
             alert_sent=False,
             alert_reason="task_stopped",
+            quota_alert_sent=False,
+            quota_alert_reason="task_stopped",
         )
 
     _persist_task_snapshot_best_effort(task_id)

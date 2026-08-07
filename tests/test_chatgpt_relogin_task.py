@@ -45,6 +45,24 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         )
         self.alert_sender = alert_sender.start()
         self.addCleanup(alert_sender.stop)
+        quota_alert_sender = mock.patch(
+            "services.chatgpt_auto_relogin_alerts.send_quota_threshold_alert",
+            return_value={
+                "sent": False,
+                "reason": "quota_alert_disabled",
+                "threshold_usd": "0.00",
+                "estimated_remaining_usd": "0.00",
+            },
+        )
+        self.quota_alert_sender = quota_alert_sender.start()
+        self.addCleanup(quota_alert_sender.stop)
+        final_quota_reader = mock.patch(
+            "services.chatgpt_codex2api_health."
+            "fetch_codex2api_quota_accounts",
+            return_value=[],
+        )
+        self.final_quota_reader = final_quota_reader.start()
+        self.addCleanup(final_quota_reader.stop)
 
     def tearDown(self):
         with _task_store._lock:
@@ -786,6 +804,8 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "stopped")
         self.assertEqual(snapshot["registered"], 0)
+        self.final_quota_reader.assert_not_called()
+        self.quota_alert_sender.assert_not_called()
 
     def test_manual_task_keeps_forced_full_login_action(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -810,6 +830,8 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         full_login.assert_called_once()
         refresh_first.assert_not_called()
         self.alert_sender.assert_not_called()
+        self.quota_alert_sender.assert_not_called()
+        self.final_quota_reader.assert_not_called()
         self.assertEqual(_task_store.snapshot(task_id)["success"], 1)
 
     def test_automatic_task_lets_codex2api_self_refresh_before_full_login(self):
@@ -961,7 +983,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             deleted_account_count=0,
             quota_eligible_failure_count=0,
             quota_exhausted_failure_count=0,
-            quota_accounts=[],
+            quota_report=mock.ANY,
         )
         self.assertTrue(
             any(
@@ -969,6 +991,193 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
                 for line in snapshot["logs"]
             )
         )
+
+    def test_automatic_task_uses_one_fresh_final_quota_report_for_both_alerts(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [241],
+            source="schedule",
+            automation=True,
+        )
+        events: list[str] = []
+        final_rows = [
+            {
+                "email": "a@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 53,
+                "billed_7d": 68.26,
+            },
+            {
+                "email": "b@example.com",
+                "remote_status": "rate_limited",
+                "usage_percent_7d": 68,
+                "billed_7d": 81.42,
+            },
+        ]
+
+        def relogin(*_args, **_kwargs):
+            events.append("relogin")
+            return {
+                "ok": True,
+                "relogin_ok": True,
+                "stage": "completed",
+                "account_id": 241,
+                "email": "a@example.com",
+                "message": "完整登录并同步成功",
+            }
+
+        def fetch_final_rows():
+            self.assertEqual(events, ["relogin"])
+            events.append("final_quota")
+            return final_rows
+
+        self.final_quota_reader.side_effect = fetch_final_rows
+        self.alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold": 5,
+        }
+        self.quota_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold_usd": "120.00",
+            "estimated_remaining_usd": "98.85",
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                241: {
+                    "account_id": 241,
+                    "email": "a@example.com",
+                    "state": "remote_missing",
+                    "message": "Codex2API 未找到同邮箱账号",
+                }
+            },
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            side_effect=relogin,
+        ):
+            _run_chatgpt_relogin_task(task_id, [241])
+
+        self.assertEqual(events, ["relogin", "final_quota"])
+        self.final_quota_reader.assert_called_once_with()
+        relogin_report = self.alert_sender.call_args.kwargs["quota_report"]
+        quota_report = self.quota_alert_sender.call_args.kwargs["quota_report"]
+        self.assertIs(relogin_report, quota_report)
+        self.assertEqual(quota_report.remote_account_count, 2)
+        self.assertEqual(quota_report.account_count, 2)
+        self.assertEqual(str(quota_report.estimated_remaining_usd), "98.85")
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        meta = snapshot["meta"]
+        self.assertEqual(meta["codex2api_account_count"], 2)
+        self.assertEqual(meta["available_quota_account_count"], 2)
+        self.assertEqual(meta["estimated_remaining_usd"], "98.85")
+        self.assertTrue(meta["quota_alert_sent"])
+        self.assertEqual(meta["quota_alert_reason"], "sent")
+        self.assertEqual(meta["quota_alert_threshold_usd"], "120.00")
+        logs = "\n".join(snapshot["logs"])
+        self.assertIn("本轮重登失败告警邮件已发送", logs)
+        self.assertIn("本轮剩余额度不足告警邮件已发送", logs)
+
+    def test_final_quota_query_failure_uses_initial_report_for_relogin_alert(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [242],
+            source="schedule",
+            automation=True,
+        )
+        initial_rows = [
+            {
+                "email": "initial@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 53,
+                "billed_7d": 68.26,
+            }
+        ]
+
+        def inspect(_account_ids, *, quota_accounts=None, **_kwargs):
+            quota_accounts.extend(initial_rows)
+            return {
+                242: {
+                    "account_id": 242,
+                    "email": "initial@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            }
+
+        self.final_quota_reader.side_effect = RuntimeError("secret detail")
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            side_effect=inspect,
+        ):
+            _run_chatgpt_relogin_task(task_id, [242])
+
+        report = self.alert_sender.call_args.kwargs["quota_report"]
+        self.assertEqual(report.remote_account_count, 1)
+        self.assertEqual(report.account_count, 1)
+        self.assertEqual(str(report.estimated_remaining_usd), "60.53")
+        self.quota_alert_sender.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["meta"]["quota_alert_reason"], "quota_query_failed")
+        self.assertEqual(
+            snapshot["meta"]["quota_query_error_type"],
+            "RuntimeError",
+        )
+        self.assertNotIn("secret detail", "\n".join(snapshot["logs"]))
+
+    def test_quota_alert_exception_does_not_change_terminal_task_outcome(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [243],
+            source="schedule",
+            automation=True,
+        )
+        self.final_quota_reader.return_value = [
+            {
+                "email": "healthy@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 50,
+            }
+        ]
+        self.quota_alert_sender.side_effect = RuntimeError("smtp secret detail")
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                243: {
+                    "account_id": 243,
+                    "email": "healthy@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            },
+        ):
+            _run_chatgpt_relogin_task(task_id, [243])
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 1)
+        self.assertFalse(snapshot["meta"]["quota_alert_sent"])
+        self.assertEqual(snapshot["meta"]["quota_alert_reason"], "send_failed")
+        self.assertEqual(
+            snapshot["meta"]["quota_alert_error_type"],
+            "RuntimeError",
+        )
+        self.assertNotIn("smtp secret detail", "\n".join(snapshot["logs"]))
 
     def test_automatic_task_counts_quota_available_and_exhausted_failures(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -1037,7 +1246,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             deleted_account_count=0,
             quota_eligible_failure_count=3,
             quota_exhausted_failure_count=3,
-            quota_accounts=list(health.values()),
+            quota_report=mock.ANY,
         )
 
     def test_automatic_task_keeps_all_exhausted_failures_below_alert_threshold(self):
@@ -1190,7 +1399,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             deleted_account_count=17,
             quota_eligible_failure_count=0,
             quota_exhausted_failure_count=0,
-            quota_accounts=[],
+            quota_report=mock.ANY,
         )
 
     def test_cleanup_failure_counts_as_relogin_failure_but_not_deleted(self):
