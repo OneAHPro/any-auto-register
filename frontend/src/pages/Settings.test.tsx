@@ -68,6 +68,33 @@ describe('Settings ChatGPT automatic relogin config', () => {
       if (path === '/automations/chatgpt-relogin') {
         return { state: 'disabled', eligible_accounts: 0 }
       }
+      if (path === '/mail-imports/providers') {
+        return {
+          items: [{
+            type: 'microsoft',
+            label: 'Microsoft',
+            description: '',
+            content_placeholder: '',
+            helper_text: '',
+            supports_filename: false,
+            filename_label: '',
+            filename_placeholder: '',
+            preview_empty_text: '',
+          }],
+        }
+      }
+      if (path.startsWith('/mail-imports/snapshot?')) {
+        return {
+          type: 'microsoft',
+          label: 'Microsoft',
+          count: 0,
+          items: [],
+          truncated: false,
+          filename: '',
+          path: '',
+          pool_dir: '',
+        }
+      }
       throw new Error(`unexpected request: ${path}`)
     })
   })
@@ -76,14 +103,13 @@ describe('Settings ChatGPT automatic relogin config', () => {
 
   it('rehydrates string config and saves all normalized automation values', async () => {
     const user = userEvent.setup()
-    render(<Settings />)
-
-    await user.click(screen.getByText('Codex2API'))
+    render(<Settings page="codex2api" />)
     const interval = await screen.findByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
     const threshold = screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement
     const quotaThreshold = screen.getByRole('spinbutton', { name: 'Codex2API 剩余额度告警阈值（美元）' }) as HTMLInputElement
     const barkEndpoint = screen.getByLabelText('Bark 推送地址') as HTMLInputElement
+    await waitFor(() => expect(interval.value).toBe('45'))
     expect(interval.value).toBe('45')
     expect(concurrency.value).toBe('3')
     expect(threshold.value).toBe('5')
@@ -119,12 +145,11 @@ describe('Settings ChatGPT automatic relogin config', () => {
       codex2api_delete_on_account_remove_enabled: '1',
     }
     const user = userEvent.setup()
-    render(<Settings />)
-
-    await user.click(screen.getByText('Codex2API'))
+    render(<Settings page="codex2api" />)
     const removalSwitch = await screen.findByRole('switch', {
       name: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
     })
+    await waitFor(() => expect(removalSwitch.getAttribute('aria-checked')).toBe('true'))
     expect(screen.getByText('删除联动')).toBeTruthy()
     expect(
       screen.getByText('自动清理、单个删除和批量删除均生效；远端删除失败时保留本地账号。'),
@@ -150,10 +175,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
   })
 
   it('defaults the Codex2API account-removal switch to off when the key is missing', async () => {
-    const user = userEvent.setup()
-    render(<Settings />)
-
-    await user.click(screen.getByText('Codex2API'))
+    render(<Settings page="codex2api" />)
     const removalSwitch = await screen.findByRole('switch', {
       name: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
     })
@@ -165,14 +187,11 @@ describe('Settings ChatGPT automatic relogin config', () => {
     ['blank interval and missing concurrency', { mail_provider: 'luckmail', chatgpt_auto_relogin_interval_minutes: '   ' }],
   ])('uses scheduler defaults for %s', async (_, response) => {
     configResponse = response
-    const user = userEvent.setup()
-    render(<Settings />)
+    render(<Settings page="codex2api" />)
 
     await waitFor(() => {
       expect(apiFetch).toHaveBeenCalledWith('/config')
     })
-    await user.click(screen.getByText('Codex2API'))
-
     await waitFor(() => {
       expect((screen.getByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement).value).toBe('2')
       expect((screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement).value).toBe('10')
@@ -278,5 +297,34 @@ describe('Settings ChatGPT automatic relogin config', () => {
 
     const alert = await screen.findByRole('alert')
     expect(alert.textContent).toContain('保存配置失败，请稍后重试')
+  })
+
+  it('renders Codex2API as a standalone page without the global registration tab', async () => {
+    render(<Settings page="codex2api" />)
+
+    expect(await screen.findByRole('heading', { name: 'Codex2API' })).toBeTruthy()
+    expect(screen.getByText('删除联动')).toBeTruthy()
+    expect(screen.getByLabelText('Codex2API 鉴权巡检间隔（分钟）')).toBeTruthy()
+    expect(screen.getByText('告警通知')).toBeTruthy()
+    expect(screen.queryByText('注册设置')).toBeNull()
+  })
+
+  it('renders mailbox import as a standalone page with its save button', async () => {
+    render(<Settings page="mail-import" />)
+
+    expect(await screen.findByRole('heading', { name: '邮箱导入' })).toBeTruthy()
+    expect(await screen.findByRole('button', { name: '确认导入' })).toBeTruthy()
+    expect(screen.getByRole('button', { name: /保存配置/ })).toBeTruthy()
+    expect(screen.queryByText('注册设置')).toBeNull()
+  })
+
+  it('keeps global settings tabs focused on global configuration', async () => {
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    expect(await screen.findByText('注册设置')).toBeTruthy()
+    expect(screen.queryByText('Codex2API')).toBeNull()
+    await user.click(screen.getByText('邮箱服务'))
+    expect(screen.queryByRole('button', { name: '确认导入' })).toBeNull()
   })
 })
