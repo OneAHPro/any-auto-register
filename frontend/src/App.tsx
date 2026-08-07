@@ -12,6 +12,8 @@ import {
   LogoutOutlined,
   PlayCircleOutlined,
   MobileOutlined,
+  ApiOutlined,
+  ImportOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import Dashboard from '@/pages/Dashboard'
@@ -98,6 +100,8 @@ function AppContent() {
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
     if (path === '/sms-pool') return ['/sms-pool']
+    if (path === '/codex2api') return ['/codex2api']
+    if (path === '/mail-import') return ['/mail-import']
     if (path === '/settings') return ['/settings']
     if (path === '/running-tasks') return ['/running-tasks']
     return ['/']
@@ -139,6 +143,16 @@ function AppContent() {
       key: '/sms-pool',
       icon: <MobileOutlined />,
       label: 'SMS接码池',
+    },
+    {
+      key: '/codex2api',
+      icon: <ApiOutlined />,
+      label: 'Codex2API',
+    },
+    {
+      key: '/mail-import',
+      icon: <ImportOutlined />,
+      label: '邮箱导入',
     },
     {
       key: '/settings',
@@ -253,6 +267,8 @@ function AppContent() {
             <Route path="/proxies" element={<Proxies />} />
             <Route path="/sms-pool" element={<SmsPool />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/codex2api" element={<Settings page="codex2api" />} />
+            <Route path="/mail-import" element={<Settings page="mail-import" />} />
           </Routes>
         </Content>
       </Layout>
