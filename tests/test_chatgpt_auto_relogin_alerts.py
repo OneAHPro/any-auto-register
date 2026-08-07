@@ -88,6 +88,74 @@ def test_invalid_rt_count_alone_does_not_open_smtp(monkeypatch):
     }
 
 
+def test_exhausted_failures_never_open_smtp(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP", pytest.fail)
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", pytest.fail)
+    result = alerts.send_auto_relogin_alert(
+        task_id="task-exhausted",
+        total_accounts=30,
+        successful_accounts=0,
+        invalid_rt_count=30,
+        relogin_failed_count=30,
+        deleted_account_count=30,
+        quota_eligible_failure_count=0,
+        quota_exhausted_failure_count=30,
+        quota_accounts=[],
+        config={**BASE_CONFIG, "chatgpt_auto_relogin_alert_threshold": "5"},
+    )
+
+    assert result == {
+        "sent": False,
+        "reason": "below_threshold",
+        "threshold": 5,
+    }
+
+
+def test_available_failure_alert_contains_remaining_usd(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+    result = alerts.send_auto_relogin_alert(
+        task_id="task-quota",
+        total_accounts=8,
+        successful_accounts=2,
+        invalid_rt_count=8,
+        relogin_failed_count=8,
+        deleted_account_count=3,
+        quota_eligible_failure_count=5,
+        quota_exhausted_failure_count=3,
+        quota_accounts=[
+            {
+                "email": "a@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 53,
+                "billed_7d": 68.26,
+            },
+            {
+                "email": "b@example.com",
+                "remote_status": "rate_limited",
+                "usage_percent_7d": 68,
+                "billed_7d": 81.42,
+            },
+        ],
+        config={**BASE_CONFIG, "chatgpt_auto_relogin_alert_threshold": "5"},
+    )
+
+    assert result["sent"] is True
+    message = FakeSMTP.instances[0].message
+    plain = message.get_body(preferencelist=("plain",)).get_content()
+    html = message.get_body(preferencelist=("html",)).get_content()
+    assert "仍有额度的重登失败：5" in plain
+    assert "额度已用完的重登失败：3" in plain
+    assert "正常可用账号：2" in plain
+    assert "估算剩余额度合计：$98.85" in plain
+    assert "a@example.com" in html
+    assert "$60.53" in html
+    assert "重置时间" not in message.as_string()
+
+
 @pytest.mark.parametrize("configured_threshold", ["", "not-a-number", "0", "-1"])
 def test_invalid_threshold_falls_back_to_twenty(monkeypatch, configured_threshold):
     from services import chatgpt_auto_relogin_alerts as alerts
@@ -372,7 +440,7 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     assert plain.index("账号总数：0") < plain.index("成功账号：0")
     assert plain.index("成功账号：0") < plain.index("鉴权失败：0")
     assert plain.index("鉴权失败：0") < plain.index("重登失败：20")
-    assert "鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。" in plain
+    assert "鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。" in plain
     assert "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。" in plain
     assert "2026-08-04 20:34:56（北京时间）" in plain
     assert "<script>" not in html

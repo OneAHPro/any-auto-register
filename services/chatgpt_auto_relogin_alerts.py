@@ -9,7 +9,7 @@ import logging
 import re
 import smtplib
 import ssl
-from typing import Mapping
+from typing import Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 
@@ -87,11 +87,23 @@ def _build_message(
     relogin_failed_count: int,
     threshold: int,
     deleted_account_count: int = 0,
+    quota_eligible_failure_count: int | None = None,
+    quota_exhausted_failure_count: int = 0,
+    quota_report=None,
 ) -> EmailMessage:
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    if quota_eligible_failure_count is None:
+        quota_eligible_failure_count = relogin_failed_count
+    quota_report = quota_report or AvailableQuotaReport(
+        account_count=0,
+        estimated_remaining_usd=0,
+        accounts=(),
+    )
     message = EmailMessage()
     message["Subject"] = (
         "[Any Auto Register] ChatGPT 重登失败账号告警"
-        f"（{relogin_failed_count} 个）"
+        f"（{quota_eligible_failure_count} 个）"
     )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
@@ -104,15 +116,41 @@ def _build_message(
         f"鉴权失败：{invalid_rt_count}\n"
         f"重登失败：{relogin_failed_count}\n"
         f"其中已删除或停用账号：{deleted_account_count}\n"
+        f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
+        f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
+        f"正常可用账号：{quota_report.account_count}\n"
+        f"估算剩余额度合计：${quota_report.estimated_remaining_usd:.2f}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
         "已删除或停用账号属于重登失败账号的子集。"
-        "鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。"
+        "鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。"
         "两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。\n\n"
+        "正常可用账号额度为按 7d 使用率和已用成本计算的估算值，金额单位为美元。\n"
+        "正常账号明细：\n"
+        + "".join(
+            f"- {row.email or ('账号 ' + str(row.remote_id or ''))}："
+            f"使用率 {_format_usage_percent(row.usage_percent)}%，"
+            f"已用 ${row.billed_usd:.2f}，估算剩余 ${row.remaining_usd:.2f}\n"
+            for row in quota_report.accounts
+        )
+        + "\n"
         "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。\n"
     )
     escaped_task_id = escape(task_id)
     escaped_occurred_at = escape(occurred_at)
+    html_quota_rows = "".join(
+        "<tr>"
+        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
+        f"{escape(row.email or ('账号 ' + str(row.remote_id or '')))}</td>"
+        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
+        f"{escape(_format_usage_percent(row.usage_percent))}%</td>"
+        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
+        f"${row.billed_usd:.2f}</td>"
+        f"<td style=\"padding:8px;border-bottom:1px solid #e5e7eb;\">"
+        f"${row.remaining_usd:.2f}</td>"
+        "</tr>"
+        for row in quota_report.accounts
+    )
     message.add_alternative(
         f"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -144,9 +182,20 @@ def _build_message(
           </tr></table>
         </td></tr>
         <tr><td style="padding:0 20px 12px;"><strong>其中已删除或停用账号：{deleted_account_count}</strong>（属于重登失败账号的子集）</td></tr>
+        <tr><td style="padding:0 20px 12px;">仍有额度的重登失败：{quota_eligible_failure_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">额度已用完的重登失败：{quota_exhausted_failure_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;">正常可用账号：{quota_report.account_count}</td></tr>
+        <tr><td style="padding:0 20px 12px;"><strong>估算剩余额度合计：${quota_report.estimated_remaining_usd:.2f}</strong>（美元）</td></tr>
+        <tr><td style="padding:0 20px 20px;">
+          <strong>正常账号额度明细</strong>
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="margin-top:8px;border-collapse:collapse;">
+            <tr style="background:#f3f4f6;"><th align="left" style="padding:8px;">账号</th><th align="left" style="padding:8px;">7d 使用率</th><th align="left" style="padding:8px;">已用成本</th><th align="left" style="padding:8px;">估算剩余</th></tr>
+            {html_quota_rows or '<tr><td colspan="4" style="padding:8px;">本轮没有可计算的正常账号额度数据</td></tr>'}
+          </table>
+        </td></tr>
         <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
         <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
-        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；重登失败数是本邮件的触发依据。两项为过程指标，可能包含同一账号，四项统计不应相加核对总数。</td></tr>
+        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。额度明细为按 7d 使用率和已用成本计算的美元估算值。</td></tr>
         <tr><td style="padding:0 20px 24px;">请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。</td></tr>
       </table>
     </td></tr></table>
@@ -155,6 +204,13 @@ def _build_message(
         subtype="html",
     )
     return message
+
+
+def _format_usage_percent(value) -> str:
+    text = format(value, "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
+    return text or "0"
 
 
 def _build_test_message(
@@ -268,6 +324,9 @@ def send_auto_relogin_alert(
     invalid_rt_count: int,
     relogin_failed_count: int,
     deleted_account_count: int = 0,
+    quota_eligible_failure_count: int | None = None,
+    quota_exhausted_failure_count: int = 0,
+    quota_accounts: Iterable[Mapping[str, object]] = (),
     config: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Send one alert when relogin failures reach the configured threshold."""
@@ -279,11 +338,20 @@ def send_auto_relogin_alert(
     )
     invalid_count = _non_negative_int(invalid_rt_count)
     failed_count = _non_negative_int(relogin_failed_count)
+    eligible_count = (
+        failed_count
+        if quota_eligible_failure_count is None
+        else _non_negative_int(quota_eligible_failure_count)
+    )
+    exhausted_count = min(
+        _non_negative_int(quota_exhausted_failure_count),
+        failed_count,
+    )
     deleted_count = min(
         _non_negative_int(deleted_account_count),
         failed_count,
     )
-    if failed_count < threshold:
+    if eligible_count < threshold:
         return {
             "sent": False,
             "reason": "below_threshold",
@@ -303,6 +371,9 @@ def send_auto_relogin_alert(
             "threshold": threshold,
         }
 
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    quota_report = summarize_available_quota(quota_accounts)
     message = _build_message(
         sender=sender,
         recipients=recipients,
@@ -311,6 +382,9 @@ def send_auto_relogin_alert(
         successful_accounts=_non_negative_int(successful_accounts),
         invalid_rt_count=invalid_count,
         relogin_failed_count=failed_count,
+        quota_eligible_failure_count=eligible_count,
+        quota_exhausted_failure_count=exhausted_count,
+        quota_report=quota_report,
         threshold=threshold,
         deleted_account_count=deleted_count,
     )
