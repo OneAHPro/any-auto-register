@@ -152,11 +152,16 @@ def test_available_failure_alert_contains_remaining_usd(monkeypatch):
     assert "仍有额度的重登失败：5" in plain
     assert "额度已用完的重登失败：3" in plain
     assert "正常可用账号：2" in plain
-    assert "Codex2API 账号总数：2" in plain
+    assert "账号总数：2" in plain
     assert "当前估算剩余额度：$98.85" in plain
     assert message["Subject"] == (
-        "$98.85｜正常可用账号 2 个｜ChatGPT 重登失败账号告警"
+        "$98.85｜正常可用账号 2 个｜Codex 重登失败账号告警"
     )
+    assert "Codex 重登失败账号告警" in html
+    assert "仍有额度的重登失败" in html
+    assert "其中封禁或删除" in html
+    assert "正常可用账号" in html
+    assert "ChatGPT 重登失败账号告警" not in html
     for account_detail in (
         "a@example.com",
         "b@example.com",
@@ -199,13 +204,19 @@ def test_quota_threshold_alert_sends_below_threshold_every_call(monkeypatch):
     assert len(FakeSMTP.instances) == 2
     message = FakeSMTP.instances[0].message
     assert message["Subject"] == (
-        "$98.85｜正常可用账号 2 个｜Codex2API 剩余额度不足告警"
+        "$98.85｜正常可用账号 2 个｜Codex 剩余额度不足告警"
     )
     plain = message.get_body(preferencelist=("plain",)).get_content()
     html = message.get_body(preferencelist=("html",)).get_content()
-    assert "额度告警阈值：$120.00" in plain
+    assert "额度告警阈值" not in plain
     assert "当前估算剩余额度：$98.85" in plain
-    assert "Codex2API 账号总数：2" in plain
+    assert "账号总数：2" in plain
+    assert "Codex 剩余额度不足告警" in html
+    assert "账号概览" in html
+    assert "本轮重登失败" in html
+    assert "Codex2API 账号总数" not in plain
+    assert "Codex2API 账号总数" not in html
+    assert "额度告警阈值" not in html
     assert "a@example.com" not in plain
     assert "a@example.com" not in html
 
@@ -338,8 +349,9 @@ def test_deleted_subset_is_clamped_to_relogin_failures_in_plain_and_html(monkeyp
     plain = message.get_body(preferencelist=("plain",)).get_content()
     html = message.get_body(preferencelist=("html",)).get_content()
     assert "其中已删除或停用账号：20" in plain
-    assert "其中已删除或停用账号：20" in html
-    assert "已删除或停用账号属于重登失败账号的子集" in html
+    assert "其中封禁或删除" in html
+    assert html.count(">20</div>") >= 2
+    assert "账号重登失败、被封禁或删除达到阈值时才触发" in html
     assert "999" not in plain
     assert "999" not in html
 
@@ -531,7 +543,7 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     plain = message.get_body(preferencelist=("plain",)).get_content()
     html = message.get_body(preferencelist=("html",)).get_content()
     assert message["Subject"] == (
-        "$0.00｜正常可用账号 0 个｜ChatGPT 重登失败账号告警"
+        "$0.00｜正常可用账号 0 个｜Codex 重登失败账号告警"
     )
     assert plain.index("账号总数：0") < plain.index("成功账号：0")
     assert plain.index("成功账号：0") < plain.index("鉴权失败：0")
@@ -541,9 +553,14 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     assert "2026-08-04 20:34:56（北京时间）" in plain
     assert "<script>" not in html
     assert "&lt;script&gt;alert(&#x27;x&#x27;)&lt;/script&gt;" in html
-    assert "本轮自动鉴权已完成，重登失败账号数已达到告警阈值。" in html
+    assert "本轮仍有剩余额度的账号重登失败数量已达到你设置的告警阈值。" in html
     assert "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。" in html
-    assert html.count('width="25%"') == 4
+    assert html.count('width="33.33%"') == 3
+    assert "ANY AUTO REGISTER · CODEX" in html
+    assert "账号异常" in html
+    assert "其中封禁或删除" in html
+    assert "额度已用完的失败账号不参与告警" in html
+    assert "font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Helvetica Neue',Arial,sans-serif" in html
     assert "@media only screen and (max-width: 600px)" in html
     assert "smtp-test-credential" not in plain
     assert "smtp-test-credential" not in html

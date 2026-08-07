@@ -103,6 +103,82 @@ def _quota_alert_threshold(value: object) -> Decimal:
     return parsed.quantize(USD_CENT, rounding=ROUND_HALF_UP)
 
 
+def _build_alert_html(
+    *,
+    title: str,
+    lead: str,
+    badge: str,
+    badge_color: str,
+    badge_border: str,
+    badge_background: str,
+    amount_label: str,
+    amount_usd: Decimal,
+    section_label: str,
+    metrics: tuple[tuple[str, int], tuple[str, int], tuple[str, int]],
+    notice_title: str,
+    notice_body: str,
+    notice_color: str,
+    task_id: str,
+    occurred_at: str,
+    footer_note: str,
+) -> str:
+    metric_cells = "".join(
+        f"""
+            <td class="metric-cell" width="33.33%" valign="middle" style="height:94px;padding:14px 8px;border:1px solid #e1e5e9;border-radius:10px;background:#f6f7f8;text-align:center;vertical-align:middle;">
+              <div style="margin:0 0 7px;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif;font-size:27px;font-weight:700;line-height:1;color:#161d26;">{escape(str(value))}</div>
+              <div style="color:#737e89;font-size:11px;font-weight:500;line-height:1.25;white-space:nowrap;">{escape(label)}</div>
+            </td>"""
+        for label, value in metrics
+    )
+    escaped_notice_color = escape(notice_color, quote=True)
+    return f"""<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      @media only screen and (max-width: 600px) {{
+        .page-pad {{ padding:12px !important; }}
+        .content-pad {{ padding-left:22px !important; padding-right:22px !important; }}
+        .metric-cell {{ display:block !important; width:100% !important; height:auto !important; box-sizing:border-box !important; margin-bottom:10px !important; }}
+      }}
+    </style>
+  </head>
+  <body style="margin:0;padding:0;background:#eef1f4;color:#161d26;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Text','PingFang SC','Helvetica Neue',Arial,sans-serif;-webkit-font-smoothing:antialiased;">
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#eef1f4">
+      <tr><td class="page-pad" align="center" style="padding:34px 12px;">
+        <table role="presentation" width="680" cellspacing="0" cellpadding="0" border="0" bgcolor="#ffffff" style="max-width:680px;width:100%;overflow:hidden;border:1px solid #e1e5e9;border-radius:16px;background:#ffffff;">
+          <tr><td height="5" bgcolor="#161d26" style="height:5px;line-height:5px;font-size:0;">&nbsp;</td></tr>
+          <tr><td class="content-pad" style="padding:28px 38px 23px;border-bottom:1px solid #eceff2;">
+            <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr>
+              <td style="color:#77818d;font-size:10px;font-weight:650;letter-spacing:1.3px;">ANY AUTO REGISTER · CODEX</td>
+              <td align="right"><span style="display:inline-block;padding:5px 9px;border:1px solid {escape(badge_border, quote=True)};border-radius:99px;color:{escape(badge_color, quote=True)};background:{escape(badge_background, quote=True)};font-size:10px;font-weight:650;">{escape(badge)}</span></td>
+            </tr></table>
+          </td></tr>
+          <tr><td class="content-pad" style="padding:32px 38px 28px;">
+            <h2 style="margin:0 0 9px;font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','PingFang SC','Helvetica Neue',Arial,sans-serif;font-size:24px;font-weight:700;line-height:1.3;letter-spacing:-0.5px;">{escape(title)}</h2>
+            <p style="margin:0 0 28px;color:#707985;font-size:13px;line-height:1.55;">{escape(lead)}</p>
+            <div style="margin-bottom:5px;color:#7a8490;font-size:11px;font-weight:500;">{escape(amount_label)}</div>
+            <div style="font-family:-apple-system,BlinkMacSystemFont,'SF Pro Display','Helvetica Neue',Arial,sans-serif;font-size:46px;font-weight:750;line-height:1.08;letter-spacing:-2px;color:#161d26;">${amount_usd:.2f}</div>
+            <div style="margin:31px 0 11px;color:#858f9a;font-size:11px;font-weight:600;">{escape(section_label)}</div>
+            <table role="presentation" width="100%" cellspacing="10" cellpadding="0" border="0"><tr>{metric_cells}
+            </tr></table>
+            <div style="margin-top:22px;padding:14px 16px;border-left:3px solid {escaped_notice_color};background:#f7f8f9;color:#5f6974;font-size:11px;line-height:1.7;">
+              <strong style="color:{escaped_notice_color};font-weight:650;">{escape(notice_title)}</strong><br>{escape(notice_body)}
+            </div>
+          </td></tr>
+          <tr><td class="content-pad" style="padding:18px 38px 22px;border-top:1px solid #eceff2;background:#fbfbfc;color:#9099a3;font-size:9px;line-height:1.85;">
+            完成时间：{escape(occurred_at)}<br>
+            <span style="color:#77818c;font-family:'SFMono-Regular',SFMono-Regular,ui-monospace,Menlo,monospace;word-break:break-all;">任务 ID：{escape(task_id)}</span><br>
+            {escape(footer_note)}
+          </td></tr>
+        </table>
+      </td></tr>
+    </table>
+  </body>
+</html>"""
+
+
 def _build_message(
     *,
     sender: str,
@@ -128,13 +204,13 @@ def _build_message(
     message = EmailMessage()
     message["Subject"] = _business_alert_subject(
         quota_report,
-        "ChatGPT 重登失败账号告警",
+        "Codex 重登失败账号告警",
     )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     occurred_at = _format_beijing_time()
     message.set_content(
-        "ChatGPT 自动认证周期触发了邮件告警。\n\n"
+        "Codex 自动认证周期触发了邮件告警。\n\n"
         f"任务 ID：{task_id}\n"
         f"账号总数：{total_accounts}\n"
         f"成功账号：{successful_accounts}\n"
@@ -144,7 +220,7 @@ def _build_message(
         f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
         f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
         f"正常可用账号：{quota_report.account_count}\n"
-        f"Codex2API 账号总数：{quota_report.remote_account_count}\n"
+        f"账号总数：{quota_report.remote_account_count}\n"
         f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
@@ -154,52 +230,33 @@ def _build_message(
         "正常可用账号额度为按 7 天用量百分比和已用成本计算的估算值，金额单位为美元。\n\n"
         "请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。\n"
     )
-    escaped_task_id = escape(task_id)
-    escaped_occurred_at = escape(occurred_at)
     message.add_alternative(
-        f"""<!DOCTYPE html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="utf-8">
-    <style>
-      .metric-cell {{ padding: 16px 10px; text-align: center; vertical-align: top; }}
-      .metric-total {{ background: #e8eef5; color: #425466; }}
-      .metric-success {{ background: #e8f5e9; color: #2e7d32; }}
-      .metric-invalid {{ background: #fff3e0; color: #e67e22; }}
-      .metric-failed {{ background: #ffebee; color: #c62828; }}
-      @media only screen and (max-width: 600px) {{
-        .metric-cell {{ display: block !important; width: 100% !important; box-sizing: border-box; }}
-      }}
-    </style>
-  </head>
-  <body style="margin:0; padding:0; color:#1f2937; font-family:Arial, 'Microsoft YaHei', sans-serif;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center">
-      <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="max-width:640px; width:100%;">
-        <tr><td style="padding:24px 20px 12px;"><h2 style="margin:0;">ChatGPT 重登失败账号告警</h2></td></tr>
-        <tr><td style="padding:0 20px 20px;">本轮自动鉴权已完成，重登失败账号数已达到告警阈值。</td></tr>
-        <tr><td style="padding:0 20px 20px;">任务 ID：{escaped_task_id}</td></tr>
-        <tr><td style="padding:0 20px 20px;">
-          <table role="presentation" width="100%" cellspacing="4" cellpadding="0" border="0"><tr>
-            <td class="metric-cell metric-total" width="25%"><strong>账号总数</strong><br>{total_accounts}</td>
-            <td class="metric-cell metric-success" width="25%"><strong>成功账号</strong><br>{successful_accounts}</td>
-            <td class="metric-cell metric-invalid" width="25%"><strong>鉴权失败</strong><br>{invalid_rt_count}</td>
-            <td class="metric-cell metric-failed" width="25%"><strong>重登失败</strong><br>{relogin_failed_count}</td>
-          </tr></table>
-        </td></tr>
-        <tr><td style="padding:0 20px 12px;"><strong>其中已删除或停用账号：{deleted_account_count}</strong>（属于重登失败账号的子集）</td></tr>
-        <tr><td style="padding:0 20px 12px;">仍有额度的重登失败：{quota_eligible_failure_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">额度已用完的重登失败：{quota_exhausted_failure_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">正常可用账号：{quota_report.account_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">Codex2API 账号总数：{quota_report.remote_account_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;"><strong>当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}</strong>（美元）</td></tr>
-        <tr><td style="padding:0 20px 12px;">告警阈值：{threshold}</td></tr>
-        <tr><td style="padding:0 20px 20px;">完成时间：{escaped_occurred_at}</td></tr>
-        <tr><td style="padding:0 20px 24px;">已删除或停用账号属于重登失败账号的子集。鉴权失败数仅用于展示；仍有额度的重登失败数是本邮件的触发依据。剩余额度为按 7 天用量百分比和已用成本计算的美元估算值。</td></tr>
-        <tr><td style="padding:0 20px 24px;">请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。</td></tr>
-      </table>
-    </td></tr></table>
-  </body>
-</html>""",
+        _build_alert_html(
+            title="Codex 重登失败账号告警",
+            lead="本轮仍有剩余额度的账号重登失败数量已达到你设置的告警阈值。",
+            badge="账号异常",
+            badge_color="#9a4b10",
+            badge_border="#f2d4b5",
+            badge_background="#fff7ed",
+            amount_label="当前正常账号估算剩余额度",
+            amount_usd=quota_report.estimated_remaining_usd,
+            section_label="本轮异常概览",
+            metrics=(
+                ("仍有额度的重登失败", quota_eligible_failure_count),
+                ("其中封禁或删除", deleted_account_count),
+                ("正常可用账号", quota_report.account_count),
+            ),
+            notice_title="告警判定规则",
+            notice_body=(
+                "只有仍有额度的账号重登失败、被封禁或删除达到阈值时才触发；"
+                "额度已用完的失败账号不参与告警。"
+                f"本轮额度已用完的重登失败为 {quota_exhausted_failure_count} 个，已自动忽略。"
+            ),
+            notice_color="#7c3d0c",
+            task_id=task_id,
+            occurred_at=occurred_at,
+            footer_note="请在 Any Auto Register 的“任务运行”页面查看本轮详细记录。",
+        ),
         subtype="html",
     )
     return message
@@ -211,7 +268,6 @@ def _build_quota_threshold_message(
     recipients: list[str],
     task_id: str,
     quota_report: AvailableQuotaReport,
-    threshold_usd: Decimal,
     quota_eligible_failure_count: int,
     quota_exhausted_failure_count: int,
     relogin_failed_count: int,
@@ -220,18 +276,17 @@ def _build_quota_threshold_message(
     message = EmailMessage()
     message["Subject"] = _business_alert_subject(
         quota_report,
-        "Codex2API 剩余额度不足告警",
+        "Codex 剩余额度不足告警",
     )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     occurred_at = _format_beijing_time()
     message.set_content(
-        "Codex2API 当前正常可用账号的估算剩余额度低于告警阈值。\n\n"
+        "Codex 当前正常可用账号的估算剩余额度低于告警阈值。\n\n"
         f"任务 ID：{task_id}\n"
         f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
-        f"额度告警阈值：${threshold_usd:.2f}\n"
         f"正常可用账号：{quota_report.account_count}\n"
-        f"Codex2API 账号总数：{quota_report.remote_account_count}\n"
+        f"账号总数：{quota_report.remote_account_count}\n"
         f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
         f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
         f"重登失败：{relogin_failed_count}\n"
@@ -241,29 +296,33 @@ def _build_quota_threshold_message(
         "自动化流程每次检测到低于阈值时都会发送本告警。\n"
     )
     message.add_alternative(
-        f"""<!DOCTYPE html>
-<html lang="zh-CN">
-  <head><meta charset="utf-8"></head>
-  <body style="margin:0;padding:0;color:#1f2937;font-family:Arial,'Microsoft YaHei',sans-serif;">
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0"><tr><td align="center">
-      <table role="presentation" width="640" cellspacing="0" cellpadding="0" border="0" style="max-width:640px;width:100%;">
-        <tr><td style="padding:24px 20px 12px;"><h2 style="margin:0;">Codex2API 剩余额度不足告警</h2></td></tr>
-        <tr><td style="padding:0 20px 20px;">当前正常可用账号的估算剩余额度低于告警阈值。</td></tr>
-        <tr><td style="padding:0 20px 12px;">任务 ID：{escape(task_id)}</td></tr>
-        <tr><td style="padding:0 20px 12px;"><strong>当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}</strong></td></tr>
-        <tr><td style="padding:0 20px 12px;">额度告警阈值：${threshold_usd:.2f}</td></tr>
-        <tr><td style="padding:0 20px 12px;">正常可用账号：{quota_report.account_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">Codex2API 账号总数：{quota_report.remote_account_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">仍有额度的重登失败：{quota_eligible_failure_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">额度已用完的重登失败：{quota_exhausted_failure_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">重登失败：{relogin_failed_count}</td></tr>
-        <tr><td style="padding:0 20px 12px;">其中已删除或停用账号：{deleted_account_count}</td></tr>
-        <tr><td style="padding:0 20px 20px;">完成时间：{escape(occurred_at)}</td></tr>
-        <tr><td style="padding:0 20px 24px;">剩余额度为按正常账号的 7 天用量百分比和已用成本计算的美元估算值。自动化流程每次检测到低于阈值时都会发送本告警。</td></tr>
-      </table>
-    </td></tr></table>
-  </body>
-</html>""",
+        _build_alert_html(
+            title="Codex 剩余额度不足告警",
+            lead="当前正常可用账号的估算剩余额度已低于告警阈值。",
+            badge="额度不足",
+            badge_color="#b83b30",
+            badge_border="#ffd0ca",
+            badge_background="#fff2f0",
+            amount_label="当前估算剩余额度",
+            amount_usd=quota_report.estimated_remaining_usd,
+            section_label="账号概览",
+            metrics=(
+                ("正常可用账号", quota_report.account_count),
+                ("账号总数", quota_report.remote_account_count),
+                ("本轮重登失败", relogin_failed_count),
+            ),
+            notice_title="持续告警规则",
+            notice_body=(
+                "自动化流程每轮检测一次；只要剩余额度仍低于你设置的阈值，"
+                "就会继续发送本邮件。"
+            ),
+            notice_color="#252e38",
+            task_id=task_id,
+            occurred_at=occurred_at,
+            footer_note=(
+                "剩余额度按正常账号的 7 天用量百分比与已用成本估算，金额单位为美元。"
+            ),
+        ),
         subtype="html",
     )
     return message
@@ -520,7 +579,6 @@ def send_quota_threshold_alert(
         recipients=recipients,
         task_id=_text(task_id),
         quota_report=quota_report,
-        threshold_usd=threshold_usd,
         quota_eligible_failure_count=eligible_count,
         quota_exhausted_failure_count=exhausted_count,
         relogin_failed_count=failed_count,
