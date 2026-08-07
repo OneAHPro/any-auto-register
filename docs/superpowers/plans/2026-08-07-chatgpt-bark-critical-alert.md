@@ -57,7 +57,7 @@ Expected reasons are `bark_disabled`, `below_threshold`, `quota_alert_disabled`,
 Run:
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest \
   pytest tests/test_chatgpt_bark_alerts.py -q
 ```
 
@@ -121,7 +121,7 @@ Patch `send_bark_test_notification` for `/config/bark/test` and verify unsaved f
 - [ ] **Step 2: Run the config tests and verify RED**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest \
   pytest tests/test_chatgpt_bark_config.py -q
 ```
 
@@ -142,7 +142,7 @@ Add `POST /config/bark/test` using the existing generic test request model. Merg
 - [ ] **Step 4: Run config tests and existing config regression tests**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest \
   pytest tests/test_chatgpt_bark_config.py \
          tests/test_config_store_env_fallback.py -q
 ```
@@ -189,7 +189,7 @@ Add focused tests proving:
 - [ ] **Step 2: Run focused task tests and verify RED**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest \
   pytest tests/test_chatgpt_relogin_task.py -q
 ```
 
@@ -213,7 +213,7 @@ Inside `if quota_query_succeeded`, repeat the independent flow for `send_bark_qu
 - [ ] **Step 4: Run task and alert regressions**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest \
   pytest tests/test_chatgpt_relogin_task.py \
          tests/test_chatgpt_auto_relogin_alerts.py \
          tests/test_chatgpt_bark_alerts.py -q
@@ -309,7 +309,7 @@ git commit -m "feat(settings): add Bark critical alert controls"
 - [ ] **Step 1: Compile modified Python modules**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt \
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt \
   python -m py_compile services/chatgpt_bark_alerts.py api/config.py api/tasks.py
 ```
 
@@ -318,7 +318,7 @@ Expected: exit 0 with no output.
 - [ ] **Step 2: Run full backend tests**
 
 ```bash
-uv run --python 3.12 --with-requirements requirements.txt --with pytest pytest -q
+PYTHONPATH=. uv run --python 3.12 --with-requirements requirements.txt --with pytest pytest -q
 ```
 
 Expected: all non-baseline tests pass; any pre-existing flaky failure is isolated and rerun before classification.
