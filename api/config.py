@@ -1,5 +1,6 @@
 import logging
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -27,6 +28,10 @@ _SMTP_CONFIG_KEYS = {
     "smtp_recipient_email",
     "smtp_use_ssl",
     "smtp_force_auth_login",
+}
+_BARK_CONFIG_KEYS = {
+    "bark_enabled",
+    "bark_endpoint",
 }
 
 CONFIG_KEYS = [
@@ -131,6 +136,8 @@ CONFIG_KEYS = [
     "smtp_recipient_email",
     "smtp_use_ssl",
     "smtp_force_auth_login",
+    "bark_enabled",
+    "bark_endpoint",
     "cliproxyapi_base_url",
     "cliproxyapi_management_key",
     "grok2api_url",
@@ -195,6 +202,17 @@ def _normalize_quota_alert_threshold(value: object) -> str:
     return f"{rounded:.2f}"
 
 
+def _normalize_bark_endpoint(value: object) -> str:
+    endpoint = str(value or "").strip().rstrip("/")
+    parsed = urlsplit(endpoint)
+    if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(
+            status_code=400,
+            detail="Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址",
+        )
+    return endpoint
+
+
 @router.get("")
 def get_config():
     all_cfg = config_store.get_all()
@@ -251,8 +269,12 @@ def get_config():
         all_cfg["smtp_use_ssl"] = "1"
     if not str(all_cfg.get("smtp_force_auth_login", "") or "").strip():
         all_cfg["smtp_force_auth_login"] = "0"
+    if not str(all_cfg.get("bark_enabled", "") or "").strip():
+        all_cfg["bark_enabled"] = "0"
     # SMTP 凭证只允许写入，不回传到前端或 API 调用方。
     all_cfg["smtp_password"] = ""
+    # Bark 推送地址包含设备密钥，只允许写入，不回传。
+    all_cfg["bark_endpoint"] = ""
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -285,6 +307,7 @@ def update_config(body: ConfigUpdate):
         "codex2api_delete_on_account_remove_enabled",
         "smtp_use_ssl",
         "smtp_force_auth_login",
+        "bark_enabled",
     ):
         if bool_key in safe:
             enabled = str(safe.get(bool_key, "")).strip().lower()
@@ -292,6 +315,14 @@ def update_config(body: ConfigUpdate):
     if "smtp_password" in safe and not str(safe.get("smtp_password") or ""):
         # 前端留空表示保留现有凭证，避免读取配置后误清空。
         safe.pop("smtp_password", None)
+    if "bark_endpoint" in safe:
+        if not str(safe.get("bark_endpoint") or "").strip():
+            # 前端留空表示保留现有 Bark 设备密钥。
+            safe.pop("bark_endpoint", None)
+        else:
+            safe["bark_endpoint"] = _normalize_bark_endpoint(
+                safe.get("bark_endpoint")
+            )
     if "chatgpt_auto_relogin_quota_alert_threshold_usd" in safe:
         safe["chatgpt_auto_relogin_quota_alert_threshold_usd"] = (
             _normalize_quota_alert_threshold(
@@ -380,6 +411,58 @@ def test_smtp_config(body: SMTPTestRequest):
     raise HTTPException(
         status_code=502,
         detail=f"SMTP 测试邮件发送失败（{error_type}）",
+    )
+
+
+@router.post("/bark/test")
+def test_bark_config(body: SMTPTestRequest):
+    snapshot = {
+        key: value
+        for key, value in dict(config_store.get_all() or {}).items()
+        if key in _BARK_CONFIG_KEYS
+    }
+    overrides = {
+        key: value
+        for key, value in dict(body.data or {}).items()
+        if key in _BARK_CONFIG_KEYS
+    }
+    if "bark_enabled" in overrides:
+        enabled = str(overrides.get("bark_enabled", "")).strip().lower()
+        overrides["bark_enabled"] = (
+            "1" if enabled in {"1", "true", "yes", "on"} else "0"
+        )
+    if "bark_endpoint" in overrides:
+        if not str(overrides.get("bark_endpoint") or "").strip():
+            overrides.pop("bark_endpoint", None)
+        else:
+            overrides["bark_endpoint"] = _normalize_bark_endpoint(
+                overrides.get("bark_endpoint")
+            )
+    snapshot.update(overrides)
+
+    from services.chatgpt_bark_alerts import send_bark_test_notification
+
+    result = send_bark_test_notification(config=snapshot)
+    if bool(result.get("sent")):
+        return {"ok": True, "message": "测试 Bark 强提醒已发送"}
+
+    reason = str(result.get("reason") or "send_failed")
+    if reason == "bark_disabled":
+        raise HTTPException(status_code=400, detail="请先启用 Bark 强提醒")
+    if reason == "bark_not_configured":
+        raise HTTPException(
+            status_code=400,
+            detail="请填写 Bark App 提供的完整推送地址",
+        )
+    if reason == "invalid_bark_endpoint":
+        raise HTTPException(
+            status_code=400,
+            detail="Bark 推送地址必须是完整的 HTTP 或 HTTPS 地址",
+        )
+    error_type = str(result.get("error_type") or "BarkError")[:80]
+    raise HTTPException(
+        status_code=502,
+        detail=f"Bark 测试通知发送失败（{error_type}）",
     )
 
 
