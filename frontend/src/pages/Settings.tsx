@@ -1928,6 +1928,8 @@ export default function Settings() {
       data.smtp_use_ssl = parseBooleanConfigValue(data.smtp_use_ssl)
       data.smtp_force_auth_login = parseBooleanConfigValue(data.smtp_force_auth_login)
       data.smtp_password = ''
+      data.bark_enabled = parseBooleanConfigValue(data.bark_enabled)
+      data.bark_endpoint = ''
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -2047,6 +2049,7 @@ export default function Settings() {
       values.smtp_port = normalizeBoundedInteger(values.smtp_port, 587, 1, 65535)
       values.smtp_use_ssl = parseBooleanConfigValue(values.smtp_use_ssl)
       values.smtp_force_auth_login = parseBooleanConfigValue(values.smtp_force_auth_login)
+      values.bark_enabled = parseBooleanConfigValue(values.bark_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -2081,6 +2084,8 @@ export default function Settings() {
         smtp_use_ssl: values.smtp_use_ssl,
         smtp_force_auth_login: values.smtp_force_auth_login,
         smtp_password: '',
+        bark_enabled: values.bark_enabled,
+        bark_endpoint: '',
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
