@@ -119,3 +119,97 @@ body {
   background: rgba(99, 102, 241, 0.35);
   color: inherit;
 }
+
+/* ── 任务卡片响应式布局 ──────────────────── */
+.running-tasks-page,
+.running-task-card,
+.running-task-card .ant-card-body {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.running-task-card {
+  overflow: hidden;
+}
+
+.running-task-card__layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 10px 12px;
+  align-items: center;
+  min-width: 0;
+}
+
+.running-task-card__identity,
+.running-task-card__progress,
+.running-task-card__actions {
+  grid-column: 1 / -1;
+  min-width: 0;
+}
+
+.running-task-card__identity > .ant-space {
+  max-width: 100%;
+}
+
+.running-task-card__quota {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 6px;
+}
+
+.running-task-card__status,
+.running-task-card__duration,
+.running-task-card__stats > .ant-typography,
+.running-task-card__stats > .ant-tag {
+  white-space: nowrap;
+}
+
+.running-task-card__duration {
+  justify-self: end;
+}
+
+.running-task-card__progress .ant-progress {
+  margin: 0;
+}
+
+.running-task-card__stats > .ant-tag {
+  margin: 0;
+}
+
+.running-task-card__actions .ant-space {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+@media (max-width: 1099px) and (pointer: coarse) {
+  .running-task-card__actions .ant-btn {
+    min-height: 44px;
+  }
+}
+
+@media (max-width: 767px) {
+  .app-content {
+    padding: 12px !important;
+  }
+}
+
+@media (min-width: 1100px) {
+  .running-task-card__layout {
+    grid-template-columns: 220px 90px 70px minmax(160px, 1fr) auto;
+  }
+
+  .running-task-card__identity,
+  .running-task-card__progress,
+  .running-task-card__actions {
+    grid-column: auto;
+  }
+
+  .running-task-card__duration {
+    justify-self: start;
+  }
+
+  .running-task-card__actions {
+    justify-self: end;
+  }
+}

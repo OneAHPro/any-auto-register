@@ -62,6 +62,14 @@ TASK_SUMMARY_META_KEYS = (
     "quota_alert_sent",
     "quota_alert_reason",
     "quota_alert_threshold_usd",
+    "bark_alert_sent",
+    "bark_alert_reason",
+    "bark_alert_error_type",
+    "bark_alert_threshold",
+    "bark_quota_alert_sent",
+    "bark_quota_alert_reason",
+    "bark_quota_alert_error_type",
+    "bark_quota_alert_threshold_usd",
 )
 _CHATGPT_LEADBEE_SECRET_KEYS = {
     CHATGPT_LEADBEE_CODES_KEY,
@@ -1353,6 +1361,10 @@ def _create_chatgpt_relogin_task_record(
                 "quota_alert_sent": False,
                 "quota_alert_reason": "pending",
                 "quota_alert_threshold_usd": "0.00",
+                "bark_alert_sent": False,
+                "bark_alert_reason": "pending",
+                "bark_quota_alert_sent": False,
+                "bark_quota_alert_reason": "pending",
             }
         )
     _task_store.create(
@@ -2123,6 +2135,9 @@ def _run_chatgpt_relogin_task_inner(
                 quota_alert_sent=False,
                 quota_alert_reason="quota_query_failed",
                 quota_query_error_type=quota_query_error_type,
+                bark_quota_alert_sent=False,
+                bark_quota_alert_reason="quota_query_failed",
+                bark_quota_query_error_type=quota_query_error_type,
             )
             _log(
                 task_id,
@@ -2182,6 +2197,72 @@ def _run_chatgpt_relogin_task_inner(
         else:
             error_type = str(alert_meta.get("alert_error_type") or "UnknownError")
             _log(task_id, f"[ALERT] 重登失败告警邮件发送失败（{error_type}）")
+
+        try:
+            from services.chatgpt_bark_alerts import (
+                send_bark_relogin_alert,
+            )
+
+            bark_alert_result = send_bark_relogin_alert(
+                task_id=task_id,
+                quota_report=quota_report,
+                quota_eligible_failure_count=quota_eligible_failure_count,
+                quota_exhausted_failure_count=quota_exhausted_failure_count,
+                relogin_failed_count=relogin_failed_count,
+                deleted_account_count=deleted_account_count,
+            )
+            if not isinstance(bark_alert_result, dict):
+                raise RuntimeError("invalid Bark alert result")
+        except Exception as exc:
+            bark_alert_result = {
+                "sent": False,
+                "reason": "send_failed",
+                "error_type": type(exc).__name__,
+            }
+
+        bark_alert_meta = {
+            "bark_alert_sent": bool(bark_alert_result.get("sent")),
+            "bark_alert_reason": str(
+                bark_alert_result.get("reason") or "unknown"
+            ),
+        }
+        if bark_alert_result.get("threshold") is not None:
+            bark_alert_meta["bark_alert_threshold"] = int(
+                bark_alert_result["threshold"]
+            )
+        if bark_alert_result.get("error_type"):
+            bark_alert_meta["bark_alert_error_type"] = str(
+                bark_alert_result["error_type"]
+            )
+        _task_store.update_meta(task_id, **bark_alert_meta)
+
+        bark_alert_reason = bark_alert_meta["bark_alert_reason"]
+        if bark_alert_meta["bark_alert_sent"]:
+            _log(task_id, "[ALERT] 本轮重登失败 Bark 强提醒已发送")
+        elif bark_alert_reason == "below_threshold":
+            _log(
+                task_id,
+                "Bark 强提醒未触发：本轮仍有额度的重登失败数未达到配置阈值",
+            )
+        elif bark_alert_reason == "bark_disabled":
+            _log(task_id, "Bark 强提醒未启用")
+        elif bark_alert_reason == "bark_not_configured":
+            _log(
+                task_id,
+                "[ALERT] 本轮仍有额度的重登失败数已达到阈值，"
+                "但 Bark 推送地址未配置",
+            )
+        elif bark_alert_reason == "invalid_bark_endpoint":
+            _log(task_id, "[ALERT] Bark 推送地址格式无效")
+        else:
+            error_type = str(
+                bark_alert_meta.get("bark_alert_error_type")
+                or "UnknownError"
+            )
+            _log(
+                task_id,
+                f"[ALERT] 重登失败 Bark 强提醒发送失败（{error_type}）",
+            )
 
         if quota_query_succeeded:
             try:
@@ -2251,6 +2332,85 @@ def _run_chatgpt_relogin_task_inner(
                     task_id,
                     f"[ALERT] 剩余额度不足告警邮件发送失败（{error_type}）",
                 )
+
+            try:
+                from services.chatgpt_bark_alerts import (
+                    send_bark_quota_threshold_alert,
+                )
+
+                bark_quota_alert_result = (
+                    send_bark_quota_threshold_alert(
+                        task_id=task_id,
+                        quota_report=quota_report,
+                    )
+                )
+                if not isinstance(bark_quota_alert_result, dict):
+                    raise RuntimeError("invalid Bark quota alert result")
+            except Exception as exc:
+                bark_quota_alert_result = {
+                    "sent": False,
+                    "reason": "send_failed",
+                    "error_type": type(exc).__name__,
+                }
+
+            bark_quota_alert_meta = {
+                "bark_quota_alert_sent": bool(
+                    bark_quota_alert_result.get("sent")
+                ),
+                "bark_quota_alert_reason": str(
+                    bark_quota_alert_result.get("reason") or "unknown"
+                ),
+            }
+            if bark_quota_alert_result.get("threshold_usd") is not None:
+                bark_quota_alert_meta[
+                    "bark_quota_alert_threshold_usd"
+                ] = str(bark_quota_alert_result["threshold_usd"])
+            if bark_quota_alert_result.get("error_type"):
+                bark_quota_alert_meta["bark_quota_alert_error_type"] = str(
+                    bark_quota_alert_result["error_type"]
+                )
+            _task_store.update_meta(task_id, **bark_quota_alert_meta)
+
+            bark_quota_alert_reason = bark_quota_alert_meta[
+                "bark_quota_alert_reason"
+            ]
+            if bark_quota_alert_meta["bark_quota_alert_sent"]:
+                _log(
+                    task_id,
+                    "[ALERT] 本轮剩余额度不足 Bark 强提醒已发送",
+                )
+            elif bark_quota_alert_reason == "quota_alert_disabled":
+                _log(
+                    task_id,
+                    "剩余额度 Bark 强提醒未启用：告警阈值为 $0.00",
+                )
+            elif bark_quota_alert_reason == "quota_not_below_threshold":
+                _log(
+                    task_id,
+                    "剩余额度 Bark 强提醒未触发：当前估算剩余额度未低于配置阈值",
+                )
+            elif bark_quota_alert_reason == "bark_disabled":
+                _log(task_id, "Bark 强提醒未启用")
+            elif bark_quota_alert_reason == "bark_not_configured":
+                _log(
+                    task_id,
+                    "[ALERT] 当前估算剩余额度已低于阈值，"
+                    "但 Bark 推送地址未配置",
+                )
+            elif bark_quota_alert_reason == "invalid_bark_endpoint":
+                _log(task_id, "[ALERT] Bark 推送地址格式无效")
+            else:
+                error_type = str(
+                    bark_quota_alert_meta.get(
+                        "bark_quota_alert_error_type"
+                    )
+                    or "UnknownError"
+                )
+                _log(
+                    task_id,
+                    "[ALERT] 剩余额度不足 Bark 强提醒发送失败"
+                    f"（{error_type}）",
+                )
     elif automation:
         _task_store.update_meta(
             task_id,
@@ -2258,6 +2418,10 @@ def _run_chatgpt_relogin_task_inner(
             alert_reason="task_stopped",
             quota_alert_sent=False,
             quota_alert_reason="task_stopped",
+            bark_alert_sent=False,
+            bark_alert_reason="task_stopped",
+            bark_quota_alert_sent=False,
+            bark_quota_alert_reason="task_stopped",
         )
 
     _persist_task_snapshot_best_effort(task_id)

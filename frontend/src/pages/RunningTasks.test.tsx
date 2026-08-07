@@ -54,6 +54,7 @@ function automaticSummary(overrides: Record<string, unknown> = {}) {
       invalid_rt_count: 6,
       relogin_failed_count: 5,
       deleted_account_count: 3,
+      estimated_remaining_usd: '98.85',
       alert_sent: true,
       alert_reason: 'sent',
     },
@@ -104,6 +105,75 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.getByText('鉴权失效 6')).toBeTruthy()
     expect(screen.getByText('重登失败 5')).toBeTruthy()
     expect(screen.getByText('邮件已提醒')).toBeTruthy()
+    expect(screen.getByText('剩余可用额度')).toBeTruthy()
+    expect(screen.getByText('$98.85')).toBeTruthy()
+    expect(screen.queryByText('本次探针剩余可用额度')).toBeNull()
+    expect(screen.queryByText('task-auto-history')).toBeNull()
+  })
+
+  it('uses responsive card regions and keeps compact metrics from breaking vertically', async () => {
+    render(<RunningTasks />)
+
+    const amount = await screen.findByText('$98.85')
+    const card = amount.closest('.running-task-card')
+    expect(card).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__layout')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__identity')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__progress')).toBeTruthy()
+    expect(card?.querySelector('.running-task-card__actions')).toBeTruthy()
+
+    const stats = card?.querySelector('.running-task-card__stats') as HTMLElement | null
+    expect(stats?.style.flexWrap).toBe('wrap')
+    expect((screen.getByText('✓ 成功 53') as HTMLElement).style.whiteSpace).toBe('nowrap')
+  })
+
+  it('shows a pending quota state while an automatic probe is still running', async () => {
+    configureApi(automaticSummary({
+      status: 'running',
+      updated_at: null,
+      meta: {
+        automation: true,
+        invalid_rt_count: 0,
+        relogin_failed_count: 0,
+        deleted_account_count: 0,
+        estimated_remaining_usd: '0.00',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('本次探针额度统计中')).toBeTruthy()
+    expect(screen.queryByText('$0.00')).toBeNull()
+  })
+
+  it('shows an unavailable quota state for a finished probe with invalid metadata', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        invalid_rt_count: 0,
+        relogin_failed_count: 0,
+        deleted_account_count: 0,
+        estimated_remaining_usd: 'unknown',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('本次探针额度未生成')).toBeTruthy()
+  })
+
+  it('hides task IDs without adding probe quota copy to manual tasks', async () => {
+    configureApi(automaticSummary({
+      id: 'task-manual-history',
+      source: 'manual',
+      meta: { automation: false },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('手动')).toBeTruthy()
+    expect(screen.queryByText('task-manual-history')).toBeNull()
+    expect(screen.queryByText(/本次探针/)).toBeNull()
   })
 
   it('shows an explicit zero deleted-account counter for automatic tasks', async () => {
@@ -280,6 +350,7 @@ describe('RunningTasks lightweight summaries', () => {
       expect(apiFetch).toHaveBeenCalledWith('/tasks/task-auto-history')
     })
     expect(await screen.findByText('delayed full log')).toBeTruthy()
+    expect(screen.queryByText('task-auto-history')).toBeNull()
   })
 
   it('keeps delete interaction working with summary-only cards', async () => {

@@ -12,6 +12,8 @@ import {
   LogoutOutlined,
   PlayCircleOutlined,
   MobileOutlined,
+  ApiOutlined,
+  ImportOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import Dashboard from '@/pages/Dashboard'
@@ -98,6 +100,8 @@ function AppContent() {
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
     if (path === '/sms-pool') return ['/sms-pool']
+    if (path === '/codex2api') return ['/codex2api']
+    if (path === '/mail-import') return ['/mail-import']
     if (path === '/settings') return ['/settings']
     if (path === '/running-tasks') return ['/running-tasks']
     return ['/']
@@ -141,6 +145,16 @@ function AppContent() {
       label: 'SMS接码池',
     },
     {
+      key: '/codex2api',
+      icon: <ApiOutlined />,
+      label: 'Codex2API',
+    },
+    {
+      key: '/mail-import',
+      icon: <ImportOutlined />,
+      label: '邮箱导入',
+    },
+    {
       key: '/settings',
       icon: <SettingOutlined />,
       label: '全局配置',
@@ -156,6 +170,10 @@ function AppContent() {
           collapsed={collapsed}
           onCollapse={setCollapsed}
           style={{
+            position: 'sticky',
+            top: 0,
+            alignSelf: 'flex-start',
+            height: '100vh',
             background: currentTheme.token?.colorBgContainer,
             borderRight: `1px solid ${currentTheme.token?.colorBorder}`,
           }}
@@ -193,6 +211,9 @@ function AppContent() {
             style={{
               borderRight: 0,
               background: 'transparent',
+              maxHeight: 'calc(100vh - 64px)',
+              overflowY: 'auto',
+              paddingBottom: hasPassword ? 164 : 108,
             }}
           />
           <div
@@ -237,7 +258,9 @@ function AppContent() {
           </div>
         </Sider>
         <Content
+          className="app-content"
           style={{
+            minWidth: 0,
             padding: 24,
             overflow: 'auto',
             background: currentTheme.token?.colorBgLayout,
@@ -253,6 +276,8 @@ function AppContent() {
             <Route path="/proxies" element={<Proxies />} />
             <Route path="/sms-pool" element={<SmsPool />} />
             <Route path="/settings" element={<Settings />} />
+            <Route path="/codex2api" element={<Settings page="codex2api" />} />
+            <Route path="/mail-import" element={<Settings page="mail-import" />} />
           </Routes>
         </Content>
       </Layout>

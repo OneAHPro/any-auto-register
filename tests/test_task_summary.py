@@ -195,6 +195,14 @@ def test_summary_uses_automatic_and_regular_error_count_rules(task_api):
                 "deleted_account_count": 4,
                 "alert_sent": True,
                 "alert_reason": "sent",
+                "bark_alert_sent": False,
+                "bark_alert_reason": "send_failed",
+                "bark_alert_error_type": "TimeoutError",
+                "bark_alert_threshold": 20,
+                "bark_quota_alert_sent": True,
+                "bark_quota_alert_reason": "sent",
+                "bark_quota_alert_error_type": "",
+                "bark_quota_alert_threshold_usd": "120.00",
                 "private": "hidden",
             }
         ),
@@ -233,6 +241,14 @@ def test_summary_uses_automatic_and_regular_error_count_rules(task_api):
         "deleted_account_count": 4,
         "alert_sent": True,
         "alert_reason": "sent",
+        "bark_alert_sent": False,
+        "bark_alert_reason": "send_failed",
+        "bark_alert_error_type": "TimeoutError",
+        "bark_alert_threshold": 20,
+        "bark_quota_alert_sent": True,
+        "bark_quota_alert_reason": "sent",
+        "bark_quota_alert_error_type": "",
+        "bark_quota_alert_threshold_usd": "120.00",
     }
     assert by_id["task-regular"]["error_count"] == 3
     assert by_id["task-automatic-floor"]["error_count"] == 0

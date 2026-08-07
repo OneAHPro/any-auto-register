@@ -88,12 +88,17 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(quotaThreshold.value).toBe('0.00')
     expect(quotaThreshold.getAttribute('aria-valuemin')).toBe('0')
     expect(quotaThreshold.getAttribute('aria-valuemax')).toBe('10000000')
-    expect(screen.getByText('每轮自动鉴权完成后，重登失败账号数达到或超过此值时发送一封提醒；鉴权失败数仅展示，不触发告警。')).toBeTruthy()
-    expect(screen.getByText(/额度低于此值都会发送一封邮件/)).toBeTruthy()
+    expect(screen.getByText(/重登失败账号数达到或超过此值时通过已启用的通知渠道发送提醒/)).toBeTruthy()
+    expect(screen.getByText(/额度低于此值都会通过已启用的通知渠道发送提醒/)).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()
     expect(screen.getByRole('button', { name: '发送测试邮件' })).toBeTruthy()
+    expect(screen.getByText('告警通知')).toBeTruthy()
+    expect(screen.getByRole('switch', { name: '启用 Bark 强提醒' }).getAttribute('aria-checked')).toBe('false')
+    expect(screen.getByLabelText('Bark 推送地址')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '发送测试 Bark 通知' })).toBeTruthy()
+    expect(screen.getByText(/critical \+ call=1/)).toBeTruthy()
     expect(screen.getByText(/主动触发 Codex2API 的 wham-only 轻量鉴权探针/)).toBeTruthy()
     expect(screen.getByText(/正常与限流账号不会刷新本地 RT/)).toBeTruthy()
   })
@@ -168,6 +173,92 @@ describe('ChatGPTAutoReloginSection', () => {
     await user.click(button)
     expect(await screen.findByText('测试邮件已发送')).toBeTruthy()
     expect(attempts).toBe(2)
+  })
+
+  it('sends a Bark test with the current unsaved form values', async () => {
+    const user = userEvent.setup()
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/automations/chatgpt-relogin') {
+        return { state: 'idle', eligible_accounts: 2 }
+      }
+      if (path === '/config/bark/test') {
+        return { ok: true, message: '测试 Bark 强提醒已发送' }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    renderSection({
+      bark_enabled: true,
+      bark_endpoint: 'https://api.day.app/UNSAVED_DEVICE_KEY',
+    })
+
+    await user.click(await screen.findByRole('button', { name: '发送测试 Bark 通知' }))
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith(
+        '/config/bark/test',
+        expect.objectContaining({ method: 'POST' }),
+      )
+    })
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      ([path]) => path === '/config/bark/test',
+    )
+    const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+    expect(payload.data).toEqual({
+      bark_enabled: true,
+      bark_endpoint: 'https://api.day.app/UNSAVED_DEVICE_KEY',
+    })
+    expect(await screen.findByText('测试 Bark 强提醒已发送')).toBeTruthy()
+  })
+
+  it('shows a Bark test failure and allows another attempt', async () => {
+    const user = userEvent.setup()
+    let attempts = 0
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/automations/chatgpt-relogin') {
+        return { state: 'idle', eligible_accounts: 2 }
+      }
+      if (path === '/config/bark/test') {
+        attempts += 1
+        if (attempts === 1) throw new Error('Bark 地址无效')
+        return { ok: true, message: '测试 Bark 强提醒已发送' }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    renderSection({ bark_enabled: true, bark_endpoint: '' })
+
+    const button = await screen.findByRole('button', { name: '发送测试 Bark 通知' })
+    await user.click(button)
+    expect((await screen.findByRole('alert')).textContent).toContain('Bark 地址无效')
+
+    await user.click(button)
+    expect(await screen.findByText('测试 Bark 强提醒已发送')).toBeTruthy()
+    expect(attempts).toBe(2)
+  })
+
+  it('does not start another Bark test while one is in flight', async () => {
+    const user = userEvent.setup()
+    const barkRequest = deferred<Record<string, unknown>>()
+    vi.mocked(apiFetch).mockImplementation((path: string) => {
+      if (path === '/automations/chatgpt-relogin') {
+        return Promise.resolve({ state: 'idle', eligible_accounts: 2 })
+      }
+      if (path === '/config/bark/test') return barkRequest.promise
+      return Promise.reject(new Error(`unexpected request: ${path}`))
+    })
+    renderSection({ bark_enabled: true, bark_endpoint: '' })
+
+    const button = await screen.findByRole('button', { name: '发送测试 Bark 通知' })
+    await user.click(button)
+    await user.click(button)
+
+    expect(
+      vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/config/bark/test'),
+    ).toHaveLength(1)
+    await act(async () => {
+      barkRequest.resolve({ ok: true, message: '测试 Bark 强提醒已发送' })
+      await barkRequest.promise
+    })
+    expect(await screen.findByText('测试 Bark 强提醒已发送')).toBeTruthy()
   })
 
   it('shows the explicit no-account paused status', async () => {

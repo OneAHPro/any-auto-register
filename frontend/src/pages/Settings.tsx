@@ -446,6 +446,12 @@ interface TabConfig {
   sections: SectionConfig[]
 }
 
+type SettingsPageMode = 'settings' | 'codex2api' | 'mail-import'
+
+interface SettingsProps {
+  page?: SettingsPageMode
+}
+
 const MAILBOX_SECTION_FIELD_KEY_BY_PROVIDER: Record<string, string> = {
   laoudo: 'laoudo_email',
   freemail: 'freemail_api_url',
@@ -1820,7 +1826,7 @@ function SecurityPanel() {
   )
 }
 
-export default function Settings() {
+export default function Settings({ page = 'settings' }: SettingsProps) {
   const [form] = Form.useForm()
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
@@ -1828,10 +1834,11 @@ export default function Settings() {
   const [configLoadState, setConfigLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [configLoadError, setConfigLoadError] = useState('')
   const [activeTab, setActiveTab] = useState('register')
+  const effectiveTab = page === 'codex2api' ? 'codex2api' : page === 'mail-import' ? 'mail-import' : activeTab
   const currentMailProviderRaw = String(Form.useWatch('mail_provider', form) || '')
   const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
   const currentMailProvider = resolveEffectiveMailProvider(currentMailProviderRaw, currentMailImportSource)
-  const showFloatingSaveButton = activeTab === 'mailbox' || activeTab === 'chatgpt'
+  const showFloatingSaveButton = page === 'settings' && (effectiveTab === 'mailbox' || effectiveTab === 'chatgpt')
   const contentPaneRef = useRef<HTMLDivElement | null>(null)
   const configLoadRequestIdRef = useRef(0)
   const [floatingSaveBounds, setFloatingSaveBounds] = useState<{ left: number; width: number } | null>(null)
@@ -1928,6 +1935,8 @@ export default function Settings() {
       data.smtp_use_ssl = parseBooleanConfigValue(data.smtp_use_ssl)
       data.smtp_force_auth_login = parseBooleanConfigValue(data.smtp_force_auth_login)
       data.smtp_password = ''
+      data.bark_enabled = parseBooleanConfigValue(data.bark_enabled)
+      data.bark_endpoint = ''
       data.cfworker_domains = parseStoredDomainList(data.cfworker_domains)
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
@@ -1987,7 +1996,7 @@ export default function Settings() {
       observer?.disconnect()
       window.removeEventListener('resize', updateBounds)
     }
-  }, [showFloatingSaveButton, activeTab])
+  }, [showFloatingSaveButton, effectiveTab])
 
   const save = async () => {
     if (configLoadState !== 'ready') return
@@ -2047,6 +2056,7 @@ export default function Settings() {
       values.smtp_port = normalizeBoundedInteger(values.smtp_port, 587, 1, 65535)
       values.smtp_use_ssl = parseBooleanConfigValue(values.smtp_use_ssl)
       values.smtp_force_auth_login = parseBooleanConfigValue(values.smtp_force_auth_login)
+      values.bark_enabled = parseBooleanConfigValue(values.bark_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
       values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
@@ -2081,6 +2091,8 @@ export default function Settings() {
         smtp_use_ssl: values.smtp_use_ssl,
         smtp_force_auth_login: values.smtp_force_auth_login,
         smtp_password: '',
+        bark_enabled: values.bark_enabled,
+        bark_endpoint: '',
         cfworker_domains: domains,
         cfworker_enabled_domains: enabledDomains,
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
@@ -2104,10 +2116,10 @@ export default function Settings() {
     }
   }
 
-  const currentTab = TAB_ITEMS.find((t) => t.key === activeTab) as TabConfig
+  const currentTab = (TAB_ITEMS.find((t) => t.key === effectiveTab) ?? TAB_ITEMS[0]) as TabConfig
   const saveDisabled = configLoadState !== 'ready'
   const mailboxSections =
-    activeTab === 'mailbox'
+    effectiveTab === 'mailbox'
       ? splitMailboxSections(currentTab.sections, currentMailProvider)
       : { defaultSection: null, selectedSection: null, remainingSections: currentTab.sections }
   const floatingSaveWidth = floatingSaveBounds ? Math.max(floatingSaveBounds.width, 0) : 0
@@ -2148,8 +2160,16 @@ export default function Settings() {
         </div>
       ) : null}
       <div>
-        <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>全局配置</h1>
-        <p style={{ color: '#7a8ba3', marginTop: 4 }}>配置将持久化保存，注册任务自动使用</p>
+        <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>
+          {page === 'codex2api' ? 'Codex2API' : page === 'mail-import' ? '邮箱导入' : '全局配置'}
+        </h1>
+        <p style={{ color: '#7a8ba3', marginTop: 4 }}>
+          {page === 'codex2api'
+            ? '管理自动上传、删除联动、鉴权巡检与告警通知'
+            : page === 'mail-import'
+              ? '导入并管理 Outlook、Hotmail、MailAPI URL 与 iCloud 邮箱池'
+              : '配置将持久化保存，注册任务自动使用'}
+        </p>
       </div>
 
       {configLoadState === 'loading' ? (
@@ -2186,37 +2206,46 @@ export default function Settings() {
         </Typography.Text>
       ) : null}
 
-      <div style={{ display: 'flex', gap: 24 }}>
-        <div style={{ width: 200 }}>
-          <Tabs
-            tabPosition="left"
-            activeKey={activeTab}
-            onChange={setActiveTab}
-            items={TAB_ITEMS.map((t) => ({
-              key: t.key,
-              label: (
-                <span>
-                  {t.icon}
-                  <span style={{ marginLeft: 8 }}>{t.label}</span>
-                </span>
-              ),
-            }))}
-          />
-        </div>
+      <div style={{ display: 'flex', gap: page === 'settings' ? 24 : 0 }}>
+        {page === 'settings' ? (
+          <div style={{ width: 200 }}>
+            <Tabs
+              tabPosition="left"
+              activeKey={activeTab}
+              onChange={setActiveTab}
+              items={TAB_ITEMS.filter((tab) => tab.key !== 'codex2api').map((t) => ({
+                key: t.key,
+                label: (
+                  <span>
+                    {t.icon}
+                    <span style={{ marginLeft: 8 }}>{t.label}</span>
+                  </span>
+                ),
+              }))}
+            />
+          </div>
+        ) : null}
 
         <div ref={contentPaneRef} style={{ flex: 1 }}>
-          {activeTab === 'integrations' ? (
+          {page === 'mail-import' ? (
+            <Form form={form} layout="vertical">
+              <MailImportPanel form={form} />
+              <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
+                {saved ? '已保存 ✓' : '保存配置'}
+              </Button>
+            </Form>
+          ) : effectiveTab === 'integrations' ? (
             <IntegrationsPanel />
-          ) : activeTab === 'security' ? (
+          ) : effectiveTab === 'security' ? (
             <SecurityPanel />
           ) : (
             <Form form={form} layout="vertical">
-              {activeTab === 'contribution' ? (
+              {effectiveTab === 'contribution' ? (
                 <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} saveDisabled={saveDisabled} />
               ) : (
                 <>
-                  {activeTab === 'captcha' ? <SolverStatus /> : null}
-                  {activeTab === 'mailbox' ? (
+                  {effectiveTab === 'captcha' ? <SolverStatus /> : null}
+                  {effectiveTab === 'mailbox' ? (
                     <>
                       {mailboxSections.defaultSection ? (
                         <ConfigSection key={mailboxSections.defaultSection.title} section={mailboxSections.defaultSection} />
@@ -2224,7 +2253,6 @@ export default function Settings() {
                       {mailboxSections.selectedSection ? (
                         <ConfigSection key={`${mailboxSections.selectedSection.title}-selected`} section={mailboxSections.selectedSection} />
                       ) : null}
-                      <MailImportPanel form={form} />
                       {currentMailProviderRaw === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
                       {mailboxSections.remainingSections.map((section) => (
                         <ConfigSection key={section.title} section={section} />
@@ -2236,7 +2264,7 @@ export default function Settings() {
                       {currentTab.sections.map((section) => (
                         <ConfigSection key={section.title} section={section} />
                       ))}
-                      {activeTab === 'codex2api' ? <ChatGPTAutoReloginSection /> : null}
+                      {effectiveTab === 'codex2api' ? <ChatGPTAutoReloginSection /> : null}
                     </>
                   )}
                   {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}

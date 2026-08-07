@@ -22,6 +22,11 @@ const SMTP_FORM_FIELDS = [
   'smtp_force_auth_login',
 ] as const
 
+const BARK_FORM_FIELDS = [
+  'bark_enabled',
+  'bark_endpoint',
+] as const
+
 function requestError(error: unknown, fallback: string) {
   if (error instanceof Error && error.message.trim()) return error.message.trim()
   return fallback
@@ -58,6 +63,11 @@ export default function ChatGPTAutoReloginSection() {
   const [statusError, setStatusError] = useState(false)
   const [smtpTestSending, setSmtpTestSending] = useState(false)
   const [smtpTestResult, setSmtpTestResult] = useState<{
+    type: 'success' | 'error'
+    message: string
+  } | null>(null)
+  const [barkTestSending, setBarkTestSending] = useState(false)
+  const [barkTestResult, setBarkTestResult] = useState<{
     type: 'success' | 'error'
     message: string
   } | null>(null)
@@ -113,6 +123,30 @@ export default function ChatGPTAutoReloginSection() {
     }
   }
 
+  const sendBarkTest = async () => {
+    if (barkTestSending) return
+    setBarkTestSending(true)
+    setBarkTestResult(null)
+    try {
+      const data = form.getFieldsValue([...BARK_FORM_FIELDS])
+      const response = await apiFetch('/config/bark/test', {
+        method: 'POST',
+        body: JSON.stringify({ data }),
+      }) as { message?: string }
+      setBarkTestResult({
+        type: 'success',
+        message: response.message || '测试 Bark 强提醒已发送',
+      })
+    } catch (error: unknown) {
+      setBarkTestResult({
+        type: 'error',
+        message: requestError(error, 'Bark 测试通知发送失败'),
+      })
+    } finally {
+      setBarkTestSending(false)
+    }
+  }
+
   return (
     <Card
       title="ChatGPT 自动重登"
@@ -146,12 +180,12 @@ export default function ChatGPTAutoReloginSection() {
         每轮主动触发 Codex2API 的 wham-only 轻量鉴权探针，正常与限流账号不会刷新本地 RT。发现 401 后先让 Codex2API 用自身 RT 自刷新；仍明确鉴权失效时才获取验证码完整登录并覆盖同步。前台新增邮箱、注册、登录和接码任务优先执行。
       </Typography.Paragraph>
 
-      <Divider orientation="left">邮件告警</Divider>
+      <Divider orientation="left">告警通知</Divider>
       <Form.Item
         name="chatgpt_auto_relogin_alert_threshold"
         label="重登失败告警阈值（账号数）"
         initialValue={20}
-        extra="每轮自动鉴权完成后，重登失败账号数达到或超过此值时发送一封提醒；鉴权失败数仅展示，不触发告警。"
+        extra="每轮自动鉴权完成后，重登失败账号数达到或超过此值时通过已启用的通知渠道发送提醒；鉴权失败数仅展示，不触发告警。"
       >
         <InputNumber aria-label="重登失败告警阈值（账号数）" min={1} max={10000} precision={0} style={{ width: '100%' }} />
       </Form.Item>
@@ -159,7 +193,7 @@ export default function ChatGPTAutoReloginSection() {
         name="chatgpt_auto_relogin_quota_alert_threshold_usd"
         label="Codex2API 剩余额度告警阈值（美元）"
         initialValue={0}
-        extra="设置为 0 时关闭额度不足告警；每轮自动鉴权结束后，额度低于此值都会发送一封邮件。"
+        extra="设置为 0 时关闭额度不足告警；每轮自动鉴权结束后，额度低于此值都会通过已启用的通知渠道发送提醒。"
       >
         <InputNumber
           aria-label="Codex2API 剩余额度告警阈值（美元）"
@@ -171,6 +205,41 @@ export default function ChatGPTAutoReloginSection() {
           style={{ width: '100%' }}
         />
       </Form.Item>
+      <Divider orientation="left" plain>Bark 强提醒</Divider>
+      <Form.Item
+        name="bark_enabled"
+        label="启用 Bark 强提醒"
+        valuePropName="checked"
+        initialValue={false}
+      >
+        <Switch aria-label="启用 Bark 强提醒" checkedChildren="开启" unCheckedChildren="关闭" />
+      </Form.Item>
+      <Form.Item
+        name="bark_endpoint"
+        label="Bark 推送地址"
+        extra="粘贴 Bark App 提供的完整地址；留空保留已保存地址。两类业务告警固定使用 critical + call=1 强提醒，并持续响铃约 30 秒。"
+      >
+        <Input.Password
+          aria-label="Bark 推送地址"
+          autoComplete="new-password"
+          placeholder="https://api.day.app/你的Key"
+        />
+      </Form.Item>
+      <Button onClick={() => void sendBarkTest()} loading={barkTestSending}>
+        发送测试 Bark 通知
+      </Button>
+      {barkTestResult ? (
+        <Typography.Text
+          role={barkTestResult.type === 'error' ? 'alert' : 'status'}
+          aria-live={barkTestResult.type === 'error' ? 'assertive' : 'polite'}
+          type={barkTestResult.type === 'error' ? 'danger' : 'success'}
+          style={{ display: 'block', marginTop: 10 }}
+        >
+          {barkTestResult.message}
+        </Typography.Text>
+      ) : null}
+
+      <Divider orientation="left" plain>邮件通知</Divider>
       <Form.Item name="smtp_host" label="SMTP 服务器地址">
         <Input aria-label="SMTP 服务器地址" placeholder="smtp.example.com" />
       </Form.Item>

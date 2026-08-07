@@ -56,6 +56,27 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         )
         self.quota_alert_sender = quota_alert_sender.start()
         self.addCleanup(quota_alert_sender.stop)
+        bark_alert_sender = mock.patch(
+            "services.chatgpt_bark_alerts.send_bark_relogin_alert",
+            return_value={
+                "sent": False,
+                "reason": "bark_disabled",
+                "threshold": 5,
+            },
+        )
+        self.bark_alert_sender = bark_alert_sender.start()
+        self.addCleanup(bark_alert_sender.stop)
+        bark_quota_alert_sender = mock.patch(
+            "services.chatgpt_bark_alerts.send_bark_quota_threshold_alert",
+            return_value={
+                "sent": False,
+                "reason": "bark_disabled",
+                "threshold_usd": "0.00",
+                "estimated_remaining_usd": "0.00",
+            },
+        )
+        self.bark_quota_alert_sender = bark_quota_alert_sender.start()
+        self.addCleanup(bark_quota_alert_sender.stop)
         final_quota_reader = mock.patch(
             "services.chatgpt_codex2api_health."
             "fetch_codex2api_quota_accounts",
@@ -985,6 +1006,14 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             quota_exhausted_failure_count=0,
             quota_report=mock.ANY,
         )
+        self.bark_alert_sender.assert_called_once_with(
+            task_id=task_id,
+            quota_report=mock.ANY,
+            quota_eligible_failure_count=0,
+            quota_exhausted_failure_count=0,
+            relogin_failed_count=1,
+            deleted_account_count=0,
+        )
         self.assertTrue(
             any(
                 "[ALERT] 本轮重登失败告警邮件已发送" in line
@@ -1044,6 +1073,17 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             "threshold_usd": "120.00",
             "estimated_remaining_usd": "98.85",
         }
+        self.bark_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold": 5,
+        }
+        self.bark_quota_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold_usd": "120.00",
+            "estimated_remaining_usd": "98.85",
+        }
 
         with mock.patch(
             "services.chatgpt_codex2api_health."
@@ -1067,6 +1107,14 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         relogin_report = self.alert_sender.call_args.kwargs["quota_report"]
         quota_report = self.quota_alert_sender.call_args.kwargs["quota_report"]
         self.assertIs(relogin_report, quota_report)
+        bark_relogin_report = self.bark_alert_sender.call_args.kwargs[
+            "quota_report"
+        ]
+        bark_quota_report = self.bark_quota_alert_sender.call_args.kwargs[
+            "quota_report"
+        ]
+        self.assertIs(relogin_report, bark_relogin_report)
+        self.assertIs(relogin_report, bark_quota_report)
         self.assertEqual(quota_report.remote_account_count, 2)
         self.assertEqual(quota_report.account_count, 2)
         self.assertEqual(str(quota_report.estimated_remaining_usd), "98.85")
@@ -1080,9 +1128,15 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertTrue(meta["quota_alert_sent"])
         self.assertEqual(meta["quota_alert_reason"], "sent")
         self.assertEqual(meta["quota_alert_threshold_usd"], "120.00")
+        self.assertTrue(meta["bark_alert_sent"])
+        self.assertEqual(meta["bark_alert_reason"], "sent")
+        self.assertTrue(meta["bark_quota_alert_sent"])
+        self.assertEqual(meta["bark_quota_alert_reason"], "sent")
         logs = "\n".join(snapshot["logs"])
         self.assertIn("本轮重登失败告警邮件已发送", logs)
         self.assertIn("本轮剩余额度不足告警邮件已发送", logs)
+        self.assertIn("本轮重登失败 Bark 强提醒已发送", logs)
+        self.assertIn("本轮剩余额度不足 Bark 强提醒已发送", logs)
 
     def test_final_quota_query_failure_uses_initial_report_for_relogin_alert(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -1125,7 +1179,10 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(report.remote_account_count, 1)
         self.assertEqual(report.account_count, 1)
         self.assertEqual(str(report.estimated_remaining_usd), "60.53")
+        bark_report = self.bark_alert_sender.call_args.kwargs["quota_report"]
+        self.assertIs(report, bark_report)
         self.quota_alert_sender.assert_not_called()
+        self.bark_quota_alert_sender.assert_not_called()
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["meta"]["quota_alert_reason"], "quota_query_failed")
@@ -1152,6 +1209,9 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             }
         ]
         self.quota_alert_sender.side_effect = RuntimeError("smtp secret detail")
+        self.bark_quota_alert_sender.side_effect = RuntimeError(
+            "bark secret detail"
+        )
 
         with mock.patch(
             "services.chatgpt_codex2api_health."
@@ -1178,6 +1238,16 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             "RuntimeError",
         )
         self.assertNotIn("smtp secret detail", "\n".join(snapshot["logs"]))
+        self.assertFalse(snapshot["meta"]["bark_quota_alert_sent"])
+        self.assertEqual(
+            snapshot["meta"]["bark_quota_alert_reason"],
+            "send_failed",
+        )
+        self.assertEqual(
+            snapshot["meta"]["bark_quota_alert_error_type"],
+            "RuntimeError",
+        )
+        self.assertNotIn("bark secret detail", "\n".join(snapshot["logs"]))
 
     def test_automatic_task_counts_quota_available_and_exhausted_failures(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -1452,6 +1522,11 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             automation=True,
         )
         self.alert_sender.side_effect = RuntimeError("smtp secret detail")
+        self.bark_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold": 5,
+        }
 
         with mock.patch(
             "services.chatgpt_codex2api_health."
@@ -1480,6 +1555,9 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertFalse(snapshot["meta"]["alert_sent"])
         self.assertEqual(snapshot["meta"]["alert_reason"], "send_failed")
+        self.assertTrue(snapshot["meta"]["bark_alert_sent"])
+        self.assertEqual(snapshot["meta"]["bark_alert_reason"], "sent")
+        self.bark_alert_sender.assert_called_once()
         self.assertNotIn("smtp secret detail", "\n".join(snapshot["logs"]))
 
     def test_terminal_snapshot_is_persisted_before_automatic_alert(self):
@@ -1575,10 +1653,19 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["status"], "stopped")
         self.assertFalse(snapshot["meta"]["alert_sent"])
         self.assertEqual(snapshot["meta"]["alert_reason"], "task_stopped")
+        self.assertFalse(snapshot["meta"]["bark_alert_sent"])
+        self.assertEqual(snapshot["meta"]["bark_alert_reason"], "task_stopped")
+        self.assertFalse(snapshot["meta"]["bark_quota_alert_sent"])
+        self.assertEqual(
+            snapshot["meta"]["bark_quota_alert_reason"],
+            "task_stopped",
+        )
         self.assertFalse(
             any("[ALERT]" in line for line in snapshot["logs"])
         )
         self.alert_sender.assert_not_called()
+        self.bark_alert_sender.assert_not_called()
+        self.bark_quota_alert_sender.assert_not_called()
 
     def test_task_reports_each_account_and_finishes_only_after_sync_results(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"

@@ -4832,9 +4832,13 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 and received_at
                 and float(received_at) >= otp_sent_at
             )
+            baseline_freshness_is_unverifiable = bool(
+                otp_sent_at and not received_at
+            )
             if (
                 code_seen_before
                 and not baseline_raced_with_new_message
+                and not baseline_freshness_is_unverifiable
             ):
                 return None
             if (
