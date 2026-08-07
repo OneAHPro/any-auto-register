@@ -44,16 +44,23 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
                         "id": 101,
                         "email": "healthy@example.com",
                         "status": "active",
+                        "usage_percent_7d": 53,
+                        "billed_7d": 68.26,
+                        "reset_7d_at": "2026-08-13T17:35:22+08:00",
                     },
                     {
                         "id": 102,
                         "name": "limited@example.com",
                         "status": "rate_limited",
+                        "usage_percent_7d": 100,
+                        "billed_7d": 120.0,
                     },
                     {
                         "id": 103,
                         "email": "invalid@example.com",
                         "status": "unauthorized",
+                        "usage_percent_7d": 68,
+                        "billed_7d": 81.42,
                     },
                     {
                         "id": 104,
@@ -75,10 +82,18 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
                         "email": "unknown-status@example.com",
                         "status": "future_status",
                     },
+                    {
+                        "id": 108,
+                        "email": "remote-only@example.com",
+                        "status": "active",
+                        "usage_percent_7d": 25,
+                        "billed_7d": 10.0,
+                    },
                 ]
             }
         ),
     ]
+    quota_accounts = []
 
     with mock.patch.object(
         health.cffi_requests,
@@ -96,9 +111,12 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
             config=BASE_CONFIG,
             local_accounts=local_accounts,
             probe_poll_interval_seconds=0,
+            quota_accounts=quota_accounts,
         )
 
     assert snapshot[1]["state"] == "healthy"
+    assert snapshot[1]["usage_percent_7d"] == 53
+    assert snapshot[1]["billed_7d"] == 68.26
     assert snapshot[2]["state"] == "healthy"
     assert snapshot[3] == {
         "account_id": 3,
@@ -107,6 +125,8 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
         "remote_id": 103,
         "remote_status": "unauthorized",
         "probe_mode": "wham_only",
+        "usage_percent_7d": 68,
+        "billed_7d": 81.42,
         "message": "Codex2API 本轮 wham 探针明确标记账号鉴权失效",
     }
     assert snapshot[4]["state"] == "deferred"
@@ -116,6 +136,17 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     )
     assert snapshot[6]["state"] == "ambiguous"
     assert snapshot[7]["state"] == "deferred"
+    assert {row["remote_id"] for row in quota_accounts} == set(range(101, 109))
+    assert all("reset_7d_at" not in row for row in quota_accounts)
+    assert next(
+        row for row in quota_accounts if row["remote_id"] == 108
+    ) == {
+        "remote_id": 108,
+        "email": "remote-only@example.com",
+        "remote_status": "active",
+        "usage_percent_7d": 25,
+        "billed_7d": 10.0,
+    }
     assert request.call_count == 3
     assert request.call_args_list[0].args[0].endswith("/api/admin/settings")
     assert request.call_args_list[1].args[0].endswith(

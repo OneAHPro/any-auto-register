@@ -177,6 +177,16 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
+    return {
+        "remote_id": _remote_id(row),
+        "email": _remote_email(row),
+        "remote_status": _text(row.get("status")).lower(),
+        "usage_percent_7d": row.get("usage_percent_7d"),
+        "billed_7d": row.get("billed_7d"),
+    }
+
+
 def _record(
     *,
     account_id: int,
@@ -186,6 +196,8 @@ def _record(
     remote_status: str = "",
     remote_updated_at: str = "",
     probe_mode: str = "",
+    usage_percent_7d: object = None,
+    billed_7d: object = None,
     message: str,
 ) -> dict[str, object]:
     result = {
@@ -200,6 +212,10 @@ def _record(
         result["remote_updated_at"] = remote_updated_at
     if probe_mode:
         result["probe_mode"] = probe_mode
+    if usage_percent_7d is not None:
+        result["usage_percent_7d"] = usage_percent_7d
+    if billed_7d is not None:
+        result["billed_7d"] = billed_7d
     return result
 
 
@@ -426,6 +442,7 @@ def inspect_codex2api_account_health(
     probe_poll_attempts: int = 90,
     probe_poll_interval_seconds: float = 1.0,
     sleep_fn=time.sleep,
+    quota_accounts: list[dict[str, object]] | None = None,
 ) -> dict[int, dict[str, object]]:
     """Return one conservative remote-auth decision for every local account."""
 
@@ -487,6 +504,12 @@ def inspect_codex2api_account_health(
     rows = payload.get("accounts") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+    if quota_accounts is not None:
+        quota_accounts.extend(
+            _quota_record(raw_row)
+            for raw_row in rows
+            if isinstance(raw_row, dict)
+        )
 
     resolved_local_accounts = (
         {
@@ -541,6 +564,10 @@ def inspect_codex2api_account_health(
         remote_status = _text(row.get("status")).lower()
         remote_id = _remote_id(row)
         remote_updated_at = _text(row.get("updated_at"))
+        quota_fields = {
+            "usage_percent_7d": row.get("usage_percent_7d"),
+            "billed_7d": row.get("billed_7d"),
+        }
         if remote_status in AUTH_FAILED_STATUSES:
             result[account_id] = _record(
                 account_id=account_id,
@@ -550,6 +577,7 @@ def inspect_codex2api_account_health(
                 remote_status=remote_status,
                 remote_updated_at=remote_updated_at,
                 probe_mode="wham_only",
+                **quota_fields,
                 message="Codex2API 本轮 wham 探针明确标记账号鉴权失效",
             )
         elif remote_status not in HEALTHY_STATUSES:
@@ -560,6 +588,7 @@ def inspect_codex2api_account_health(
                 remote_id=remote_id,
                 remote_status=remote_status,
                 remote_updated_at=remote_updated_at,
+                **quota_fields,
                 message=(
                     "Codex2API 账号状态为临时错误，等待下一轮复查"
                     if remote_status in DEFERRED_STATUSES
@@ -579,6 +608,7 @@ def inspect_codex2api_account_health(
                 remote_id=remote_id,
                 remote_status=remote_status,
                 remote_updated_at=remote_updated_at,
+                **quota_fields,
                 message=f"Codex2API 鉴权状态正常（{remote_status}）",
             )
 
