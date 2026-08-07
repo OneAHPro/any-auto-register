@@ -170,6 +170,10 @@ function AppContent() {
           collapsed={collapsed}
           onCollapse={setCollapsed}
           style={{
+            position: 'sticky',
+            top: 0,
+            alignSelf: 'flex-start',
+            height: '100vh',
             background: currentTheme.token?.colorBgContainer,
             borderRight: `1px solid ${currentTheme.token?.colorBorder}`,
           }}
@@ -207,6 +211,9 @@ function AppContent() {
             style={{
               borderRight: 0,
               background: 'transparent',
+              maxHeight: 'calc(100vh - 64px)',
+              overflowY: 'auto',
+              paddingBottom: hasPassword ? 164 : 108,
             }}
           />
           <div

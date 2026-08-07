@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -66,5 +66,16 @@ describe('App primary navigation', () => {
     await user.click(await screen.findByText('邮箱导入'))
 
     await waitFor(() => expect(window.location.pathname).toBe('/mail-import'))
+  })
+
+  it('keeps the primary navigation pinned while long pages scroll', async () => {
+    render(<App />)
+
+    const sider = await screen.findByRole('complementary')
+
+    expect(sider.style.position).toBe('sticky')
+    expect(sider.style.top).toBe('0px')
+    expect(sider.style.height).toBe('100vh')
+    expect(within(sider).getAllByRole('menu')[0].style.overflowY).toBe('auto')
   })
 })
