@@ -94,6 +94,7 @@ def test_summarize_available_quota_filters_non_normal_accounts():
         ]
     )
 
+    assert report.remote_account_count == 4
     assert report.account_count == 2
     assert report.estimated_remaining_usd == Decimal("98.85")
     assert [row.email for row in report.accounts] == [

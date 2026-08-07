@@ -22,6 +22,45 @@ BASE_CONFIG = {
 }
 
 
+def test_fetch_quota_accounts_reads_latest_rows_without_triggering_probe():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 101,
+                        "email": "one@example.com",
+                        "status": "active",
+                        "usage_percent_7d": 53,
+                        "billed_7d": 68.26,
+                        "reset_7d_at": "ignored",
+                    }
+                ]
+            }
+        ),
+    ) as request, mock.patch.object(health.cffi_requests, "post") as post:
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    assert rows == [
+        {
+            "remote_id": 101,
+            "email": "one@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 53,
+            "billed_7d": 68.26,
+        }
+    ]
+    request.assert_called_once()
+    assert request.call_args.args[0].endswith(
+        "/api/admin/accounts?channel=codex"
+    )
+    post.assert_not_called()
+
+
 def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     from services import chatgpt_codex2api_health as health
 

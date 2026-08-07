@@ -187,6 +187,33 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
     }
 
 
+def fetch_codex2api_quota_accounts(
+    *,
+    config: Mapping[str, object] | None = None,
+) -> list[dict[str, object]]:
+    """Read the latest Codex2API account quota rows without probing."""
+
+    snapshot = dict(config) if config is not None else _get_config()
+    base_url = _text(snapshot.get("codex2api_api_url")).rstrip("/")
+    admin_key = _text(snapshot.get("codex2api_admin_key"))
+    if not base_url or not admin_key:
+        raise Codex2APIHealthError("Codex2API 地址或 Admin Key 未配置")
+
+    payload = _get_json(
+        base_url,
+        "/api/admin/accounts?channel=codex",
+        admin_key,
+    )
+    rows = payload.get("accounts") if isinstance(payload, dict) else payload
+    if not isinstance(rows, list):
+        raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+    return [
+        _quota_record(row)
+        for row in rows
+        if isinstance(row, dict)
+    ]
+
+
 def _record(
     *,
     account_id: int,
@@ -620,5 +647,6 @@ __all__ = [
     "HEALTHY_STATUSES",
     "Codex2APIHealthError",
     "confirm_codex2api_auth_failure",
+    "fetch_codex2api_quota_accounts",
     "inspect_codex2api_account_health",
 ]

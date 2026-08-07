@@ -34,6 +34,7 @@ class AvailableQuotaReport:
     account_count: int
     estimated_remaining_usd: Decimal
     accounts: tuple[AvailableQuotaAccount, ...]
+    remote_account_count: int = 0
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -88,7 +89,9 @@ def summarize_available_quota(
     """Aggregate estimated USD quota for normal, non-exhausted accounts."""
 
     accounts: list[AvailableQuotaAccount] = []
+    remote_account_count = 0
     for row in rows:
+        remote_account_count += 1
         status = str(
             row.get("remote_status") or row.get("status") or ""
         ).strip().lower()
@@ -119,6 +122,7 @@ def summarize_available_quota(
         start=Decimal("0.00"),
     ).quantize(CENT, rounding=ROUND_HALF_UP)
     return AvailableQuotaReport(
+        remote_account_count=remote_account_count,
         account_count=len(accounts),
         estimated_remaining_usd=total,
         accounts=tuple(accounts),
