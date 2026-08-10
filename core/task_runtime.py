@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -75,6 +76,72 @@ class RegisterTaskControl:
         self._active_slot_semaphore: threading.BoundedSemaphore | None = None
         self._active_slot_limit = 0
         self._slot_holding_attempt_ids: set[int] = set()
+        self._next_interrupt_id = 1
+        self._attempt_interrupts: dict[int, dict[int, Callable[[], None]]] = {}
+
+    @staticmethod
+    def _invoke_interrupts(callbacks: list[Callable[[], None]]) -> None:
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception:
+                # A broken resource callback must not block the sticky task
+                # control flag or other active attempts from being interrupted.
+                pass
+
+    def _pop_attempt_interrupts_locked(
+        self,
+        attempt_ids: set[int],
+    ) -> list[Callable[[], None]]:
+        callbacks: list[Callable[[], None]] = []
+        for attempt_id in attempt_ids:
+            callbacks.extend(self._attempt_interrupts.pop(attempt_id, {}).values())
+        return callbacks
+
+    def register_attempt_interrupt(
+        self,
+        attempt_id: int,
+        callback: Callable[[], None],
+    ) -> Callable[[], None]:
+        """Register one idempotent resource interrupt for an active attempt.
+
+        Callbacks must be fast and must not re-enter ``RegisterTaskStore``: a
+        caller may request task control while holding its own coordination lock.
+        """
+        normalized_attempt_id = int(attempt_id)
+        invoke_now = False
+        interrupt_id = 0
+        with self._lock:
+            if normalized_attempt_id not in self._active_attempt_ids:
+                raise RuntimeError("只能为活跃账号登记中断资源")
+            if (
+                self._stop_requested
+                or normalized_attempt_id in self._skip_active_attempt_ids
+            ):
+                invoke_now = True
+            else:
+                interrupt_id = self._next_interrupt_id
+                self._next_interrupt_id += 1
+                self._attempt_interrupts.setdefault(
+                    normalized_attempt_id,
+                    {},
+                )[interrupt_id] = callback
+
+        if invoke_now:
+            self._invoke_interrupts([callback])
+
+        def unregister() -> None:
+            if not interrupt_id:
+                return
+            with self._lock:
+                callbacks = self._attempt_interrupts.get(normalized_attempt_id)
+                if callbacks is None:
+                    return
+                callbacks.pop(interrupt_id, None)
+                if not callbacks:
+                    self._attempt_interrupts.pop(normalized_attempt_id, None)
+
+        return unregister
 
     def configure_active_slots(self, limit: int) -> None:
         """Limit foreground attempts while allowing mailbox waits to yield."""
@@ -150,17 +217,28 @@ class RegisterTaskControl:
 
     def request_stop_once(self) -> bool:
         """Set the sticky stop flag and report whether this call changed it."""
+        callbacks: list[Callable[[], None]] = []
         with self._lock:
             first_request = not self._stop_requested
             self._stop_requested = True
-            return first_request
+            if first_request:
+                callbacks = self._pop_attempt_interrupts_locked(
+                    set(self._active_attempt_ids)
+                )
+        self._invoke_interrupts(callbacks)
+        return first_request
 
     def request_skip_current(self) -> None:
+        callbacks: list[Callable[[], None]] = []
         with self._lock:
             if self._active_attempt_ids:
                 self._skip_active_attempt_ids.update(self._active_attempt_ids)
+                callbacks = self._pop_attempt_interrupts_locked(
+                    set(self._active_attempt_ids)
+                )
             else:
                 self._pending_skip_requests += 1
+        self._invoke_interrupts(callbacks)
 
     def start_attempt(self) -> int:
         acquired_slot = self._acquire_new_attempt_slot()
@@ -189,6 +267,7 @@ class RegisterTaskControl:
         with self._lock:
             self._active_attempt_ids.discard(attempt_id)
             self._skip_active_attempt_ids.discard(attempt_id)
+            self._attempt_interrupts.pop(attempt_id, None)
             if attempt_id in self._slot_holding_attempt_ids:
                 self._slot_holding_attempt_ids.remove(attempt_id)
                 semaphore = self._active_slot_semaphore
@@ -229,6 +308,48 @@ class RegisterTaskControl:
                 "active_slot_limit": self._active_slot_limit,
                 "active_slots_in_use": len(self._slot_holding_attempt_ids),
             }
+
+
+@dataclass(frozen=True, slots=True)
+class TaskAttemptContext:
+    control: RegisterTaskControl
+    attempt_id: int
+
+
+_task_attempt_local = threading.local()
+
+
+def current_task_attempt_context() -> TaskAttemptContext | None:
+    return getattr(_task_attempt_local, "current", None)
+
+
+@contextmanager
+def bind_task_attempt_context(
+    control: RegisterTaskControl,
+    attempt_id: int,
+):
+    """Expose one active attempt to deeply nested blocking resources."""
+    previous = current_task_attempt_context()
+    _task_attempt_local.current = TaskAttemptContext(
+        control=control,
+        attempt_id=int(attempt_id),
+    )
+    try:
+        yield _task_attempt_local.current
+    finally:
+        if previous is None:
+            try:
+                del _task_attempt_local.current
+            except AttributeError:
+                pass
+        else:
+            _task_attempt_local.current = previous
+
+
+def checkpoint_current_task_attempt() -> None:
+    context = current_task_attempt_context()
+    if context is not None:
+        context.control.checkpoint(attempt_id=context.attempt_id)
 
 
 @dataclass

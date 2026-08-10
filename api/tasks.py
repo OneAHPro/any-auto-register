@@ -23,6 +23,7 @@ from core.task_runtime import (
     RegisterTaskStore,
     SkipCurrentAttemptRequested,
     StopTaskRequested,
+    bind_task_attempt_context,
 )
 from core.sms_pool import SmsPoolExhaustedError, mask_sms_code, sms_pool_service
 from core.chatgpt_task_gate import chatgpt_task_gate
@@ -3533,10 +3534,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 _log(task_id, f"开始{action_name}第 {i + 1}/{req.count} 个账号")
                 if _proxy:
                     _log(task_id, f"使用代理: {_proxy}")
-                account = _platform.register(
-                    email=bound_email or req.email or None,
-                    password=req.password,
-                )
+                with bind_task_attempt_context(control, attempt_id):
+                    account = _platform.register(
+                        email=bound_email or req.email or None,
+                        password=req.password,
+                    )
                 current_email = account.email or current_email
                 if str(merged_extra.get("mail_provider", "")).strip() == "cfworker":
                     from core.email_domain_policy import validate_email_domain_policy

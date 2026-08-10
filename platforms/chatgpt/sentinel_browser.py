@@ -6,9 +6,11 @@ import json
 import os
 import subprocess
 import tempfile
+import threading
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from core.browser_runtime import (
     ensure_browser_display_available,
@@ -19,11 +21,71 @@ from core.proxy_utils import (
     build_requests_proxy_config,
     is_authenticated_socks5_proxy,
 )
+from core.task_runtime import (
+    TaskInterruption,
+    checkpoint_current_task_attempt,
+    current_task_attempt_context,
+)
 
 
 SENTINEL_VERSION = "20260219f9f6"
 SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_VERSION}/sdk.js"
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+
+
+def _playwright_driver_process(playwright: Any) -> Any:
+    """Best-effort access to the driver owned by this Playwright instance."""
+    try:
+        return playwright._impl_obj._connection._transport._proc
+    except AttributeError:
+        return None
+
+
+def _terminate_playwright_driver(process: Any) -> None:
+    """Terminate one attempt's Playwright driver without touching the app."""
+    if process is None:
+        return
+    try:
+        if getattr(process, "returncode", None) is not None:
+            return
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            terminate()
+    except (ProcessLookupError, OSError, ValueError, TypeError):
+        return
+
+
+def _register_current_attempt_driver_interrupt(
+    playwright: Any,
+) -> Callable[[], None]:
+    context = current_task_attempt_context()
+    driver_process = _playwright_driver_process(playwright)
+    if context is None or driver_process is None:
+        return lambda: None
+
+    state_lock = threading.Lock()
+    active = True
+
+    def interrupt() -> None:
+        nonlocal active
+        with state_lock:
+            if not active:
+                return
+            active = False
+            _terminate_playwright_driver(driver_process)
+
+    unregister_control = context.control.register_attempt_interrupt(
+        context.attempt_id,
+        interrupt,
+    )
+
+    def unregister() -> None:
+        nonlocal active
+        with state_lock:
+            active = False
+        unregister_control()
+
+    return unregister
 
 
 def _flow_page_url(flow: str) -> str:
@@ -331,8 +393,15 @@ def get_sentinel_token_via_browser(
 
     logger(f"Sentinel Browser 启动: flow={flow}, url={target_url}")
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(**launch_args)
+    playwright = None
+    browser = None
+    unregister_interrupt = lambda: None
+    try:
+        playwright = sync_playwright().start()
+        unregister_interrupt = _register_current_attempt_driver_interrupt(
+            playwright,
+        )
+        browser = playwright.chromium.launch(**launch_args)
         try:
             context = browser.new_context(
                 viewport={"width": 1440, "height": 900},
@@ -370,20 +439,38 @@ def get_sentinel_token_via_browser(
 
             result = page.evaluate(
                 """
-                async ({ flow }) => {
+                async ({ flow, timeoutMs }) => {
+                    let timeoutId;
                     try {
-                        const token = await window.SentinelSDK.token(flow);
+                        const token = await Promise.race([
+                            window.SentinelSDK.token(flow),
+                            new Promise((_, reject) => {
+                                timeoutId = setTimeout(
+                                    () => reject(new Error(
+                                        `SentinelSDK.token timeout after ${timeoutMs}ms`
+                                    )),
+                                    timeoutMs,
+                                );
+                            }),
+                        ]);
                         return { success: true, token };
                     } catch (e) {
                         return {
                             success: false,
                             error: (e && (e.message || String(e))) || "unknown",
                         };
+                    } finally {
+                        if (timeoutId) clearTimeout(timeoutId);
                     }
                 }
                 """,
-                {"flow": flow},
+                {
+                    "flow": flow,
+                    "timeoutMs": min(max(int(timeout_ms), 1000), 45000),
+                },
             )
+
+            checkpoint_current_task_attempt()
 
             if not result or not result.get("success") or not result.get("token"):
                 logger(
@@ -409,8 +496,28 @@ def get_sentinel_token_via_browser(
                 logger(f"Sentinel Browser 成功: len={len(token)}")
 
             return token
+        except TaskInterruption:
+            raise
         except Exception as e:
             logger(f"Sentinel Browser 异常: {e}")
+            checkpoint_current_task_attempt()
             return None
-        finally:
-            browser.close()
+    except TaskInterruption:
+        raise
+    except Exception as e:
+        logger(f"Sentinel Browser 启动异常: {e}")
+        checkpoint_current_task_attempt()
+        return None
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception as e:
+                logger(f"Sentinel Browser 关闭异常: {e}")
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception as e:
+                logger(f"Sentinel Browser 驱动停止异常: {e}")
+        unregister_interrupt()
+        checkpoint_current_task_attempt()

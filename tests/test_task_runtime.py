@@ -2,6 +2,7 @@ import threading
 import unittest
 from unittest import mock
 
+from core import task_runtime
 from core.task_runtime import (
     AttemptOutcome,
     AttemptResult,
@@ -21,6 +22,77 @@ class AttemptResultTests(unittest.TestCase):
 
 
 class RegisterTaskControlTests(unittest.TestCase):
+    def test_task_attempt_context_is_scoped_and_restored(self):
+        outer_control = RegisterTaskControl()
+        inner_control = RegisterTaskControl()
+        outer_attempt = outer_control.start_attempt()
+        inner_attempt = inner_control.start_attempt()
+
+        self.assertIsNone(task_runtime.current_task_attempt_context())
+        with task_runtime.bind_task_attempt_context(
+            outer_control,
+            outer_attempt,
+        ):
+            outer = task_runtime.current_task_attempt_context()
+            self.assertIs(outer.control, outer_control)
+            self.assertEqual(outer.attempt_id, outer_attempt)
+            with task_runtime.bind_task_attempt_context(
+                inner_control,
+                inner_attempt,
+            ):
+                inner = task_runtime.current_task_attempt_context()
+                self.assertIs(inner.control, inner_control)
+                self.assertEqual(inner.attempt_id, inner_attempt)
+            self.assertIs(
+                task_runtime.current_task_attempt_context().control,
+                outer_control,
+            )
+        self.assertIsNone(task_runtime.current_task_attempt_context())
+
+        outer_control.finish_attempt(outer_attempt)
+        inner_control.finish_attempt(inner_attempt)
+
+    def test_stop_interrupts_registered_attempt_resource(self):
+        control = RegisterTaskControl()
+        attempt_id = control.start_attempt()
+        interrupted: list[int] = []
+
+        unregister = control.register_attempt_interrupt(
+            attempt_id,
+            lambda: interrupted.append(attempt_id),
+        )
+
+        self.assertTrue(control.request_stop_once())
+        self.assertEqual(interrupted, [attempt_id])
+        self.assertFalse(control.request_stop_once())
+        self.assertEqual(interrupted, [attempt_id])
+
+        unregister()
+        control.finish_attempt(attempt_id)
+
+    def test_skip_interrupts_only_live_attempt_resources(self):
+        control = RegisterTaskControl()
+        live_attempt = control.start_attempt()
+        finished_attempt = control.start_attempt()
+        interrupted: list[int] = []
+
+        control.register_attempt_interrupt(
+            live_attempt,
+            lambda: interrupted.append(live_attempt),
+        )
+        control.register_attempt_interrupt(
+            finished_attempt,
+            lambda: interrupted.append(finished_attempt),
+        )
+        control.finish_attempt(finished_attempt)
+
+        control.request_skip_current()
+
+        self.assertEqual(interrupted, [live_attempt])
+        with self.assertRaises(SkipCurrentAttemptRequested):
+            control.checkpoint(attempt_id=live_attempt)
+        control.finish_attempt(live_attempt)
+
     def test_paused_active_slot_allows_next_attempt_then_reacquires(self):
         control = RegisterTaskControl()
         control.configure_active_slots(1)

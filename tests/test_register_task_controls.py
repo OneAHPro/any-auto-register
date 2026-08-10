@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import api.tasks as tasks_module
 from api.tasks import RegisterTaskRequest, _create_task_record, _run_register, _task_store
+from core import task_runtime
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
 from core.chatgpt_task_gate import ChatGPTTaskGate
@@ -123,6 +124,45 @@ class _YieldingChatGPTPlatform(BasePlatform):
         return True
 
 
+class _InterruptibleStuckChatGPTPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+    started = threading.Event()
+    interrupted = threading.Event()
+    release_without_interrupt = threading.Event()
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    @classmethod
+    def reset(cls):
+        cls.started = threading.Event()
+        cls.interrupted = threading.Event()
+        cls.release_without_interrupt = threading.Event()
+
+    def register(self, email: str, password: str = None) -> Account:
+        context = task_runtime.current_task_attempt_context()
+        type(self).started.set()
+        if context is None:
+            type(self).release_without_interrupt.wait(timeout=2)
+            raise RuntimeError("任务 attempt 上下文未绑定")
+
+        unregister = context.control.register_attempt_interrupt(
+            context.attempt_id,
+            type(self).interrupted.set,
+        )
+        try:
+            if not type(self).interrupted.wait(timeout=2):
+                raise RuntimeError("浏览器中断回调未执行")
+            raise RuntimeError("Playwright driver 已结束")
+        finally:
+            unregister()
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
 class RegisterTaskControlFlowTests(unittest.TestCase):
     def setUp(self):
         self.initial_task_ids = {
@@ -230,6 +270,57 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(snapshot["errors"], [])
+
+    def test_stop_interrupts_stuck_browser_attempt_and_releases_foreground_gate(self):
+        task_id = f"task-chatgpt-stuck-browser-{uuid.uuid4().hex}"
+        req = self._build_request(platform="chatgpt")
+        _create_task_record(task_id, req, "manual", None)
+        gate = ChatGPTTaskGate()
+        errors: list[BaseException] = []
+        _InterruptibleStuckChatGPTPlatform.reset()
+
+        def run() -> None:
+            try:
+                _run_register(task_id, req)
+            except BaseException as exc:
+                errors.append(exc)
+
+        worker = threading.Thread(target=run)
+        try:
+            with (
+                patch("api.tasks.chatgpt_task_gate", gate),
+                patch(
+                    "core.registry.get",
+                    return_value=_InterruptibleStuckChatGPTPlatform,
+                ),
+                patch(
+                    "core.base_mailbox.create_mailbox",
+                    return_value=_FakeMailbox(),
+                ),
+                patch("api.tasks._save_task_log"),
+            ):
+                worker.start()
+                self.assertTrue(
+                    _InterruptibleStuckChatGPTPlatform.started.wait(timeout=1)
+                )
+                tasks_module.stop_task(task_id)
+                self.assertTrue(
+                    _InterruptibleStuckChatGPTPlatform.interrupted.wait(timeout=0.5)
+                )
+                worker.join(timeout=1)
+        finally:
+            _InterruptibleStuckChatGPTPlatform.release_without_interrupt.set()
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "stopped")
+        self.assertEqual(snapshot["control"]["active_attempts"], 0)
+        self.assertEqual(gate.snapshot()["foreground_active"], 0)
+        automation_lease = gate.try_enter_automation()
+        self.assertIsNotNone(automation_lease)
+        gate.leave_automation(automation_lease)
 
     def test_chatgpt_background_executor_is_bounded(self):
         self.assertEqual(
