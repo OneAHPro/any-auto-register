@@ -6,6 +6,7 @@ from pydantic import BaseModel, Field
 
 
 MailImportProviderType = Literal["applemail", "microsoft"]
+MailImportExecuteProviderType = Literal["auto", "applemail", "microsoft"]
 MailImportAccountType = Literal[
     "microsoft_oauth",
     "mailapi_url",
@@ -53,8 +54,9 @@ class MailImportSnapshotRequest(BaseModel):
 
 
 class MailImportExecuteRequest(BaseModel):
-    type: MailImportProviderType
+    type: MailImportExecuteProviderType
     content: str
+    preferred_provider: MailImportProviderType | None = None
     filename: str = ""
     pool_dir: str = ""
     pool_file: str = ""
@@ -118,8 +120,29 @@ class MailImportSummary(BaseModel):
 
 
 class MailImportResponse(BaseModel):
-    type: MailImportProviderType
+    type: MailImportExecuteProviderType
     summary: MailImportSummary
     snapshot: MailImportSnapshot
     errors: list[str] = Field(default_factory=list)
     meta: dict[str, Any] = Field(default_factory=dict)
+
+
+class MailImportDetectionRequest(BaseModel):
+    content: str = Field(min_length=1)
+
+
+class MailImportDetectionRow(BaseModel):
+    line_number: int
+    email: str = ""
+    provider: MailImportProviderType | None = None
+    account_type: MailImportAccountType | None = None
+    resolved: bool
+    message: str = ""
+
+
+class MailImportDetectionResponse(BaseModel):
+    counts: dict[str, int] = Field(default_factory=dict)
+    can_import: bool
+    has_duplicates: bool = False
+    duplicate_emails: list[str] = Field(default_factory=list)
+    rows: list[MailImportDetectionRow] = Field(default_factory=list)

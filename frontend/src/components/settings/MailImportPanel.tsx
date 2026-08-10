@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { App, Alert, Button, Card, Form, Input, InputNumber, Popconfirm, Select, Space, Switch, Table, Tag, Typography } from 'antd'
 import type { FormInstance } from 'antd'
 
@@ -56,11 +56,32 @@ interface MailImportSummary {
 }
 
 interface MailImportResult {
-  type: MailImportProviderType
+  type: MailImportProviderType | 'auto'
   summary: MailImportSummary
   snapshot: MailImportSnapshot
   errors: string[]
   meta: Record<string, unknown>
+}
+
+interface MailImportDetectionRow {
+  line_number: number
+  email: string
+  provider?: MailImportProviderType | null
+  account_type?: MailImportSnapshotItem['account_type']
+  resolved: boolean
+  message: string
+}
+
+interface MailImportDetection {
+  counts: {
+    microsoft: number
+    applemail: number
+    unresolved: number
+  }
+  can_import: boolean
+  has_duplicates: boolean
+  duplicate_emails: string[]
+  rows: MailImportDetectionRow[]
 }
 
 const SUPPORTED_IMPORT_TYPES: MailImportProviderType[] = ['applemail', 'microsoft']
@@ -232,6 +253,11 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   const [aliasSplitEnabled, setAliasSplitEnabled] = useState(false)
   const [aliasSplitCount, setAliasSplitCount] = useState(5)
   const [aliasIncludeOriginal, setAliasIncludeOriginal] = useState(false)
+  const [detection, setDetection] = useState<MailImportDetection | null>(null)
+  const [detecting, setDetecting] = useState(false)
+  const [detectionError, setDetectionError] = useState('')
+  const [manualFallback, setManualFallback] = useState(false)
+  const detectionRequestId = useRef(0)
 
   const providerMap = useMemo(
     () => new Map(providers.map((provider) => [provider.type, provider])),
@@ -239,7 +265,17 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   )
   const selectedProvider = providerMap.get(selectedType) ?? null
   const selectedApiType = selectedProvider?.apiType ?? toImportApiType(selectedType)
-  const supportsAliasSplit = selectedApiType === 'microsoft'
+  const hasImportContent = Boolean(content.trim())
+  const supportsAliasSplit = manualFallback
+    ? selectedApiType === 'microsoft'
+    : hasImportContent
+      ? Boolean(detection?.counts.microsoft)
+      : selectedApiType === 'microsoft'
+  const supportsFilename = manualFallback
+    ? selectedApiType === 'applemail'
+    : hasImportContent
+      ? Boolean(detection?.counts.applemail)
+      : Boolean(selectedProvider?.supports_filename)
   const preferredImportType = useMemo(
     () => resolvePreferredImportType(
       currentMailProvider,
@@ -324,10 +360,45 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     setSelectedRowKeys([])
   }, [selectedType, rawSnapshot])
 
+  useEffect(() => {
+    const payload = content.trim()
+    const requestId = ++detectionRequestId.current
+    setManualFallback(false)
+    setDetectionError('')
+    if (!payload) {
+      setDetection(null)
+      setDetecting(false)
+      return
+    }
+
+    setDetecting(true)
+    const timer = window.setTimeout(() => {
+      void apiFetch('/mail-imports/detect', {
+        method: 'POST',
+        body: JSON.stringify({ content: payload }),
+      }).then((response) => {
+        if (detectionRequestId.current !== requestId) return
+        setDetection(response as MailImportDetection)
+      }).catch((error) => {
+        if (detectionRequestId.current !== requestId) return
+        setDetection(null)
+        setDetectionError(error instanceof Error ? error.message : '自动识别失败')
+      }).finally(() => {
+        if (detectionRequestId.current === requestId) setDetecting(false)
+      })
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [content])
+
   const handleImport = async () => {
     const payload = content.trim()
     if (!payload) {
       message.error('请输入导入内容')
+      return
+    }
+    if (!manualFallback && (!detection || !detection.can_import)) {
+      message.error('请等待自动识别完成，或对未识别内容启用手动兜底')
       return
     }
 
@@ -335,19 +406,16 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     try {
       const apiType = toImportApiType(selectedType)
       const body: Record<string, unknown> = {
-        type: apiType,
+        type: manualFallback ? apiType : 'auto',
         content: payload,
         enabled: true,
         bind_to_config: true,
-      }
-
-      if (apiType === 'applemail') {
-        body.filename = filename.trim()
-        body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
-      } else {
-        body.alias_split_enabled = aliasSplitEnabled
-        body.alias_split_count = aliasSplitCount
-        body.alias_include_original = aliasIncludeOriginal
+        preferred_provider: selectedApiType,
+        filename: filename.trim(),
+        pool_dir: String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail',
+        alias_split_enabled: aliasSplitEnabled,
+        alias_split_count: aliasSplitCount,
+        alias_include_original: aliasIncludeOriginal,
       }
 
       const response = await apiFetch('/mail-imports', {
@@ -359,6 +427,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       setRawSnapshot(response.snapshot)
       setContent('')
       setFilename('')
+      setDetection(null)
+      setManualFallback(false)
 
       if (response.type === 'applemail') {
         form.setFieldsValue({
@@ -371,6 +441,20 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         form.setFieldsValue({
           mail_provider: 'mail_import',
           mail_import_source: 'microsoft',
+        })
+      } else if (response.type === 'auto') {
+        const boundProvider = String(response.meta.bound_provider || '')
+        const applemailPoolFile = String(response.meta.applemail_pool_file || '')
+        const applemailPoolDir = String(response.meta.applemail_pool_dir || '')
+        form.setFieldsValue({
+          ...(boundProvider ? {
+            mail_provider: 'mail_import',
+            mail_import_source: boundProvider,
+          } : {}),
+          ...(applemailPoolFile ? {
+            applemail_pool_dir: applemailPoolDir || 'mail',
+            applemail_pool_file: applemailPoolFile,
+          } : {}),
         })
       }
 
@@ -627,6 +711,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       title="邮箱导入"
       extra={(
         <Select
+          aria-label="邮箱池视图"
           value={selectedType}
           onChange={handleTypeChange}
           loading={loadingProviders}
@@ -640,6 +725,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       style={{ marginBottom: 16 }}
     >
       <Space direction="vertical" style={{ width: '100%' }} size={12}>
+        <Typography.Text strong>
+          粘贴后自动识别邮箱类型；右上角仅用于切换已导入邮箱池的预览和手动兜底类型。
+        </Typography.Text>
         <Typography.Text type="secondary">
           {selectedProvider?.description || '通过统一导入接口，将内容导入到对应邮箱账号池。'}
         </Typography.Text>
@@ -647,12 +735,12 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           <Typography.Text type="secondary">{selectedProvider.helper_text}</Typography.Text>
         ) : null}
 
-        {selectedProvider?.supports_filename ? (
-          <Form.Item label={selectedProvider.filename_label || '文件名'} style={{ marginBottom: 0 }}>
+        {supportsFilename ? (
+          <Form.Item label={selectedProvider?.filename_label || '文件名'} style={{ marginBottom: 0 }}>
             <Input
               value={filename}
               onChange={(event) => setFilename(event.target.value)}
-              placeholder={selectedProvider.filename_placeholder}
+              placeholder={selectedProvider?.filename_placeholder || 'applemail_日期.json（可选）'}
             />
           </Form.Item>
         ) : null}
@@ -693,12 +781,61 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         ) : null}
 
         <Input.TextArea
+          aria-label="邮箱导入内容"
           value={content}
           onChange={(event) => setContent(event.target.value)}
           rows={10}
           placeholder={selectedProvider?.content_placeholder || ''}
           style={{ fontFamily: 'monospace' }}
         />
+
+        {hasImportContent ? (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <Typography.Text type="secondary">自动识别：</Typography.Text>
+            <Tag color="blue">微软邮箱 {detection?.counts.microsoft || 0}</Tag>
+            <Tag color="purple">AppleMail {detection?.counts.applemail || 0}</Tag>
+            <Tag color={detection?.counts.unresolved ? 'orange' : 'green'}>
+              待确认 {detection?.counts.unresolved || 0}
+            </Tag>
+            {detecting ? <Typography.Text type="secondary">检测中…</Typography.Text> : null}
+          </div>
+        ) : null}
+
+        {detection?.counts.unresolved ? (
+          <Alert
+            type="warning"
+            showIcon
+            message={`有 ${detection.counts.unresolved} 条内容无法可靠识别`}
+            description={detection.rows.find((row) => !row.resolved)?.message || '请检查格式，或按当前邮箱池类型导入。'}
+            action={(
+              <Button
+                size="small"
+                type={manualFallback ? 'primary' : 'default'}
+                onClick={() => setManualFallback((enabled) => !enabled)}
+              >
+                {manualFallback ? '已启用手动兜底' : '按当前邮箱池类型导入'}
+              </Button>
+            )}
+          />
+        ) : null}
+
+        {detectionError ? (
+          <Alert
+            type="error"
+            showIcon
+            message="自动识别请求失败"
+            description={detectionError}
+            action={(
+              <Button
+                size="small"
+                type={manualFallback ? 'primary' : 'default'}
+                onClick={() => setManualFallback((enabled) => !enabled)}
+              >
+                {manualFallback ? '已启用手动兜底' : '按当前邮箱池类型导入'}
+              </Button>
+            )}
+          />
+        ) : null}
 
         <Space style={{ width: '100%', justifyContent: 'space-between' }}>
           <Button
@@ -707,6 +844,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
               setContent('')
               setFilename('')
               setResult(null)
+              setDetection(null)
+              setManualFallback(false)
             }}
           >
             清空
@@ -715,7 +854,12 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             <Button onClick={() => void loadSnapshot(selectedType)} loading={loadingSnapshot}>
               刷新预览
             </Button>
-            <Button type="primary" onClick={handleImport} loading={importing}>
+            <Button
+              type="primary"
+              onClick={handleImport}
+              loading={importing}
+              disabled={hasImportContent && !manualFallback && (detecting || !detection?.can_import)}
+            >
               确认导入
             </Button>
           </Space>

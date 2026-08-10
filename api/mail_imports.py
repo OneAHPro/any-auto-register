@@ -3,12 +3,15 @@ from fastapi import APIRouter, HTTPException, Query
 from services.mail_imports import (
     MailImportBatchDeleteRequest,
     MailImportDeleteRequest,
+    MailImportDetectionRequest,
     MailImportExecuteRequest,
     MailImportSnapshotRequest,
     mail_import_registry,
 )
+from services.mail_imports.auto_import import AutoMailImportService
 
 router = APIRouter(prefix="/mail-imports", tags=["mail-imports"])
+auto_mail_import_service = AutoMailImportService(mail_import_registry)
 
 
 @router.get("/providers")
@@ -41,12 +44,19 @@ def get_mail_import_snapshot(
 @router.post("")
 def execute_mail_import(body: MailImportExecuteRequest):
     try:
+        if body.type == "auto":
+            return auto_mail_import_service.execute(body)
         strategy = mail_import_registry.get(body.type)
         return strategy.execute(body)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/detect")
+def detect_mail_import(body: MailImportDetectionRequest):
+    return auto_mail_import_service.detect(body.content)
 
 
 @router.post("/delete")
