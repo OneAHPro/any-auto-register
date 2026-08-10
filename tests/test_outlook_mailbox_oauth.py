@@ -992,6 +992,66 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(mock_get.call_count, 2)
 
     @mock.patch("requests.get")
+    def test_mailapi_html_card_with_ambiguous_code_still_follows_detail(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/inbox/TOKEN",
+            },
+        )
+        list_response = _FakeResponse(
+            200,
+            text="""
+            <html><body>
+              <article class="mail-card">
+                <span class="subject">OpenAI login verification code</span>
+
+                <span class="preview">246810</span>
+                <a href="/api/messages/latest">View message</a>
+                <span class="date">2026-08-10 13:00:03</span>
+              </article>
+            </body></html>
+            """,
+        )
+        detail_response = _FakeResponse(
+            200,
+            text=json.dumps(
+                {
+                    "subject": "OpenAI login verification code",
+                    "body": "Your verification code is 246810",
+                    "received_at": "2026-08-10T13:00:03+08:00",
+                    "message_id": "latest",
+                }
+            ),
+        )
+
+        def fake_get(url, **_kwargs):
+            if url == account.extra["mailapi_url"]:
+                return list_response
+            self.assertEqual(
+                url,
+                "https://mail.example.test/api/messages/latest",
+            )
+            return detail_response
+
+        mock_get.side_effect = fake_get
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertEqual(code, "246810")
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
     def test_mailapi_direct_json_code_wins_over_unrelated_url_field(
         self,
         mock_get,

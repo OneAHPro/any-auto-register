@@ -4663,7 +4663,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         if (
             direct_content
             and direct_content != text
-            and self._extract_code(direct_content, None)
+            and self._extract_message_code(direct_message, text, None)
         ):
             return text
         source_url = str(getattr(response, "url", "") or url)
