@@ -4186,6 +4186,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             "received_at": cls._parse_timestamp(received_text),
             "message_id": message_id,
             "bounded_content": True,
+            "visible_html_content": True,
             "status": None,
         }
 
@@ -4840,7 +4841,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         content = str(message.get("content") or "")
         bounded_content = bool(message.get("bounded_content"))
-        if bounded_content:
+        if bounded_content and message.get("visible_html_content"):
             visible = self._mailapi_visible_text(content)
             code = str(
                 self.mailbox._safe_extract(visible, code_pattern) or ""
@@ -4857,7 +4858,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         if not code:
             return ""
 
-        if bounded_content:
+        if bounded_content and message.get("visible_html_content"):
             normalized = " ".join(visible.split())
         else:
             raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(
