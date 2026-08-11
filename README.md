@@ -1,4 +1,4 @@
-# Any Auto Register
+# Workspace Toolkit
 
 <p align="center">
   <a href="https://linux.do" target="_blank">
@@ -14,7 +14,7 @@
   <a href="README_vi.md">Tiếng Việt</a>
 </p>
 
-多平台账号自动注册与管理系统，支持插件化扩展、Web UI 管理、批量注册、状态同步，以及本地 Turnstile Solver 自动拉起。
+一个面向可配置任务编排、服务集成和运营面板的模块化工作区。
 
 ## 目录
 
@@ -41,7 +41,7 @@
 
 ## 项目简介
 
-本项目基于 [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git) 二次开发
+本项目用于集中管理可配置的自动化任务、外部服务连接和运行记录。
 
 ## 当前界面与实际平台展示
 

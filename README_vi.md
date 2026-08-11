@@ -1,4 +1,4 @@
-# Any Auto Register
+# Workspace Toolkit
 
 <p align="center">
   <a href="https://linux.do" target="_blank">
@@ -8,7 +8,7 @@
 
 > ⚠️ Tuyên bố miễn trừ trách nhiệm: Dự án này chỉ phục vụ mục đích học tập và nghiên cứu, không được sử dụng cho bất kỳ mục đích thương mại nào. Người sử dụng dự án này phải tự chịu hoàn toàn trách nhiệm về mọi hậu quả phát sinh.
 
-Hệ thống quản lý và tự động đăng ký tài khoản đa nền tảng, hỗ trợ mở rộng dạng plugin, quản lý qua Web UI, đăng ký hàng loạt, đồng bộ trạng thái, và tự động khởi chạy Turnstile Solver cục bộ.
+Không gian làm việc mô-đun cho việc điều phối tác vụ có thể cấu hình, tích hợp dịch vụ và bảng điều khiển vận hành.
 
 ## Mục lục
 
@@ -35,7 +35,7 @@ Hệ thống quản lý và tự động đăng ký tài khoản đa nền tản
 
 ## Giới thiệu dự án
 
-Dự án này được phát triển lại từ [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git).
+Dự án tập trung các tác vụ tự động hóa có thể cấu hình, kết nối dịch vụ bên ngoài và lịch sử chạy.
 
 ## Giao diện hiện tại & các nền tảng được hỗ trợ
 

@@ -1,4 +1,4 @@
-# Any Auto Register
+# Workspace Toolkit
 
 <p align="center">
   <a href="https://linux.do" target="_blank">
@@ -8,7 +8,7 @@
 
 > Disclaimer: This project is for learning and research purposes only. It must not be used for any commercial purposes. All consequences arising from the use of this project are solely the responsibility of the user.
 
-Multi-platform automated account registration and management system, supporting plugin-based extensibility, Web UI management, batch registration, state synchronization, and automatic local Turnstile Solver launch.
+A modular workspace for configurable task orchestration, service integrations, and operational dashboards.
 
 ## Table of Contents
 
@@ -35,7 +35,7 @@ Multi-platform automated account registration and management system, supporting 
 
 ## Project Overview
 
-This project is a fork/secondary development based on [lxf746/any-auto-register](https://github.com/lxf746/any-auto-register.git).
+This project centralizes configurable automation tasks, external service connections, and run history.
 
 ## Current Interface & Supported Platforms
 
