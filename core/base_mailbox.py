@@ -3956,6 +3956,10 @@ class OutlookGraphMailboxBackend(OutlookMailboxBackend):
 class MailApiUrlOtpBackend(OutlookMailboxBackend):
     backend_name = "mailapi_url"
 
+    def __init__(self, mailbox: "OutlookMailbox"):
+        super().__init__(mailbox)
+        self._detail_discovery_log_keys: set[tuple[str, tuple[str, ...]]] = set()
+
     @staticmethod
     def _code_key(code: str) -> str:
         return f"mailapi_code:{str(code or '').strip()}"
@@ -4078,7 +4082,72 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "message_id": message_id,
                 "status": None,
             }
-        return None
+
+        # Some MailAPI providers render the newest message directly in a
+        # `.panel` page instead of wrapping it in the historical
+        # `<article class="mail-card">` shape.  Keep the extraction bounded to
+        # the panel and its metadata so tracking links, styles, and mailbox
+        # chrome cannot become message content or fake OTP candidates.
+        panel_match = re.search(
+            r"<section\b([^>]*)\bclass\s*=\s*(['\"])([^'\"]*\bpanel\b[^'\"]*)\2[^>]*>"
+            r"(.*?)</section\s*>",
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if panel_match is None:
+            panel_match = re.search(
+                r"<div\b([^>]*)\bclass\s*=\s*(['\"])([^'\"]*\bpanel\b[^'\"]*)\2[^>]*>"
+                r"(.*?)</div\s*>\s*</(?:main|body|html)>",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+        if panel_match is None:
+            return None
+
+        panel_html = panel_match.group(0)
+        panel_body = panel_match.group(4)
+
+        def _class_body(class_name: str) -> str:
+            match = re.search(
+                rf"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\b{class_name}\b[^'\"]*\1[^>]*>"
+                rf"(.*?)</[^>]+>",
+                panel_body,
+                re.IGNORECASE | re.DOTALL,
+            )
+            return match.group(2) if match else ""
+
+        subject = cls._mailapi_visible_text(_class_body("subject"))
+        content_html = _class_body("content") or panel_body
+        received_text = ""
+        labeled_time = re.search(
+            r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\blabel\b[^'\"]*\1[^>]*>"
+            r"\s*(?:时间|日期|Date|Received)\s*</[^>]+>\s*"
+            r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\bvalue\b[^'\"]*\2[^>]*>"
+            r"(.*?)</[^>]+>",
+            panel_body,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if labeled_time:
+            received_text = cls._mailapi_visible_text(labeled_time.group(3))
+        if not received_text:
+            date_match = re.search(
+                r"(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2})",
+                panel_body,
+                re.IGNORECASE,
+            )
+            received_text = date_match.group(0) if date_match else ""
+
+        visible_panel = cls._mailapi_visible_text(panel_html)
+        identity = "|".join((subject, received_text, visible_panel))
+        message_id = "mailapi_message:" + hashlib.sha256(
+            identity.encode("utf-8", errors="ignore")
+        ).hexdigest()
+        return {
+            "content": content_html,
+            "received_at": cls._parse_timestamp(received_text),
+            "message_id": message_id,
+            "status": None,
+        }
 
     @staticmethod
     def _is_openai_history_subject(value: Any) -> bool:
@@ -4396,6 +4465,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return None
         if source.netloc and target.netloc.lower() != source.netloc.lower():
             return None
+        if target.path.lower().startswith("/cdn-cgi/l/email-protection"):
+            return None
         return resolved
 
     @classmethod
@@ -4671,9 +4742,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         if not detail_urls:
             return text
 
-        self.mailbox._log("[MailAPI] 入口为邮件列表，自动发现并跟进邮件详情")
+        detail_log_key = (source_url, tuple(detail_urls[:3]))
+        if detail_log_key not in self._detail_discovery_log_keys:
+            if len(self._detail_discovery_log_keys) >= 128:
+                self._detail_discovery_log_keys.clear()
+            self._detail_discovery_log_keys.add(detail_log_key)
+            self.mailbox._log(
+                "[MailAPI] 入口为邮件列表，自动发现并跟进邮件详情"
+            )
         cookies = self._collect_mailapi_cookies(response)
-        first_detail_text = ""
         # The newest/highest-confidence messages are ranked first.  Bound the
         # detail fan-out so a slow stale message cannot add up to eight 15s
         # waits to every OTP poll.
@@ -4687,14 +4764,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 detail_text = str(detail_response.text or "")
                 if not detail_text:
                     continue
-                if not first_detail_text:
-                    first_detail_text = detail_text
                 detail_message = self._parse_mailapi_message(detail_text)
                 if self._extract_message_code(detail_message, detail_text, None):
                     return detail_text
             except Exception:
                 continue
-        return first_detail_text or text
+        # A discovered detail may be stale, inaccessible, or a tracking page.
+        # Preserve the original list/single-message page so its own visible OTP
+        # can still be parsed on this poll.
+        return text
 
     def _extract_code(self, text: str, code_pattern: str | None) -> str:
         normalized_text = self.mailbox._decode_raw_content(text) or str(text or "")
@@ -4850,7 +4928,17 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             seen.add(code_key)
             if message_id:
                 seen.add(message_id)
-            self.mailbox._log(f"[MailAPI] 收到验证码: {code}")
+            try:
+                from platforms.chatgpt.log_sanitizer import (
+                    sanitize_chatgpt_log_message,
+                )
+
+                safe_log = sanitize_chatgpt_log_message(
+                    f"[MailAPI] 收到验证码: {code}"
+                )
+            except Exception:
+                safe_log = "[MailAPI] 收到验证码: [验证码已隐藏]"
+            self.mailbox._log(safe_log)
             return code
 
         return self.mailbox._run_polling_wait(

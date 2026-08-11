@@ -2709,7 +2709,13 @@ def _auto_upload_integrations(task_id: str, account):
                 _log(task_id, f"  [{name}] {'[OK] ' + msg if ok else '[FAIL] ' + msg}")
         except Exception as e:
             _log(task_id, f"  [Auto Upload] 自动导入异常: {e}")
-    threading.Thread(target=_run, daemon=True).start()
+    worker = threading.Thread(
+        target=_run,
+        name=f"external-sync-{task_id[-8:]}",
+        daemon=True,
+    )
+    worker.start()
+    return worker
 
 
 def _complete_chatgpt_leadbee_verification(
@@ -3255,6 +3261,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     success = 0
     skipped = 0
     errors = []
+    external_sync_threads: list[threading.Thread] = []
+    external_sync_threads_lock = threading.Lock()
     start_gate_lock = threading.Lock()
     next_start_time = time.time()
     action_name, success_action_name = _task_action_terms(req)
@@ -3270,6 +3278,13 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             chunk = min(0.25, remaining)
             time.sleep(chunk)
             remaining -= chunk
+
+    def _schedule_external_sync(account) -> None:
+        worker = _auto_upload_integrations(task_id, account)
+        if not isinstance(worker, threading.Thread):
+            return
+        with external_sync_threads_lock:
+            external_sync_threads.append(worker)
 
     try:
         PlatformCls = get(req.platform)
@@ -3521,25 +3536,63 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     proxy=_proxy,
                     extra=merged_extra,
                 )
-                _mailbox = _build_mailbox(_proxy, attempt_mail_provider)
-                _platform = PlatformCls(config=_config, mailbox=_mailbox)
-                _platform._task_attempt_token = attempt_id
-                _platform._log_fn = lambda msg: _log(task_id, msg)
-                _platform.bind_task_control(control)
-                if getattr(_platform, "mailbox", None) is not None:
-                    _platform.mailbox._task_attempt_token = attempt_id
-                    _platform.mailbox._log_fn = _platform._log_fn
-                _task_store.set_progress(task_id, f"{i + 1}/{req.count}")
-                _persist_task_snapshot(task_id)
+
+                def _new_platform_session():
+                    mailbox = _build_mailbox(_proxy, attempt_mail_provider)
+                    platform = PlatformCls(config=_config, mailbox=mailbox)
+                    platform._task_attempt_token = attempt_id
+                    platform._log_fn = lambda msg: _log(task_id, msg)
+                    platform.bind_task_control(control)
+                    if getattr(platform, "mailbox", None) is not None:
+                        platform.mailbox._task_attempt_token = attempt_id
+                        platform.mailbox._log_fn = platform._log_fn
+                    return mailbox, platform
+
+                def _phone_oauth_is_ready(candidate) -> bool:
+                    candidate_extra = (
+                        dict(candidate.extra)
+                        if isinstance(getattr(candidate, "extra", None), dict)
+                        else {}
+                    )
+                    resume = candidate_extra.get("oauth_resume_context")
+                    return bool(
+                        _is_truthy(candidate_extra.get("phone_oauth_ready"))
+                        or (isinstance(resume, dict) and bool(resume))
+                    )
+
+                _mailbox, _platform = _new_platform_session()
                 _log(task_id, f"开始{action_name}第 {i + 1}/{req.count} 个账号")
                 if _proxy:
                     _log(task_id, f"使用代理: {_proxy}")
-                with bind_task_attempt_context(control, attempt_id):
-                    account = _platform.register(
-                        email=bound_email or req.email or None,
-                        password=req.password,
+                login_email = bound_email or req.email or None
+                oauth_recovery_attempted = False
+                while True:
+                    with bind_task_attempt_context(control, attempt_id):
+                        account = _platform.register(
+                            email=login_email,
+                            password=req.password,
+                        )
+                    current_email = account.email or current_email
+                    if (
+                        not _bind_phone_and_get_rt
+                        or _phone_oauth_is_ready(account)
+                        or oauth_recovery_attempted
+                    ):
+                        break
+
+                    oauth_recovery_attempted = True
+                    _log(
+                        task_id,
+                        "手机授权事务暂未就绪，重新建立一次 OAuth 登录会话",
                     )
-                current_email = account.email or current_email
+                    if not _requeue_chatgpt_login_mailbox(_mailbox, account):
+                        _log(
+                            task_id,
+                            "[WARN] 当前邮箱登录凭据未能重新入池，停止本轮 OAuth 恢复",
+                        )
+                        break
+                    login_email = current_email or login_email
+                    _mailbox, _platform = _new_platform_session()
                 if str(merged_extra.get("mail_provider", "")).strip() == "cfworker":
                     from core.email_domain_policy import validate_email_domain_policy
 
@@ -3614,20 +3667,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         ),
                         parent_binding_id=parent_binding_id,
                     )
-                    account_extra = (
-                        dict(account.extra)
-                        if isinstance(getattr(account, "extra", None), dict)
-                        else {}
-                    )
-                    resume_context = account_extra.get("oauth_resume_context")
-                    phone_oauth_ready = bool(
-                        _is_truthy(account_extra.get("phone_oauth_ready"))
-                        or (
-                            isinstance(resume_context, dict)
-                            and bool(resume_context)
-                        )
-                    )
-                    if not phone_oauth_ready:
+                    if not _phone_oauth_is_ready(account):
                         failure = (
                             "邮箱登录成功，Access Token 已保存，但手机授权事务未就绪；"
                             "本次未启动 LeadBee，请重新执行该账号的登录接码"
@@ -4086,7 +4126,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         status="success",
                         parent_binding_id=parent_binding_id,
                     )
-                    _auto_upload_integrations(task_id, final_account)
+                    _schedule_external_sync(final_account)
                     return AttemptResult.success()
 
                 _log(task_id, f"[OK] {success_action_name}成功: {account.email}")
@@ -4097,7 +4137,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 )
                 if refresh_message:
                     _log(task_id, f"  {refresh_message}")
-                _auto_upload_integrations(task_id, saved_account or account)
+                _schedule_external_sync(saved_account or account)
                 cashier_url = (account.extra or {}).get("cashier_url", "")
                 if cashier_url:
                     _log(task_id, f"  [升级链接] {cashier_url}")
@@ -4249,6 +4289,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 max_workers,
             )
         stopped = False
+        processed = 0
         with ThreadPoolExecutor(max_workers=executor_workers) as pool:
             futures = [pool.submit(_do_one, i) for i in range(req.count)]
             for f in as_completed(futures):
@@ -4259,15 +4300,17 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 except Exception as e:
                     _log(task_id, f"[ERROR] 任务线程异常: {e}")
                     errors.append(str(e))
-                    continue
-                if result.outcome == AttemptOutcome.SUCCESS:
-                    success += 1
-                elif result.outcome == AttemptOutcome.SKIPPED:
-                    skipped += 1
-                elif result.outcome == AttemptOutcome.STOPPED:
-                    stopped = True
                 else:
-                    errors.append(result.message)
+                    if result.outcome == AttemptOutcome.SUCCESS:
+                        success += 1
+                    elif result.outcome == AttemptOutcome.SKIPPED:
+                        skipped += 1
+                    elif result.outcome == AttemptOutcome.STOPPED:
+                        stopped = True
+                    else:
+                        errors.append(result.message)
+                processed += 1
+                _task_store.set_progress(task_id, f"{processed}/{req.count}")
                 _task_store.update_counters(
                     task_id,
                     success=success,
@@ -4279,6 +4322,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     for pending in futures:
                         if pending is not f:
                             pending.cancel()
+        with external_sync_threads_lock:
+            pending_sync_threads = tuple(external_sync_threads)
+        for worker in pending_sync_threads:
+            worker.join()
     except Exception as e:
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(
@@ -4302,6 +4349,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     else:
         summary = f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
     _log(task_id, summary)
+    if final_status == "done":
+        processed = req.count
+    _task_store.set_progress(task_id, f"{processed}/{req.count}")
     _task_store.finish(
         task_id,
         status=final_status,

@@ -23,12 +23,14 @@ class _LoginMailbox:
     _lock = threading.Lock()
     marked_used = []
     bound_claim_scopes = []
+    requeued = []
 
     @classmethod
     def reset(cls):
         with cls._lock:
             cls.marked_used = []
             cls.bound_claim_scopes = []
+            cls.requeued = []
 
     def bind_claim_scope(self, scope):
         with type(self)._lock:
@@ -37,6 +39,11 @@ class _LoginMailbox:
     def mark_account_used(self, account):
         with type(self)._lock:
             type(self).marked_used.append(str(getattr(account, "email", "") or ""))
+        return True
+
+    def requeue_account(self, account):
+        with type(self)._lock:
+            type(self).requeued.append(str(getattr(account, "email", "") or ""))
         return True
 
 
@@ -48,6 +55,7 @@ class _ExistingAccountPlatform(BasePlatform):
     _counter = 0
     seen_extras = []
     phone_oauth_ready = True
+    phone_oauth_ready_sequence = []
     phone_oauth_prepare_error = ""
 
     @classmethod
@@ -56,6 +64,7 @@ class _ExistingAccountPlatform(BasePlatform):
             cls._counter = 0
             cls.seen_extras = []
             cls.phone_oauth_ready = True
+            cls.phone_oauth_ready_sequence = []
             cls.phone_oauth_prepare_error = ""
 
     def __init__(self, config=None, mailbox=None):
@@ -67,6 +76,11 @@ class _ExistingAccountPlatform(BasePlatform):
             type(self)._counter += 1
             index = type(self)._counter
             type(self).seen_extras.append(dict(self.config.extra or {}))
+            ready = (
+                bool(type(self).phone_oauth_ready_sequence[index - 1])
+                if index <= len(type(self).phone_oauth_ready_sequence)
+                else bool(type(self).phone_oauth_ready)
+            )
         return Account(
             platform="chatgpt",
             email=f"existing-{index}@example.com",
@@ -77,13 +91,19 @@ class _ExistingAccountPlatform(BasePlatform):
                 "access_token": f"access-token-{index}",
                 "refresh_token": "",
                 "chatgpt_token_source": "existing_account_web_login",
-                "phone_oauth_ready": type(self).phone_oauth_ready,
+                "phone_oauth_ready": ready,
                 "phone_oauth_prepare_error": type(self).phone_oauth_prepare_error,
                 "oauth_resume_context": (
                     {"version": 1, "attempt": index}
-                    if type(self).phone_oauth_ready
+                    if ready
                     else {}
                 ),
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": f"existing-{index}@example.com",
+                    "account_id": str(index),
+                    "extra": {"account_type": "mailapi_url"},
+                },
             },
         )
 
@@ -437,21 +457,23 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         completion,
         account_was_created=True,
         persist_refresh_token_on_completion=True,
+        count=2,
     ):
         req = RegisterTaskRequest(
             platform="chatgpt",
-            count=2,
-            concurrency=2,
+            count=count,
+            concurrency=count,
             proxy="http://proxy.local:8080",
             extra={
                 "mail_provider": "microsoft",
                 "chatgpt_existing_account_login_only": True,
                 "chatgpt_existing_account_login_stage": "access_token",
                 "chatgpt_existing_account_bind_phone_and_get_rt": True,
-                "chatgpt_existing_account_leadbee_codes": [
-                    "card-secret-one",
-                    "card-secret-two",
-                ],
+                "chatgpt_existing_account_leadbee_codes": (
+                    ["card-secret-one", "card-secret-two"]
+                    if count == 2
+                    else [f"card-secret-{index + 1}" for index in range(count)]
+                ),
             },
         )
         _task_store.create(
@@ -548,6 +570,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         )
 
         self.assertEqual(snapshot["success"], 2)
+        self.assertEqual(snapshot["progress"], "2/2")
         self.assertEqual(
             {call.kwargs["leadbee_code"] for call in complete.call_args_list},
             {"card-secret-one", "card-secret-two"},
@@ -694,6 +717,28 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             self.assertTrue(call.kwargs["detail"]["partial_success"])
             self.assertTrue(call.kwargs["detail"]["access_token_saved"])
             self.assertFalse(call.kwargs["detail"]["exchange_code_consumed"])
+
+    def test_unprepared_phone_oauth_retries_fresh_login_once(self):
+        _ExistingAccountPlatform.phone_oauth_ready_sequence = [False, True]
+
+        snapshot, saved, complete, _save_task_log, cleanup_incomplete = self._run(
+            "task-chatgpt-login-phone-oauth-recovery",
+            count=1,
+            completion=lambda **_: {
+                "status": "completed",
+                "message": "手机验证完成，Refresh Token 已保存",
+                "phone_verified": True,
+                "exchange_code_consumed": True,
+            },
+        )
+
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(_ExistingAccountPlatform._counter, 2)
+        complete.assert_called_once()
+        cleanup_incomplete.assert_not_called()
+        joined_logs = "\n".join(snapshot["logs"])
+        self.assertIn("重新建立一次 OAuth 登录会话", joined_logs)
 
 
 if __name__ == "__main__":

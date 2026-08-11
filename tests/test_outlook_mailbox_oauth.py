@@ -678,6 +678,180 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             15,
         )
 
+    def test_mailapi_parses_single_message_panel_with_timestamp_and_code(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <!doctype html>
+        <html lang="zh-CN">
+          <head>
+            <title>Your temporary ChatGPT login code - 最新邮件</title>
+            <style>
+              .content{padding:20px;line-height:1.65}
+              .content table{max-width:100%;border-collapse:collapse}
+            </style>
+          </head>
+          <body>
+            <main class="wrap">
+              <div class="top">
+                <h1>最新邮件</h1>
+                <div class="mailbox">
+                  <a href="/cdn-cgi/l/email-protection" class="__cf_email__">
+                    [email protected]
+                  </a>
+                </div>
+              </div>
+              <section class="panel">
+                <div class="meta">
+                  <div class="subject">Your temporary ChatGPT login code</div>
+                  <div class="row">
+                    <div class="label">时间</div>
+                    <div class="value">2026-08-12 00:23:22</div>
+                  </div>
+                </div>
+                <div class="content">
+                  <table><tr><td>
+                    <p>Enter this temporary verification code to continue:</p>
+                    <p style="font-family: Menlo">326097</p>
+                  </td></tr></table>
+                </div>
+              </section>
+            </main>
+          </body>
+        </html>
+        """
+
+        message = backend._parse_mailapi_message(page)
+        code = backend._extract_message_code(message, page, None)
+
+        self.assertEqual(code, "326097")
+        self.assertEqual(
+            message["received_at"],
+            datetime.fromisoformat("2026-08-12T00:23:22").timestamp(),
+        )
+        self.assertTrue(message["message_id"].startswith("mailapi_message:"))
+        self.assertNotEqual(message["content"], page)
+
+    def test_mailapi_detail_discovery_ignores_cloudflare_email_protection(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <html><body>
+          <section class="panel">
+            <a href="/cdn-cgi/l/email-protection" class="__cf_email__">
+              [email protected]
+            </a>
+          </section>
+        </body></html>
+        """
+
+        urls = backend._find_mailapi_detail_urls(
+            page,
+            "https://mail.example.test/mailbox/TOKEN",
+        )
+
+        self.assertEqual(urls, [])
+
+    @mock.patch("requests.get")
+    def test_mailapi_detail_without_code_falls_back_to_original_page(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/mailbox/TOKEN",
+            },
+        )
+        list_page = """
+        <html><body>
+          <a href="/message/latest">View message</a>
+          <div>Enter this temporary verification code to continue: 326097</div>
+        </body></html>
+        """
+
+        def fake_get(url, **_kwargs):
+            if url == account.extra["mailapi_url"]:
+                return _FakeResponse(200, text=list_page)
+            self.assertEqual(url, "https://mail.example.test/message/latest")
+            return _FakeResponse(200, text="<html><body>Message unavailable</body></html>")
+
+        mock_get.side_effect = fake_get
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertEqual(code, "326097")
+        self.assertEqual(mock_get.call_count, 2)
+
+    @mock.patch("requests.get")
+    def test_mailapi_detail_discovery_log_is_deduplicated(self, mock_get):
+        logs = []
+        mailbox = OutlookMailbox()
+        mailbox._log_fn = logs.append
+        backend = mailbox._backends["mailapi_url"]
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/mailbox/TOKEN",
+            },
+        )
+        list_page = "<html><body><a href=\"/message/latest\">View</a></body></html>"
+        mock_get.side_effect = [
+            _FakeResponse(200, text=list_page),
+            _FakeResponse(200, text="<html><body>Notice</body></html>"),
+            _FakeResponse(200, text=list_page),
+            _FakeResponse(200, text="<html><body>Notice</body></html>"),
+        ]
+
+        backend._fetch_mailapi_text(account)
+        backend._fetch_mailapi_text(account)
+
+        self.assertEqual(
+            logs.count("[MailAPI] 入口为邮件列表，自动发现并跟进邮件详情"),
+            1,
+        )
+
+    @mock.patch("requests.get")
+    def test_mailapi_otp_log_redacts_the_code(self, mock_get):
+        logs = []
+        mailbox = OutlookMailbox()
+        mailbox._log_fn = logs.append
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text=(
+                "<section class=\"panel\"><div class=\"meta\">"
+                "<div class=\"subject\">Your temporary ChatGPT login code</div>"
+                "<div class=\"label\">时间</div><div class=\"value\">"
+                "2026-08-12 00:23:22</div></div>"
+                "<div class=\"content\">Enter this temporary verification code "
+                "to continue: 326097</div></section>"
+            ),
+        )
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertEqual(code, "326097")
+        rendered = "\n".join(logs)
+        self.assertIn("[验证码已隐藏]", rendered)
+        self.assertNotIn("326097", rendered)
+
     @mock.patch("requests.get")
     def test_mailapi_html_list_follows_latest_verification_message_detail(
         self,

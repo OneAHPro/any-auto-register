@@ -2120,7 +2120,10 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             _run_chatgpt_relogin_task(task_id, [27, 28, 29], concurrency=1)
 
         snapshot = _task_store.snapshot(task_id)
-        self.assertEqual(relogin_calls, [27, 28, 29])
+        # The executor may over-provision workers so OTP waits do not occupy
+        # the requested active-login slots; completion order is therefore not
+        # part of the task contract.
+        self.assertCountEqual(relogin_calls, [27, 28, 29])
         self.assertEqual(snapshot["status"], "done")
         self.assertEqual(snapshot["success"], 3)
         self.assertEqual(snapshot["registered"], 3)

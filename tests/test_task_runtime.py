@@ -2,6 +2,7 @@ import threading
 import unittest
 from unittest import mock
 
+import api.tasks as tasks_module
 from core import task_runtime
 from core.task_runtime import (
     AttemptOutcome,
@@ -19,6 +20,22 @@ class AttemptResultTests(unittest.TestCase):
 
         self.assertEqual(result.outcome, AttemptOutcome.REMOVED)
         self.assertEqual(result.message, "账号已删除")
+
+    def test_auto_upload_integrations_returns_joinable_worker(self):
+        account = type("Account", (), {"email": "demo@example.com"})()
+        with (
+            mock.patch(
+                "services.external_sync.sync_account",
+                return_value=[{"name": "Codex2API", "ok": True, "msg": "ok"}],
+            ),
+            mock.patch("api.tasks._log") as log,
+        ):
+            worker = tasks_module._auto_upload_integrations("task-sync", account)
+            self.assertIsInstance(worker, threading.Thread)
+            worker.join(timeout=2)
+
+        self.assertFalse(worker.is_alive())
+        log.assert_called_once_with("task-sync", "  [Codex2API] [OK] ok")
 
 
 class RegisterTaskControlTests(unittest.TestCase):
