@@ -39,7 +39,8 @@ _QUERY_CODE_RE = re.compile(
 )
 _DIRECT_OTP_RE = re.compile(
     r"(?P<prefix>"
-    r"(?:成功获取验证码|跳过已尝试验证码|尝试\s*[Oo][Tt][Pp]|"
+    r"(?:成功获取验证码|跳过已尝试验证码|验证码(?:提取成功)?|"
+    r"尝试\s*[Oo][Tt][Pp]|"
     r"验证码|verification\s+code|[Oo][Tt][Pp])"
     r"\s*[:：=]?\s*)"
     r"(?P<value>\"?[A-Za-z0-9-]{4,}\"?)",

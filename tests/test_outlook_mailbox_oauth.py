@@ -732,6 +732,23 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertTrue(message["message_id"].startswith("mailapi_message:"))
         self.assertNotEqual(message["content"], page)
 
+    def test_mailapi_panel_does_not_scan_page_chrome_for_otp(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <html><body>
+          <section class="panel">
+            <div class="subject">Mailbox status</div>
+            <div class="content">No new message</div>
+          </section>
+          <footer>For help, use verification code 111111.</footer>
+        </body></html>
+        """
+
+        message = backend._parse_mailapi_message(page)
+
+        self.assertEqual(backend._extract_message_code(message, page, None), "")
+
     def test_mailapi_detail_discovery_ignores_cloudflare_email_protection(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]
@@ -846,11 +863,39 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             side_effect=lambda **kwargs: kwargs["poll_once"](),
         ):
             code = mailbox.wait_for_code(account, timeout=5)
+            skipped = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                exclude_codes={"326097"},
+            )
 
         self.assertEqual(code, "326097")
+        self.assertIsNone(skipped)
         rendered = "\n".join(logs)
         self.assertIn("[验证码已隐藏]", rendered)
         self.assertNotIn("326097", rendered)
+        self.assertEqual(
+            len([line for line in logs if "跳过已尝试验证码" in line]),
+            1,
+        )
+
+    def test_mailapi_detail_discovery_skips_destructive_links(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <html><body>
+          <a href="/delete">Delete all messages</a>
+          <a href="/logout">Sign out</a>
+          <a href="/messages/latest">Latest message</a>
+        </body></html>
+        """
+
+        urls = backend._find_mailapi_detail_urls(
+            page,
+            "https://mail.example.test/mailbox/TOKEN",
+        )
+
+        self.assertEqual(urls, ["https://mail.example.test/messages/latest"])
 
     @mock.patch("requests.get")
     def test_mailapi_html_list_follows_latest_verification_message_detail(

@@ -57,6 +57,7 @@ class _ExistingAccountPlatform(BasePlatform):
     phone_oauth_ready = True
     phone_oauth_ready_sequence = []
     phone_oauth_prepare_error = ""
+    register_emails = []
 
     @classmethod
     def reset(cls):
@@ -66,6 +67,7 @@ class _ExistingAccountPlatform(BasePlatform):
             cls.phone_oauth_ready = True
             cls.phone_oauth_ready_sequence = []
             cls.phone_oauth_prepare_error = ""
+            cls.register_emails = []
 
     def __init__(self, config=None, mailbox=None):
         super().__init__(config)
@@ -75,15 +77,17 @@ class _ExistingAccountPlatform(BasePlatform):
         with type(self)._lock:
             type(self)._counter += 1
             index = type(self)._counter
+            type(self).register_emails.append(email)
             type(self).seen_extras.append(dict(self.config.extra or {}))
             ready = (
                 bool(type(self).phone_oauth_ready_sequence[index - 1])
                 if index <= len(type(self).phone_oauth_ready_sequence)
                 else bool(type(self).phone_oauth_ready)
             )
+        account_email = str(email or f"existing-{index}@example.com")
         return Account(
             platform="chatgpt",
-            email=f"existing-{index}@example.com",
+            email=account_email,
             password=password or "mail-password",
             token=f"access-token-{index}",
             status=AccountStatus.REGISTERED,
@@ -100,7 +104,7 @@ class _ExistingAccountPlatform(BasePlatform):
                 ),
                 "mailbox_login_context": {
                     "provider": "microsoft",
-                    "email": f"existing-{index}@example.com",
+                    "email": account_email,
                     "account_id": str(index),
                     "extra": {"account_type": "mailapi_url"},
                 },
@@ -735,6 +739,11 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(len(saved), 1)
         self.assertEqual(_ExistingAccountPlatform._counter, 2)
+        self.assertEqual(
+            _ExistingAccountPlatform.register_emails,
+            [None, "existing-1@example.com"],
+        )
+        self.assertEqual(_LoginMailbox.requeued, ["existing-1@example.com"])
         complete.assert_called_once()
         cleanup_incomplete.assert_not_called()
         joined_logs = "\n".join(snapshot["logs"])

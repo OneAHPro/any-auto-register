@@ -3286,6 +3286,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         with external_sync_threads_lock:
             external_sync_threads.append(worker)
 
+    def _join_external_sync_threads() -> None:
+        with external_sync_threads_lock:
+            pending_sync_threads = tuple(external_sync_threads)
+        for worker in pending_sync_threads:
+            worker.join()
+
     try:
         PlatformCls = get(req.platform)
 
@@ -4322,11 +4328,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     for pending in futures:
                         if pending is not f:
                             pending.cancel()
-        with external_sync_threads_lock:
-            pending_sync_threads = tuple(external_sync_threads)
-        for worker in pending_sync_threads:
-            worker.join()
+        _join_external_sync_threads()
     except Exception as e:
+        _join_external_sync_threads()
         _log(task_id, f"致命错误: {e}")
         _task_store.finish(
             task_id,

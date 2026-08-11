@@ -3547,6 +3547,15 @@ class OutlookMailboxBackend(ABC):
     def __init__(self, mailbox: "OutlookMailbox"):
         self.mailbox = mailbox
 
+    @staticmethod
+    def _safe_otp_log(message: str) -> str:
+        try:
+            from platforms.chatgpt.log_sanitizer import sanitize_chatgpt_log_message
+
+            return sanitize_chatgpt_log_message(message)
+        except Exception:
+            return str(message or "").rsplit(":", 1)[0] + ": [验证码已隐藏]"
+
     @abstractmethod
     def get_current_ids(self, account: MailboxAccount) -> set:
         ...
@@ -3723,11 +3732,17 @@ class OutlookImapMailboxBackend(OutlookMailboxBackend):
                             continue
                         if code in exclude_codes:
                             self.mailbox._log(
-                                f"[微软邮箱][IMAP] folder={folder} 跳过已尝试验证码: {code}"
+                                self._safe_otp_log(
+                                    f"[微软邮箱][IMAP] folder={folder} "
+                                    f"跳过已尝试验证码: {code}"
+                                )
                             )
                             continue
                         self.mailbox._log(
-                            f"[微软邮箱][IMAP] folder={folder} 验证码提取成功: {code}"
+                            self._safe_otp_log(
+                                f"[微软邮箱][IMAP] folder={folder} "
+                                f"验证码提取成功: {code}"
+                            )
                         )
                         return code
                 except imaplib.IMAP4.abort as exc:
@@ -3886,11 +3901,17 @@ class OutlookGraphMailboxBackend(OutlookMailboxBackend):
                             continue
                         if code in exclude_codes:
                             self.mailbox._log(
-                                f"[微软邮箱][Graph] folder={folder} 跳过已尝试验证码: {code}"
+                                self._safe_otp_log(
+                                    f"[微软邮箱][Graph] folder={folder} "
+                                    f"跳过已尝试验证码: {code}"
+                                )
                             )
                             continue
                         self.mailbox._log(
-                            f"[微软邮箱][Graph] folder={folder} 验证码提取成功: {code}"
+                            self._safe_otp_log(
+                                f"[微软邮箱][Graph] folder={folder} "
+                                f"验证码提取成功: {code}"
+                            )
                         )
                         return code
                 except Exception as exc:
@@ -3932,7 +3953,10 @@ class OutlookGraphMailboxBackend(OutlookMailboxBackend):
                                         code = self.mailbox._safe_extract(text, code_pattern)
                                 if code and code not in exclude_codes:
                                     self.mailbox._log(
-                                        f"[微软邮箱][Graph] folder={folder} 刷新 token 后验证码提取成功: {code}"
+                                        self._safe_otp_log(
+                                            f"[微软邮箱][Graph] folder={folder} "
+                                            f"刷新 token 后验证码提取成功: {code}"
+                                        )
                                     )
                                     return code
                         except Exception as retry_exc:
@@ -4080,6 +4104,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "content": card_html,
                 "received_at": cls._parse_timestamp(received_text),
                 "message_id": message_id,
+                "bounded_content": True,
                 "status": None,
             }
 
@@ -4109,12 +4134,12 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         def _class_body(class_name: str) -> str:
             match = re.search(
-                rf"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\b{class_name}\b[^'\"]*\1[^>]*>"
-                rf"(.*?)</[^>]+>",
+                rf"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*(['\"])[^'\"]*\b{class_name}\b[^'\"]*\2[^>]*>"
+                rf"(.*?)</(?P=tag)\s*>",
                 panel_body,
                 re.IGNORECASE | re.DOTALL,
             )
-            return match.group(2) if match else ""
+            return match.group(3) if match else ""
 
         subject = cls._mailapi_visible_text(_class_body("subject"))
         content_html = _class_body("content") or panel_body
@@ -4146,6 +4171,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             "content": content_html,
             "received_at": cls._parse_timestamp(received_text),
             "message_id": message_id,
+            "bounded_content": True,
             "status": None,
         }
 
@@ -4454,6 +4480,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
     def _mailapi_same_origin_url(cls, value: Any, source_url: str) -> Optional[str]:
         from html import unescape
         from urllib.parse import urljoin, urlsplit
+        import re
 
         candidate = unescape(str(value or "")).strip()
         if not candidate or candidate.startswith(("#", "javascript:", "mailto:")):
@@ -4465,7 +4492,13 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return None
         if source.netloc and target.netloc.lower() != source.netloc.lower():
             return None
-        if target.path.lower().startswith("/cdn-cgi/l/email-protection"):
+        target_path = target.path.lower()
+        if target_path.startswith("/cdn-cgi/l/email-protection"):
+            return None
+        if re.search(
+            r"(?:^|/)(?:delete|remove|logout|signout|unsubscribe|settings?)(?:/|$)",
+            target_path,
+        ):
             return None
         return resolved
 
@@ -4563,6 +4596,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         def add(value: Any, label: str = "", score: Optional[int] = None) -> None:
             nonlocal sequence
+            if re.search(
+                r"\b(?:delete|remove|logout|sign[ -]?out|unsubscribe|settings?)\b",
+                f"{value} {label}".lower(),
+            ):
+                return
             resolved = cls._mailapi_same_origin_url(value, source_url)
             if not resolved:
                 return
@@ -4788,16 +4826,23 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         content = str(message.get("content") or "")
         code = self._extract_code(content, code_pattern)
-        if not code and content != str(raw_text or ""):
+        if (
+            not code
+            and not bool(message.get("bounded_content"))
+            and content != str(raw_text or "")
+        ):
             code = self._extract_code(str(raw_text or ""), code_pattern)
         if not code:
             return ""
 
         visible = self.mailbox._decode_raw_content(content) or content
-        raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(
-            raw_text or ""
-        )
-        normalized = " ".join(f"{visible} {raw_visible}".split())
+        if message.get("bounded_content"):
+            normalized = " ".join(visible.split())
+        else:
+            raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(
+                raw_text or ""
+            )
+            normalized = " ".join(f"{visible} {raw_visible}".split())
         semantic_otp = re.search(
             r"(?is)\b(?:verification|login|security)\s+code\b|"
             r"\b(?:temporary|one[-\s]*time)\b.{0,32}\b(?:code|password)\b|"
@@ -4891,7 +4936,17 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             if not code:
                 return None
             if code in exclude_codes:
-                self.mailbox._log(f"[MailAPI] 跳过已尝试验证码: {code}")
+                try:
+                    from platforms.chatgpt.log_sanitizer import (
+                        sanitize_chatgpt_log_message,
+                    )
+
+                    safe_log = sanitize_chatgpt_log_message(
+                        f"[MailAPI] 跳过已尝试验证码: {code}"
+                    )
+                except Exception:
+                    safe_log = "[MailAPI] 跳过已尝试验证码: [验证码已隐藏]"
+                self.mailbox._log(safe_log)
                 return None
             received_at = message.get("received_at")
             if (
