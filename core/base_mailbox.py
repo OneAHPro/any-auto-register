@@ -4839,18 +4839,25 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         import re
 
         content = str(message.get("content") or "")
-        code = self._extract_code(content, code_pattern)
+        bounded_content = bool(message.get("bounded_content"))
+        if bounded_content:
+            visible = self._mailapi_visible_text(content)
+            code = str(
+                self.mailbox._safe_extract(visible, code_pattern) or ""
+            ).strip()
+        else:
+            visible = self.mailbox._decode_raw_content(content) or content
+            code = self._extract_code(content, code_pattern)
         if (
             not code
-            and not bool(message.get("bounded_content"))
+            and not bounded_content
             and content != str(raw_text or "")
         ):
             code = self._extract_code(str(raw_text or ""), code_pattern)
         if not code:
             return ""
 
-        visible = self.mailbox._decode_raw_content(content) or content
-        if message.get("bounded_content"):
+        if bounded_content:
             normalized = " ".join(visible.split())
         else:
             raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(

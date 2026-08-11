@@ -740,7 +740,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
           <div class="content">
             <div class="top"><img alt="ChatGPT"></div>
             <div class="message-body">
-              <div class="copy">Your temporary verification code:</div>
+              <div class="copy">Your temporary verification code:</div>\r\n\r\n
               <div class="code">326097</div>
             </div>
           </div>
