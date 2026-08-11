@@ -4134,12 +4134,26 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
         def _class_body(class_name: str) -> str:
             match = re.search(
-                rf"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*(['\"])[^'\"]*\b{class_name}\b[^'\"]*\2[^>]*>"
-                rf"(.*?)</(?P=tag)\s*>",
+                rf"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*(['\"])[^'\"]*\b{class_name}\b[^'\"]*\2[^>]*>",
                 panel_body,
                 re.IGNORECASE | re.DOTALL,
             )
-            return match.group(3) if match else ""
+            if match is None:
+                return ""
+            tag = str(match.group("tag") or "")
+            depth = 1
+            tag_pattern = re.compile(
+                rf"<(?P<closing>/)?{re.escape(tag)}\b[^>]*>",
+                re.IGNORECASE | re.DOTALL,
+            )
+            for tag_match in tag_pattern.finditer(panel_body, match.end()):
+                if tag_match.group("closing"):
+                    depth -= 1
+                else:
+                    depth += 1
+                if depth == 0:
+                    return panel_body[match.end() : tag_match.start()]
+            return panel_body[match.end() :]
 
         subject = cls._mailapi_visible_text(_class_body("subject"))
         content_html = _class_body("content") or panel_body

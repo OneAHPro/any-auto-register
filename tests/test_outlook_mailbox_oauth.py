@@ -732,6 +732,25 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertTrue(message["message_id"].startswith("mailapi_message:"))
         self.assertNotEqual(message["content"], page)
 
+    def test_mailapi_panel_content_supports_nested_divs(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <section class="panel">
+          <div class="content">
+            <div class="top"><img alt="ChatGPT"></div>
+            <div class="message-body">
+              <div class="copy">Your temporary verification code:</div>
+              <div class="code">326097</div>
+            </div>
+          </div>
+        </section>
+        """
+
+        message = backend._parse_mailapi_message(page)
+
+        self.assertEqual(backend._extract_message_code(message, page, None), "326097")
+
     def test_mailapi_panel_does_not_scan_page_chrome_for_otp(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]
