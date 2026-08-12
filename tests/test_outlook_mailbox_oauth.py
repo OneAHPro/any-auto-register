@@ -1590,6 +1590,48 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(code, "574876")
 
     @mock.patch("requests.get")
+    def test_mailapi_accepts_latest_iframe_email_with_chinese_time(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text=(
+                '<div class="container"><h1>最新邮件信息</h1>'
+                '<div class="info"><div class="label">接收时间：</div>'
+                '<div class="time">2026年08月13日 00:19:55 (北京时间)</div></div>'
+                '<div class="info"><div class="label">邮件主题：</div>'
+                '<div class="subject">Your authentication code</div></div>'
+                '<iframe class="email-frame" id="emailFrame"></iframe></div>'
+                '<script>var htmlContent = "Your authentication code is 417024";'
+                '</script>'
+            ),
+        )
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-13T00:19:54+08:00"
+        ).timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=otp_sent_at,
+                exclude_codes={"417024"},
+            )
+
+        self.assertEqual(code, "417024")
+
+    @mock.patch("requests.get")
     def test_mailapi_html_rejects_old_latest_card(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(

@@ -4128,6 +4128,44 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "status": None,
             }
 
+        latest_mail_page = "最新邮件信息" in cls._mailapi_visible_text(raw)
+        if latest_mail_page:
+            received_match = re.search(
+                r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\b(?:time|date)\b[^'\"]*\1[^>]*>"
+                r"(.*?)</[^>]+>",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            subject_match = re.search(
+                r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\bsubject\b[^'\"]*\1[^>]*>"
+                r"(.*?)</[^>]+>",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            received_text = (
+                cls._mailapi_visible_text(received_match.group(2))
+                if received_match
+                else ""
+            )
+            subject = (
+                cls._mailapi_visible_text(subject_match.group(2))
+                if subject_match
+                else ""
+            )
+            code = str(cls._extract_code_from_latest_page(raw) or "").strip()
+            if code and cls._is_openai_history_subject(subject):
+                identity = "|".join((subject, received_text, code))
+                message_id = "mailapi_message:" + hashlib.sha256(
+                    identity.encode("utf-8", errors="ignore")
+                ).hexdigest()
+                return {
+                    "content": f"{subject} authentication code {code}",
+                    "received_at": cls._parse_timestamp(received_text),
+                    "message_id": message_id,
+                    "bounded_content": True,
+                    "status": None,
+                }
+
         # Some MailAPI providers render the newest message directly in a
         # `.panel` page instead of wrapping it in the historical
         # `<article class="mail-card">` shape.  Keep the extraction bounded to
@@ -4210,6 +4248,20 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             "visible_html_content": True,
             "status": None,
         }
+
+    @classmethod
+    def _extract_code_from_latest_page(cls, raw: str) -> str:
+        import re
+
+        visible = cls._mailapi_visible_text(raw)
+        match = re.search(
+            r"(?is)\b(?:verification|authentication|login|security)\s+code\b"
+            r".{0,160}?\b(\d{6})\b",
+            visible,
+        )
+        if match:
+            return match.group(1)
+        return ""
 
     @staticmethod
     def _is_openai_history_subject(value: Any) -> bool:
