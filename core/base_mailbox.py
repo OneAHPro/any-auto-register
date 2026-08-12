@@ -3990,7 +3990,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
 
     @staticmethod
     def _parse_timestamp(value: Any) -> Optional[float]:
-        from datetime import datetime
+        from datetime import datetime, timezone, timedelta
+        import re
 
         if value in (None, ""):
             return None
@@ -4005,6 +4006,25 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return numeric / 1000 if numeric > 10_000_000_000 else numeric
         except (TypeError, ValueError):
             pass
+        chinese_datetime = re.search(
+            r"(?P<year>20\d{2})年(?P<month>\d{1,2})月(?P<day>\d{1,2})日"
+            r"\s*(?P<hour>\d{1,2}):(?P<minute>\d{2}):(?P<second>\d{2})",
+            text,
+        )
+        if chinese_datetime:
+            parts = {
+                key: int(raw)
+                for key, raw in chinese_datetime.groupdict().items()
+            }
+            tzinfo = (
+                timezone(timedelta(hours=8))
+                if "北京时间" in text
+                else None
+            )
+            try:
+                return datetime(**parts, tzinfo=tzinfo).timestamp()
+            except ValueError:
+                return None
         try:
             return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
         except ValueError:
@@ -4160,7 +4180,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         received_text = ""
         labeled_time = re.search(
             r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\blabel\b[^'\"]*\1[^>]*>"
-            r"\s*(?:时间|日期|Date|Received)\s*</[^>]+>\s*"
+            r"\s*(?:接收时间|时间|日期|Date|Received)\s*[：:]?\s*</[^>]+>\s*"
             r"<[^>]+\bclass\s*=\s*(['\"])[^'\"]*\bvalue\b[^'\"]*\2[^>]*>"
             r"(.*?)</[^>]+>",
             panel_body,
@@ -4170,7 +4190,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             received_text = cls._mailapi_visible_text(labeled_time.group(3))
         if not received_text:
             date_match = re.search(
-                r"(?:20\d{2}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}:\d{2})",
+                r"(?:20\d{2}(?:[-/]\d{1,2}[-/]\d{1,2}|年\d{1,2}月\d{1,2}日)"
+                r"\s+\d{1,2}:\d{2}:\d{2}(?:\s*[（(]?北京时间[）)]?)?)",
                 panel_body,
                 re.IGNORECASE,
             )
@@ -4866,7 +4887,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             )
             normalized = " ".join(f"{visible} {raw_visible}".split())
         semantic_otp = re.search(
-            r"(?is)\b(?:verification|login|security)\s+code\b|"
+            r"(?is)\b(?:verification|authentication|login|security)\s+code\b|"
             r"\b(?:temporary|one[-\s]*time)\b.{0,32}\b(?:code|password)\b|"
             r"\botp\b|验证码|校验码|动态码|登录代码|登錄代碼|登入代碼|"
             r"認証コード|認證碼|驗證碼",

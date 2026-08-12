@@ -1550,6 +1550,46 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(code, "246810")
 
     @mock.patch("requests.get")
+    def test_mailapi_accepts_reused_code_with_chinese_beijing_timestamp(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text=(
+                '<section class="panel">'
+                '<div class="label">接收时间：</div>'
+                '<div class="value">2026年08月12日 23:52:49（北京时间）</div>'
+                '<div class="subject">Your authentication code</div>'
+                '<div class="content">Your authentication code is 574876</div>'
+                '</section>'
+            ),
+        )
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-12T23:52:48+08:00"
+        ).timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=otp_sent_at,
+                exclude_codes={"574876"},
+            )
+
+        self.assertEqual(code, "574876")
+
+    @mock.patch("requests.get")
     def test_mailapi_html_rejects_old_latest_card(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(
