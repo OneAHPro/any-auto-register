@@ -1949,7 +1949,6 @@ class OAuthClient:
                     email,
                     timeout=wait_seconds,
                     otp_sent_at=otp_sent_at,
-                    exclude_codes=set(),
                 )
                 or ""
             ).strip()

@@ -586,7 +586,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "user@example.com",
             timeout=120,
             otp_sent_at=1000.0,
-            exclude_codes=set(),
         )
         issue_call, verify_call = client.session.post.call_args_list
         self.assertEqual(

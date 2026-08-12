@@ -1508,6 +1508,48 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(code, "246810")
 
     @mock.patch("requests.get")
+    def test_mailapi_accepts_reused_code_from_new_challenge_email(self, mock_get):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/messages",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text=json.dumps(
+                {
+                    "email": "demo@icloud.com",
+                    "msg": "Enter this temporary verification code to continue:\n246810",
+                    "received_at": "2026-07-31T03:28:01Z",
+                    "request_id": "mfa-message-new",
+                    "status": True,
+                    "subject": "Your authentication code",
+                }
+            ),
+        )
+        otp_sent_at = datetime.fromisoformat(
+            "2026-07-31T03:28:00.900+00:00"
+        ).timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=otp_sent_at,
+                exclude_codes={"246810"},
+            )
+
+        self.assertEqual(code, "246810")
+
+    @mock.patch("requests.get")
     def test_mailapi_html_rejects_old_latest_card(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(

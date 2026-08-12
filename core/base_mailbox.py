@@ -4957,7 +4957,20 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             code = self._extract_message_code(message, text, code_pattern)
             if not code:
                 return None
-            if code in exclude_codes:
+            received_at = message.get("received_at")
+            if (
+                otp_sent_at
+                and received_at
+                and float(received_at) < otp_sent_at - 5.0
+            ):
+                self.mailbox._log("[MailAPI] 跳过发送验证码之前收到的旧邮件")
+                return None
+            received_after_challenge = bool(
+                otp_sent_at
+                and received_at
+                and float(received_at) >= otp_sent_at
+            )
+            if code in exclude_codes and not received_after_challenge:
                 try:
                     from platforms.chatgpt.log_sanitizer import (
                         sanitize_chatgpt_log_message,
@@ -4970,22 +4983,12 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                     safe_log = "[MailAPI] 跳过已尝试验证码: [验证码已隐藏]"
                 self.mailbox._log(safe_log)
                 return None
-            received_at = message.get("received_at")
-            if (
-                otp_sent_at
-                and received_at
-                and float(received_at) < otp_sent_at - 5.0
-            ):
-                self.mailbox._log("[MailAPI] 跳过发送验证码之前收到的旧邮件")
-                return None
             code_key = self._code_key(code)
             message_id = str(message.get("message_id") or "").strip()
             code_seen_before = code_key in seen
             message_seen_before = bool(message_id and message_id in seen)
             baseline_raced_with_new_message = bool(
-                otp_sent_at
-                and received_at
-                and float(received_at) >= otp_sent_at
+                received_after_challenge
             )
             baseline_freshness_is_unverifiable = bool(
                 otp_sent_at and not received_at
