@@ -1915,7 +1915,7 @@ class OAuthClient:
             "json": {
                 "id": factor_id,
                 "type": factor_type,
-                "force_fresh_challenge": False,
+                "force_fresh_challenge": True,
             },
             "headers": issue_headers,
             "timeout": 30,

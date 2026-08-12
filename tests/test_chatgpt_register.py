@@ -590,7 +590,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         issue_call, verify_call = client.session.post.call_args_list
         self.assertEqual(
             issue_call.kwargs["json"],
-            {"id": "factor-email", "type": "email", "force_fresh_challenge": False},
+            {"id": "factor-email", "type": "email", "force_fresh_challenge": True},
         )
         self.assertEqual(
             verify_call.kwargs["json"],
