@@ -5224,6 +5224,36 @@ class OutlookMailbox(BaseMailbox):
                 session.commit()
         self._log(f"[微软邮箱] 账号已回退到本地池: {email}")
 
+    def commit_password_reset(
+        self,
+        account: MailboxAccount,
+        new_password: str = "",
+    ) -> bool:
+        """Persist a ChatGPT password alongside a MailAPI mailbox record."""
+        from core.db import _utcnow, engine, OutlookAccountModel
+        from sqlmodel import Session, select
+
+        email = str(getattr(account, "email", "") or "").strip()
+        password = str(new_password or "").strip()
+        if not email or len(password) < 12:
+            return False
+        with self._lock:
+            with Session(engine) as session:
+                existing = session.exec(
+                    select(OutlookAccountModel).where(
+                        OutlookAccountModel.email == email
+                    )
+                ).first()
+                if existing is None:
+                    return False
+                existing.password = password
+                existing.updated_at = _utcnow()
+                session.add(existing)
+                session.commit()
+        if isinstance(getattr(account, "extra", None), dict):
+            account.extra["password"] = password
+        return True
+
     def _token_endpoints(self) -> list[str]:
         if self._token_endpoint:
             return [self._token_endpoint]

@@ -684,10 +684,11 @@ class ChatGPTPluginTests(unittest.TestCase):
             mailbox=mailbox,
         )
         adapter = mock.Mock()
+        captured = {}
 
         def run(context):
             adapter.context = context
-            context.email_service.create_email()
+            captured["email_info"] = context.email_service.create_email()
             return mock.Mock(success=True)
 
         adapter.run.side_effect = run
@@ -706,6 +707,11 @@ class ChatGPTPluginTests(unittest.TestCase):
             platform.register()
 
         self.assertEqual(adapter.context.password, "")
+        self.assertEqual(captured["email_info"]["account_type"], "mailapi_url")
+        self.assertEqual(
+            captured["email_info"]["mail_api_url"],
+            "https://mail.example.test/messages",
+        )
         self.assertEqual(adapter.build_account.call_args.args[1], "")
 
     def test_successful_chatgpt_flow_persists_consumed_mailbox_credentials(self):

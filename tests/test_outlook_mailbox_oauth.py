@@ -63,6 +63,49 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(restored.refresh_token, "mail-refresh")
         self.assertTrue(restored.enabled)
 
+    def test_mailapi_account_can_persist_chatgpt_password_after_reset(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="reset@example.com",
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/messages",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="reset@example.com",
+            extra={
+                "password": "",
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/messages",
+            },
+        )
+        with mock.patch("core.db.engine", test_engine):
+            committed = mailbox.commit_password_reset(
+                account,
+                "Replacement-Password-2026!",
+            )
+
+        self.assertTrue(committed)
+        self.assertEqual(account.extra["password"], "Replacement-Password-2026!")
+        with Session(test_engine) as session:
+            saved = session.exec(
+                select(OutlookAccountModel).where(
+                    OutlookAccountModel.email == "reset@example.com"
+                )
+            ).one()
+        self.assertEqual(saved.password, "Replacement-Password-2026!")
+
     def test_get_email_by_address_preserves_retry_binding_order(self):
         test_engine = create_engine(
             "sqlite://",

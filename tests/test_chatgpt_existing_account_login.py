@@ -128,6 +128,29 @@ class PasswordResetUrlEmailService:
         return True
 
 
+class MailApiOnlyEmailService:
+    service_type = type("ServiceType", (), {"value": "microsoft"})()
+
+    def __init__(self):
+        self.committed_password = ""
+
+    def create_email(self):
+        return {
+            "email": "mailapi-only@icloud.com",
+            "service_id": "mailapi-only@icloud.com",
+            "account_type": "mailapi_url",
+            "password": "",
+            "mail_api_url": "https://mail.example.test/messages?token=secret",
+        }
+
+    def get_verification_code(self, **kwargs):
+        return "123456"
+
+    def commit_password_reset(self, new_password):
+        self.committed_password = str(new_password or "")
+        return True
+
+
 class ExistingAccountLoginTests(unittest.TestCase):
     def _make_engine(
         self,
@@ -314,6 +337,55 @@ class ExistingAccountLoginTests(unittest.TestCase):
             rejected_client.login_existing_account_and_get_session.call_args.kwargs[
                 "password_reset_required"
             ]
+        )
+
+    def test_mailapi_only_login_409_resets_password_once_and_restarts(self):
+        email_service = MailApiOnlyEmailService()
+        engine = self._make_engine(email_service=email_service)
+        rejected_client = mock.Mock()
+        rejected_client.login_and_get_tokens.return_value = None
+        rejected_client.last_error = (
+            '触发 passwordless OTP 失败: 409 - '
+            '{"error":{"message":"Your sign-in session is no longer valid. '
+            'Please start over to continue.","code":"invalid_auth_step"}}'
+        )
+        reset_client = self._successful_oauth_client()
+        successful_tokens = reset_client.login_and_get_tokens.return_value
+
+        def finish_reset(*args, **kwargs):
+            self.assertEqual(args[1], "Replacement-Password-2026!")
+            self.assertTrue(kwargs["password_reset_required"])
+            self.assertTrue(kwargs["force_password_login"])
+            self.assertFalse(kwargs["prefer_passwordless_login"])
+            self.assertTrue(kwargs["on_password_reset"](args[1]))
+            return successful_tokens
+
+        reset_client.login_and_get_tokens.side_effect = finish_reset
+        engine._build_oauth_client = mock.Mock(
+            side_effect=[rejected_client, reset_client]
+        )
+        engine._extract_account_info = mock.Mock(
+            return_value={
+                "email": "mailapi-only@icloud.com",
+                "account_id": "account-1",
+            }
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
+            return_value="Replacement-Password-2026!",
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.password, "Replacement-Password-2026!")
+        self.assertEqual(
+            email_service.committed_password,
+            "Replacement-Password-2026!",
+        )
+        self.assertEqual(engine._build_oauth_client.call_count, 2)
+        self.assertTrue(
+            any("补充 ChatGPT 密码" in line for line in result.logs)
         )
 
     def test_totp_with_mail_access_login_resets_rejected_password_and_keeps_totp(self):

@@ -420,6 +420,37 @@ class RefreshTokenRegistrationEngine:
             and callable(getattr(self.email_service, "commit_password_reset", None))
         )
 
+    @staticmethod
+    def _is_invalid_passwordless_session(message: str) -> bool:
+        text = str(message or "").strip().lower()
+        return (
+            "409" in text
+            and "passwordless" in text
+            and (
+                "sign-in session is no longer valid" in text
+                or "invalid_auth_step" in text
+            )
+        )
+
+    def _can_reset_invalid_passwordless_session(
+        self,
+        result: RegistrationResult,
+    ) -> bool:
+        email_info = self.email_info if isinstance(self.email_info, dict) else {}
+        account_type = str(email_info.get("account_type") or "").strip()
+        return bool(
+            not result.success
+            and not self.password
+            and self._is_invalid_passwordless_session(result.error_message)
+            and account_type in {"mailapi_url", "microsoft_oauth"}
+            and str(
+                email_info.get("mail_api_url")
+                or email_info.get("mailapi_url")
+                or ""
+            ).strip()
+            and callable(getattr(self.email_service, "commit_password_reset", None))
+        )
+
     def _prepare_rejected_url_password_reset(
         self,
         result: RegistrationResult,
@@ -434,6 +465,24 @@ class RefreshTokenRegistrationEngine:
             self.email_info["password_reset_required"] = True
         self._log(
             "已保存密码被认证服务明确拒绝，自动改走忘记密码流程",
+            "warning",
+        )
+
+    def _prepare_invalid_passwordless_session_password(
+        self,
+        result: RegistrationResult,
+    ) -> None:
+        replacement = generate_random_password(20)
+        self.password = replacement
+        self.password_reset_required = True
+        result.password = replacement
+        result.error_message = ""
+        if isinstance(self.email_info, dict):
+            self.email_info["account_type"] = "chatgpt_password_reset_url_mail"
+            self.email_info["new_password"] = replacement
+            self.email_info["password_reset_required"] = True
+        self._log(
+            "无密码 OTP 会话已失效，自动补充 ChatGPT 密码并重新开始登录",
             "warning",
         )
 
@@ -456,6 +505,14 @@ class RefreshTokenRegistrationEngine:
             otp_wait_seconds=otp_wait_seconds,
             otp_resend_wait_seconds=otp_resend_wait_seconds,
         )
+        if self._can_reset_invalid_passwordless_session(first_result):
+            self._prepare_invalid_passwordless_session_password(first_result)
+            return login_method(
+                result=first_result,
+                email_adapter=email_adapter,
+                otp_wait_seconds=otp_wait_seconds,
+                otp_resend_wait_seconds=otp_resend_wait_seconds,
+            )
         if not self._can_reset_rejected_url_password(first_result):
             return first_result
         self._prepare_rejected_url_password_reset(first_result)

@@ -49,6 +49,23 @@ class MailImportServiceTests(unittest.TestCase):
         self.assertEqual(record.account_type, "mailapi_url")
         self.assertEqual(record.mailapi_url, "https://mailapi.icu/key?type=html&orderNo=abc123")
 
+    def test_parse_microsoft_import_line_supports_chatgpt_password_and_mailapi_url(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+
+        record = parse_microsoft_import_line(
+            1,
+            "demo@icloud.com----ChatGPT-Password-2026!----https://mail.example.test/messages",
+        )
+
+        self.assertEqual(record.email, "demo@icloud.com")
+        self.assertEqual(record.password, "ChatGPT-Password-2026!")
+        self.assertEqual(record.account_type, "mailapi_url")
+        self.assertEqual(
+            record.mailapi_url,
+            "https://mail.example.test/messages",
+        )
+
     def test_rule_engine_returns_first_failure(self):
         rules_module = load_microsoft_import_rules_module()
         MicrosoftMailImportRecord = rules_module.MicrosoftMailImportRecord

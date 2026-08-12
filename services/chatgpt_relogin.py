@@ -718,6 +718,18 @@ class _PersistedEmailService:
                 ),
                 "new_password": str(account_extra.get("new_password") or ""),
             })
+        elif account_type == "mailapi_url":
+            mail_api_url = _text(
+                account_extra.get("mail_api_url")
+                or account_extra.get("mailapi_url")
+            )
+            if mail_api_url:
+                result.update({
+                    "account_type": "mailapi_url",
+                    "password": str(account_extra.get("password") or ""),
+                    "mail_api_url": mail_api_url,
+                    "mailapi_url": mail_api_url,
+                })
         return result
 
     def commit_password_reset(self, new_password=""):

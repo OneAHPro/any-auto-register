@@ -117,10 +117,28 @@ class AutoDetectRowParser:
         parts = [part.strip() for part in str(line or "").split("----")]
         if len(parts) == 2:
             return self._mailapi_parser.parse(line_number, line)
+        if len(parts) == 3:
+            email, password, mailapi_url = parts
+            if not _is_valid_email(email):
+                raise ValueError(f"行 {line_number}: 无效的邮箱地址: {email}")
+            if not password:
+                raise ValueError(f"行 {line_number}: 缺少 ChatGPT 登录密码")
+            if not _is_valid_mailapi_url(mailapi_url):
+                raise ValueError(
+                    f"行 {line_number}: 无效的 mailapi_url（需为 http/https）：{mailapi_url}"
+                )
+            return MicrosoftMailImportRecord(
+                line_number=line_number,
+                email=email,
+                password=password,
+                account_type=ACCOUNT_TYPE_MAILAPI_URL,
+                mailapi_url=mailapi_url,
+            )
         if len(parts) >= 4:
             return self._oauth_parser.parse(line_number, line)
         raise ValueError(
-            f"行 {line_number}: 格式错误，仅支持 邮箱----mailapi_url 或 邮箱----密码----client_id----refresh_token"
+            f"行 {line_number}: 格式错误，仅支持 邮箱----mailapi_url、"
+            "邮箱----ChatGPT密码----mailapi_url 或 邮箱----密码----client_id----refresh_token"
         )
 
 

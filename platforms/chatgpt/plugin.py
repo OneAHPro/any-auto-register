@@ -189,6 +189,21 @@ class ChatGPTPlatform(BasePlatform):
                                 "new_password": str(account_extra.get("new_password") or ""),
                             }
                         )
+                    elif str(account_extra.get("account_type") or "").strip() == "mailapi_url":
+                        mail_api_url = str(
+                            account_extra.get("mail_api_url")
+                            or account_extra.get("mailapi_url")
+                            or ""
+                        ).strip()
+                        if mail_api_url:
+                            result.update(
+                                {
+                                    "account_type": "mailapi_url",
+                                    "password": str(account_extra.get("password") or ""),
+                                    "mail_api_url": mail_api_url,
+                                    "mailapi_url": mail_api_url,
+                                }
+                            )
                     return result
 
                 def _load_baseline(self, get_current_ids):
