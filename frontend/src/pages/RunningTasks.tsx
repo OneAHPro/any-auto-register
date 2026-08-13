@@ -43,8 +43,10 @@ interface TaskSnapshot {
     relogin_failed_count?: number
     deleted_account_count?: number
     estimated_remaining_usd?: string | number
+    quota_data_available?: boolean
     alert_sent?: boolean
     alert_reason?: string
+    quota_alert_reason?: string
   }
 }
 
@@ -208,7 +210,11 @@ export default function RunningTasks() {
     const invalidRtCount = Math.max(0, Number(task.meta?.invalid_rt_count) || 0)
     const reloginFailedCount = Math.max(0, Number(task.meta?.relogin_failed_count) || 0)
     const deletedAccountCount = Math.max(0, Number(task.meta?.deleted_account_count) || 0)
-    const remainingQuota = formatRemainingQuota(task.meta?.estimated_remaining_usd)
+    const quotaDataAvailable = task.meta?.quota_data_available !== false
+      && task.meta?.quota_alert_reason !== 'quota_query_failed'
+    const remainingQuota = quotaDataAvailable
+      ? formatRemainingQuota(task.meta?.estimated_remaining_usd)
+      : null
 
     const duration = isActive(task)
       ? formatDuration(task.created_at, now)

@@ -61,6 +61,62 @@ def test_fetch_quota_accounts_reads_latest_rows_without_triggering_probe():
     post.assert_not_called()
 
 
+def test_fetch_quota_accounts_rejects_active_oauth_rows_without_complete_quota():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 101,
+                        "email": "one@example.com",
+                        "status": "active",
+                        "account_type": "oauth",
+                        "usage_percent_7d": 53,
+                    }
+                ]
+            }
+        ),
+    ):
+        with pytest.raises(health.Codex2APIHealthError, match="额度数据未就绪"):
+            health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+
+def test_fetch_quota_accounts_ignores_missing_quota_on_unauthorized_oauth_rows():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 101,
+                        "email": "one@example.com",
+                        "status": "active",
+                        "account_type": "oauth",
+                        "usage_percent_7d": 53,
+                        "billed_7d": 68.26,
+                    },
+                    {
+                        "id": 102,
+                        "email": "two@example.com",
+                        "status": "unauthorized",
+                        "account_type": "oauth",
+                    },
+                ]
+            }
+        ),
+    ):
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    assert len(rows) == 2
+
+
 def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     from services import chatgpt_codex2api_health as health
 

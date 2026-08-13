@@ -162,6 +162,25 @@ describe('RunningTasks lightweight summaries', () => {
     expect(await screen.findByText('本次探针额度未生成')).toBeTruthy()
   })
 
+  it('does not render zero as real quota when the final quota query failed', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        invalid_rt_count: 0,
+        relogin_failed_count: 0,
+        deleted_account_count: 0,
+        estimated_remaining_usd: '0.00',
+        quota_data_available: false,
+        quota_alert_reason: 'quota_query_failed',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('本次探针额度未生成')).toBeTruthy()
+    expect(screen.queryByText('$0.00')).toBeNull()
+  })
+
   it('hides task IDs without adding probe quota copy to manual tasks', async () => {
     configureApi(automaticSummary({
       id: 'task-manual-history',

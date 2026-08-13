@@ -1125,6 +1125,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(meta["codex2api_account_count"], 2)
         self.assertEqual(meta["available_quota_account_count"], 2)
         self.assertEqual(meta["estimated_remaining_usd"], "98.85")
+        self.assertTrue(meta["quota_data_available"])
         self.assertTrue(meta["quota_alert_sent"])
         self.assertEqual(meta["quota_alert_reason"], "sent")
         self.assertEqual(meta["quota_alert_threshold_usd"], "120.00")
@@ -1190,6 +1191,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             snapshot["meta"]["quota_query_error_type"],
             "RuntimeError",
         )
+        self.assertFalse(snapshot["meta"]["quota_data_available"])
         self.assertNotIn("secret detail", "\n".join(snapshot["logs"]))
 
     def test_quota_alert_exception_does_not_change_terminal_task_outcome(self):

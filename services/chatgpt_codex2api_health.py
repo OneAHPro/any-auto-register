@@ -207,6 +207,18 @@ def fetch_codex2api_quota_accounts(
     rows = payload.get("accounts") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+    oauth_rows = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and _text(row.get("account_type")).lower() == "oauth"
+        and _text(row.get("status")).lower() in HEALTHY_STATUSES
+    ]
+    if oauth_rows and any(
+        row.get("usage_percent_7d") is None or row.get("billed_7d") is None
+        for row in oauth_rows
+    ):
+        raise Codex2APIHealthError("Codex2API 额度数据未就绪")
     return [
         _quota_record(row)
         for row in rows
