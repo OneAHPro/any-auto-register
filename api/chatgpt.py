@@ -1,7 +1,7 @@
 """ChatGPT 专用功能 API"""
 from fastapi import APIRouter, Depends, HTTPException
 from sqlmodel import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from typing import Optional
 from core.db import AccountModel, get_session
 from services.chatgpt_account_state import apply_chatgpt_status_policy
@@ -60,8 +60,11 @@ def _persist_local_probe(acc: AccountModel, probe: dict, session: Session) -> No
 
 
 class PhoneVerificationStartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     phone: Optional[str] = None
     leadbee_code: Optional[str] = None
+    leadbee_api: bool = False
 
 
 class PhoneVerificationCodeRequest(BaseModel):
@@ -91,9 +94,17 @@ def start_phone_verification(
         raise HTTPException(400, "账号已有 Refresh Token，无需再次接码")
     phone = str(body.phone or "").strip()
     leadbee_code = str(body.leadbee_code or "").strip()
-    if phone and leadbee_code:
+    leadbee_api = bool(body.leadbee_api)
+    if phone and leadbee_code and not leadbee_api:
         raise HTTPException(400, "手机号和 LeadBee 兑换码只能选择一种接码方式")
+    if leadbee_api and (phone or leadbee_code):
+        raise HTTPException(400, "手机号、LeadBee 兑换码和 API 只能选择一种接码方式")
     try:
+        if leadbee_api:
+            return phone_verification_manager.start(
+                account_id,
+                leadbee_api=True,
+            )
         if leadbee_code:
             return phone_verification_manager.start(
                 account_id,
@@ -101,7 +112,7 @@ def start_phone_verification(
             )
         if phone:
             return phone_verification_manager.start(account_id, phone)
-        raise ValueError("请输入手机号码或 LeadBee 兑换码")
+        raise ValueError("请输入手机号码、LeadBee 兑换码或选择 LeadBee API")
     except ValueError as exc:
         raise _phone_error(exc) from exc
 

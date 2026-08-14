@@ -25,6 +25,31 @@ LEADBEE_PROVIDER_SLOT_WAIT_SECONDS = 30.0
 KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset(
     {"restored", "consumed", "unusable"}
 )
+LEADBEE_API_CLIENT_ORDER_RE = re.compile(r"^aar_[0-9a-f]{32}$")
+
+
+def _truthy_config(value: Any) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _validate_leadbee_api_config(config: dict[str, Any]) -> None:
+    if not _truthy_config(config.get("leadbee_api_enabled")):
+        raise ValueError("LeadBee API 未启用")
+    if not all(
+        str(config.get(key) or "").strip()
+        for key in (
+            "leadbee_api_key",
+            "leadbee_api_secret",
+            "leadbee_api_product_id",
+        )
+    ):
+        raise ValueError("LeadBee API 配置不完整")
+
+
+def _require_leadbee_api_config() -> None:
+    from core.config_store import config_store
+
+    _validate_leadbee_api_config(config_store.get_all())
 
 
 def normalize_e164_phone(value: str) -> str:
@@ -47,6 +72,13 @@ def _redact_secret(value: Any, secret: str, replacement: str = "[卡密已隐藏
     return text.replace(normalized_secret, replacement) if normalized_secret else text
 
 
+def _mask_phone(value: str) -> str:
+    phone = str(value or "").strip()
+    if len(phone) <= 5:
+        return "*" * len(phone)
+    return f"{phone[:3]}{'*' * (len(phone) - 5)}{phone[-2:]}"
+
+
 @dataclass(frozen=True)
 class PhoneVerificationCommand:
     id: str
@@ -65,6 +97,8 @@ class InteractivePhoneVerificationBroker:
         account_id: int,
         phone: str = "",
         provider: str = "manual",
+        leadbee_api: bool = False,
+        client_order_id: str = "",
         request_fingerprint: str = "",
         ttl_seconds: int = 600,
         resend_cooldown_seconds: int = 60,
@@ -76,14 +110,29 @@ class InteractivePhoneVerificationBroker:
         self.account_id = int(account_id)
         self.phone = normalize_e164_phone(phone) if str(phone or "").strip() else ""
         self.provider = str(provider or "manual").strip().lower() or "manual"
+        self.leadbee_api = bool(leadbee_api)
+        self.client_order_id = str(client_order_id or "").strip()
+        if self.leadbee_api and not LEADBEE_API_CLIENT_ORDER_RE.fullmatch(
+            self.client_order_id
+        ):
+            raise ValueError("LeadBee API 客户端订单标识无效")
         self._request_fingerprint = str(request_fingerprint or "")
         self.automatic = self.provider == "leadbee"
+        self.provider_mode = (
+            "api"
+            if self.leadbee_api
+            else ("exchange_code" if self.automatic else "manual")
+        )
         self.created_at = time.time()
         self.expires_at = self.created_at + max(0, int(ttl_seconds))
         self.resend_cooldown_seconds = max(0, int(resend_cooldown_seconds))
         self.resend_available_at = self.created_at
         self.status = "starting"
-        self.message = "正在恢复 OpenAI 授权会话并请求短信验证码"
+        self.message = (
+            "正在恢复 OpenAI 授权会话并启动 LeadBee API 自动接码"
+            if self.leadbee_api
+            else "正在恢复 OpenAI 授权会话并请求短信验证码"
+        )
         self.phone_verified = False
         self.provider_started = False
         self.provider_error_code = ""
@@ -95,9 +144,13 @@ class InteractivePhoneVerificationBroker:
         self.exchange_code_settlement = ""
         self._on_provider_start = on_provider_start
         self._exchange_code_callback_fired = False
-        self._on_exchange_code_consumed = on_exchange_code_consumed
+        self._on_exchange_code_consumed = (
+            None if self.leadbee_api else on_exchange_code_consumed
+        )
         self._restoration_callback_fired = False
-        self._on_exchange_code_restored = on_exchange_code_restored
+        self._on_exchange_code_restored = (
+            None if self.leadbee_api else on_exchange_code_restored
+        )
         self._logs: list[str] = []
         self.tokens: dict[str, Any] = {}
         self._condition = threading.Condition()
@@ -146,9 +199,12 @@ class InteractivePhoneVerificationBroker:
             return {
                 "session_id": self.session_id,
                 "account_id": self.account_id,
-                "phone": self.phone,
+                "phone": _mask_phone(self.phone) if self.leadbee_api else self.phone,
                 "provider": self.provider,
                 "automatic": self.automatic,
+                "leadbee_api": self.leadbee_api,
+                "provider_mode": self.provider_mode,
+                "client_order_id": self.client_order_id,
                 "status": status,
                 "message": message,
                 "phone_verified": self.phone_verified,
@@ -182,7 +238,11 @@ class InteractivePhoneVerificationBroker:
             if self._terminal:
                 return
             self.status = "starting"
-            self.message = str(message or "正在处理手机验证")
+            self.message = (
+                "LeadBee API 自动接码处理中"
+                if self.leadbee_api
+                else str(message or "正在处理手机验证")
+            )
             self._append_log_locked(self.message)
             self._condition.notify_all()
 
@@ -211,12 +271,13 @@ class InteractivePhoneVerificationBroker:
         with self._condition:
             if self._terminal:
                 return
-            if not self._exchange_code_callback_fired:
-                consumed_callback = self._on_exchange_code_consumed
-                self._exchange_code_callback_fired = True
-            self.exchange_code_consumed = True
-            self.exchange_code_unusable = True
-            self.exchange_code_settlement = "consumed"
+            if not self.leadbee_api:
+                if not self._exchange_code_callback_fired:
+                    consumed_callback = self._on_exchange_code_consumed
+                    self._exchange_code_callback_fired = True
+                self.exchange_code_consumed = True
+                self.exchange_code_unusable = True
+                self.exchange_code_settlement = "consumed"
             self.status = "verifying"
             self.message = "已自动获取短信验证码，正在提交验证"
             self._append_log_locked(self.message)
@@ -242,6 +303,11 @@ class InteractivePhoneVerificationBroker:
         """Preserve the first structured provider failure for task-level recovery."""
         normalized_code = str(error_code or "").strip().upper()
         normalized_message = str(message or "").strip()
+        if self.leadbee_api:
+            if normalized_code:
+                normalized_code = "LEADBEE_API_ERROR"
+            if normalized_message:
+                normalized_message = "LeadBee API 服务返回错误"
         with self._condition:
             if normalized_code and not self.provider_error_code:
                 self.provider_error_code = normalized_code
@@ -253,6 +319,8 @@ class InteractivePhoneVerificationBroker:
         """Record the provider's explicit confirmation that the code is reusable."""
         restored_callback = None
         with self._condition:
+            if self.leadbee_api:
+                return
             if self.exchange_code_settlement in {"consumed", "unusable"}:
                 return
             if self.exchange_code_restoration_confirmed:
@@ -270,6 +338,8 @@ class InteractivePhoneVerificationBroker:
         """Quarantine a card whose provider session never reached a known end."""
         normalized_message = str(message or "").strip()
         with self._condition:
+            if self.leadbee_api:
+                return
             if self.exchange_code_settlement in KNOWN_EXCHANGE_CODE_SETTLEMENTS:
                 return
             self.exchange_code_settlement = "active_unknown"
@@ -282,6 +352,8 @@ class InteractivePhoneVerificationBroker:
         consumed_callback = None
         normalized_message = str(message or "").strip()
         with self._condition:
+            if self.leadbee_api:
+                return
             if self.exchange_code_settlement in {"restored", "consumed"}:
                 return
             if not self._exchange_code_callback_fired:
@@ -345,6 +417,11 @@ class InteractivePhoneVerificationBroker:
             self.status = "completed"
             if self.phone_verified:
                 self.message = "手机验证完成，Refresh Token 已保存"
+            elif self.leadbee_api:
+                self.message = (
+                    "OpenAI 未要求新增手机号，LeadBee API 订单未创建；"
+                    "Refresh Token 已保存"
+                )
             elif self.automatic:
                 self.message = (
                     "OpenAI 未要求新增手机号，LeadBee 兑换码未使用；"
@@ -369,7 +446,9 @@ class InteractivePhoneVerificationBroker:
 
     def append_log(self, message: str) -> None:
         with self._condition:
-            self._append_log_locked(message)
+            self._append_log_locked(
+                "LeadBee API 状态已更新" if self.leadbee_api else message
+            )
             self._condition.notify_all()
 
     def mark_failed(self, message: str) -> None:
@@ -377,7 +456,11 @@ class InteractivePhoneVerificationBroker:
             if self._cancel_event.is_set() and self._terminal:
                 return
             self.status = "failed"
-            self.message = str(message or "手机验证失败")
+            self.message = (
+                "LeadBee API 自动接码失败"
+                if self.leadbee_api
+                else str(message or "手机验证失败")
+            )
             self._append_log_locked(self.message)
             self._terminal = True
             self._finalizing = False
@@ -391,13 +474,20 @@ class InteractivePhoneVerificationBroker:
                 return self.snapshot()
             self._cancel_event.set()
             if self._finalizing:
-                self._append_log_locked(
-                    "Refresh Token 正在保存，已忽略会导致已消费卡密误判失败的取消请求"
+                finalizing_message = (
+                    "Refresh Token 正在保存，已忽略会中断已完成验证的取消请求"
+                    if self.leadbee_api
+                    else "Refresh Token 正在保存，已忽略会导致已消费卡密误判失败的取消请求"
                 )
+                self._append_log_locked(finalizing_message)
                 self._condition.notify_all()
             else:
                 self.status = "failed"
-                self.message = str(message or "手机验证已取消")
+                self.message = (
+                    "LeadBee API 自动接码已取消"
+                    if self.leadbee_api
+                    else str(message or "手机验证已取消")
+                )
                 self._append_log_locked(self.message)
                 self._terminal = True
                 self.terminal_at = time.time()
@@ -788,7 +878,8 @@ class ChatGPTPhoneVerificationManager:
                 provider_lock_owned = False
             settlement = broker.snapshot()
             if (
-                bool(settlement.get("provider_started"))
+                not broker.leadbee_api
+                and bool(settlement.get("provider_started"))
                 and str(settlement.get("exchange_code_settlement") or "")
                 not in KNOWN_EXCHANGE_CODE_SETTLEMENTS
             ):
@@ -818,9 +909,9 @@ class ChatGPTPhoneVerificationManager:
                     broker.raise_if_cancelled()
                     remaining = slot_deadline - time.monotonic()
                     if remaining <= 0:
-                        raise RuntimeError(
-                            "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
-                        )
+                        if broker.leadbee_api:
+                            raise RuntimeError("LeadBee API 服务并发槽位排队超时")
+                        raise RuntimeError("LeadBee 服务并发槽位排队超时，兑换码尚未激活")
                     provider_lock_owned = leadbee_phone_flow_lock.acquire(
                         timeout=min(0.25, remaining)
                     )
@@ -853,9 +944,12 @@ class ChatGPTPhoneVerificationManager:
             self._refresh_status_best_effort(broker)
             broker.mark_completion_settled()
         except Exception as exc:
-            broker.mark_failed(
-                _redact_secret(exc, exchange_code) or "LeadBee 自动接码失败"
-            )
+            if broker.leadbee_api:
+                broker.mark_failed("LeadBee API 自动接码失败")
+            else:
+                broker.mark_failed(
+                    _redact_secret(exc, exchange_code) or "LeadBee 自动接码失败"
+                )
         finally:
             # Slot-wait and other pre-run failures also publish cleanup. Both
             # operations stay outside the manager lock, avoiding a lock /
@@ -876,6 +970,8 @@ class ChatGPTPhoneVerificationManager:
         phone: Optional[str] = None,
         *,
         leadbee_code: Optional[str] = None,
+        leadbee_api: bool = False,
+        client_order_id: Optional[str] = None,
         leadbee_base_url: Optional[str] = None,
         on_provider_start: Optional[Callable[[], None]] = None,
         on_exchange_code_consumed: Optional[Callable[[], None]] = None,
@@ -883,10 +979,29 @@ class ChatGPTPhoneVerificationManager:
         provider_lock_already_held: bool = False,
         on_provider_lock_handoff: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
-        automatic = leadbee_code is not None
+        api_mode = bool(leadbee_api)
+        if api_mode and (str(phone or "").strip() or leadbee_code is not None):
+            raise ValueError("手机号、LeadBee 兑换码和 API 只能选择一种接码方式")
+        if not api_mode and client_order_id is not None:
+            raise ValueError("客户端订单标识仅用于 LeadBee API 模式")
+        if api_mode:
+            _require_leadbee_api_config()
+
+        automatic = api_mode or leadbee_code is not None
         exchange_code = str(leadbee_code or "").strip()
-        receive_base_url = str(leadbee_base_url or "").strip().rstrip("/")
-        if automatic:
+        receive_base_url = (
+            "" if api_mode else str(leadbee_base_url or "").strip().rstrip("/")
+        )
+        if api_mode:
+            exchange_code = str(client_order_id or "").strip() or (
+                f"aar_{secrets.token_hex(16)}"
+            )
+            if not LEADBEE_API_CLIENT_ORDER_RE.fullmatch(exchange_code):
+                raise ValueError("LeadBee API 客户端订单标识无效")
+            normalized_phone = ""
+            provider = "leadbee"
+            request_fingerprint = self._fingerprint_request(provider, "api")
+        elif automatic:
             if not exchange_code:
                 raise ValueError("请输入 LeadBee 兑换码")
             normalized_phone = ""
@@ -952,6 +1067,8 @@ class ChatGPTPhoneVerificationManager:
                 account_id=account_key,
                 phone=normalized_phone,
                 provider=provider,
+                leadbee_api=api_mode,
+                client_order_id=exchange_code if api_mode else "",
                 request_fingerprint=request_fingerprint,
                 ttl_seconds=self.ttl_seconds,
                 resend_cooldown_seconds=self.resend_cooldown_seconds,
@@ -1317,12 +1434,19 @@ def run_leadbee_phone_oauth_flow(
     from core.config_store import config_store
     from platforms.chatgpt.oauth_client import OAuthClient
 
-    normalized_code = str(exchange_code or "").strip()
-    if not normalized_code:
-        raise ValueError("请输入 LeadBee 兑换码")
+    config = config_store.get_all().copy()
+    api_mode = getattr(broker, "leadbee_api", False) is True
+    if api_mode:
+        _validate_leadbee_api_config(config)
+        client_order_id = str(getattr(broker, "client_order_id", "") or "").strip()
+        if not LEADBEE_API_CLIENT_ORDER_RE.fullmatch(client_order_id):
+            raise ValueError("LeadBee API 客户端订单标识无效")
+    else:
+        normalized_code = str(exchange_code or "").strip()
+        if not normalized_code:
+            raise ValueError("请输入 LeadBee 兑换码")
 
     email, password, account_extra = _load_account_context(account_id)
-    config = config_store.get_all().copy()
     for key in (
         "chatgpt_phone_number",
         "openai_phone_number",
@@ -1339,15 +1463,26 @@ def run_leadbee_phone_oauth_flow(
     config.update(
         {
             "chatgpt_phone_provider": "leadbee",
-            "leadbee_code": normalized_code,
             "chatgpt_phone_progress_broker": broker,
         }
     )
-    leadbee_base_url = str(
-        getattr(broker, "leadbee_base_url", "") or ""
-    ).strip().rstrip("/")
-    if leadbee_base_url:
-        config["leadbee_base_url"] = leadbee_base_url
+    if api_mode:
+        config.pop("leadbee_code", None)
+        config.pop("leadbee_base_url", None)
+        config.update(
+            {
+                "leadbee_api_enabled": "1",
+                "leadbee_api_client_order_id": client_order_id,
+            }
+        )
+    else:
+        config["leadbee_api_enabled"] = "0"
+        config["leadbee_code"] = normalized_code
+        leadbee_base_url = str(
+            getattr(broker, "leadbee_base_url", "") or ""
+        ).strip().rstrip("/")
+        if leadbee_base_url:
+            config["leadbee_base_url"] = leadbee_base_url
     proxy = str(account_extra.get("proxy_used") or "").strip() or None
     oauth_client = OAuthClient(config, proxy=proxy, verbose=False, browser_mode="protocol")
     resume_context, resume_source = _take_phone_oauth_resume_context(email, account_extra)

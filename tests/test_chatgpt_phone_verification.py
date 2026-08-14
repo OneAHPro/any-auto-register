@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
@@ -472,6 +473,7 @@ class PhoneOAuthResumeTests(unittest.TestCase):
         }
         oauth_client.last_workspace_id = "workspace-1"
         broker = mock.Mock()
+        broker.leadbee_base_url = ""
         loaded = (
             "existing@example.com",
             "account-password",
@@ -504,7 +506,14 @@ class PhoneOAuthResumeTests(unittest.TestCase):
             return_value=oauth_client,
         ) as oauth_client_type, mock.patch(
             "core.config_store.config_store.get_all",
-            return_value={"chatgpt_phone_number": "+19999999999"},
+            return_value={
+                "chatgpt_phone_number": "+19999999999",
+                "leadbee_api_enabled": "1",
+                "leadbee_api_key": "fixture-api-key",
+                "leadbee_api_secret": "fixture-api-secret",
+                "leadbee_api_product_id": "fixture-product",
+                "leadbee_base_url": "https://stored-legacy.invalid",
+            },
         ):
             result = run_leadbee_phone_oauth_flow(
                 7,
@@ -516,14 +525,319 @@ class PhoneOAuthResumeTests(unittest.TestCase):
         oauth_config = oauth_client_type.call_args.args[0]
         self.assertEqual(oauth_config["chatgpt_phone_provider"], "leadbee")
         self.assertEqual(oauth_config["leadbee_code"], "bei-sms-DEMO-CODE")
+        self.assertEqual(oauth_config["leadbee_api_enabled"], "0")
+        self.assertEqual(
+            oauth_config["leadbee_base_url"], "https://stored-legacy.invalid"
+        )
         self.assertIs(oauth_config["chatgpt_phone_progress_broker"], broker)
         self.assertNotIn("chatgpt_phone_number", oauth_config)
         login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
         self.assertTrue(login_kwargs["allow_phone_verification"])
         self.assertEqual(login_kwargs["login_source"], "automatic_phone_verification")
 
+    def test_leadbee_api_flow_uses_stored_credentials_and_server_reference(self):
+        api_key = "fixture-api-key"
+        api_secret = "fixture-api-secret"
+        client_order_id = "aar_0123456789abcdef0123456789abcdef"
+        oauth_client = mock.Mock()
+        oauth_client.login_and_get_tokens.return_value = {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+        }
+        oauth_client.last_workspace_id = "workspace-1"
+        broker = InteractivePhoneVerificationBroker(
+            account_id=7,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id=client_order_id,
+        )
+        broker.leadbee_base_url = "https://arbitrary.invalid"
+        loaded = (
+            "existing@example.com",
+            "account-password",
+            {"proxy_used": "http://127.0.0.1:7890"},
+        )
+        resume_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-1",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="prepared-verifier",
+            oauth_state="prepared-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        stored_config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": api_key,
+            "leadbee_api_secret": api_secret,
+            "leadbee_api_product_id": "fixture-product",
+            "leadbee_code": "stale-fixture-card",
+            "leadbee_base_url": "https://stored-arbitrary.invalid",
+            "chatgpt_phone_number": "+19999999999",
+        }
+
+        with mock.patch(
+            "services.chatgpt_phone_verification._load_account_context",
+            return_value=loaded,
+            create=True,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.oauth_resume_cache.take",
+            return_value=resume_context,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.OAuthClient",
+            return_value=oauth_client,
+        ) as oauth_client_type, mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=stored_config,
+        ):
+            result = run_leadbee_phone_oauth_flow(
+                7,
+                "ignored-legacy-exchange-code-argument",
+                broker,
+            )
+
+        self.assertEqual(result["refresh_token"], "new-rt")
+        oauth_config = oauth_client_type.call_args.args[0]
+        self.assertEqual(oauth_config["leadbee_api_enabled"], "1")
+        self.assertEqual(oauth_config["leadbee_api_key"], api_key)
+        self.assertEqual(oauth_config["leadbee_api_secret"], api_secret)
+        self.assertEqual(oauth_config["leadbee_api_product_id"], "fixture-product")
+        self.assertEqual(oauth_config["leadbee_api_client_order_id"], client_order_id)
+        self.assertEqual(oauth_config["chatgpt_phone_provider"], "leadbee")
+        self.assertNotIn("leadbee_code", oauth_config)
+        self.assertNotIn("leadbee_base_url", oauth_config)
+        self.assertNotIn("chatgpt_phone_number", oauth_config)
+
+    def test_leadbee_api_flow_rejects_incomplete_stored_configuration(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=7,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_0123456789abcdef0123456789abcdef",
+        )
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={"leadbee_api_enabled": "1"},
+        ):
+            with self.assertRaisesRegex(ValueError, "配置不完整"):
+                run_leadbee_phone_oauth_flow(
+                    7,
+                    broker.client_order_id,
+                    broker,
+                )
+
 
 class PhoneVerificationManagerTests(unittest.TestCase):
+    def test_leadbee_api_start_generates_unique_stable_server_references(self):
+        observed = []
+
+        def runner(_account_id, client_order_id, broker):
+            observed.append((client_order_id, broker.client_order_id))
+            broker.mark_phone_verified()
+            return {"refresh_token": "new-rt"}
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ):
+            first = manager.start(101, leadbee_api=True)
+            second = manager.start(102, leadbee_api=True)
+
+        self.assertEqual(first["provider_mode"], "api")
+        self.assertTrue(first["automatic"])
+        self.assertTrue(first["leadbee_api"])
+        self.assertRegex(first["client_order_id"], r"^aar_[0-9a-f]{32}$")
+        self.assertRegex(second["client_order_id"], r"^aar_[0-9a-f]{32}$")
+        self.assertNotEqual(first["client_order_id"], second["client_order_id"])
+        self.assertEqual(
+            observed,
+            [
+                (first["client_order_id"], first["client_order_id"]),
+                (second["client_order_id"], second["client_order_id"]),
+            ],
+        )
+
+    def test_leadbee_api_active_account_session_is_reused_without_new_reference(self):
+        release_runner = threading.Event()
+        runner_started = threading.Event()
+        observed = []
+
+        def runner(_account_id, client_order_id, _broker):
+            observed.append(client_order_id)
+            runner_started.set()
+            release_runner.wait(timeout=1)
+            return {"refresh_token": "new-rt"}
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda _account_id: None,
+            start_timeout_seconds=0,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        try:
+            with mock.patch(
+                "core.config_store.config_store.get_all",
+                return_value=config,
+            ):
+                first = manager.start(103, leadbee_api=True)
+                self.assertTrue(runner_started.wait(timeout=1))
+                second = manager.start(103, leadbee_api=True)
+            self.assertTrue(second["reused"])
+            self.assertEqual(first["session_id"], second["session_id"])
+            self.assertEqual(first["client_order_id"], second["client_order_id"])
+            self.assertEqual(observed, [first["client_order_id"]])
+        finally:
+            release_runner.set()
+
+    def test_leadbee_api_incomplete_config_fails_before_broker_or_worker(self):
+        cases = (
+            ({"leadbee_api_enabled": "0"}, "未启用"),
+            (
+                {
+                    "leadbee_api_enabled": "1",
+                    "leadbee_api_key": "fixture-api-key",
+                },
+                "配置不完整",
+            ),
+        )
+        for config, expected_error in cases:
+            manager = ChatGPTPhoneVerificationManager(start_timeout_seconds=0)
+            with self.subTest(expected_error=expected_error), mock.patch(
+                "core.config_store.config_store.get_all",
+                return_value=config,
+            ), mock.patch(
+                "services.chatgpt_phone_verification.threading.Thread"
+            ) as thread_type, mock.patch(
+                "services.chatgpt_phone_verification.leadbee_phone_flow_lock.acquire"
+            ) as acquire:
+                with self.assertRaisesRegex(ValueError, expected_error) as ctx:
+                    manager.start(104, leadbee_api=True)
+
+            thread_type.assert_not_called()
+            acquire.assert_not_called()
+            self.assertEqual(manager._sessions, {})
+            self.assertNotIn("fixture-api-key", str(ctx.exception))
+
+    def test_leadbee_api_runner_error_does_not_publish_credentials(self):
+        api_key = "fixture-api-key"
+        api_secret = "fixture-api-secret"
+
+        def runner(*_args):
+            raise RuntimeError(f"provider rejected {api_key} / {api_secret}")
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": api_key,
+            "leadbee_api_secret": api_secret,
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ):
+            result = manager.start(105, leadbee_api=True)
+
+        published = repr(result)
+        self.assertNotIn(api_key, published)
+        self.assertNotIn(api_secret, published)
+        self.assertIn("LeadBee API", result["message"])
+
+    def test_leadbee_api_does_not_fire_exchange_card_callbacks(self):
+        consumed = mock.Mock()
+        restored = mock.Mock()
+        api_key = "fixture-api-key"
+        api_secret = "fixture-api-secret"
+        api_signature = "fixture-api-signature"
+        phone = "+447456344799"
+        verification_code = "846291"
+        broker = InteractivePhoneVerificationBroker(
+            account_id=106,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_0123456789abcdef0123456789abcdef",
+            on_exchange_code_consumed=consumed,
+            on_exchange_code_restored=restored,
+        )
+
+        broker.mark_automatic_code_received()
+        broker.mark_exchange_code_restored()
+        broker.mark_phone_acquired(phone)
+        broker.mark_provider_error(
+            f"AUTH_{api_key}_{api_secret}_{api_signature}_{phone}_{verification_code}",
+            f"{api_key} / {api_secret} / {api_signature} / {phone} / {verification_code}",
+        )
+        unsafe_public_text = (
+            f"{api_key} / {api_secret} / {api_signature} / {phone} / "
+            f"{verification_code}"
+        )
+        broker.mark_progress(unsafe_public_text)
+        broker.append_log(unsafe_public_text)
+        broker.mark_failed(unsafe_public_text)
+
+        snapshot = broker.snapshot()
+        consumed.assert_not_called()
+        restored.assert_not_called()
+        self.assertEqual(snapshot["exchange_code_settlement"], "")
+        self.assertFalse(snapshot["exchange_code_consumed"])
+        self.assertEqual(snapshot["provider_error_code"], "LEADBEE_API_ERROR")
+        self.assertEqual(snapshot["message"], "LeadBee API 自动接码失败")
+        self.assertNotEqual(snapshot["phone"], phone)
+        self.assertRegex(snapshot["phone"], r"^\+44\*+99$")
+        published = repr(snapshot)
+        for sensitive_value in (
+            api_key,
+            api_secret,
+            api_signature,
+            phone,
+            verification_code,
+        ):
+            self.assertNotIn(sensitive_value, published)
+
+    def test_leadbee_api_completion_logs_do_not_use_exchange_card_terms(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=107,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_0123456789abcdef0123456789abcdef",
+        )
+
+        broker.begin_persisting()
+        broker.cancel()
+        broker.mark_completed({"refresh_token": "fixture-rt"})
+
+        snapshot = broker.snapshot()
+        published_copy = " ".join([snapshot["message"], *snapshot["logs"]])
+        self.assertNotIn("兑换码", published_copy)
+        self.assertNotIn("卡密", published_copy)
+        self.assertIn("LeadBee API", snapshot["message"])
+
     def test_provider_slot_is_released_before_token_persistence_finishes(self):
         provider_slot = threading.BoundedSemaphore(1)
         persister_started = threading.Event()
@@ -1373,6 +1687,20 @@ class PhoneVerificationManagerTests(unittest.TestCase):
 
 
 class PhoneVerificationApiTests(unittest.TestCase):
+    def test_start_request_rejects_client_order_and_credentials(self):
+        from api.chatgpt import PhoneVerificationStartRequest
+
+        for field in (
+            "client_order_id",
+            "leadbee_api_key",
+            "leadbee_api_secret",
+        ):
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                PhoneVerificationStartRequest(
+                    leadbee_api=True,
+                    **{field: "fixture-value"},
+                )
+
     def test_chatgpt_phone_routes_are_registered(self):
         from main import app
 
@@ -1465,6 +1793,62 @@ class PhoneVerificationApiTests(unittest.TestCase):
             5,
             leadbee_code="bei-sms-DEMO-CODE",
         )
+
+    def test_start_endpoint_dispatches_explicit_leadbee_api_mode(self):
+        from api.chatgpt import PhoneVerificationStartRequest, start_phone_verification
+
+        account = mock.Mock()
+        account.platform = "chatgpt"
+        account.email = "existing@example.com"
+        account.token = "existing-at"
+        account.get_extra.return_value = {
+            "access_token": "existing-at",
+            "refresh_token": "",
+        }
+        session = mock.Mock()
+        session.get.return_value = account
+
+        with mock.patch(
+            "api.chatgpt.phone_verification_manager.start",
+            return_value={"session_id": "api-session", "status": "starting"},
+        ) as start_mock:
+            result = start_phone_verification(
+                6,
+                PhoneVerificationStartRequest(leadbee_api=True),
+                session,
+            )
+
+        self.assertEqual(result["session_id"], "api-session")
+        start_mock.assert_called_once_with(6, leadbee_api=True)
+
+    def test_start_endpoint_rejects_mixed_leadbee_api_modes(self):
+        from api.chatgpt import PhoneVerificationStartRequest, start_phone_verification
+
+        account = mock.Mock()
+        account.platform = "chatgpt"
+        account.email = "existing@example.com"
+        account.token = "existing-at"
+        account.get_extra.return_value = {
+            "access_token": "existing-at",
+            "refresh_token": "",
+        }
+        session = mock.Mock()
+        session.get.return_value = account
+
+        for body in (
+            PhoneVerificationStartRequest(
+                phone="+447456344799",
+                leadbee_api=True,
+            ),
+            PhoneVerificationStartRequest(
+                leadbee_code="bei-sms-DEMO-CODE",
+                leadbee_api=True,
+            ),
+        ):
+            with self.subTest(body=body), self.assertRaises(HTTPException) as ctx:
+                start_phone_verification(6, body, session)
+            self.assertEqual(ctx.exception.status_code, 400)
+            self.assertIn("只能选择一种", ctx.exception.detail)
 
 
 if __name__ == "__main__":
