@@ -968,6 +968,12 @@ def _open_api_service(client, *, clock=None, logs=None, **config):
 
 
 class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
+    def test_normalizes_digit_only_international_phone_from_order_detail(self):
+        self.assertEqual(
+            LeadBeeOpenAPIPhoneService._phone("12025550123"),
+            "+12025550123",
+        )
+
     def test_factory_api_flag_is_truthy_and_uses_fixed_client_configuration(self):
         for enabled in (True, 1, "1", "true", "yes", "on", " TRUE "):
             with (

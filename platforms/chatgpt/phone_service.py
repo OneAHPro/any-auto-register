@@ -988,6 +988,8 @@ class LeadBeeOpenAPIPhoneService:
     @staticmethod
     def _phone(value: Any) -> str:
         phone = str(value or "").strip()
+        if re.fullmatch(r"[1-9]\d{7,14}", phone):
+            phone = f"+{phone}"
         return phone if re.fullmatch(r"\+[1-9]\d{7,14}", phone) else ""
 
     @staticmethod
