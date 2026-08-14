@@ -7,6 +7,12 @@ from typing import Any
 from urllib.parse import urlsplit
 
 from core.applemail_pool import parse_applemail_pool_import_content
+from core.mail_import_delimiters import (
+    has_mail_import_dash_delimiter,
+    mail_import_row_pattern,
+    split_mail_import_fields,
+    split_mail_import_first_field,
+)
 
 from .microsoft_import_rules import AutoDetectRowParser
 from .schemas import MailImportAccountType, MailImportProviderType
@@ -31,7 +37,7 @@ _EMAIL_ADDRESS_RE = re.compile(
     re.IGNORECASE,
 )
 _EMAIL_ROW_RE = re.compile(
-    rf"{_EMAIL_ADDRESS_RE.pattern[:-1]}(?:----|\t|\s)",
+    mail_import_row_pattern(_EMAIL_ADDRESS_RE.pattern[:-1]),
     re.IGNORECASE,
 )
 
@@ -121,20 +127,16 @@ def _email_domain(email: str) -> str:
 
 
 def _split_row(line: str) -> list[str]:
-    if "----" in line:
-        return [part.strip() for part in line.split("----")]
-    if "\t" in line:
-        return [part.strip() for part in line.split("\t")]
-    return [part.strip() for part in line.split()]
+    return split_mail_import_fields(line)
 
 
 def _looks_like_credential_line(line: str) -> bool:
     """Keep malformed credential rows visible without treating prose as an account."""
     if _EMAIL_ROW_RE.match(line) or "@" in line:
         return True
-    if "----" not in line and "\t" not in line:
+    if not has_mail_import_dash_delimiter(line) and "\t" not in line:
         return False
-    first_field = re.split(r"----|\t", line, maxsplit=1)[0].strip()
+    first_field = split_mail_import_first_field(line)
     return bool(re.fullmatch(r"[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+\.[A-Z]{2,}", first_field, re.IGNORECASE))
 
 

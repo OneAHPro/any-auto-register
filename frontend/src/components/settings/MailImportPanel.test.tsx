@@ -116,6 +116,12 @@ describe('MailImportPanel automatic detection', () => {
     })
   })
 
+  it('documents both supported dash delimiters', async () => {
+    renderPanel()
+
+    expect(await screen.findByText(/完整的 --- 或 ---- 分隔符/)).toBeTruthy()
+  })
+
   it('detects mixed content without changing the snapshot selector', async () => {
     const user = userEvent.setup()
     renderPanel()

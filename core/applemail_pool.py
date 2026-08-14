@@ -11,6 +11,12 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+from core.mail_import_delimiters import (
+    mail_import_row_pattern,
+    split_mail_import_fields,
+    split_mail_import_first_field,
+)
+
 
 _POOL_FILE_LOCK = threading.RLock()
 
@@ -447,11 +453,7 @@ def _normalize_text_record(line: str) -> dict[str, str]:
     if not text:
         raise ValueError("空邮箱记录")
 
-    if "----" in text:
-        return _normalize_sequence_record(text.split("----"))
-    if "\t" in text:
-        return _normalize_sequence_record(text.split("\t"))
-    return _normalize_sequence_record(text.split())
+    return _normalize_sequence_record(split_mail_import_fields(text))
 
 
 def _unwrap_json_records(payload: Any) -> list[Any]:
@@ -492,7 +494,9 @@ def parse_applemail_pool_content(
 
 
 _EMAIL_ROW_RE = re.compile(
-    r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}(?:----|\t|\s)",
+    mail_import_row_pattern(
+        r"^[A-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Z0-9.-]+\.[A-Z]{2,}"
+    ),
     re.IGNORECASE,
 )
 
@@ -525,7 +529,7 @@ def parse_applemail_pool_import_content(
         if isinstance(item, dict):
             safe_email = _extract_first(item, "email", "mail", "address", "username")
         else:
-            safe_email = re.split(r"----|\t|\s", str(item), maxsplit=1)[0].strip()
+            safe_email = split_mail_import_first_field(str(item))
         try:
             records.append(_normalize_record(item))
         except Exception as exc:

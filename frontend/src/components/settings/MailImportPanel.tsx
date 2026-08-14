@@ -157,7 +157,7 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
         apiType: 'microsoft',
         label: 'Outlook',
         description: '导入 Outlook 本地号池，支持 mixed 导入（OAuth / MailAPI URL）；运行时按账号类型自动选择 Graph/IMAP 或 MailAPI URL 轮询取码。',
-        helper_text: '支持自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @outlook 的 OAuth 账号。',
+        helper_text: '支持完整的 --- 或 ---- 分隔符并自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @outlook 的 OAuth 账号。',
         content_placeholder: 'example@outlook.com----password----client_id----refresh_token',
         preview_empty_text: '当前还没有可预览的 Outlook 已导入账号。',
       },
@@ -167,7 +167,7 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
         apiType: 'microsoft',
         label: 'Hotmail',
         description: '导入 Hotmail 本地号池，支持 mixed 导入（OAuth / MailAPI URL）；运行时按账号类型自动选择 Graph/IMAP 或 MailAPI URL 轮询取码。',
-        helper_text: '支持自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @hotmail 的 OAuth 账号。',
+        helper_text: '支持完整的 --- 或 ---- 分隔符并自动识别：邮箱----密码----client_id----refresh_token 或 邮箱----mailapi_url；当前视图仅展示 @hotmail 的 OAuth 账号。',
         content_placeholder: 'example@hotmail.com----password----client_id----refresh_token',
         preview_empty_text: '当前还没有可预览的 Hotmail 已导入账号。',
       },
@@ -177,7 +177,7 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
         apiType: 'microsoft',
         label: 'MailAPI URL',
         description: '导入 MailAPI URL 账号池（邮箱----mailapi_url），运行时通过 URL 轮询网页内容提取验证码。',
-        helper_text: '支持 mixed 导入。当前视图仅展示 account_type=mailapi_url 的账号。',
+        helper_text: '支持 mixed 导入及完整的 --- 或 ---- 分隔符。当前视图仅展示 account_type=mailapi_url 的账号。',
         content_placeholder: 'example@hotmail.com----https://mailapi.icu/key?type=html&orderNo=xxxxxxxx',
         preview_empty_text: '当前还没有可预览的 MailAPI URL 已导入账号。',
       },
@@ -726,7 +726,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     >
       <Space direction="vertical" style={{ width: '100%' }} size={12}>
         <Typography.Text strong>
-          粘贴后自动识别邮箱类型；右上角仅用于切换已导入邮箱池的预览和手动兜底类型。
+          粘贴后自动识别邮箱类型，字段支持完整的 --- 或 ---- 分隔符；右上角仅用于切换已导入邮箱池的预览和手动兜底类型。
         </Typography.Text>
         <Typography.Text type="secondary">
           {selectedProvider?.description || '通过统一导入接口，将内容导入到对应邮箱账号池。'}

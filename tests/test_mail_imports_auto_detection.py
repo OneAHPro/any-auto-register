@@ -43,6 +43,23 @@ class MailImportAutoDetectionTests(unittest.TestCase):
         self.assertEqual(result.rows[0].account_type, "chatgpt_password_totp")
         self.assertNotIn(secret, json.dumps(result.to_public_dict()))
 
+    def test_accepts_mixed_three_and_four_dash_rows_without_splitting_short_runs(self):
+        microsoft_line = "one@outlook.com----https://mail.test/messages/one"
+        applemail_line = (
+            "two@gmail.com---ChatGPT-Password--2026!---"
+            "QM5QPLWGNKZYUQDWSCBDJIJUGXEHIQA3"
+        )
+
+        result = detect_mail_import_content(f"{microsoft_line}\n{applemail_line}")
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(
+            result.counts,
+            {"microsoft": 1, "applemail": 1, "unresolved": 0},
+        )
+        self.assertEqual(result.provider_content("microsoft"), microsoft_line)
+        self.assertEqual(result.provider_content("applemail"), applemail_line)
+
     def test_detects_url_credentials_and_reset_mail_as_applemail(self):
         content = "\n".join(
             [

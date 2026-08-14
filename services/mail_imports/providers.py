@@ -91,7 +91,7 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
                 "以及 AppleMail OAuth 凭据。"
             ),
             helper_text=(
-                "支持数组/对象 JSON，也支持每行一条："
+                "支持数组/对象 JSON，也支持每行一条；TXT 字段可使用完整的 `---` 或 `----` 分隔符："
                 "ChatGPT 使用 `email----ChatGPT密码----MFA秘钥`；"
                 "URL 凭据使用 `email----密码----收件URL----2FA URL`；"
                 "忘记密码记录使用 `email----登陆请点击忘记密码----收件URL`；"
@@ -375,7 +375,7 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
             type="microsoft",
             label="微软邮箱（Outlook / Hotmail，本地导入）",
             description="导入微软邮箱本地账号池，运行时从数据库取账号并通过 Graph / IMAP 策略轮询邮件（默认 Graph）。",
-            helper_text="支持两种格式并自动识别：1) 邮箱----密码----client_id----refresh_token（微软 OAuth）；2) 邮箱----mailapi_url（MailAPI URL 轮询取码）。",
+            helper_text="支持完整的 --- 或 ---- 分隔符并自动识别：1) 邮箱----密码----client_id----refresh_token（微软 OAuth）；2) 邮箱----mailapi_url（MailAPI URL 轮询取码）。",
             content_placeholder=(
                 "example@outlook.com----password----client_id----refresh_token\n"
                 "example@hotmail.com----password----client_id----refresh_token\n"

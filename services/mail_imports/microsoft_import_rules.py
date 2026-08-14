@@ -2,6 +2,8 @@ from dataclasses import dataclass
 from typing import Any, Optional, Protocol
 from urllib.parse import urlparse
 
+from core.mail_import_delimiters import split_mail_import_dash_fields
+
 
 ACCOUNT_TYPE_MICROSOFT_OAUTH = "microsoft_oauth"
 ACCOUNT_TYPE_MAILAPI_URL = "mailapi_url"
@@ -44,7 +46,7 @@ def _is_valid_mailapi_url(url: str) -> bool:
 
 class MicrosoftOAuthRowParser:
     def parse(self, line_number: int, line: str) -> MicrosoftMailImportRecord:
-        parts = [part.strip() for part in str(line or "").split("----")]
+        parts = split_mail_import_dash_fields(line)
         if len(parts) < 4:
             raise ValueError(
                 f"行 {line_number}: 格式错误，微软 OAuth 导入需为 邮箱----密码----client_id----refresh_token"
@@ -77,7 +79,7 @@ class MicrosoftOAuthRowParser:
 
 class MailApiUrlRowParser:
     def parse(self, line_number: int, line: str) -> MicrosoftMailImportRecord:
-        parts = [part.strip() for part in str(line or "").split("----")]
+        parts = split_mail_import_dash_fields(line)
         if len(parts) < 2:
             raise ValueError(
                 f"行 {line_number}: 格式错误，MailAPI URL 导入需为 邮箱----mailapi_url"
@@ -114,7 +116,7 @@ class AutoDetectRowParser:
         self._mailapi_parser = mailapi_parser or MailApiUrlRowParser()
 
     def parse(self, line_number: int, line: str) -> MicrosoftMailImportRecord:
-        parts = [part.strip() for part in str(line or "").split("----")]
+        parts = split_mail_import_dash_fields(line)
         if len(parts) == 2:
             return self._mailapi_parser.parse(line_number, line)
         if len(parts) == 3:
@@ -213,7 +215,7 @@ class MicrosoftMailboxAvailabilityRule:
 
 def parse_microsoft_import_record(line_number: int, line: str) -> MicrosoftMailImportRecord:
     """兼容旧调用：仅按微软 OAuth 四段格式解析。"""
-    parts = [part.strip() for part in str(line or "").split("----")]
+    parts = split_mail_import_dash_fields(line)
     if len(parts) >= 2 and len(parts) < 4:
         raise ValueError(
             f"行 {line_number}: 缺少 client_id 或 refresh_token，无法通过微软邮箱可用性检测"

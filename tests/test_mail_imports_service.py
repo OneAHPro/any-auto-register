@@ -12,6 +12,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.db import OutlookAccountModel
+from core.applemail_pool import parse_applemail_pool_import_content
 
 
 def load_microsoft_import_rules_module():
@@ -65,6 +66,31 @@ class MailImportServiceTests(unittest.TestCase):
             record.mailapi_url,
             "https://mail.example.test/messages",
         )
+
+    def test_three_dash_delimiter_preserves_single_and_double_hyphens(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+
+        record = parse_microsoft_import_line(
+            1,
+            "demo@outlook.com---Password-2026--safe---client-id---refresh-token",
+        )
+
+        self.assertEqual(record.email, "demo@outlook.com")
+        self.assertEqual(record.password, "Password-2026--safe")
+        self.assertEqual(record.client_id, "client-id")
+        self.assertEqual(record.refresh_token, "refresh-token")
+
+    def test_applemail_import_accepts_three_dash_delimiter(self):
+        records, errors, total = parse_applemail_pool_import_content(
+            "demo@icloud.com---Password-2026--safe---"
+            "QM5QPLWGNKZYUQDWSCBDJIJUGXEHIQA3"
+        )
+
+        self.assertEqual(total, 1)
+        self.assertEqual(errors, [])
+        self.assertEqual(records[0]["email"], "demo@icloud.com")
+        self.assertEqual(records[0]["password"], "Password-2026--safe")
 
     def test_rule_engine_returns_first_failure(self):
         rules_module = load_microsoft_import_rules_module()
