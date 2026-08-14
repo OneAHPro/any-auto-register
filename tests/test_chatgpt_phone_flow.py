@@ -898,6 +898,8 @@ class _OpenAPIClient:
         result = self.results[operation].pop(0)
         if isinstance(result, Exception):
             raise result
+        if callable(result):
+            return result()
         return result
 
     def create_order(
@@ -1046,6 +1048,140 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
             [call[0] for call in client.calls],
             ["create", "get", "get"],
         )
+
+    def test_late_create_response_is_ambiguous_and_never_accepted_or_reposted(self):
+        phone = "+12025550123"
+        clock = _OpenAPIClock()
+
+        def late_create():
+            clock.now = 6.0
+            return {
+                "order_id": "order_fixture_late_create",
+                "status": "WAITING_CODE",
+                "phone": phone,
+            }
+
+        client = _OpenAPIClient(create=[late_create])
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            leadbee_phone_timeout_seconds=5,
+            leadbee_total_timeout_seconds=5,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "期限"):
+            service.acquire_phone()
+        with self.assertRaises(RuntimeError):
+            service.acquire_phone()
+
+        self.assertEqual(service.order_id, "")
+        self.assertTrue(service.card_at_risk)
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            1,
+        )
+
+    def test_late_read_response_does_not_return_completed_code(self):
+        phone = "+12025550123"
+        code = "654321"
+        clock = _OpenAPIClock()
+
+        def late_read():
+            clock.now = 6.0
+            return {
+                "order_id": "order_fixture_late_read",
+                "status": "COMPLETED",
+                "code": code,
+            }
+
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_late_read",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[late_read],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            leadbee_total_timeout_seconds=5,
+        )
+        entry = service.acquire_phone()
+
+        self.assertIsNone(service.wait_for_code(entry, timeout=10))
+        self.assertEqual(service._status(service._order), "WAITING_CODE")
+        self.assertTrue(service.card_at_risk)
+
+    def test_late_replace_response_is_not_accepted_as_success(self):
+        phone = "+12025550123"
+        clock = _OpenAPIClock()
+
+        def late_replace():
+            clock.now = 6.0
+            return {
+                "order_id": "order_fixture_late_replace",
+                "status": "REPLACING",
+            }
+
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_late_replace",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                }
+            ],
+            replace=[late_replace],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            leadbee_total_timeout_seconds=5,
+        )
+        entry = service.acquire_phone()
+
+        with self.assertRaisesRegex(RuntimeError, "期限"):
+            service.request_replacement(entry.phone)
+
+        self.assertEqual(service._status(service._order), "WAITING_CODE")
+        self.assertTrue(service.card_at_risk)
+
+    def test_late_cancel_response_is_not_accepted_as_canceled(self):
+        phone = "+12025550123"
+        clock = _OpenAPIClock()
+
+        def late_cancel():
+            clock.now = 6.0
+            return {
+                "order_id": "order_fixture_late_cancel",
+                "status": "CANCELED",
+            }
+
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_late_cancel",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                }
+            ],
+            cancel=[late_cancel],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            leadbee_total_timeout_seconds=5,
+        )
+        service.acquire_phone()
+
+        self.assertFalse(service.cancel_active())
+        self.assertTrue(service.card_at_risk)
+        self.assertIn("期限", service.last_cancel_error)
+        self.assertEqual(service._status(service._order), "WAITING_CODE")
 
     def test_create_retries_reuse_client_reference_body_and_idempotency_key(self):
         client = _OpenAPIClient(
@@ -2657,6 +2793,240 @@ class LeadBeePhoneServiceTests(unittest.TestCase):
 
 
 class LeadBeeOAuthFlowTests(unittest.TestCase):
+    def test_open_api_oauth_success_logs_only_masked_phone_hint(self):
+        phone = "+12025550123"
+        code = "654321"
+        api_key = "ak_test_oauth_fixture"
+        api_secret = "secret_test_oauth_fixture"
+        broker = InteractivePhoneVerificationBroker(
+            account_id=21,
+            provider="leadbee-api",
+        )
+        provider_client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_oauth_success",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_oauth_success",
+                    "status": "COMPLETED",
+                    "code": code,
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            provider_client,
+            leadbee_api_key=api_key,
+            leadbee_api_secret=api_secret,
+        )
+        oauth_logs = []
+        client = OAuthClient(
+            {
+                "chatgpt_phone_progress_broker": broker,
+                "leadbee_api_enabled": True,
+                "leadbee_api_key": api_key,
+                "leadbee_api_secret": api_secret,
+                "leadbee_api_product_id": "product_phone_fixture",
+                "leadbee_api_client_order_id": "client_order_oauth_fixture",
+            },
+            verbose=False,
+        )
+        client._log = oauth_logs.append
+        phone_state = FlowState(
+            page_type="phone_otp_verification",
+            continue_url="https://auth.openai.com/phone-verification",
+        )
+        completed_state = FlowState(
+            page_type="oauth_callback",
+            continue_url="http://localhost:1455/auth/callback?code=done",
+        )
+
+        def create_service(_config, log_fn=None):
+            service.log_fn = log_fn
+            return service
+
+        with (
+            mock.patch(
+                "platforms.chatgpt.oauth_client.create_phone_service",
+                side_effect=create_service,
+            ),
+            mock.patch.object(
+                client,
+                "_send_phone_number",
+                return_value=(True, phone_state, ""),
+            ) as send_phone,
+            mock.patch.object(
+                client,
+                "_decode_oauth_session_cookie",
+                return_value={
+                    "phone_verification_channel": "sms",
+                    "phone_number": phone,
+                },
+            ),
+            mock.patch.object(
+                client,
+                "_validate_phone_otp",
+                return_value=(True, completed_state, ""),
+            ) as validate_otp,
+        ):
+            state = client._handle_add_phone_verification(
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="add_phone"),
+            )
+
+        visible_logs = "\n".join(oauth_logs + broker.snapshot()["logs"])
+        self.assertEqual(state, completed_state)
+        self.assertEqual(send_phone.call_args.args[0], phone)
+        self.assertEqual(validate_otp.call_args.args[0], code)
+        self.assertNotIn(phone, visible_logs)
+        self.assertNotIn(code, visible_logs)
+        self.assertNotIn(api_key, visible_logs)
+        self.assertNotIn(api_secret, visible_logs)
+        self.assertIn("+12***0123", visible_logs)
+
+    def test_open_api_oauth_missing_code_logs_only_masked_phone_hint(self):
+        phone = "+12025550123"
+        broker = InteractivePhoneVerificationBroker(
+            account_id=22,
+            provider="leadbee-api",
+        )
+        provider_client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_oauth_timeout",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_oauth_timeout",
+                    "status": "COMPLETED",
+                    "code": "invalid-code",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            provider_client,
+            leadbee_phone_attempts=1,
+        )
+        oauth_logs = []
+        client = OAuthClient(
+            {"chatgpt_phone_progress_broker": broker},
+            verbose=False,
+        )
+        client._log = oauth_logs.append
+        phone_state = FlowState(
+            page_type="phone_otp_verification",
+            continue_url="https://auth.openai.com/phone-verification",
+        )
+
+        def create_service(_config, log_fn=None):
+            service.log_fn = log_fn
+            return service
+
+        with (
+            mock.patch(
+                "platforms.chatgpt.oauth_client.create_phone_service",
+                side_effect=create_service,
+            ),
+            mock.patch.object(
+                client,
+                "_send_phone_number",
+                return_value=(True, phone_state, ""),
+            ),
+            mock.patch.object(
+                client,
+                "_decode_oauth_session_cookie",
+                return_value={
+                    "phone_verification_channel": "sms",
+                    "phone_number": phone,
+                },
+            ),
+        ):
+            state = client._handle_add_phone_verification(
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="add_phone"),
+            )
+
+        visible_logs = "\n".join(oauth_logs + broker.snapshot()["logs"])
+        self.assertIsNone(state)
+        self.assertNotIn(phone, visible_logs)
+        self.assertIn("+12***0123", visible_logs)
+        self.assertIn("未收到短信验证码", visible_logs)
+
+    def test_open_api_oauth_blacklist_log_uses_masked_phone_hint(self):
+        phone = "+12025550123"
+        provider_client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_oauth_blacklist",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                }
+            ],
+            replace=[
+                {
+                    "order_id": "order_fixture_oauth_blacklist",
+                    "status": "REPLACING",
+                }
+            ],
+            cancel=[
+                {
+                    "order_id": "order_fixture_oauth_blacklist",
+                    "status": "CANCELED",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            provider_client,
+            leadbee_phone_attempts=1,
+        )
+        oauth_logs = []
+        client = OAuthClient({}, verbose=False)
+        client._log = oauth_logs.append
+
+        def create_service(_config, log_fn=None):
+            service.log_fn = log_fn
+            return service
+
+        with (
+            mock.patch(
+                "platforms.chatgpt.oauth_client.create_phone_service",
+                side_effect=create_service,
+            ),
+            mock.patch.object(
+                client,
+                "_send_phone_number",
+                return_value=(False, None, "phone number is invalid"),
+            ),
+        ):
+            state = client._handle_add_phone_verification(
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="add_phone"),
+            )
+
+        visible_logs = "\n".join(oauth_logs)
+        self.assertIsNone(state)
+        self.assertNotIn(phone, visible_logs)
+        self.assertIn("+12***0123", visible_logs)
+        self.assertIn("已处理被拒绝手机号", visible_logs)
+
     def test_provider_log_redacts_exchange_code_before_api_snapshot(self):
         exchange_code = "bei-sms-OAUTH-SECRET-CODE"
         broker = InteractivePhoneVerificationBroker(

@@ -401,11 +401,23 @@ class OAuthClient:
             provider_name = str(
                 getattr(phone_service, "provider_name", "手机号服务") or "手机号服务"
             )
-            self._log(f"{provider_name} 已处理被拒绝手机号: {entry.phone}")
+            phone_hint = self._phone_log_hint(phone_service, entry.phone)
+            self._log(f"{provider_name} 已处理被拒绝手机号: {phone_hint}")
             return True
         except Exception as e:
             self._log(f"写入手机号黑名单失败: {e}")
             return False
+
+    @staticmethod
+    def _phone_log_hint(phone_service, phone):
+        formatter = getattr(type(phone_service), "log_phone_hint", None)
+        if not callable(formatter):
+            return str(phone or "").strip()
+        try:
+            hint = str(formatter(phone_service, phone) or "").strip()
+        except Exception:
+            return "[手机号已脱敏]"
+        return hint or "[手机号已脱敏]"
 
     def _headers(
         self,
@@ -4245,7 +4257,9 @@ class OAuthClient:
             safe_message = re.sub(r"\s+", " ", str(message or "")).strip()
             exchange_code = str(getattr(phone_service, "code", "") or "").strip()
             if exchange_code:
-                safe_message = safe_message.replace(exchange_code, "[LeadBee兑换码已脱敏]")
+                safe_message = safe_message.replace(
+                    exchange_code, "[LeadBee兑换码已脱敏]"
+                )
             safe_message = re.sub(
                 r"(?i)(bearer\s+)[a-z0-9._~+/=-]+",
                 r"\1[凭据已脱敏]",
@@ -4274,10 +4288,11 @@ class OAuthClient:
                     break
 
                 prefix = phone_service.prefix_hint(entry.phone)
+                phone_log_hint = self._phone_log_hint(phone_service, entry.phone)
                 if progress_broker is not None:
                     progress_broker.mark_phone_acquired(entry.phone)
                 self._log(
-                    f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {entry.phone} ({entry.country_slug})"
+                    f"步骤5: add_phone 选择手机号 {attempt + 1}/{phone_service.max_attempts}: {phone_log_hint} ({entry.country_slug})"
                 )
 
                 sent, next_state, detail = self._send_phone_number(
@@ -4329,8 +4344,12 @@ class OAuthClient:
                     str(session_data.get("phone_number") or entry.phone).strip()
                     or entry.phone
                 )
+                bound_phone_log_hint = self._phone_log_hint(
+                    phone_service,
+                    bound_phone,
+                )
                 self._log(
-                    f"add_phone 发码成功: phone={bound_phone}, channel={verification_channel}"
+                    f"add_phone 发码成功: phone={bound_phone_log_hint}, channel={verification_channel}"
                 )
 
                 if verification_channel != "sms":
@@ -4360,7 +4379,7 @@ class OAuthClient:
                             code = phone_service.wait_for_code(entry)
                     if not code:
                         last_failure = (
-                            resend_detail or f"手机号 {entry.phone} 未收到短信验证码"
+                            resend_detail or f"手机号 {phone_log_hint} 未收到短信验证码"
                         )
                         _log_phone_failure(last_failure)
                         excluded_prefixes.add(prefix)

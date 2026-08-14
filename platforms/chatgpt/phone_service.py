@@ -975,6 +975,10 @@ class LeadBeeOpenAPIPhoneService:
     def prefix_hint(self, phone: str) -> str:
         return _prefix_hint(phone)
 
+    def log_phone_hint(self, phone: str) -> str:
+        """Return a masked phone representation safe for application logs."""
+        return self._masked_phone(str(phone or "").strip())
+
     @staticmethod
     def _phone(value: Any) -> str:
         phone = str(value or "").strip()
@@ -1081,7 +1085,7 @@ class LeadBeeOpenAPIPhoneService:
             if self._monotonic() >= deadline:
                 raise RuntimeError(f"LeadBee API {phase}超过本地期限")
             try:
-                return operation()
+                result = operation()
             except LeadBeeAPIError as exc:
                 if not self._retryable(exc):
                     raise
@@ -1092,13 +1096,17 @@ class LeadBeeOpenAPIPhoneService:
                 )
             except Exception:  # noqa: BLE001 - sanitize injected client failures
                 raise RuntimeError("LeadBee API 请求失败") from None
+            else:
+                if self._monotonic() >= deadline:
+                    raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+                return result
 
     def _read_order(self, *, deadline: float, phase: str) -> dict[str, Any]:
         while True:
             if self._monotonic() >= deadline:
                 raise RuntimeError(f"LeadBee API {phase}超过本地期限")
             try:
-                return self._client.get_order(self.order_id)
+                result = self._client.get_order(self.order_id)
             except LeadBeeAPIError as exc:
                 if not self._retryable(exc):
                     raise
@@ -1109,6 +1117,10 @@ class LeadBeeOpenAPIPhoneService:
                 )
             except Exception:  # noqa: BLE001 - sanitize injected client failures
                 raise RuntimeError("LeadBee API 请求失败") from None
+            else:
+                if self._monotonic() >= deadline:
+                    raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+                return result
 
     def _quarantine(self, status: str) -> None:
         self._quarantined = True
