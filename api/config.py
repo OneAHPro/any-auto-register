@@ -1,4 +1,5 @@
 import logging
+import re
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from fastapi import APIRouter, HTTPException
@@ -6,6 +7,7 @@ from pydantic import BaseModel, Field
 from core.config_store import config_store
 from services.chatgpt_bark_alerts import BarkEndpointError, normalize_bark_endpoint
 from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
+from platforms.chatgpt.leadbee_open_api import LeadBeeAPIError, LeadBeeOpenAPIClient
 
 router = APIRouter(prefix="/config", tags=["config"])
 logger = logging.getLogger(__name__)
@@ -36,6 +38,15 @@ _BARK_CONFIG_KEYS = {
     "bark_enabled",
     "bark_endpoint",
 }
+_LEADBEE_CONFIG_KEYS = {
+    "leadbee_api_enabled",
+    "leadbee_api_key",
+    "leadbee_api_secret",
+    "leadbee_api_product_id",
+}
+_LEADBEE_SECRET_KEYS = {"leadbee_api_key", "leadbee_api_secret"}
+_LEADBEE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
+_LEADBEE_CURRENCY_RE = re.compile(r"^[A-Z]{3,8}$")
 
 CONFIG_KEYS = [
     "email_domain_rule_enabled",
@@ -141,6 +152,10 @@ CONFIG_KEYS = [
     "smtp_force_auth_login",
     "bark_enabled",
     "bark_endpoint",
+    "leadbee_api_enabled",
+    "leadbee_api_key",
+    "leadbee_api_secret",
+    "leadbee_api_product_id",
     "cliproxyapi_base_url",
     "cliproxyapi_management_key",
     "grok2api_url",
@@ -164,6 +179,10 @@ class ConfigUpdate(BaseModel):
 
 
 class SMTPTestRequest(BaseModel):
+    data: dict = Field(default_factory=dict)
+
+
+class LeadBeeTestRequest(BaseModel):
     data: dict = Field(default_factory=dict)
 
 
@@ -213,6 +232,104 @@ def _normalize_bark_endpoint(value: object) -> str:
             status_code=400,
             detail=BARK_ENDPOINT_VALIDATION_MESSAGE,
         ) from None
+
+
+def _normalize_enabled(value: object) -> str:
+    return "1" if str(value or "").strip().lower() in {"1", "true", "yes", "on"} else "0"
+
+
+def _normalize_leadbee_product_id(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _leadbee_value(snapshot: dict, key: str) -> str:
+    return str(snapshot.get(key, "") or "").strip()
+
+
+def _leadbee_product_ids(payload: object) -> list[str]:
+    """Extract only bounded IDs from common product collection envelopes."""
+    found: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: object) -> None:
+        if not isinstance(value, str):
+            return
+        candidate = value.strip()
+        if not candidate or len(candidate) > 128 or not _LEADBEE_ID_RE.fullmatch(candidate):
+            return
+        if candidate not in seen:
+            seen.add(candidate)
+            found.append(candidate)
+
+    def walk(value: object, *, collection: bool = False) -> None:
+        if isinstance(value, list):
+            for item in value:
+                walk(item, collection=True)
+            return
+        if not isinstance(value, dict):
+            if collection:
+                add(value)
+            return
+        if collection:
+            for key in ("id", "product_id", "productId"):
+                if key in value:
+                    add(value.get(key))
+                    break
+        for key, child in value.items():
+            if str(key).casefold() in {"products", "items", "list"}:
+                walk(child, collection=True)
+            elif isinstance(child, dict):
+                walk(child, collection=collection)
+
+    walk(payload)
+    return found
+
+
+def _leadbee_balance(payload: object) -> tuple[str | None, str | None]:
+    amount: object = None
+    currency: object = None
+
+    def walk(value: object) -> None:
+        nonlocal amount, currency
+        if not isinstance(value, dict):
+            return
+        for key, child in value.items():
+            folded = str(key).casefold()
+            if amount is None and folded in {
+                "balance",
+                "available_balance",
+                "availablebalance",
+                "amount",
+            } and not isinstance(child, (dict, list)):
+                amount = child
+            if currency is None and folded in {
+                "currency",
+                "currency_code",
+                "currencycode",
+            }:
+                if isinstance(child, str):
+                    currency = child
+                elif isinstance(child, dict) and isinstance(child.get("code"), str):
+                    currency = child["code"]
+            if isinstance(child, dict):
+                walk(child)
+
+    walk(payload)
+    balance: str | None = None
+    try:
+        if isinstance(amount, bool) or amount is None:
+            raise InvalidOperation
+        parsed = Decimal(str(amount).strip())
+        if parsed.is_finite() and parsed >= 0:
+            balance = format(parsed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
+    except (InvalidOperation, ValueError, TypeError):
+        balance = None
+    normalized_currency: str | None = None
+    if isinstance(currency, str):
+        candidate = currency.strip().upper()
+        if _LEADBEE_CURRENCY_RE.fullmatch(candidate):
+            normalized_currency = candidate
+    return balance, normalized_currency
 
 
 @router.get("")
@@ -273,10 +390,16 @@ def get_config():
         all_cfg["smtp_force_auth_login"] = "0"
     if not str(all_cfg.get("bark_enabled", "") or "").strip():
         all_cfg["bark_enabled"] = "0"
+    all_cfg["leadbee_api_enabled"] = _normalize_enabled(
+        all_cfg.get("leadbee_api_enabled", "")
+    )
     # SMTP 凭证只允许写入，不回传到前端或 API 调用方。
     all_cfg["smtp_password"] = ""
     # Bark 推送地址包含设备密钥，只允许写入，不回传。
     all_cfg["bark_endpoint"] = ""
+    # LeadBee API credentials are write-only; product selection is public.
+    all_cfg["leadbee_api_key"] = ""
+    all_cfg["leadbee_api_secret"] = ""
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -284,6 +407,10 @@ def get_config():
 @router.put("")
 def update_config(body: ConfigUpdate):
     # 只允许更新已知 key
+    try:
+        stored_snapshot = dict(config_store.get_all() or {})
+    except Exception:  # a validation-only update must not require an initialized DB
+        stored_snapshot = {}
     safe = {k: v for k, v in body.data.items() if k in CONFIG_KEYS}
     if safe.get("mail_provider") == "outlook":
         safe["mail_provider"] = "microsoft"
@@ -304,6 +431,20 @@ def update_config(body: ConfigUpdate):
         enabled = str(safe.get("chatgpt_auto_relogin_enabled", "")).strip().lower()
         safe["chatgpt_auto_relogin_enabled"] = (
             "1" if enabled in {"1", "true", "yes", "on"} else "0"
+        )
+    if "leadbee_api_enabled" in safe:
+        safe["leadbee_api_enabled"] = _normalize_enabled(safe["leadbee_api_enabled"])
+    for credential_key in _LEADBEE_SECRET_KEYS:
+        if credential_key in safe:
+            value = str(safe.get(credential_key) or "").strip()
+            if value:
+                safe[credential_key] = value
+            else:
+                # Blank write-only fields mean "leave the persisted value alone".
+                safe.pop(credential_key, None)
+    if "leadbee_api_product_id" in safe:
+        safe["leadbee_api_product_id"] = _normalize_leadbee_product_id(
+            safe["leadbee_api_product_id"]
         )
     for bool_key in (
         "codex2api_delete_on_account_remove_enabled",
@@ -349,6 +490,24 @@ def update_config(body: ConfigUpdate):
                 detail=f"{label}必须在 {minimum} 到 {maximum} 之间",
             )
         safe[key] = str(value)
+
+    # Validate the effective point-in-time configuration before writing.  A
+    # blank credential in this request has already been removed above, so the
+    # stored secret remains part of the effective snapshot.
+    if "leadbee_api_enabled" in safe or _leadbee_value(
+        stored_snapshot, "leadbee_api_enabled"
+    ) == "1":
+        leadbee_snapshot = dict(stored_snapshot)
+        leadbee_snapshot.update(safe)
+        if _normalize_enabled(leadbee_snapshot.get("leadbee_api_enabled")) == "1":
+            if not all(
+                _leadbee_value(leadbee_snapshot, key)
+                for key in ("leadbee_api_key", "leadbee_api_secret", "leadbee_api_product_id")
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="LeadBee API 启用时必须完整配置凭证和产品 ID",
+                )
     config_store.set_many(safe)
     if _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS.intersection(safe):
         try:
@@ -466,6 +625,65 @@ def test_bark_config(body: SMTPTestRequest):
         status_code=502,
         detail=f"Bark 测试通知发送失败（{error_type}）",
     )
+
+
+@router.post("/leadbee/test")
+def test_leadbee_config(body: LeadBeeTestRequest):
+    stored = {
+        key: value
+        for key, value in dict(config_store.get_all() or {}).items()
+        if key in _LEADBEE_CONFIG_KEYS
+    }
+    overrides = {
+        key: value
+        for key, value in dict(body.data or {}).items()
+        if key in _LEADBEE_CONFIG_KEYS
+    }
+    for credential_key in _LEADBEE_SECRET_KEYS:
+        if credential_key in overrides:
+            value = str(overrides.get(credential_key) or "").strip()
+            if value:
+                overrides[credential_key] = value
+            else:
+                overrides.pop(credential_key, None)
+    if "leadbee_api_product_id" in overrides:
+        overrides["leadbee_api_product_id"] = _normalize_leadbee_product_id(
+            overrides["leadbee_api_product_id"]
+        )
+    merged = dict(stored)
+    merged.update(overrides)
+    api_key = _leadbee_value(merged, "leadbee_api_key")
+    api_secret = _leadbee_value(merged, "leadbee_api_secret")
+    product_id = _leadbee_value(merged, "leadbee_api_product_id")
+    if not api_key or not api_secret or not product_id:
+        raise HTTPException(
+            status_code=400,
+            detail="请完整填写 LeadBee API 凭证和产品 ID",
+        )
+
+    # Deliberately omit base_url: the production connection test always uses
+    # the official endpoint baked into LeadBeeOpenAPIClient.
+    try:
+        client = LeadBeeOpenAPIClient(api_key=api_key, api_secret=api_secret)
+        products_payload = client.get_products()
+        balance_payload = client.get_balance()
+        product_ids = _leadbee_product_ids(products_payload)
+        balance_available, currency = _leadbee_balance(balance_payload)
+        return {
+            "ok": True,
+            "product_ids": product_ids,
+            "configured_product_available": product_id in product_ids,
+            "balance_available": balance_available,
+            "currency": currency,
+        }
+    except LeadBeeAPIError as exc:
+        logger.warning("LeadBee connection test failed (%s)", exc.code or "provider_error")
+        raise HTTPException(status_code=502, detail="LeadBee 连接测试失败") from None
+    except Exception:
+        # Provider exception text may contain credentials or verification data;
+        # keep logs deliberately generic as well as the HTTP response.
+        logger.warning("LeadBee connection test failed (provider_error)")
+        raise HTTPException(status_code=502, detail="LeadBee 连接测试失败") from None
 
 
 @router.post("/applemail/import")

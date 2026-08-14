@@ -24,6 +24,10 @@ PUBLIC_KEYS = {
     "smtp_recipient_email",
     "smtp_use_ssl",
     "smtp_force_auth_login",
+    "leadbee_api_enabled",
+    "leadbee_api_key",
+    "leadbee_api_secret",
+    "leadbee_api_product_id",
 }
 
 
@@ -84,6 +88,9 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert response["chatgpt_auto_relogin_concurrency"] == "10"
     assert response["chatgpt_auto_relogin_alert_threshold"] == "20"
     assert response["chatgpt_auto_relogin_quota_alert_threshold_usd"] == "0.00"
+    assert response["leadbee_api_enabled"] == "0"
+    assert response["leadbee_api_key"] == ""
+    assert response["leadbee_api_secret"] == ""
     assert response["smtp_port"] == "587"
     assert response["smtp_use_ssl"] == "1"
     assert store.writes == []
