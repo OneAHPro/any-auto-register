@@ -161,6 +161,67 @@ def test_connection_test_merges_unsaved_credentials_without_persisting(monkeypat
     assert store.writes == []
 
 
+def test_connection_test_redacts_sensitive_product_metadata(monkeypatch):
+    from api import config as config_api
+
+    api_key = "FixtureKey-Alpha987"
+    api_secret = "FixtureSecret-Beta654"
+    store = FakeConfigStore(
+        {
+            "leadbee_api_key": api_key,
+            "leadbee_api_secret": api_secret,
+            "leadbee_api_product_id": "prod-1",
+        }
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs == {"api_key": api_key, "api_secret": api_secret}
+
+        def get_products(self):
+            return {
+                "data": {
+                    "results": [
+                        {"id": api_key},
+                        {"id": f"prefix-{api_key.swapcase()}-suffix"},
+                        {"id": "KEY-ALPHA987"},
+                        {"id": api_secret.upper()},
+                        {"id": f"prefix-{api_secret.lower()}-suffix"},
+                        {"id": "secret-beta654"},
+                        {"id": "13800138000"},
+                        {"id": "1234"},
+                        {"id": "12345678"},
+                        {"id": "a3" * 32},
+                        {"id": "Authorization"},
+                        {"id": "X-API-Key"},
+                        {"id": "api_secret"},
+                        {"id": "prod-1"},
+                        {"id": "sku_A.B/9:blue-2"},
+                        {"id": "123"},
+                        {"id": "123456789"},
+                    ]
+                }
+            }
+
+        def get_balance(self):
+            return {"balance": "12.5", "currency": "USD"}
+
+    monkeypatch.setattr(config_api, "config_store", store)
+    monkeypatch.setattr(config_api, "LeadBeeOpenAPIClient", FakeClient)
+
+    result = config_api.test_leadbee_config(
+        config_api.LeadBeeTestRequest(data={})
+    )
+
+    assert result == {
+        "ok": True,
+        "product_ids": ["prod-1", "sku_A.B/9:blue-2", "123", "123456789"],
+        "configured_product_available": True,
+        "balance_available": "12.50",
+        "currency": "USD",
+    }
+
+
 def test_connection_test_redacts_provider_errors_and_payload_secrets(monkeypatch):
     from api import config as config_api
 

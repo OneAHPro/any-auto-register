@@ -47,6 +47,21 @@ _LEADBEE_CONFIG_KEYS = {
 _LEADBEE_SECRET_KEYS = {"leadbee_api_key", "leadbee_api_secret"}
 _LEADBEE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
 _LEADBEE_CURRENCY_RE = re.compile(r"^[A-Z]{3,8}$")
+_LEADBEE_SENSITIVE_HEADER_NAMES = {
+    "authorization",
+    "proxyauthorization",
+    "apikey",
+    "xapikey",
+    "apisecret",
+    "xapisecret",
+    "authtoken",
+    "xauthtoken",
+    "accesstoken",
+    "xaccesstoken",
+    "refreshtoken",
+    "cookie",
+    "setcookie",
+}
 
 CONFIG_KEYS = [
     "email_domain_rule_enabled",
@@ -246,16 +261,45 @@ def _leadbee_value(snapshot: dict, key: str) -> str:
     return str(snapshot.get(key, "") or "").strip()
 
 
-def _leadbee_product_ids(payload: object) -> list[str]:
+def _leadbee_product_ids(
+    payload: object, *, sensitive_values: tuple[str, ...] = ()
+) -> list[str]:
     """Extract only bounded IDs from common product collection envelopes."""
     found: list[str] = []
     seen: set[str] = set()
+    folded_sensitive_values = tuple(
+        value.strip().casefold() for value in sensitive_values if value.strip()
+    )
+
+    def is_sensitive(candidate: str) -> bool:
+        folded = candidate.casefold()
+        if any(
+            folded == sensitive
+            or folded in sensitive
+            or sensitive in folded
+            for sensitive in folded_sensitive_values
+        ):
+            return True
+        if re.fullmatch(r"\d{4,8}", candidate):
+            return True
+        digits_only = re.sub(r"[\s().-]", "", candidate)
+        if digits_only.isdigit() and 10 <= len(digits_only) <= 15:
+            return True
+        if re.fullmatch(r"[0-9a-fA-F]{64}", candidate):
+            return True
+        header_name = re.sub(r"[^a-z0-9]", "", folded)
+        return header_name in _LEADBEE_SENSITIVE_HEADER_NAMES
 
     def add(value: object) -> bool:
         if not isinstance(value, str):
             return False
         candidate = value.strip()
-        if not candidate or len(candidate) > 128 or not _LEADBEE_ID_RE.fullmatch(candidate):
+        if (
+            not candidate
+            or len(candidate) > 128
+            or not _LEADBEE_ID_RE.fullmatch(candidate)
+            or is_sensitive(candidate)
+        ):
             return False
         if candidate not in seen:
             seen.add(candidate)
@@ -669,7 +713,10 @@ def test_leadbee_config(body: LeadBeeTestRequest):
         client = LeadBeeOpenAPIClient(api_key=api_key, api_secret=api_secret)
         products_payload = client.get_products()
         balance_payload = client.get_balance()
-        product_ids = _leadbee_product_ids(products_payload)
+        product_ids = _leadbee_product_ids(
+            products_payload,
+            sensitive_values=(api_key, api_secret),
+        )
         balance_available, currency = _leadbee_balance(balance_payload)
         return {
             "ok": True,
