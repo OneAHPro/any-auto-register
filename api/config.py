@@ -61,6 +61,16 @@ _LEADBEE_SENSITIVE_HEADER_NAMES = {
     "refreshtoken",
     "cookie",
     "setcookie",
+    "xsignature",
+    "xtimestamp",
+    "xnonce",
+    "idempotencykey",
+    "requestid",
+    "xrequestid",
+    "correlationid",
+    "xcorrelationid",
+    "traceparent",
+    "tracestate",
 }
 
 CONFIG_KEYS = [
@@ -287,8 +297,11 @@ def _leadbee_product_ids(
             return True
         if re.fullmatch(r"[0-9a-fA-F]{64}", candidate):
             return True
-        header_name = re.sub(r"[^a-z0-9]", "", folded)
-        return header_name in _LEADBEE_SENSITIVE_HEADER_NAMES
+        normalized_candidate = re.sub(r"[^a-z0-9]", "", folded)
+        return any(
+            header_name in normalized_candidate
+            for header_name in _LEADBEE_SENSITIVE_HEADER_NAMES
+        )
 
     def add(value: object) -> bool:
         if not isinstance(value, str):
