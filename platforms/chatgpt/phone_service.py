@@ -25,6 +25,7 @@ from smstome_tool import (
 from .leadbee_open_api import (
     LeadBeeAPIError,
     LeadBeeOpenAPIClient,
+    LeadBeeResponseError,
     LeadBeeTransportError,
 )
 
@@ -917,8 +918,13 @@ class LeadBeeOpenAPIPhoneService:
         self.poll_interval_seconds = _to_positive_int(
             self.config.get("leadbee_poll_interval_seconds"), 4, minimum=1
         )
+        self.request_timeout_seconds = _to_positive_int(
+            self.config.get("leadbee_request_timeout_seconds"), 20, minimum=5
+        )
         self._sleep = sleep_fn or time.sleep
         self._monotonic = monotonic or time.monotonic
+        self._progress_broker = self.config.get("chatgpt_phone_progress_broker")
+        self._provider_started = False
         self._client = client
         if self._client is None and self._configuration_complete:
             # Production always uses the client's fixed official default base.
@@ -1043,11 +1049,41 @@ class LeadBeeOpenAPIPhoneService:
             now + float(timeout_seconds),
         )
 
-    def _sleep_before(self, delay: float, deadline: float, phase: str) -> None:
+    def _raise_if_cancelled(self) -> None:
+        checker = getattr(self._progress_broker, "raise_if_cancelled", None)
+        if callable(checker):
+            checker()
+
+    def _mark_provider_started(self) -> None:
+        if self._provider_started:
+            return
+        marker = getattr(self._progress_broker, "mark_provider_started", None)
+        if callable(marker):
+            marker()
+        self._provider_started = True
+
+    def _remaining_request_timeout(self, deadline: float, phase: str) -> float:
+        remaining = float(deadline) - self._monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+        return min(float(self.request_timeout_seconds), remaining)
+
+    def _sleep_before(
+        self,
+        delay: float,
+        deadline: float,
+        phase: str,
+        *,
+        check_cancellation: bool = True,
+    ) -> None:
+        if check_cancellation:
+            self._raise_if_cancelled()
         remaining = deadline - self._monotonic()
         if remaining <= 0:
             raise RuntimeError(f"LeadBee API {phase}超过本地期限")
         self._sleep(min(float(delay), remaining))
+        if check_cancellation:
+            self._raise_if_cancelled()
         if self._monotonic() >= deadline:
             raise RuntimeError(f"LeadBee API {phase}超过本地期限")
 
@@ -1076,51 +1112,62 @@ class LeadBeeOpenAPIPhoneService:
 
     def _write_with_retry(
         self,
-        operation: Callable[[], dict[str, Any]],
+        operation: Callable[[float], dict[str, Any]],
         *,
         deadline: float,
         phase: str,
+        check_cancellation: bool = True,
     ) -> dict[str, Any]:
         while True:
-            if self._monotonic() >= deadline:
-                raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+            if check_cancellation:
+                self._raise_if_cancelled()
+            request_timeout = self._remaining_request_timeout(deadline, phase)
+            result: dict[str, Any] = {}
+            retry_delay: float | None = None
+            unexpected_failure = False
             try:
-                result = operation()
+                result = operation(request_timeout)
             except LeadBeeAPIError as exc:
                 if not self._retryable(exc):
                     raise
-                self._sleep_before(
-                    self._retry_delay(exc),
-                    deadline,
-                    phase,
-                )
+                retry_delay = self._retry_delay(exc)
             except Exception:  # noqa: BLE001 - sanitize injected client failures
-                raise RuntimeError("LeadBee API 请求失败") from None
-            else:
-                if self._monotonic() >= deadline:
-                    raise RuntimeError(f"LeadBee API {phase}超过本地期限")
-                return result
+                unexpected_failure = True
 
-    def _read_order(self, *, deadline: float, phase: str) -> dict[str, Any]:
-        while True:
-            if self._monotonic() >= deadline:
-                raise RuntimeError(f"LeadBee API {phase}超过本地期限")
-            try:
-                result = self._client.get_order(self.order_id)
-            except LeadBeeAPIError as exc:
-                if not self._retryable(exc):
-                    raise
+            if unexpected_failure:
+                # Raise after leaving the handler so the injected exception is
+                # not retained as either __context__ or __cause__.
+                raise RuntimeError("LeadBee API 请求失败") from None
+            if retry_delay is not None:
                 self._sleep_before(
-                    self._retry_delay(exc),
+                    retry_delay,
                     deadline,
                     phase,
+                    check_cancellation=check_cancellation,
                 )
-            except Exception:  # noqa: BLE001 - sanitize injected client failures
-                raise RuntimeError("LeadBee API 请求失败") from None
-            else:
-                if self._monotonic() >= deadline:
-                    raise RuntimeError(f"LeadBee API {phase}超过本地期限")
-                return result
+                continue
+            if check_cancellation:
+                self._raise_if_cancelled()
+            if self._monotonic() >= deadline:
+                raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+            return result
+
+    def _read_order(
+        self,
+        *,
+        deadline: float,
+        phase: str,
+        check_cancellation: bool = True,
+    ) -> dict[str, Any]:
+        return self._write_with_retry(
+            lambda request_timeout: self._client.get_order(
+                self.order_id,
+                request_timeout=request_timeout,
+            ),
+            deadline=deadline,
+            phase=phase,
+            check_cancellation=check_cancellation,
+        )
 
     def _quarantine(self, status: str) -> None:
         self._quarantined = True
@@ -1159,6 +1206,16 @@ class LeadBeeOpenAPIPhoneService:
             self._quarantined = False
         return order
 
+    @staticmethod
+    def _create_failure_is_ambiguous(exc: LeadBeeAPIError) -> bool:
+        if isinstance(exc, LeadBeeTransportError):
+            return True
+        if isinstance(exc, LeadBeeResponseError) and 200 <= exc.http_status < 300:
+            return True
+        if exc.http_status >= 500:
+            return True
+        return exc.error_code == "IDEMPOTENCY_CONFLICT"
+
     def _create_order(self, *, deadline: float) -> dict[str, Any]:
         if self.order_id:
             return self._order
@@ -1166,25 +1223,31 @@ class LeadBeeOpenAPIPhoneService:
             self._quarantine(self._status(self._order))
         if self._create_failed:
             raise RuntimeError("LeadBee API 创建订单已失败，未重复提交")
-        self._create_attempted = True
+
+        def create(request_timeout: float) -> dict[str, Any]:
+            self._create_attempted = True
+            return self._client.create_order(
+                self.client_order_id,
+                self.product_id,
+                1,
+                idempotency_key=self._create_idempotency_key,
+                request_timeout=request_timeout,
+            )
+
         try:
             data = self._write_with_retry(
-                lambda: self._client.create_order(
-                    self.client_order_id,
-                    self.product_id,
-                    1,
-                    idempotency_key=self._create_idempotency_key,
-                ),
+                create,
                 deadline=deadline,
                 phase="创建订单",
             )
-        except LeadBeeAPIError:
-            self._create_ambiguous = False
+        except LeadBeeAPIError as exc:
+            self._create_ambiguous = self._create_failure_is_ambiguous(exc)
             self._create_failed = True
             raise
         except RuntimeError:
-            self._create_ambiguous = True
-            self._create_failed = True
+            if self._create_attempted:
+                self._create_ambiguous = True
+                self._create_failed = True
             raise
         try:
             order = self._accept_order(data, require_order_id=True)
@@ -1194,13 +1257,26 @@ class LeadBeeOpenAPIPhoneService:
         self._create_ambiguous = False
         return order
 
-    def _poll_order(self, *, deadline: float, phase: str) -> dict[str, Any]:
+    def _poll_order(
+        self,
+        *,
+        deadline: float,
+        phase: str,
+        check_cancellation: bool = True,
+    ) -> dict[str, Any]:
         self._sleep_before(
             self._poll_delay(self._order),
             deadline,
             phase,
+            check_cancellation=check_cancellation,
         )
-        return self._accept_order(self._read_order(deadline=deadline, phase=phase))
+        return self._accept_order(
+            self._read_order(
+                deadline=deadline,
+                phase=phase,
+                check_cancellation=check_cancellation,
+            )
+        )
 
     def _entry(self, phone: str) -> PhoneEntry:
         self._current_phone = phone
@@ -1215,12 +1291,17 @@ class LeadBeeOpenAPIPhoneService:
         self, *, exclude_prefixes: Optional[Iterable[str]] = None
     ) -> Optional[PhoneEntry]:
         del exclude_prefixes
+        self._raise_if_cancelled()
         self._ensure_enabled()
         if self._quarantined:
             self._quarantine(self._status(self._order))
         replacing = self._replacement_pending
         deadline = self._phase_deadline(self.phone_timeout_seconds)
-        order = self._order if self.order_id else self._create_order(deadline=deadline)
+        if self.order_id:
+            order = self._order
+        else:
+            self._mark_provider_started()
+            order = self._create_order(deadline=deadline)
 
         while True:
             status = self._status(order)
@@ -1242,6 +1323,7 @@ class LeadBeeOpenAPIPhoneService:
     def wait_for_code(
         self, entry: PhoneEntry, *, timeout: Optional[int] = None
     ) -> Optional[str]:
+        self._raise_if_cancelled()
         self._ensure_enabled()
         if not self.order_id:
             raise RuntimeError("LeadBee API 订单尚未创建")
@@ -1286,6 +1368,7 @@ class LeadBeeOpenAPIPhoneService:
 
     def request_replacement(self, phone: str, *, reason: str = "") -> bool:
         del reason
+        self._raise_if_cancelled()
         self._ensure_enabled()
         if not self.order_id or self._quarantined:
             return False
@@ -1302,9 +1385,10 @@ class LeadBeeOpenAPIPhoneService:
         )
         deadline = self._ensure_flow_deadline()
         data = self._write_with_retry(
-            lambda: self._client.replace_order(
+            lambda request_timeout: self._client.replace_order(
                 self.order_id,
                 idempotency_key=idempotency_key,
+                request_timeout=request_timeout,
             ),
             deadline=deadline,
             phase="更换手机号",
@@ -1336,12 +1420,14 @@ class LeadBeeOpenAPIPhoneService:
         deadline = self._ensure_flow_deadline()
         try:
             data = self._write_with_retry(
-                lambda: self._client.cancel_order(
+                lambda request_timeout: self._client.cancel_order(
                     self.order_id,
                     idempotency_key=self._cancel_idempotency_key,
+                    request_timeout=request_timeout,
                 ),
                 deadline=deadline,
                 phase="取消订单",
+                check_cancellation=False,
             )
             order = self._accept_order(data)
             while True:
@@ -1356,6 +1442,7 @@ class LeadBeeOpenAPIPhoneService:
                 order = self._poll_order(
                     deadline=deadline,
                     phase="确认取消状态",
+                    check_cancellation=False,
                 )
         except LeadBeeAPIError as exc:
             self.last_cancel_error = str(exc)

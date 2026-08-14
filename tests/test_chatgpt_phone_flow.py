@@ -10,6 +10,8 @@ from curl_cffi import requests as cffi_requests
 
 from platforms.chatgpt.leadbee_open_api import (
     LeadBeeAPIError,
+    LeadBeeHTTPError,
+    LeadBeeResponseError,
     LeadBeeTransportError,
 )
 from platforms.chatgpt.oauth_client import OAuthClient
@@ -909,6 +911,7 @@ class _OpenAPIClient:
         quantity=1,
         *,
         idempotency_key,
+        request_timeout=None,
     ):
         self.calls.append(
             (
@@ -917,20 +920,21 @@ class _OpenAPIClient:
                 product_id,
                 quantity,
                 idempotency_key,
+                request_timeout,
             )
         )
         return self._result("create")
 
-    def get_order(self, order_id):
-        self.calls.append(("get", order_id))
+    def get_order(self, order_id, *, request_timeout=None):
+        self.calls.append(("get", order_id, request_timeout))
         return self._result("get")
 
-    def replace_order(self, order_id, *, idempotency_key):
-        self.calls.append(("replace", order_id, idempotency_key))
+    def replace_order(self, order_id, *, idempotency_key, request_timeout=None):
+        self.calls.append(("replace", order_id, idempotency_key, request_timeout))
         return self._result("replace")
 
-    def cancel_order(self, order_id, *, idempotency_key):
-        self.calls.append(("cancel", order_id, idempotency_key))
+    def cancel_order(self, order_id, *, idempotency_key, request_timeout=None):
+        self.calls.append(("cancel", order_id, idempotency_key, request_timeout))
         return self._result("cancel")
 
 
@@ -1255,6 +1259,456 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
             [call[0] for call in client.calls].count("create"),
             1,
         )
+
+    def test_2xx_response_parse_failure_keeps_create_ambiguous_and_at_risk(self):
+        for error_code in ("INVALID_JSON", "INVALID_ENVELOPE"):
+            with self.subTest(error_code=error_code):
+                client = _OpenAPIClient(
+                    create=[
+                        LeadBeeResponseError(
+                            "fixture parse failure",
+                            code=error_code,
+                            status_code=200,
+                        )
+                    ]
+                )
+                service, _clock, _logs = _open_api_service(client)
+
+                with self.assertRaises(LeadBeeResponseError):
+                    service.acquire_phone()
+
+                self.assertTrue(service._create_ambiguous)
+                self.assertTrue(service.card_at_risk)
+                self.assertEqual(service.order_id, "")
+                self.assertFalse(service.cancel_active())
+                with self.assertRaises(RuntimeError):
+                    service.acquire_phone()
+                self.assertEqual(
+                    [call[0] for call in client.calls].count("create"),
+                    1,
+                )
+
+    def test_5xx_and_idempotency_conflict_create_failures_are_ambiguous(self):
+        failures = (
+            LeadBeeHTTPError(
+                "fixture server failure",
+                code="AUTH_REQUIRED",
+                status_code=500,
+            ),
+            LeadBeeAPIError(
+                "fixture server envelope failure",
+                code="API_ERROR",
+                status_code=500,
+            ),
+            LeadBeeAPIError(
+                "fixture conflict",
+                code="IDEMPOTENCY_CONFLICT",
+                status_code=409,
+            ),
+        )
+        for failure in failures:
+            with self.subTest(error_code=failure.error_code):
+                client = _OpenAPIClient(create=[failure])
+                service, _clock, _logs = _open_api_service(client)
+
+                with self.assertRaises(LeadBeeAPIError):
+                    service.acquire_phone()
+
+                self.assertTrue(service._create_ambiguous)
+                self.assertTrue(service.card_at_risk)
+
+    def test_explicit_4xx_create_rejections_are_not_marked_ambiguous(self):
+        failures = (
+            LeadBeeHTTPError(
+                "fixture auth rejection",
+                code="AUTH_REQUIRED",
+                status_code=401,
+            ),
+            LeadBeeHTTPError(
+                "fixture permission rejection",
+                code="PERMISSION_DENIED",
+                status_code=403,
+            ),
+            LeadBeeHTTPError(
+                "fixture product rejection",
+                code="PRODUCT_NOT_FOUND",
+                status_code=404,
+            ),
+        )
+        for failure in failures:
+            with self.subTest(error_code=failure.error_code):
+                client = _OpenAPIClient(create=[failure])
+                service, _clock, _logs = _open_api_service(client)
+
+                with self.assertRaises(LeadBeeAPIError):
+                    service.acquire_phone()
+
+                self.assertFalse(service._create_ambiguous)
+                self.assertFalse(service.card_at_risk)
+
+    def test_provider_passes_remaining_deadline_to_each_order_endpoint(self):
+        first_phone = "+12025550123"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_timeouts",
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_timeouts",
+                    "status": "WAITING_CODE",
+                    "phone": first_phone,
+                }
+            ],
+            replace=[
+                {
+                    "order_id": "order_fixture_timeouts",
+                    "status": "REPLACING",
+                }
+            ],
+            cancel=[
+                {
+                    "order_id": "order_fixture_timeouts",
+                    "status": "CANCELED",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_total_timeout_seconds=10,
+            leadbee_request_timeout_seconds=20,
+        )
+
+        entry = service.acquire_phone()
+        self.assertTrue(service.request_replacement(entry.phone))
+        self.assertTrue(service.cancel_active())
+
+        self.assertEqual(
+            [call[0] for call in client.calls],
+            [
+                "create",
+                "get",
+                "replace",
+                "cancel",
+            ],
+        )
+        self.assertEqual([call[-1] for call in client.calls], [10.0, 9.0, 9.0, 9.0])
+
+    def test_provider_uses_subsecond_remaining_deadline_instead_of_client_default(self):
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_subsecond",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_request_timeout_seconds=20,
+        )
+        service._flow_deadline = 0.05
+
+        service.acquire_phone()
+
+        self.assertEqual(client.calls[0][-1], 0.05)
+
+    def test_provider_recomputes_smaller_request_timeout_for_write_retry(self):
+        clock = _OpenAPIClock()
+
+        def fail_after_two_seconds():
+            clock.now = 2.0
+            raise LeadBeeTransportError("fixture transport")
+
+        client = _OpenAPIClient(
+            create=[
+                fail_after_two_seconds,
+                {
+                    "order_id": "order_fixture_retry_timeout",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            leadbee_request_timeout_seconds=20,
+        )
+        service._flow_deadline = 10.0
+
+        service.acquire_phone()
+
+        self.assertEqual(
+            [call[-1] for call in client.calls if call[0] == "create"],
+            [10.0, 7.0],
+        )
+
+    def test_provider_recomputes_smaller_request_timeout_for_read_retry(self):
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_read_retry_timeout",
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                LeadBeeTransportError("fixture transport"),
+                {
+                    "order_id": "order_fixture_read_retry_timeout",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_total_timeout_seconds=10,
+            leadbee_request_timeout_seconds=20,
+        )
+
+        service.acquire_phone()
+
+        self.assertEqual(
+            [call[-1] for call in client.calls],
+            [10.0, 9.0, 8.0],
+        )
+
+    def test_provider_request_timeout_is_capped_by_validated_configuration(self):
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_timeout_cap",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_total_timeout_seconds=10,
+            leadbee_request_timeout_seconds=5,
+        )
+
+        service.acquire_phone()
+
+        self.assertEqual(client.calls[0][-1], 5.0)
+
+    def test_broker_precancel_stops_before_provider_start_and_order_create(self):
+        broker = mock.Mock()
+        broker.raise_if_cancelled.side_effect = RuntimeError("fixture canceled")
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_precancel",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            chatgpt_phone_progress_broker=broker,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "fixture canceled"):
+            service.acquire_phone()
+
+        self.assertNotIn("create", [call[0] for call in client.calls])
+        broker.mark_provider_started.assert_not_called()
+        self.assertFalse(service.card_at_risk)
+
+    def test_provider_started_marker_precedes_first_create_request(self):
+        events = []
+        broker = mock.Mock()
+        broker.mark_provider_started.side_effect = lambda: events.append("started")
+
+        def create_result():
+            events.append("create")
+            return {
+                "order_id": "order_fixture_started",
+                "status": "WAITING_CODE",
+                "phone": "+12025550123",
+            }
+
+        client = _OpenAPIClient(create=[create_result])
+        service, _clock, _logs = _open_api_service(
+            client,
+            chatgpt_phone_progress_broker=broker,
+        )
+
+        service.acquire_phone()
+
+        self.assertEqual(events, ["started", "create"])
+        broker.mark_provider_started.assert_called_once_with()
+
+    def test_broker_cancellation_after_poll_sleep_prevents_next_get(self):
+        state = {"cancelled": False}
+        broker = mock.Mock()
+
+        def raise_if_cancelled():
+            if state["cancelled"]:
+                raise RuntimeError("fixture canceled during poll")
+
+        broker.raise_if_cancelled.side_effect = raise_if_cancelled
+        clock = _OpenAPIClock()
+
+        def canceling_sleep(seconds):
+            clock.now += seconds
+            state["cancelled"] = True
+
+        clock.sleep = canceling_sleep
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_poll_cancel",
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_poll_cancel",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            clock=clock,
+            chatgpt_phone_progress_broker=broker,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "fixture canceled during poll"):
+            service.acquire_phone()
+
+        self.assertNotIn("get", [call[0] for call in client.calls])
+        self.assertTrue(service.card_at_risk)
+
+    def test_broker_cancellation_after_create_response_is_not_accepted(self):
+        state = {"cancelled": False}
+        broker = mock.Mock()
+
+        def raise_if_cancelled():
+            if state["cancelled"]:
+                raise RuntimeError("fixture canceled after create")
+
+        broker.raise_if_cancelled.side_effect = raise_if_cancelled
+
+        def create_result():
+            state["cancelled"] = True
+            return {
+                "order_id": "order_fixture_cancel_after_create",
+                "status": "WAITING_CODE",
+                "phone": "+12025550123",
+            }
+
+        client = _OpenAPIClient(create=[create_result])
+        service, _clock, _logs = _open_api_service(
+            client,
+            chatgpt_phone_progress_broker=broker,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "fixture canceled after create"):
+            service.acquire_phone()
+
+        self.assertEqual(service.order_id, "")
+        self.assertTrue(service.card_at_risk)
+
+    def test_canceled_broker_stops_wait_and_replacement_but_cleanup_can_cancel(self):
+        state = {"cancelled": False}
+        broker = mock.Mock()
+
+        def raise_if_cancelled():
+            if state["cancelled"]:
+                raise RuntimeError("fixture session replaced")
+
+        broker.raise_if_cancelled.side_effect = raise_if_cancelled
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_cleanup_cancel",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_cleanup_cancel",
+                    "status": "COMPLETED",
+                    "code": "654321",
+                }
+            ],
+            replace=[
+                {
+                    "order_id": "order_fixture_cleanup_cancel",
+                    "status": "REPLACING",
+                }
+            ],
+            cancel=[
+                {
+                    "order_id": "order_fixture_cleanup_cancel",
+                    "status": "CANCELED",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            chatgpt_phone_progress_broker=broker,
+        )
+        entry = service.acquire_phone()
+        state["cancelled"] = True
+
+        with self.assertRaisesRegex(RuntimeError, "fixture session replaced"):
+            service.wait_for_code(entry)
+        with self.assertRaisesRegex(RuntimeError, "fixture session replaced"):
+            service.request_replacement(entry.phone)
+
+        self.assertNotIn("get", [call[0] for call in client.calls])
+        self.assertNotIn("replace", [call[0] for call in client.calls])
+        self.assertTrue(service.cancel_active())
+        self.assertIn("cancel", [call[0] for call in client.calls])
+
+    def test_injected_client_failure_has_no_sensitive_exception_chain(self):
+        secret = "fixture_client_secret_value"
+        client = _OpenAPIClient(create=[RuntimeError(secret)])
+        service, _clock, _logs = _open_api_service(client)
+
+        with self.assertRaises(RuntimeError) as caught:
+            service.acquire_phone()
+
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
+
+    def test_injected_read_failure_has_no_sensitive_exception_chain(self):
+        secret = "fixture_read_secret_value"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_read_failure",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[RuntimeError(secret)],
+        )
+        service, _clock, _logs = _open_api_service(client)
+        entry = service.acquire_phone()
+
+        with self.assertRaises(RuntimeError) as caught:
+            service.wait_for_code(entry)
+
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertIsNone(caught.exception.__cause__)
+        self.assertIsNone(caught.exception.__context__)
 
     def test_auth_permission_product_and_conflict_errors_override_retryable_http(self):
         cases = (

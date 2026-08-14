@@ -28,6 +28,7 @@ _SENSITIVE_DIAGNOSTIC_LABELS = (
     "api_secret",
     "api-secret",
 )
+_RequestTimeout = float | tuple[float, float]
 
 
 class LeadBeeAPIError(RuntimeError):
@@ -97,7 +98,7 @@ class LeadBeeOpenAPIClient:
         api_secret: str,
         base_url: str = LEADBEE_API_BASE,
         session: Any | None = None,
-        request_timeout: float | tuple[float, float] = 20.0,
+        request_timeout: _RequestTimeout = 20.0,
         clock: Callable[[], float] | None = None,
         nonce_factory: Callable[[], str] | None = None,
     ) -> None:
@@ -131,15 +132,21 @@ class LeadBeeOpenAPIClient:
             nonce_factory if nonce_factory is not None else lambda: uuid.uuid4().hex
         )
 
-    def get_products(self) -> dict[str, Any]:
-        return self._request("GET", "/products")
+    def get_products(
+        self, *, request_timeout: _RequestTimeout | None = None
+    ) -> dict[str, Any]:
+        return self._request("GET", "/products", request_timeout=request_timeout)
 
-    def list_products(self) -> dict[str, Any]:
+    def list_products(
+        self, *, request_timeout: _RequestTimeout | None = None
+    ) -> dict[str, Any]:
         """Compatibility alias matching the integration design."""
-        return self.get_products()
+        return self.get_products(request_timeout=request_timeout)
 
-    def get_balance(self) -> dict[str, Any]:
-        return self._request("GET", "/balance")
+    def get_balance(
+        self, *, request_timeout: _RequestTimeout | None = None
+    ) -> dict[str, Any]:
+        return self._request("GET", "/balance", request_timeout=request_timeout)
 
     def create_order(
         self,
@@ -148,6 +155,7 @@ class LeadBeeOpenAPIClient:
         quantity: int = 1,
         *,
         idempotency_key: str,
+        request_timeout: _RequestTimeout | None = None,
     ) -> dict[str, Any]:
         _require_non_empty("client_order_id", client_order_id)
         _require_non_empty("product_id", product_id)
@@ -165,25 +173,49 @@ class LeadBeeOpenAPIClient:
             "/orders",
             body=body,
             idempotency_key=_validate_idempotency_key(idempotency_key),
+            request_timeout=request_timeout,
         )
 
-    def get_order(self, order_id: str) -> dict[str, Any]:
-        return self._request("GET", f"/orders/{_path_segment(order_id)}")
+    def get_order(
+        self,
+        order_id: str,
+        *,
+        request_timeout: _RequestTimeout | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"/orders/{_path_segment(order_id)}",
+            request_timeout=request_timeout,
+        )
 
-    def replace_order(self, order_id: str, *, idempotency_key: str) -> dict[str, Any]:
+    def replace_order(
+        self,
+        order_id: str,
+        *,
+        idempotency_key: str,
+        request_timeout: _RequestTimeout | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             f"/orders/{_path_segment(order_id)}/replace",
             body=b"",
             idempotency_key=_validate_idempotency_key(idempotency_key),
+            request_timeout=request_timeout,
         )
 
-    def cancel_order(self, order_id: str, *, idempotency_key: str) -> dict[str, Any]:
+    def cancel_order(
+        self,
+        order_id: str,
+        *,
+        idempotency_key: str,
+        request_timeout: _RequestTimeout | None = None,
+    ) -> dict[str, Any]:
         return self._request(
             "POST",
             f"/orders/{_path_segment(order_id)}/cancel",
             body=b"",
             idempotency_key=_validate_idempotency_key(idempotency_key),
+            request_timeout=request_timeout,
         )
 
     def _request(
@@ -193,7 +225,13 @@ class LeadBeeOpenAPIClient:
         *,
         body: bytes = b"",
         idempotency_key: str = "",
+        request_timeout: _RequestTimeout | None = None,
     ) -> dict[str, Any]:
+        effective_timeout = (
+            self._request_timeout
+            if request_timeout is None
+            else _validate_request_timeout(request_timeout)
+        )
         url = f"{self._base_url}{relative_path}"
         request_path = urlsplit(url).path
         timestamp = str(int(self._clock()))
@@ -238,7 +276,7 @@ class LeadBeeOpenAPIClient:
                 headers=headers,
                 data=body,
                 allow_redirects=False,
-                timeout=self._request_timeout,
+                timeout=effective_timeout,
             )
         except Exception:  # noqa: BLE001 - injected sessions may use other errors
             transport_error = LeadBeeTransportError(
@@ -329,7 +367,7 @@ def _validate_idempotency_key(value: Any) -> str:
 
 def _validate_request_timeout(
     value: Any,
-) -> float | tuple[float, float]:
+) -> _RequestTimeout:
     if _is_positive_finite_number(value):
         return value
     if (

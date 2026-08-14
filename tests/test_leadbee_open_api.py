@@ -568,6 +568,105 @@ def test_request_timeout_is_forwarded_to_session(request_timeout: Any):
     assert session.calls[0].allow_redirects is False
 
 
+def test_each_public_endpoint_forwards_its_request_timeout_override():
+    session = FakeSession(
+        *[
+            FakeResponse(payload={"success": True, "data": {"call": index}})
+            for index in range(7)
+        ]
+    )
+    client = make_client(session)
+
+    assert client.get_products(request_timeout=0.11) == {"call": 0}
+    assert client.list_products(request_timeout=(0.12, 0.22)) == {"call": 1}
+    assert client.get_balance(request_timeout=0.13) == {"call": 2}
+    assert client.create_order(
+        "customer_order_timeout",
+        "product_timeout",
+        idempotency_key="create_timeout_fixture",
+        request_timeout=0.14,
+    ) == {"call": 3}
+    assert client.get_order("order_timeout", request_timeout=0.15) == {"call": 4}
+    assert client.replace_order(
+        "order_timeout",
+        idempotency_key="replace_timeout_fixture",
+        request_timeout=0.16,
+    ) == {"call": 5}
+    assert client.cancel_order(
+        "order_timeout",
+        idempotency_key="cancel_timeout_fixture",
+        request_timeout=0.17,
+    ) == {"call": 6}
+
+    assert [call.timeout for call in session.calls] == [
+        0.11,
+        (0.12, 0.22),
+        0.13,
+        0.14,
+        0.15,
+        0.16,
+        0.17,
+    ]
+
+
+def test_endpoint_timeout_override_does_not_mutate_the_client_default():
+    session = FakeSession(
+        *[FakeResponse(payload={"success": True, "data": {}}) for _index in range(3)]
+    )
+    client = LeadBeeOpenAPIClient(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        session=session,
+        request_timeout=(4, 6),
+        clock=lambda: TIMESTAMP,
+        nonce_factory=lambda: NONCE,
+    )
+
+    client.get_products(request_timeout=(0.2, 0.8))
+    client.get_products()
+    client.get_products(request_timeout=None)
+
+    assert [call.timeout for call in session.calls] == [
+        (0.2, 0.8),
+        (4, 6),
+        (4, 6),
+    ]
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda client: client.get_products(request_timeout=0),
+        lambda client: client.list_products(request_timeout=True),
+        lambda client: client.get_balance(request_timeout=float("inf")),
+        lambda client: client.create_order(
+            "customer_order_timeout",
+            "product_timeout",
+            idempotency_key="create_timeout_fixture",
+            request_timeout=(1, 0),
+        ),
+        lambda client: client.get_order("order_timeout", request_timeout=[]),
+        lambda client: client.replace_order(
+            "order_timeout",
+            idempotency_key="replace_timeout_fixture",
+            request_timeout=(1,),
+        ),
+        lambda client: client.cancel_order(
+            "order_timeout",
+            idempotency_key="cancel_timeout_fixture",
+            request_timeout=-1,
+        ),
+    ],
+)
+def test_each_public_endpoint_rejects_invalid_request_timeout_override(operation):
+    session = FakeSession()
+
+    with pytest.raises(ValueError, match="request_timeout"):
+        operation(make_client(session))
+
+    assert session.calls == []
+
+
 @pytest.mark.parametrize(
     "request_timeout",
     [
