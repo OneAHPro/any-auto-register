@@ -1,0 +1,339 @@
+"""Small signed client for LeadBee's Open API v1."""
+
+from __future__ import annotations
+
+import hashlib
+import hmac
+import json
+import re
+import time
+import uuid
+from collections.abc import Callable
+from typing import Any
+from urllib.parse import quote, urlsplit
+
+import requests
+
+LEADBEE_API_ORIGIN = "https://api.leadbee.cn"
+LEADBEE_API_PREFIX = "/api/open/v1"
+LEADBEE_API_BASE = f"{LEADBEE_API_ORIGIN}{LEADBEE_API_PREFIX}"
+
+_SAFE_DIAGNOSTIC = re.compile(r"^[A-Za-z0-9_.:/-]{1,160}$")
+_IDEMPOTENCY_KEY = re.compile(r"^[!-~]{16,128}$")
+
+
+class LeadBeeAPIError(RuntimeError):
+    """A sanitized LeadBee failure with structured retry diagnostics."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "",
+        request_id: str = "",
+        retry_after: float | None = None,
+        status_code: int = 0,
+        error_code: str | None = None,
+        http_status: int | None = None,
+    ) -> None:
+        self.message = message
+        self.error_code = _safe_diagnostic(
+            error_code if error_code is not None else code
+        )
+        self.request_id = _safe_diagnostic(request_id)
+        self.retry_after = retry_after
+        self.http_status = int(status_code if http_status is None else http_status)
+        super().__init__(self.__str__())
+
+    @property
+    def code(self) -> str:
+        return self.error_code
+
+    @property
+    def status_code(self) -> int:
+        return self.http_status
+
+    def __str__(self) -> str:
+        diagnostics = [f"http_status={self.http_status}"]
+        if self.error_code:
+            diagnostics.append(f"error_code={self.error_code}")
+        if self.request_id:
+            diagnostics.append(f"request_id={self.request_id}")
+        if self.retry_after is not None:
+            diagnostics.append(f"retry_after={self.retry_after:g}")
+        return f"{self.message} ({', '.join(diagnostics)})"
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self!s})"
+
+
+class LeadBeeTransportError(LeadBeeAPIError):
+    """The request did not produce an HTTP response."""
+
+
+class LeadBeeHTTPError(LeadBeeAPIError):
+    """LeadBee returned a non-successful HTTP status."""
+
+
+class LeadBeeResponseError(LeadBeeAPIError):
+    """LeadBee returned malformed JSON or an invalid response envelope."""
+
+
+class LeadBeeOpenAPIClient:
+    """Perform byte-exact signed requests without implicit retries."""
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        api_secret: str,
+        base_url: str = LEADBEE_API_BASE,
+        session: Any | None = None,
+        clock: Callable[[], float] | None = None,
+        nonce_factory: Callable[[], str] | None = None,
+    ) -> None:
+        if not isinstance(api_key, str) or not api_key.strip():
+            raise ValueError("api_key must be a non-empty string")
+        if not isinstance(api_secret, str) or not api_secret.strip():
+            raise ValueError("api_secret must be a non-empty string")
+        if not isinstance(base_url, str) or not base_url.strip():
+            raise ValueError("base_url must be a non-empty URL")
+
+        normalized_base = base_url.rstrip("/")
+        parsed_base = urlsplit(normalized_base)
+        if (
+            parsed_base.scheme not in {"http", "https"}
+            or not parsed_base.netloc
+            or parsed_base.query
+            or parsed_base.fragment
+        ):
+            raise ValueError(
+                "base_url must be an absolute URL without query or fragment"
+            )
+
+        self._api_key = api_key
+        self._api_secret = api_secret.encode("utf-8")
+        self._base_url = normalized_base
+        self._session = session if session is not None else requests.Session()
+        self._clock = clock if clock is not None else time.time
+        self._nonce_factory = (
+            nonce_factory if nonce_factory is not None else lambda: uuid.uuid4().hex
+        )
+
+    def get_products(self) -> dict[str, Any]:
+        return self._request("GET", "/products")
+
+    def list_products(self) -> dict[str, Any]:
+        """Compatibility alias matching the integration design."""
+        return self.get_products()
+
+    def get_balance(self) -> dict[str, Any]:
+        return self._request("GET", "/balance")
+
+    def create_order(
+        self,
+        client_order_id: str,
+        product_id: str,
+        quantity: int = 1,
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        _require_non_empty("client_order_id", client_order_id)
+        _require_non_empty("product_id", product_id)
+        if isinstance(quantity, bool) or not isinstance(quantity, int) or quantity < 1:
+            raise ValueError("quantity must be a positive integer")
+        body = _json_bytes(
+            {
+                "client_order_id": client_order_id,
+                "product_id": product_id,
+                "quantity": quantity,
+            }
+        )
+        return self._request(
+            "POST",
+            "/orders",
+            body=body,
+            idempotency_key=_validate_idempotency_key(idempotency_key),
+        )
+
+    def get_order(self, order_id: str) -> dict[str, Any]:
+        return self._request("GET", f"/orders/{_path_segment(order_id)}")
+
+    def replace_order(self, order_id: str, *, idempotency_key: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/orders/{_path_segment(order_id)}/replace",
+            body=b"",
+            idempotency_key=_validate_idempotency_key(idempotency_key),
+        )
+
+    def cancel_order(self, order_id: str, *, idempotency_key: str) -> dict[str, Any]:
+        return self._request(
+            "POST",
+            f"/orders/{_path_segment(order_id)}/cancel",
+            body=b"",
+            idempotency_key=_validate_idempotency_key(idempotency_key),
+        )
+
+    def _request(
+        self,
+        method: str,
+        relative_path: str,
+        *,
+        body: bytes = b"",
+        idempotency_key: str = "",
+    ) -> dict[str, Any]:
+        url = f"{self._base_url}{relative_path}"
+        request_path = urlsplit(url).path
+        timestamp = str(int(self._clock()))
+        nonce = self._nonce_factory()
+        if not isinstance(nonce, str) or not nonce:
+            raise ValueError("nonce_factory must return a non-empty string")
+
+        canonical = "\n".join(
+            (
+                method,
+                request_path,
+                "",
+                hashlib.sha256(body).hexdigest(),
+                timestamp,
+                nonce,
+                idempotency_key,
+            )
+        ).encode("utf-8")
+        signature = hmac.new(self._api_secret, canonical, hashlib.sha256).hexdigest()
+        headers = {
+            "Accept": "application/json",
+            "X-API-Key": self._api_key,
+            "X-Timestamp": timestamp,
+            "X-Nonce": nonce,
+            "X-Signature": signature,
+        }
+        if method != "GET":
+            headers["Content-Type"] = "application/json"
+            headers["Idempotency-Key"] = idempotency_key
+
+        try:
+            response = self._session.request(
+                method,
+                url,
+                headers=headers,
+                data=body,
+            )
+        except Exception:  # noqa: BLE001 - injected sessions may use other errors
+            raise LeadBeeTransportError(
+                "LeadBee transport failure",
+                code="TRANSPORT_ERROR",
+            ) from None
+
+        status_code = int(response.status_code)
+        retry_after = _retry_after_seconds(getattr(response, "headers", {}))
+        if not 200 <= status_code < 300:
+            error_code, request_id = _response_diagnostics(response)
+            raise LeadBeeHTTPError(
+                "LeadBee HTTP request failed",
+                code=error_code or "HTTP_ERROR",
+                request_id=request_id,
+                retry_after=retry_after,
+                status_code=status_code,
+            )
+
+        try:
+            envelope = response.json()
+        except Exception:  # noqa: BLE001 - response JSON decoders vary by session
+            raise LeadBeeResponseError(
+                "LeadBee response was not valid JSON",
+                code="INVALID_JSON",
+                status_code=status_code,
+            ) from None
+
+        if not isinstance(envelope, dict) or envelope.get("success") is not True:
+            if isinstance(envelope, dict) and envelope.get("success") is False:
+                error_code, request_id = _payload_diagnostics(envelope)
+                raise LeadBeeAPIError(
+                    "LeadBee API rejected the request",
+                    code=error_code or "API_ERROR",
+                    request_id=request_id,
+                    retry_after=retry_after,
+                    status_code=status_code,
+                )
+            raise LeadBeeResponseError(
+                "LeadBee response envelope was invalid",
+                code="INVALID_ENVELOPE",
+                status_code=status_code,
+            )
+
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            raise LeadBeeResponseError(
+                "LeadBee response envelope was invalid",
+                code="INVALID_ENVELOPE",
+                status_code=status_code,
+            )
+        return data
+
+
+def _json_bytes(payload: dict[str, Any]) -> bytes:
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _require_non_empty(name: str, value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{name} must be a non-empty string")
+    return value
+
+
+def _validate_idempotency_key(value: Any) -> str:
+    if not isinstance(value, str) or not _IDEMPOTENCY_KEY.fullmatch(value):
+        raise ValueError(
+            "idempotency_key must contain 16 to 128 visible ASCII characters"
+        )
+    return value
+
+
+def _path_segment(value: Any) -> str:
+    return quote(_require_non_empty("path segment", value), safe="")
+
+
+def _safe_diagnostic(value: Any) -> str:
+    if not isinstance(value, str) or not _SAFE_DIAGNOSTIC.fullmatch(value):
+        return ""
+    return value
+
+
+def _payload_diagnostics(payload: dict[str, Any]) -> tuple[str, str]:
+    error = payload.get("error")
+    error_data = error if isinstance(error, dict) else {}
+    error_code = _safe_diagnostic(error_data.get("code") or payload.get("code"))
+    request_id = _safe_diagnostic(
+        payload.get("request_id") or error_data.get("request_id")
+    )
+    return error_code, request_id
+
+
+def _response_diagnostics(response: Any) -> tuple[str, str]:
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - error parsing must not mask the HTTP error
+        return "", ""
+    if not isinstance(payload, dict):
+        return "", ""
+    return _payload_diagnostics(payload)
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    try:
+        raw_value = headers.get("Retry-After")
+        if raw_value is None:
+            raw_value = headers.get("retry-after")
+    except Exception:  # noqa: BLE001 - tolerate non-mapping response header objects
+        return None
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
