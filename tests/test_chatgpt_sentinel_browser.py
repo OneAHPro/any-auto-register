@@ -35,19 +35,25 @@ class _FakePage:
         *,
         block_evaluate: bool = False,
         evaluate_error: BaseException | None = None,
+        wait_error: BaseException | None = None,
     ):
         self.block_evaluate = block_evaluate
         self.evaluate_error = evaluate_error
+        self.wait_error = wait_error
         self.evaluate_started = threading.Event()
         self.release_evaluate = threading.Event()
         self.evaluate_script = ""
         self.evaluate_arg = None
+        self.goto_url = ""
+        self.goto_kwargs = {}
 
-    def goto(self, *_args, **_kwargs) -> None:
-        return None
+    def goto(self, url, **kwargs) -> None:
+        self.goto_url = str(url)
+        self.goto_kwargs = dict(kwargs)
 
     def wait_for_function(self, *_args, **_kwargs) -> None:
-        return None
+        if self.wait_error is not None:
+            raise self.wait_error
 
     def evaluate(self, script, arg):
         self.evaluate_script = script
@@ -67,9 +73,10 @@ class _FakePage:
 class _FakeBrowserContext:
     def __init__(self, page: _FakePage):
         self.page = page
+        self.cookies = []
 
-    def add_cookies(self, _cookies) -> None:
-        return None
+    def add_cookies(self, cookies) -> None:
+        self.cookies.extend(cookies)
 
     def new_page(self) -> _FakePage:
         return self.page
@@ -82,9 +89,11 @@ class _FakeBrowser:
         self.close_calls = 0
         self.close_started = threading.Event()
         self.release_close = threading.Event()
+        self.context = None
 
     def new_context(self, **_kwargs) -> _FakeBrowserContext:
-        return _FakeBrowserContext(self.page)
+        self.context = _FakeBrowserContext(self.page)
+        return self.context
 
     def close(self) -> None:
         self.close_calls += 1
@@ -138,9 +147,7 @@ def _browser_patches(manager: _FakePlaywrightManager):
             "platforms.chatgpt.sentinel_browser.resolve_browser_headless",
             return_value=(True, "test"),
         ),
-        patch(
-            "platforms.chatgpt.sentinel_browser.ensure_browser_display_available"
-        ),
+        patch("platforms.chatgpt.sentinel_browser.ensure_browser_display_available"),
     )
 
 
@@ -162,6 +169,55 @@ def test_sentinel_sdk_evaluate_has_a_bounded_javascript_timeout():
         "flow": "password_verify",
         "timeoutMs": 45_000,
     }
+
+
+def test_browser_loads_fixed_sentinel_frame_and_scopes_device_cookie_to_both_hosts():
+    page = _FakePage()
+    playwright = _FakePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+    logs = []
+
+    with sync_patch, headless_patch, display_patch:
+        token = get_sentinel_token_via_browser(
+            flow="password_verify",
+            page_url="https://auth.openai.com/log-in/password?state=secret-query",
+            device_id="fixture-device-id",
+            log_fn=logs.append,
+        )
+
+    assert token
+    assert page.goto_url == (
+        "https://sentinel.openai.com/backend-api/sentinel/frame.html?sv=20260219f9f6"
+    )
+    assert page.goto_kwargs["wait_until"] == "load"
+    assert playwright.browser.context is not None
+    assert {cookie.get("url") for cookie in playwright.browser.context.cookies} == {
+        "https://sentinel.openai.com/",
+        "https://auth.openai.com/",
+    }
+    assert all("secret-query" not in line for line in logs)
+    assert all("fixture-device-id" not in line for line in logs)
+
+
+def test_sdk_wait_failure_is_logged_as_recoverable_http_pow_fallback():
+    page = _FakePage(wait_error=RuntimeError("Timeout 15000ms exceeded"))
+    playwright = _FakePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+    logs = []
+
+    with sync_patch, headless_patch, display_patch:
+        token = get_sentinel_token_via_browser(
+            flow="password_verify",
+            log_fn=logs.append,
+        )
+
+    assert token is None
+    assert "Sentinel 浏览器通道未就绪，准备使用 HTTP PoW" in logs
+    assert all("Timeout 15000ms exceeded" not in line for line in logs)
+    assert playwright.browser.close_calls == 1
+    assert playwright.stop_calls == 1
 
 
 def test_task_stop_terminates_only_the_current_sentinel_driver():

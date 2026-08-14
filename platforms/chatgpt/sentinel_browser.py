@@ -31,6 +31,9 @@ from core.task_runtime import (
 SENTINEL_VERSION = "20260219f9f6"
 SENTINEL_SDK_URL = f"https://sentinel.openai.com/sentinel/{SENTINEL_VERSION}/sdk.js"
 SENTINEL_REQ_URL = "https://sentinel.openai.com/backend-api/sentinel/req"
+SENTINEL_FRAME_URL = (
+    f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}"
+)
 
 
 def _playwright_driver_process(playwright: Any) -> Any:
@@ -373,7 +376,10 @@ def get_sentinel_token_via_browser(
         logger(f"Sentinel Browser 不可用: {e}")
         return None
 
-    target_url = str(page_url or _flow_page_url(flow)).strip() or _flow_page_url(flow)
+    # Keep ``page_url`` in the public signature for existing callers, but load
+    # the SDK from OpenAI's dedicated frame. Auth pages can return 403 and do
+    # not guarantee that ``window.SentinelSDK`` is installed.
+    del page_url
     effective_headless, reason = resolve_browser_headless(headless)
     ensure_browser_display_available(effective_headless)
     logger(
@@ -391,7 +397,7 @@ def get_sentinel_token_via_browser(
     if proxy_config:
         launch_args["proxy"] = proxy_config
 
-    logger(f"Sentinel Browser 启动: flow={flow}, url={target_url}")
+    logger(f"Sentinel Browser 启动: flow={flow}")
 
     playwright = None
     browser = None
@@ -419,11 +425,17 @@ def get_sentinel_token_via_browser(
                             {
                                 "name": "oai-did",
                                 "value": str(device_id),
-                                "domain": "auth.openai.com",
-                                "path": "/",
+                                "url": "https://sentinel.openai.com/",
                                 "secure": True,
                                 "sameSite": "Lax",
-                            }
+                            },
+                            {
+                                "name": "oai-did",
+                                "value": str(device_id),
+                                "url": "https://auth.openai.com/",
+                                "secure": True,
+                                "sameSite": "Lax",
+                            },
                         ]
                     )
                 except Exception as ex:
@@ -431,7 +443,7 @@ def get_sentinel_token_via_browser(
                     pass
 
             page = context.new_page()
-            page.goto(target_url, wait_until="domcontentloaded", timeout=timeout_ms)
+            page.goto(SENTINEL_FRAME_URL, wait_until="load", timeout=timeout_ms)
             page.wait_for_function(
                 "() => typeof window.SentinelSDK !== 'undefined' && typeof window.SentinelSDK.token === 'function'",
                 timeout=min(timeout_ms, 15000),
@@ -498,14 +510,14 @@ def get_sentinel_token_via_browser(
             return token
         except TaskInterruption:
             raise
-        except Exception as e:
-            logger(f"Sentinel Browser 异常: {e}")
+        except Exception:
+            logger("Sentinel 浏览器通道未就绪，准备使用 HTTP PoW")
             checkpoint_current_task_attempt()
             return None
     except TaskInterruption:
         raise
-    except Exception as e:
-        logger(f"Sentinel Browser 启动异常: {e}")
+    except Exception:
+        logger("Sentinel 浏览器通道未就绪，准备使用 HTTP PoW")
         checkpoint_current_task_attempt()
         return None
     finally:
