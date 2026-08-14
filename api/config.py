@@ -251,15 +251,16 @@ def _leadbee_product_ids(payload: object) -> list[str]:
     found: list[str] = []
     seen: set[str] = set()
 
-    def add(value: object) -> None:
+    def add(value: object) -> bool:
         if not isinstance(value, str):
-            return
+            return False
         candidate = value.strip()
         if not candidate or len(candidate) > 128 or not _LEADBEE_ID_RE.fullmatch(candidate):
-            return
+            return False
         if candidate not in seen:
             seen.add(candidate)
             found.append(candidate)
+        return True
 
     def walk(value: object, *, collection: bool = False) -> None:
         if isinstance(value, list):
@@ -273,10 +274,10 @@ def _leadbee_product_ids(payload: object) -> list[str]:
         if collection:
             for key in ("id", "product_id", "productId"):
                 if key in value:
-                    add(value.get(key))
-                    break
+                    if add(value.get(key)):
+                        break
         for key, child in value.items():
-            if str(key).casefold() in {"products", "items", "list"}:
+            if str(key).casefold() in {"products", "items", "list", "data", "results"}:
                 walk(child, collection=True)
             elif isinstance(child, dict):
                 walk(child, collection=collection)
@@ -291,6 +292,10 @@ def _leadbee_balance(payload: object) -> tuple[str | None, str | None]:
 
     def walk(value: object) -> None:
         nonlocal amount, currency
+        if isinstance(value, list):
+            for child in value:
+                walk(child)
+            return
         if not isinstance(value, dict):
             return
         for key, child in value.items():
@@ -311,7 +316,7 @@ def _leadbee_balance(payload: object) -> tuple[str | None, str | None]:
                     currency = child
                 elif isinstance(child, dict) and isinstance(child.get("code"), str):
                     currency = child["code"]
-            if isinstance(child, dict):
+            if isinstance(child, (dict, list)):
                 walk(child)
 
     walk(payload)
@@ -494,20 +499,17 @@ def update_config(body: ConfigUpdate):
     # Validate the effective point-in-time configuration before writing.  A
     # blank credential in this request has already been removed above, so the
     # stored secret remains part of the effective snapshot.
-    if "leadbee_api_enabled" in safe or _leadbee_value(
-        stored_snapshot, "leadbee_api_enabled"
-    ) == "1":
-        leadbee_snapshot = dict(stored_snapshot)
-        leadbee_snapshot.update(safe)
-        if _normalize_enabled(leadbee_snapshot.get("leadbee_api_enabled")) == "1":
-            if not all(
-                _leadbee_value(leadbee_snapshot, key)
-                for key in ("leadbee_api_key", "leadbee_api_secret", "leadbee_api_product_id")
-            ):
-                raise HTTPException(
-                    status_code=400,
-                    detail="LeadBee API 启用时必须完整配置凭证和产品 ID",
-                )
+    leadbee_snapshot = dict(stored_snapshot)
+    leadbee_snapshot.update(safe)
+    if _normalize_enabled(leadbee_snapshot.get("leadbee_api_enabled")) == "1":
+        if not all(
+            _leadbee_value(leadbee_snapshot, key)
+            for key in ("leadbee_api_key", "leadbee_api_secret", "leadbee_api_product_id")
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail="LeadBee API 启用时必须完整配置凭证和产品 ID",
+            )
     config_store.set_many(safe)
     if _CHATGPT_AUTO_RELOGIN_CONFIG_KEYS.intersection(safe):
         try:
@@ -676,8 +678,8 @@ def test_leadbee_config(body: LeadBeeTestRequest):
             "balance_available": balance_available,
             "currency": currency,
         }
-    except LeadBeeAPIError as exc:
-        logger.warning("LeadBee connection test failed (%s)", exc.code or "provider_error")
+    except LeadBeeAPIError:
+        logger.warning("LeadBee connection test failed (provider_error)")
         raise HTTPException(status_code=502, detail="LeadBee 连接测试失败") from None
     except Exception:
         # Provider exception text may contain credentials or verification data;

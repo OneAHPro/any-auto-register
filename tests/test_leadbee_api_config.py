@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from platforms.chatgpt.leadbee_open_api import LeadBeeAPIError
 
 
 class FakeConfigStore:
@@ -66,6 +67,22 @@ def test_enable_validation_rejects_without_writing(monkeypatch):
     assert store.writes == []
 
 
+@pytest.mark.parametrize("persisted_enabled", ["true", "YES", True])
+def test_historical_enabled_values_still_validate_unrelated_updates(
+    monkeypatch, persisted_enabled
+):
+    from api import config as config_api
+
+    store = FakeConfigStore({"leadbee_api_enabled": persisted_enabled})
+    monkeypatch.setattr(config_api, "config_store", store)
+    with pytest.raises(HTTPException) as exc:
+        config_api.update_config(
+            config_api.ConfigUpdate(data={"leadbee_api_product_id": "prod-1"})
+        )
+    assert exc.value.status_code == 400
+    assert store.writes == []
+
+
 def test_blank_leadbee_credentials_preserve_existing_values(monkeypatch):
     from api import config as config_api
 
@@ -109,11 +126,18 @@ def test_connection_test_merges_unsaved_credentials_without_persisting(monkeypat
 
         def get_products(self):
             calls.append("products")
-            return {"products": [{"id": "prod-1"}, {"id": "prod-2"}]}
+            return {
+                "data": {
+                    "results": [
+                        {"id": 123, "product_id": "prod-1"},
+                        {"id": "prod-2"},
+                    ]
+                }
+            }
 
         def get_balance(self):
             calls.append("balance")
-            return {"balance": "12.50", "currency": "usd"}
+            return {"data": [{"balance": "12.5", "currency": {"code": "usd"}}]}
 
     monkeypatch.setattr(config_api, "config_store", store)
     monkeypatch.setattr(config_api, "LeadBeeOpenAPIClient", FakeClient)
@@ -166,3 +190,36 @@ def test_connection_test_redacts_provider_errors_and_payload_secrets(monkeypatch
     detail = str(exc.value.detail)
     assert "stored_fixture_secret" not in detail
     assert "13800138000" not in detail
+
+
+def test_connection_test_logs_no_provider_diagnostics(monkeypatch, caplog):
+    from api import config as config_api
+
+    store = FakeConfigStore(
+        {
+            "leadbee_api_key": "stored_fixture_key",
+            "leadbee_api_secret": "stored_fixture_secret",
+            "leadbee_api_product_id": "prod-1",
+        }
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            pass
+
+        def get_products(self):
+            raise LeadBeeAPIError(
+                "provider detail stored_fixture_secret",
+                code="13800138000",
+            )
+
+        def get_balance(self):
+            pytest.fail("balance must not be called after products failure")
+
+    monkeypatch.setattr(config_api, "config_store", store)
+    monkeypatch.setattr(config_api, "LeadBeeOpenAPIClient", FakeClient)
+    with pytest.raises(HTTPException):
+        config_api.test_leadbee_config(config_api.LeadBeeTestRequest(data={}))
+    logs = caplog.text
+    assert "13800138000" not in logs
+    assert "stored_fixture_secret" not in logs
