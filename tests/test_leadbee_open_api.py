@@ -263,12 +263,48 @@ def test_endpoint_methods_paths_bodies_and_idempotency_headers():
         ("POST", f"{LEADBEE_API_BASE}/orders/{encoded_order}/cancel"),
         ("GET", f"{LEADBEE_API_BASE}/products"),
     ]
-    assert [call.body for call in session.calls] == [b"", b"", b"", b"", b""]
+    assert [call.body for call in session.calls] == [b"", b"", b"{}", b"{}", b""]
     assert "Idempotency-Key" not in session.calls[0].headers
     assert "Idempotency-Key" not in session.calls[1].headers
     assert session.calls[2].headers["Idempotency-Key"] == "replace_fixture_001"
     assert session.calls[3].headers["Idempotency-Key"] == "cancel_fixture_0001"
     assert "Idempotency-Key" not in session.calls[4].headers
+
+
+def test_cancel_and_replace_send_json_object_body_for_provider_contract():
+    """Write endpoints must send valid JSON even when they have no options."""
+
+    class JsonObjectRequiredSession(FakeSession):
+        def request(
+            self, method, url, *, headers, data, allow_redirects=None, timeout=None
+        ):
+            self.calls.append(
+                RequestCall(method, url, headers, data, allow_redirects, timeout)
+            )
+            if (
+                method == "POST"
+                and url.endswith(("/replace", "/cancel"))
+                and data != b"{}"
+            ):
+                return FakeResponse(
+                    status_code=400,
+                    payload={
+                        "success": False,
+                        "error": {"code": "INVALID_JSON", "message": "fixture"},
+                    },
+                )
+            return FakeResponse(payload={"success": True, "data": {"status": "ok"}})
+
+    session = JsonObjectRequiredSession()
+    client = make_client(session)
+
+    assert client.replace_order("order-1", idempotency_key="replace_fixture_001") == {
+        "status": "ok"
+    }
+    assert client.cancel_order("order-1", idempotency_key="cancel_fixture_0001") == {
+        "status": "ok"
+    }
+    assert [call.body for call in session.calls] == [b"{}", b"{}"]
 
 
 @pytest.mark.parametrize("status_code", [200, 201, 202, 204, 299])

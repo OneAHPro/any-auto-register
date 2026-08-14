@@ -198,7 +198,10 @@ class LeadBeeOpenAPIClient:
         return self._request(
             "POST",
             f"/orders/{_path_segment(order_id)}/replace",
-            body=b"",
+            # LeadBee validates every write body as JSON.  An empty byte
+            # string reaches the endpoint as invalid JSON and leaves an
+            # already-created order active when replacement cleanup fails.
+            body=b"{}",
             idempotency_key=_validate_idempotency_key(idempotency_key),
             request_timeout=request_timeout,
         )
@@ -213,7 +216,7 @@ class LeadBeeOpenAPIClient:
         return self._request(
             "POST",
             f"/orders/{_path_segment(order_id)}/cancel",
-            body=b"",
+            body=b"{}",
             idempotency_key=_validate_idempotency_key(idempotency_key),
             request_timeout=request_timeout,
         )

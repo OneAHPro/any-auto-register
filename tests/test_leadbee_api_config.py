@@ -188,7 +188,7 @@ def test_connection_test_reports_unit_price_reserved_balance_and_capacity(monkey
                 "data": {
                     "items": [
                         {
-                            "id": "prod-capacity",
+                            "productID": "prod-capacity",
                             "price": "1.300000",
                             "currency": "cny",
                             "status": "AVAILABLE",

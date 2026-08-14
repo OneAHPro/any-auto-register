@@ -63,3 +63,33 @@ def test_capacity_omits_invalid_amounts_and_unavailable_product():
         "estimated_order_capacity": None,
         "currency": None,
     }
+
+
+def test_capacity_parses_top_level_envelope_and_camel_case_product_fields():
+    snapshot = parse_leadbee_capacity(
+        {
+            "products": [
+                {
+                    "productID": "sms_verification_us",
+                    "unitPrice": "1.300000",
+                    "status": "AVAILABLE",
+                    "currency": {"code": "CNY"},
+                }
+            ]
+        },
+        {
+            "availableBalance": "22.700000",
+            "reservedBalance": "0.000000",
+            "currency": "CNY",
+        },
+        product_id="sms_verification_us",
+    )
+
+    assert snapshot.public_dict() == {
+        "configured_product_available": True,
+        "balance_available": "22.70",
+        "balance_reserved": "0.00",
+        "unit_price": "1.30",
+        "estimated_order_capacity": 17,
+        "currency": "CNY",
+    }

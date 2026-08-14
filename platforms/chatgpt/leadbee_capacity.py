@@ -8,7 +8,7 @@ from decimal import ROUND_FLOOR, ROUND_HALF_UP, Decimal, InvalidOperation
 from typing import Any
 
 _CENT = Decimal("0.01")
-_PRODUCT_ID_KEYS = ("id", "product_id", "productId")
+_PRODUCT_ID_KEYS = ("id", "product_id", "productId", "productID")
 _PRICE_KEYS = (
     "price",
     "unit_price",

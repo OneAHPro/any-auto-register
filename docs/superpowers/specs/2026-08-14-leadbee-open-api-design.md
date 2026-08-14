@@ -126,9 +126,9 @@ backoff. The existing five-flow semaphore stays in place for the first rollout,
 which remains below the provider's global request and active-order limits.
 
 The public documentation lists replacement and cancellation paths but omits
-their request bodies. The adapter isolates those bodies in one method and uses
-an empty body for the documented no-argument operation. A live compatibility
-probe must verify this before enabling production orders.
+their request bodies. A production compatibility probe confirmed that LeadBee
+rejects an empty byte string as `INVALID_JSON`; both no-argument writes must
+therefore sign and send the exact JSON object body `{}`.
 
 ## Single-account flow
 

@@ -334,7 +334,7 @@ def _leadbee_product_ids(
                 add(value)
             return
         if collection:
-            for key in ("id", "product_id", "productId"):
+            for key in ("id", "product_id", "productId", "productID"):
                 if key in value:
                     if add(value.get(key)):
                         break
