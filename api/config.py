@@ -1,13 +1,19 @@
 import logging
 import re
-from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
+
 from core.config_store import config_store
-from services.chatgpt_bark_alerts import BarkEndpointError, normalize_bark_endpoint
-from services.mail_imports import MailImportExecuteRequest, MailImportSnapshotRequest, mail_import_registry
+from platforms.chatgpt.leadbee_capacity import parse_leadbee_capacity
 from platforms.chatgpt.leadbee_open_api import LeadBeeAPIError, LeadBeeOpenAPIClient
+from services.chatgpt_bark_alerts import BarkEndpointError, normalize_bark_endpoint
+from services.mail_imports import (
+    MailImportExecuteRequest,
+    MailImportSnapshotRequest,
+    mail_import_registry,
+)
 
 router = APIRouter(prefix="/config", tags=["config"])
 logger = logging.getLogger(__name__)
@@ -46,7 +52,6 @@ _LEADBEE_CONFIG_KEYS = {
 }
 _LEADBEE_SECRET_KEYS = {"leadbee_api_key", "leadbee_api_secret"}
 _LEADBEE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$")
-_LEADBEE_CURRENCY_RE = re.compile(r"^[A-Z]{3,8}$")
 _LEADBEE_SENSITIVE_HEADER_NAMES = {
     "authorization",
     "proxyauthorization",
@@ -341,57 +346,6 @@ def _leadbee_product_ids(
 
     walk(payload)
     return found
-
-
-def _leadbee_balance(payload: object) -> tuple[str | None, str | None]:
-    amount: object = None
-    currency: object = None
-
-    def walk(value: object) -> None:
-        nonlocal amount, currency
-        if isinstance(value, list):
-            for child in value:
-                walk(child)
-            return
-        if not isinstance(value, dict):
-            return
-        for key, child in value.items():
-            folded = str(key).casefold()
-            if amount is None and folded in {
-                "balance",
-                "available_balance",
-                "availablebalance",
-                "amount",
-            } and not isinstance(child, (dict, list)):
-                amount = child
-            if currency is None and folded in {
-                "currency",
-                "currency_code",
-                "currencycode",
-            }:
-                if isinstance(child, str):
-                    currency = child
-                elif isinstance(child, dict) and isinstance(child.get("code"), str):
-                    currency = child["code"]
-            if isinstance(child, (dict, list)):
-                walk(child)
-
-    walk(payload)
-    balance: str | None = None
-    try:
-        if isinstance(amount, bool) or amount is None:
-            raise InvalidOperation
-        parsed = Decimal(str(amount).strip())
-        if parsed.is_finite() and parsed >= 0:
-            balance = format(parsed.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP), "f")
-    except (InvalidOperation, ValueError, TypeError):
-        balance = None
-    normalized_currency: str | None = None
-    if isinstance(currency, str):
-        candidate = currency.strip().upper()
-        if _LEADBEE_CURRENCY_RE.fullmatch(candidate):
-            normalized_currency = candidate
-    return balance, normalized_currency
 
 
 @router.get("")
@@ -730,13 +684,19 @@ def test_leadbee_config(body: LeadBeeTestRequest):
             products_payload,
             sensitive_values=(api_key, api_secret),
         )
-        balance_available, currency = _leadbee_balance(balance_payload)
+        capacity = parse_leadbee_capacity(
+            products_payload,
+            balance_payload,
+            product_id=product_id,
+        ).public_dict()
         return {
             "ok": True,
             "product_ids": product_ids,
-            "configured_product_available": product_id in product_ids,
-            "balance_available": balance_available,
-            "currency": currency,
+            **capacity,
+            "configured_product_available": bool(
+                product_id in product_ids
+                and capacity["configured_product_available"]
+            ),
         }
     except LeadBeeAPIError:
         logger.warning("LeadBee connection test failed (provider_error)")

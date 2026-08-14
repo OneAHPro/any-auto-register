@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+
 from platforms.chatgpt.leadbee_open_api import LeadBeeAPIError
 
 
@@ -151,6 +152,9 @@ def test_connection_test_merges_unsaved_credentials_without_persisting(monkeypat
         "product_ids": ["prod-1", "prod-2"],
         "configured_product_available": True,
         "balance_available": "12.50",
+        "balance_reserved": None,
+        "unit_price": None,
+        "estimated_order_capacity": None,
         "currency": "USD",
     }
     assert calls == [
@@ -159,6 +163,66 @@ def test_connection_test_merges_unsaved_credentials_without_persisting(monkeypat
         "balance",
     ]
     assert store.writes == []
+
+
+def test_connection_test_reports_unit_price_reserved_balance_and_capacity(monkeypatch):
+    from api import config as config_api
+
+    store = FakeConfigStore(
+        {
+            "leadbee_api_key": "stored_fixture_key",
+            "leadbee_api_secret": "stored_fixture_secret",
+            "leadbee_api_product_id": "prod-capacity",
+        }
+    )
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            assert kwargs == {
+                "api_key": "stored_fixture_key",
+                "api_secret": "stored_fixture_secret",
+            }
+
+        def get_products(self):
+            return {
+                "data": {
+                    "items": [
+                        {
+                            "id": "prod-capacity",
+                            "price": "1.300000",
+                            "currency": "cny",
+                            "status": "AVAILABLE",
+                        }
+                    ]
+                }
+            }
+
+        def get_balance(self):
+            return {
+                "data": {
+                    "available_balance": "35.70",
+                    "reserved_balance": "0.00",
+                    "currency": {"code": "cny"},
+                }
+            }
+
+    monkeypatch.setattr(config_api, "config_store", store)
+    monkeypatch.setattr(config_api, "LeadBeeOpenAPIClient", FakeClient)
+
+    result = config_api.test_leadbee_config(
+        config_api.LeadBeeTestRequest(data={})
+    )
+
+    assert result == {
+        "ok": True,
+        "product_ids": ["prod-capacity"],
+        "configured_product_available": True,
+        "balance_available": "35.70",
+        "balance_reserved": "0.00",
+        "unit_price": "1.30",
+        "estimated_order_capacity": 27,
+        "currency": "CNY",
+    }
 
 
 def test_connection_test_redacts_sensitive_product_metadata(monkeypatch):
@@ -238,6 +302,9 @@ def test_connection_test_redacts_sensitive_product_metadata(monkeypatch):
         ],
         "configured_product_available": True,
         "balance_available": "12.50",
+        "balance_reserved": None,
+        "unit_price": None,
+        "estimated_order_capacity": None,
         "currency": "USD",
     }
 
