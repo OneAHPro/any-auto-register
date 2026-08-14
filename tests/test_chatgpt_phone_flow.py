@@ -976,6 +976,20 @@ class _RecordingLeadBeeRateLimiter:
         self.calls.append((create, deadline))
 
 
+class _RecordingCapacityLease:
+    def __init__(self):
+        self.events = []
+
+    def commit(self):
+        self.events.append("commit")
+
+    def release(self):
+        self.events.append("release")
+
+    def quarantine(self):
+        self.events.append("quarantine")
+
+
 class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
     def test_poll_delay_never_goes_below_provider_safe_minimum(self):
         service, _clock, _logs = _open_api_service(
@@ -1027,6 +1041,87 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
             [create for create, _deadline in limiter.calls],
             [True, False, False],
         )
+
+    def test_successful_order_create_commits_capacity_lease(self):
+        lease = _RecordingCapacityLease()
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_capacity_commit",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_capacity_lease=lease,
+        )
+
+        service.acquire_phone()
+
+        self.assertEqual(lease.events, ["commit"])
+
+    def test_explicit_balance_rejection_releases_lease_and_publishes_coarse_code(self):
+        lease = _RecordingCapacityLease()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=301,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_" + "a" * 32,
+        )
+        client = _OpenAPIClient(
+            create=[
+                LeadBeeAPIError(
+                    "fixture balance rejection",
+                    code="INSUFFICIENT_BALANCE",
+                    status_code=400,
+                )
+            ]
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_capacity_lease=lease,
+            chatgpt_phone_progress_broker=broker,
+        )
+
+        with self.assertRaises(LeadBeeAPIError):
+            service.acquire_phone()
+
+        self.assertEqual(lease.events, ["release"])
+        self.assertEqual(
+            broker.snapshot()["provider_error_code"],
+            "LEADBEE_API_CAPACITY_EXHAUSTED",
+        )
+        self.assertFalse(service.card_at_risk)
+
+    def test_ambiguous_create_quarantines_capacity_lease_without_fallback_marker(self):
+        lease = _RecordingCapacityLease()
+        broker = InteractivePhoneVerificationBroker(
+            account_id=302,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_" + "b" * 32,
+        )
+        client = _OpenAPIClient(
+            create=[LeadBeeTransportError("fixture transport")],
+        )
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_capacity_lease=lease,
+            chatgpt_phone_progress_broker=broker,
+            leadbee_total_timeout_seconds=5,
+        )
+
+        with self.assertRaises(RuntimeError):
+            service.acquire_phone()
+
+        self.assertEqual(lease.events, ["quarantine"])
+        self.assertNotEqual(
+            broker.snapshot()["provider_error_code"],
+            "LEADBEE_API_CAPACITY_EXHAUSTED",
+        )
+        self.assertTrue(service.card_at_risk)
 
     def test_normalizes_digit_only_international_phone_from_order_detail(self):
         self.assertEqual(

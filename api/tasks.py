@@ -38,13 +38,18 @@ CLEANUP_THRESHOLD = 250
 CHATGPT_BIND_PHONE_FLAG = "chatgpt_existing_account_bind_phone_and_get_rt"
 CHATGPT_LEADBEE_CODES_KEY = "chatgpt_existing_account_leadbee_codes"
 CHATGPT_LEADBEE_API_KEY = "chatgpt_existing_account_leadbee_api"
-CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY = "chatgpt_existing_account_leadbee_client_order_ids"
+CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY = (
+    "chatgpt_existing_account_leadbee_client_order_ids"
+)
 CHATGPT_USE_SMS_POOL_FLAG = "chatgpt_existing_account_use_sms_pool"
+CHATGPT_SMS_MODE_KEY = "chatgpt_existing_account_sms_mode"
+CHATGPT_SMS_MODES = frozenset({"api_fallback_pool", "pool", "none"})
 CHATGPT_LEADBEE_BASE_URLS_KEY = "chatgpt_existing_account_leadbee_base_urls"
 CHATGPT_SMS_POOL_ITEM_IDS_KEY = "chatgpt_sms_pool_item_ids"
 CHATGPT_RETRY_BINDINGS_KEY = "chatgpt_retry_bindings"
 CHATGPT_MAIL_PROVIDER_PLAN_KEY = "chatgpt_existing_account_mail_provider_plan"
 CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
+CHATGPT_EXISTING_LOGIN_MAX_CONCURRENCY = 50
 CHATGPT_BACKGROUND_WAIT_MAX_WORKERS = 64
 CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS = 45.0
 MAX_PERSISTED_TASK_LOG_ENTRIES = 500
@@ -132,9 +137,10 @@ def _automation_force_stop_seconds() -> float:
 
 
 def _is_automatic_chatgpt_task(snapshot: dict) -> bool:
-    return (
-        str(snapshot.get("platform") or "").strip().lower() == "chatgpt"
-        and _is_truthy((snapshot.get("meta") or {}).get("automation"))
+    return str(
+        snapshot.get("platform") or ""
+    ).strip().lower() == "chatgpt" and _is_truthy(
+        (snapshot.get("meta") or {}).get("automation")
     )
 
 
@@ -187,10 +193,7 @@ def _arm_automation_stop_watchdog(task_id: str) -> bool:
         finally:
             # This also keeps tests deterministic when os._exit is mocked.
             with _automation_stop_watchdog_lock:
-                if (
-                    _automation_stop_watchdog_tasks.get(task_id)
-                    is runner_finished
-                ):
+                if _automation_stop_watchdog_tasks.get(task_id) is runner_finished:
                     _automation_stop_watchdog_tasks.pop(task_id, None)
 
     watchdog = threading.Thread(
@@ -202,10 +205,7 @@ def _arm_automation_stop_watchdog(task_id: str) -> bool:
         watchdog.start()
     except Exception:
         with _automation_stop_watchdog_lock:
-            if (
-                _automation_stop_watchdog_tasks.get(task_id)
-                is runner_finished
-            ):
+            if _automation_stop_watchdog_tasks.get(task_id) is runner_finished:
                 _automation_stop_watchdog_tasks.pop(task_id, None)
         # The gate deliberately swallows stop-callback exceptions. If a
         # watchdog thread cannot start, recycle synchronously instead of
@@ -304,9 +304,7 @@ def _normalize_leadbee_codes(value) -> list[str]:
     else:
         raise HTTPException(400, "LeadBee 卡密格式无效，请一行填写一个卡密")
     normalized = [
-        str(code or "").strip()
-        for code in candidates
-        if str(code or "").strip()
+        str(code or "").strip() for code in candidates if str(code or "").strip()
     ]
     if len(normalized) != len(set(normalized)):
         raise HTTPException(
@@ -325,6 +323,7 @@ def _normalize_leadbee_client_order_ids(value) -> list[str]:
     if len(normalized) != len(set(normalized)):
         raise HTTPException(400, "LeadBee API 客户端订单标识不能重复")
     import re as _re
+
     if any(not _re.fullmatch(r"aar_[0-9a-f]{32}", item) for item in normalized):
         raise HTTPException(400, "LeadBee API 客户端订单标识格式无效")
     return normalized
@@ -341,8 +340,40 @@ def _chatgpt_leadbee_api_config_ready(config: dict | None = None) -> bool:
     )
 
 
+def _reserve_chatgpt_leadbee_api_capacity(
+    *,
+    config: dict,
+    client_order_id: str,
+    checkpoint,
+):
+    from platforms.chatgpt.leadbee_open_api import LeadBeeOpenAPIClient
+    from platforms.chatgpt.leadbee_runtime import leadbee_capacity_coordinator
+
+    checkpoint()
+    client = LeadBeeOpenAPIClient(
+        api_key=str(config.get("leadbee_api_key") or "").strip(),
+        api_secret=str(config.get("leadbee_api_secret") or "").strip(),
+    )
+    return leadbee_capacity_coordinator.reserve_from_client(
+        client=client,
+        product_id=str(config.get("leadbee_api_product_id") or "").strip(),
+        client_order_id=str(client_order_id or "").strip(),
+        deadline=time.monotonic() + 30.0,
+        checkpoint=checkpoint,
+    )
+
+
 def _chatgpt_leadbee_api_mode(req: RegisterTaskRequest) -> bool:
     return _is_truthy(req.extra.get(CHATGPT_LEADBEE_API_KEY))
+
+
+def _normalize_chatgpt_sms_mode(value) -> str:
+    if value in (None, ""):
+        return ""
+    normalized = str(value or "").strip().lower()
+    if normalized not in CHATGPT_SMS_MODES:
+        raise HTTPException(400, "ChatGPT 接码方式无效")
+    return normalized
 
 
 def _normalize_leadbee_base_urls(value) -> list[str]:
@@ -396,6 +427,11 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
                     if isinstance(mailbox_context, dict)
                     else False
                 ),
+                "sms_mode": (
+                    mailbox_context.get("sms_mode")
+                    if isinstance(mailbox_context, dict)
+                    else ""
+                ),
             }
         elif isinstance(raw, dict):
             source = raw
@@ -404,9 +440,7 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
         email = str(source.get("email") or "").strip()
         leadbee_api = _is_truthy(source.get("leadbee_api"))
         leadbee_code = str(
-            source.get("leadbee_code")
-            or source.get("client_order_id")
-            or ""
+            source.get("leadbee_code") or source.get("client_order_id") or ""
         ).strip()
         try:
             binding_id = int(source.get("id") or source.get("binding_id") or 0)
@@ -432,13 +466,16 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
             item["account_id"] = account_id
         if leadbee_api or leadbee_code.startswith("aar_"):
             item["leadbee_api"] = True
-        if _is_truthy(
-            source.get("use_sms_pool") or source.get("sms_pool_managed")
-        ):
+        if _is_truthy(source.get("use_sms_pool") or source.get("sms_pool_managed")):
             item["use_sms_pool"] = True
-        mail_provider = str(
-            source.get("mail_provider") or source.get("provider") or ""
-        ).strip().lower()
+        sms_mode = _normalize_chatgpt_sms_mode(source.get("sms_mode"))
+        if sms_mode:
+            item["sms_mode"] = sms_mode
+        mail_provider = (
+            str(source.get("mail_provider") or source.get("provider") or "")
+            .strip()
+            .lower()
+        )
         if mail_provider not in {"", "custom_provider", "chatgpt_credentials"}:
             item["mail_provider"] = mail_provider
         normalized.append(item)
@@ -472,9 +509,7 @@ def _build_chatgpt_retry_request(
     )
     config = config_store.get_all().copy()
     executor_type = str(config.get("default_executor") or "headless").strip()
-    captcha_solver = str(
-        config.get("default_captcha_solver") or "yescaptcha"
-    ).strip()
+    captcha_solver = str(config.get("default_captcha_solver") or "yescaptcha").strip()
     pool_modes = [bool(item.get("use_sms_pool")) for item in normalized]
     if any(pool_modes) and not all(pool_modes):
         raise HTTPException(409, "手填卡密与 SMS 接码池任务不能混合重试")
@@ -483,6 +518,14 @@ def _build_chatgpt_retry_request(
     if any(api_modes) and not all(api_modes):
         raise HTTPException(409, "LeadBee API 与卡密绑定不能混合重试")
     api_mode = bool(api_modes and all(api_modes))
+    explicit_modes = {
+        str(item.get("sms_mode") or "").strip()
+        for item in normalized
+        if str(item.get("sms_mode") or "").strip()
+    }
+    if len(explicit_modes) > 1:
+        raise HTTPException(409, "不同接码方式的失败账号不能混合重试")
+    explicit_mode = next(iter(explicit_modes), "")
     extra = {
         "chatgpt_registration_mode": "refresh_token",
         "chatgpt_has_refresh_token_solution": True,
@@ -494,14 +537,19 @@ def _build_chatgpt_retry_request(
     }
     if str(config.get("mail_provider") or "").strip():
         extra["mail_provider"] = str(config.get("mail_provider") or "").strip()
-    if api_mode:
+    if explicit_mode == "api_fallback_pool":
+        extra[CHATGPT_SMS_MODE_KEY] = explicit_mode
+        extra[CHATGPT_LEADBEE_API_KEY] = True
+        extra[CHATGPT_USE_SMS_POOL_FLAG] = False
+    elif explicit_mode == "pool":
+        extra[CHATGPT_SMS_MODE_KEY] = explicit_mode
+        extra[CHATGPT_USE_SMS_POOL_FLAG] = True
+    elif api_mode:
         extra[CHATGPT_LEADBEE_API_KEY] = True
     elif use_sms_pool:
         extra[CHATGPT_USE_SMS_POOL_FLAG] = True
     else:
-        extra[CHATGPT_LEADBEE_CODES_KEY] = [
-            item["leadbee_code"] for item in normalized
-        ]
+        extra[CHATGPT_LEADBEE_CODES_KEY] = [item["leadbee_code"] for item in normalized]
     return RegisterTaskRequest(
         platform="chatgpt",
         count=len(normalized),
@@ -1056,12 +1104,13 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     if not is_platform_enabled(prepared.platform):
         raise HTTPException(400, f"{prepared.platform} 平台已下线，不再支持注册")
 
-    is_chatgpt_login = (
-        prepared.platform == "chatgpt"
-        and _is_truthy(
-            prepared.extra.get("chatgpt_existing_account_login_only")
-        )
+    is_chatgpt_login = prepared.platform == "chatgpt" and _is_truthy(
+        prepared.extra.get("chatgpt_existing_account_login_only")
     )
+    if is_chatgpt_login and not (
+        1 <= int(prepared.concurrency) <= CHATGPT_EXISTING_LOGIN_MAX_CONCURRENCY
+    ):
+        raise HTTPException(400, "ChatGPT 已有账号登录并发数必须在 1 到 50 之间")
     provider_plan = _normalize_chatgpt_mail_provider_plan(
         prepared.extra.get(CHATGPT_MAIL_PROVIDER_PLAN_KEY)
     )
@@ -1072,11 +1121,18 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     else:
         prepared.extra.pop(CHATGPT_MAIL_PROVIDER_PLAN_KEY, None)
 
-    bind_phone_requested = _is_truthy(
-        prepared.extra.get(CHATGPT_BIND_PHONE_FLAG)
+    explicit_sms_mode = _normalize_chatgpt_sms_mode(
+        prepared.extra.get(CHATGPT_SMS_MODE_KEY)
     )
-    use_sms_pool_requested = _is_truthy(
-        prepared.extra.get(CHATGPT_USE_SMS_POOL_FLAG)
+    bind_phone_requested = (
+        explicit_sms_mode != "none"
+        if explicit_sms_mode
+        else _is_truthy(prepared.extra.get(CHATGPT_BIND_PHONE_FLAG))
+    )
+    use_sms_pool_requested = (
+        explicit_sms_mode == "pool"
+        if explicit_sms_mode
+        else _is_truthy(prepared.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
     )
     if bind_phone_requested:
         try:
@@ -1086,19 +1142,20 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         if not isinstance(global_config, dict):
             global_config = {}
         global_api_enabled = _is_truthy(global_config.get("leadbee_api_enabled"))
-        if (
-            prepared.platform != "chatgpt"
-            or not _is_truthy(
-                prepared.extra.get("chatgpt_existing_account_login_only")
-            )
+        if prepared.platform != "chatgpt" or not _is_truthy(
+            prepared.extra.get("chatgpt_existing_account_login_only")
         ):
             raise HTTPException(400, "登录并接码仅支持 ChatGPT 已有账号登录任务")
         api_marker_requested = _chatgpt_leadbee_api_mode(prepared)
-        api_mode_requested = api_marker_requested or global_api_enabled
+        api_mode_requested = (
+            explicit_sms_mode == "api_fallback_pool"
+            if explicit_sms_mode
+            else api_marker_requested or global_api_enabled
+        )
         if api_mode_requested:
             if not _chatgpt_leadbee_api_config_ready(global_config):
                 raise HTTPException(409, "LeadBee API 未启用或配置不完整")
-            if use_sms_pool_requested:
+            if use_sms_pool_requested and not explicit_sms_mode:
                 raise HTTPException(400, "LeadBee API 模式不能与 SMS 接码池混用")
             prepared.extra[CHATGPT_LEADBEE_API_KEY] = True
             prepared.extra.pop(CHATGPT_LEADBEE_CODES_KEY, None)
@@ -1110,6 +1167,8 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             use_sms_pool_requested = False
             codes = []
         elif use_sms_pool_requested:
+            prepared.extra.pop(CHATGPT_LEADBEE_API_KEY, None)
+            prepared.extra.pop(CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY, None)
             codes = []
             prepared.extra.pop(CHATGPT_LEADBEE_CODES_KEY, None)
             prepared.extra.pop(CHATGPT_LEADBEE_BASE_URLS_KEY, None)
@@ -1147,6 +1206,8 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             prepared.extra.pop(CHATGPT_RETRY_BINDINGS_KEY, None)
         prepared.extra[CHATGPT_BIND_PHONE_FLAG] = True
         prepared.extra[CHATGPT_USE_SMS_POOL_FLAG] = use_sms_pool_requested
+        if explicit_sms_mode:
+            prepared.extra[CHATGPT_SMS_MODE_KEY] = explicit_sms_mode
         if not use_sms_pool_requested and not api_mode_requested:
             prepared.extra[CHATGPT_LEADBEE_CODES_KEY] = codes
         # 先走已经实测稳定的 AT 登录，再续接同一授权事务完成手机验证。
@@ -1157,14 +1218,15 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra.pop(CHATGPT_LEADBEE_BASE_URLS_KEY, None)
         prepared.extra.pop(CHATGPT_SMS_POOL_ITEM_IDS_KEY, None)
         prepared.extra.pop(CHATGPT_USE_SMS_POOL_FLAG, None)
+        prepared.extra.pop(CHATGPT_LEADBEE_API_KEY, None)
+        prepared.extra.pop(CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY, None)
         prepared.extra.pop(CHATGPT_RETRY_BINDINGS_KEY, None)
-        if (
-            prepared.platform == "chatgpt"
-            and _is_truthy(
-                prepared.extra.get("chatgpt_existing_account_login_only")
-            )
+        if prepared.platform == "chatgpt" and _is_truthy(
+            prepared.extra.get("chatgpt_existing_account_login_only")
         ):
             prepared.extra[CHATGPT_BIND_PHONE_FLAG] = False
+            if explicit_sms_mode:
+                prepared.extra[CHATGPT_SMS_MODE_KEY] = explicit_sms_mode
         else:
             prepared.extra.pop(CHATGPT_BIND_PHONE_FLAG, None)
 
@@ -2862,6 +2924,7 @@ def _complete_chatgpt_leadbee_verification(
     leadbee_base_url: str = "",
     leadbee_api: bool = False,
     client_order_id: str = "",
+    leadbee_capacity_lease=None,
     on_provider_start=None,
     on_exchange_code_consumed=None,
     on_exchange_code_restored=None,
@@ -2935,6 +2998,7 @@ def _complete_chatgpt_leadbee_verification(
             leadbee_base_url=leadbee_base_url,
             leadbee_api=leadbee_api,
             client_order_id=client_order_id,
+            leadbee_capacity_lease=(leadbee_capacity_lease if leadbee_api else None),
             on_provider_start=(
                 _tracked_provider_start if callable(on_provider_start) else None
             ),
@@ -3004,6 +3068,7 @@ def _complete_chatgpt_leadbee_verification_serialized(
     leadbee_base_url: str = "",
     leadbee_api: bool = False,
     client_order_id: str = "",
+    leadbee_capacity_lease=None,
     on_provider_start=None,
     on_exchange_code_consumed=None,
     on_exchange_code_restored=None,
@@ -3024,6 +3089,7 @@ def _complete_chatgpt_leadbee_verification_serialized(
             {
                 "leadbee_api": True,
                 "client_order_id": str(client_order_id or "").strip(),
+                "leadbee_capacity_lease": leadbee_capacity_lease,
             }
         )
     else:
@@ -3066,9 +3132,9 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 except Exception as exc:
                     callback_errors.append(f"{name}:{type(exc).__name__}")
 
-            settlement = str(
-                snapshot.get("exchange_code_settlement") or ""
-            ).strip().lower()
+            settlement = (
+                str(snapshot.get("exchange_code_settlement") or "").strip().lower()
+            )
             existing_provider_started = bool(snapshot.get("provider_started"))
             existing_cleanup_settled = bool(
                 snapshot.get("provider_cleanup_settled", False)
@@ -3377,7 +3443,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
     if req.platform != "chatgpt":
         return _run_register_inner(task_id, req)
 
-    uses_sms_pool = _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
+    sms_mode = _normalize_chatgpt_sms_mode(req.extra.get(CHATGPT_SMS_MODE_KEY))
+    uses_sms_pool = bool(
+        _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
+        or sms_mode == "api_fallback_pool"
+    )
     if uses_sms_pool:
         with _sms_pool_quarantine_lock:
             _sms_pool_quarantine_item_ids_by_task[task_id] = set()
@@ -3406,11 +3476,9 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
         try:
             if uses_sms_pool:
                 with _sms_pool_quarantine_lock:
-                    quarantine_item_ids = (
-                        _sms_pool_quarantine_item_ids_by_task.pop(
-                            task_id,
-                            set(),
-                        )
+                    quarantine_item_ids = _sms_pool_quarantine_item_ids_by_task.pop(
+                        task_id,
+                        set(),
                     )
                 if quarantine_item_ids:
                     sms_pool_service.release_task(
@@ -3483,7 +3551,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
 
         # 预先计算 merged_extra，所有线程共享只读副本，避免每线程重复调用 config_store
         from core.config_store import config_store as _cs
+
         _bind_phone_and_get_rt = _chatgpt_bind_phone_enabled(req)
+        _sms_mode = _normalize_chatgpt_sms_mode(req.extra.get(CHATGPT_SMS_MODE_KEY))
+        _api_fallback_pool = _sms_mode == "api_fallback_pool"
         _leadbee_api = _chatgpt_leadbee_api_mode(req) and _bind_phone_and_get_rt
         _leadbee_codes = (
             _normalize_leadbee_codes(req.extra.get(CHATGPT_LEADBEE_CODES_KEY))
@@ -3498,27 +3569,21 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             else []
         )
         _use_sms_pool = (
-            _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
-            and not _leadbee_api
+            _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG)) and not _leadbee_api
         )
+        _uses_sms_pool_lifecycle = bool(_use_sms_pool or _api_fallback_pool)
         _leadbee_base_urls = (
-            _normalize_leadbee_base_urls(
-                req.extra.get(CHATGPT_LEADBEE_BASE_URLS_KEY)
-            )
+            _normalize_leadbee_base_urls(req.extra.get(CHATGPT_LEADBEE_BASE_URLS_KEY))
             if _use_sms_pool
             else []
         )
         _sms_pool_item_ids = (
-            _normalize_sms_pool_item_ids(
-                req.extra.get(CHATGPT_SMS_POOL_ITEM_IDS_KEY)
-            )
+            _normalize_sms_pool_item_ids(req.extra.get(CHATGPT_SMS_POOL_ITEM_IDS_KEY))
             if _use_sms_pool
             else []
         )
         _retry_bindings = (
-            _normalize_chatgpt_retry_bindings(
-                req.extra.get(CHATGPT_RETRY_BINDINGS_KEY)
-            )
+            _normalize_chatgpt_retry_bindings(req.extra.get(CHATGPT_RETRY_BINDINGS_KEY))
             if _bind_phone_and_get_rt
             else []
         )
@@ -3527,14 +3592,17 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         )
         if _leadbee_api and len(_leadbee_client_order_ids) != req.count:
             raise RuntimeError("LeadBee API 客户端订单标识数量与登录数量不一致")
-        if _bind_phone_and_get_rt and not _leadbee_api and len(_leadbee_codes) != req.count:
+        if (
+            _bind_phone_and_get_rt
+            and not _leadbee_api
+            and len(_leadbee_codes) != req.count
+        ):
             raise RuntimeError(
                 "卡密数量需与登录数量一致"
                 f"（需要 {req.count} 个，当前 {len(_leadbee_codes)} 个）"
             )
         if _use_sms_pool and (
-            len(_leadbee_base_urls) != req.count
-            or len(_sms_pool_item_ids) != req.count
+            len(_leadbee_base_urls) != req.count or len(_sms_pool_item_ids) != req.count
         ):
             raise RuntimeError("SMS 接码池卡密绑定数量与登录数量不一致")
         if _retry_bindings and len(_retry_bindings) != req.count:
@@ -3549,7 +3617,17 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             if req.platform == "chatgpt" and not _retry_bindings
             else None
         )
-        _base_extra = _cs.get_all().copy()
+        _stored_config = _cs.get_all().copy()
+        _leadbee_api_runtime_config = {
+            key: _stored_config.get(key)
+            for key in (
+                "leadbee_api_enabled",
+                "leadbee_api_key",
+                "leadbee_api_secret",
+                "leadbee_api_product_id",
+            )
+        }
+        _base_extra = _stored_config.copy()
         if _bind_phone_and_get_rt:
             for secret_key in _CHATGPT_LEADBEE_SECRET_KEYS:
                 _base_extra.pop(secret_key, None)
@@ -3557,20 +3635,20 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             {
                 k: v
                 for k, v in req.extra.items()
-                if k not in _CHATGPT_LEADBEE_SECRET_KEYS
-                and v is not None
-                and v != ""
+                if k not in _CHATGPT_LEADBEE_SECRET_KEYS and v is not None and v != ""
             }
         )
 
         # 批量预取代理（无固定代理时），减少每线程单独查 DB
         from core.proxy_pool import proxy_pool as _proxy_pool
+
         _prefetched_proxies: list[str] = []
         _prefetch_lock = threading.Lock()
         if not req.proxy and req.count > 1:
             with Session(engine) as _s:
                 from core.db import ProxyModel
                 from sqlmodel import select as _sel
+
                 _active = _s.exec(
                     _sel(ProxyModel).where(ProxyModel.is_active == True)
                 ).all()
@@ -3583,6 +3661,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 with _prefetch_lock:
                     if _prefetched_proxies:
                         import random
+
                         return random.choice(_prefetched_proxies)
             return _proxy_pool.get_next()
 
@@ -3608,9 +3687,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         def _persist_binding(**kwargs):
             if binding_persistence_disabled.is_set():
                 if _leadbee_api:
-                    raise RuntimeError(
-                        "LeadBee API 订单绑定无法持久化，未启动接码"
-                    )
+                    raise RuntimeError("LeadBee API 订单绑定无法持久化，未启动接码")
                 return None
             try:
                 row = _upsert_chatgpt_attempt_binding(**kwargs)
@@ -3632,9 +3709,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     )
                 return None
             if _leadbee_api and row is None:
-                raise RuntimeError(
-                    "LeadBee API 订单绑定保存失败，未启动接码"
-                )
+                raise RuntimeError("LeadBee API 订单绑定保存失败，未启动接码")
             return row
 
         def _do_one(i: int):
@@ -3650,12 +3725,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             retry_binding = _retry_bindings[i] if _retry_bindings else {}
             bound_email = str(retry_binding.get("email") or "").strip()
             bound_account_id = int(retry_binding.get("account_id") or 0)
-            bound_mail_provider = str(
-                retry_binding.get("mail_provider") or ""
-            ).strip()
-            client_order_id = (
-                _leadbee_client_order_ids[i] if _leadbee_api else ""
-            )
+            bound_mail_provider = str(retry_binding.get("mail_provider") or "").strip()
+            client_order_id = _leadbee_client_order_ids[i] if _leadbee_api else ""
             leadbee_code = (
                 client_order_id
                 if _leadbee_api
@@ -3671,11 +3742,17 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             current_account_id = bound_account_id
             current_stage = "login"
             attempt_id: int | None = None
+            active_leadbee_api = _leadbee_api
+            capacity_lease = None
 
             def _sms_pool_binding_context(value=None):
                 context = dict(value) if isinstance(value, dict) else {}
-                if _leadbee_api:
+                if active_leadbee_api:
                     context["leadbee_api"] = True
+                else:
+                    context.pop("leadbee_api", None)
+                if _sms_mode:
+                    context["sms_mode"] = _sms_mode
                 if sms_pool_item_id:
                     context["sms_pool_managed"] = True
                     context["sms_pool_item_id"] = sms_pool_item_id
@@ -3718,9 +3795,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 # 每个 attempt 使用独立字典，避免并发任务之间发生配置串用。
                 merged_extra = _base_extra.copy()
                 planned_mail_provider = (
-                    _mail_provider_plan[i]
-                    if i < len(_mail_provider_plan)
-                    else ""
+                    _mail_provider_plan[i] if i < len(_mail_provider_plan) else ""
                 )
                 attempt_mail_provider = (
                     bound_mail_provider
@@ -3731,24 +3806,27 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     merged_extra["mail_provider"] = attempt_mail_provider
 
                 if _bind_phone_and_get_rt:
+
                     def _record_mailbox_binding(email_value, mailbox_account):
                         nonlocal current_email
                         current_email = str(email_value or current_email or "").strip()
                         account_extra = dict(
                             getattr(mailbox_account, "extra", None) or {}
                         )
-                        mailbox_context = _sms_pool_binding_context({
-                            "provider": str(
-                                account_extra.get("provider")
-                                or merged_extra.get("mail_provider")
-                                or "custom_provider"
-                            ).strip(),
-                            "email": current_email,
-                            "account_id": str(
-                                getattr(mailbox_account, "account_id", "") or ""
-                            ).strip(),
-                            "extra": account_extra,
-                        })
+                        mailbox_context = _sms_pool_binding_context(
+                            {
+                                "provider": str(
+                                    account_extra.get("provider")
+                                    or merged_extra.get("mail_provider")
+                                    or "custom_provider"
+                                ).strip(),
+                                "email": current_email,
+                                "account_id": str(
+                                    getattr(mailbox_account, "account_id", "") or ""
+                                ).strip(),
+                                "extra": account_extra,
+                            }
+                        )
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -3886,9 +3964,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     _proxy_pool.report_success(_proxy)
 
                 if _bind_phone_and_get_rt:
-                    saved_account_id = int(
-                        getattr(saved_account, "id", 0) or 0
-                    )
+                    saved_account_id = int(getattr(saved_account, "id", 0) or 0)
                     current_account_id = _resolve_chatgpt_retry_account_id(
                         bound_account_id,
                         saved_account,
@@ -3970,10 +4046,6 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         )
                         return AttemptResult.failed(failure)
 
-                    _log(
-                        task_id,
-                        f"邮箱登录成功，Access Token 已保存；开始自动接码: {account.email}",
-                    )
                     # Every card initially reserved for this task belongs to a
                     # specific mailbox attempt.  A released card from another
                     # attempt is not a "spare" and must never be stolen here.
@@ -3982,18 +4054,140 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         for item_id in _sms_pool_item_ids
                         if int(item_id or 0) > 0
                     }
+
+                    def _activate_sms_pool_fallback() -> bool:
+                        nonlocal active_leadbee_api
+                        nonlocal leadbee_code
+                        nonlocal leadbee_base_url
+                        nonlocal sms_pool_item_id
+                        nonlocal sms_pool_consumed
+                        nonlocal sms_pool_restoration_confirmed
+                        nonlocal sms_pool_settlement_pending
+                        try:
+                            rows = sms_pool_service.reserve(
+                                task_id=task_id,
+                                count=1,
+                                exclude_item_ids=set(attempted_sms_pool_item_ids),
+                            )
+                        except SmsPoolExhaustedError:
+                            return False
+                        if not rows:
+                            return False
+                        fallback_row = rows[0]
+                        fallback_item_id = int(fallback_row.id or 0)
+                        fallback_code = str(fallback_row.code or "").strip()
+                        fallback_base_url = str(fallback_row.base_url or "").strip()
+                        if not fallback_item_id or not fallback_code:
+                            if fallback_item_id:
+                                sms_pool_service.finalize(
+                                    item_id=fallback_item_id,
+                                    task_id=task_id,
+                                    consumed=False,
+                                )
+                            raise RuntimeError("SMS 接码池返回的卡密绑定无效")
+
+                        active_leadbee_api = False
+                        leadbee_code = fallback_code
+                        leadbee_base_url = fallback_base_url
+                        sms_pool_item_id = fallback_item_id
+                        attempted_sms_pool_item_ids.add(fallback_item_id)
+                        sms_pool_consumed = False
+                        sms_pool_restoration_confirmed = False
+                        sms_pool_settlement_pending = False
+                        try:
+                            _persist_binding(
+                                task_id=task_id,
+                                attempt_index=i,
+                                leadbee_code=leadbee_code,
+                                email=account.email,
+                                account_id=int(account_id),
+                                stage=current_stage,
+                                status="running",
+                                mailbox_context=_sms_pool_binding_context(
+                                    account.extra.get("mailbox_login_context")
+                                    if isinstance(
+                                        getattr(account, "extra", None),
+                                        dict,
+                                    )
+                                    else None
+                                ),
+                                parent_binding_id=parent_binding_id,
+                            )
+                        except Exception:
+                            sms_pool_service.finalize(
+                                item_id=fallback_item_id,
+                                task_id=task_id,
+                                consumed=False,
+                            )
+                            sms_pool_item_id = 0
+                            leadbee_code = client_order_id
+                            leadbee_base_url = ""
+                            active_leadbee_api = True
+                            raise
+                        _log(
+                            task_id,
+                            "  [接码] API 余额不足，已切换 SMS 卡密接码",
+                        )
+                        return True
+
+                    capacity_preflight_failure = ""
+                    if active_leadbee_api:
+                        from platforms.chatgpt.leadbee_runtime import (
+                            LeadBeeCapacityExhausted,
+                        )
+
+                        try:
+                            capacity_lease = _reserve_chatgpt_leadbee_api_capacity(
+                                config=_leadbee_api_runtime_config,
+                                client_order_id=client_order_id,
+                                checkpoint=lambda: control.checkpoint(
+                                    attempt_id=attempt_id
+                                ),
+                            )
+                        except (
+                            SkipCurrentAttemptRequested,
+                            StopTaskRequested,
+                        ):
+                            raise
+                        except LeadBeeCapacityExhausted:
+                            if _api_fallback_pool and _activate_sms_pool_fallback():
+                                capacity_preflight_failure = ""
+                            elif _api_fallback_pool:
+                                capacity_preflight_failure = (
+                                    "API 余额不足且卡密池无可用卡密"
+                                )
+                            else:
+                                capacity_preflight_failure = "LeadBee API 可用余额不足"
+                        except Exception:
+                            capacity_preflight_failure = "LeadBee API 容量检查失败"
+
+                    _log(
+                        task_id,
+                        f"邮箱登录成功，Access Token 已保存；开始自动接码: {account.email}",
+                    )
                     same_card_no_number_retries = 0
-                    phone_result: dict = {}
+                    phone_result: dict = (
+                        {
+                            "status": "failed",
+                            "message": capacity_preflight_failure,
+                            "provider_error_code": (
+                                "LEADBEE_API_CAPACITY_EXHAUSTED"
+                                if "余额不足" in capacity_preflight_failure
+                                else "LEADBEE_API_ERROR"
+                            ),
+                        }
+                        if capacity_preflight_failure
+                        else {}
+                    )
                     phone_status = ""
                     phone_message = ""
                     exchange_code_consumed = False
+                    preflight_result_pending = bool(phone_result)
 
                     while True:
                         active_pool_item_id = int(sms_pool_item_id or 0)
                         active_leadbee_code = str(leadbee_code or "").strip()
-                        active_leadbee_base_url = str(
-                            leadbee_base_url or ""
-                        ).strip()
+                        active_leadbee_base_url = str(leadbee_base_url or "").strip()
                         if active_pool_item_id:
                             attempted_sms_pool_item_ids.add(active_pool_item_id)
 
@@ -4018,9 +4212,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 task_id=task_id,
                                 account_email=current_email,
                             ):
-                                raise RuntimeError(
-                                    "SMS 接码池卡密使用中状态保存失败"
-                                )
+                                raise RuntimeError("SMS 接码池卡密使用中状态保存失败")
                             # A previously restored card stays reusable while
                             # waiting to retry. It becomes at-risk again only
                             # when the provider actually starts a new attempt.
@@ -4037,52 +4229,67 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                     item_id=_item_id,
                                     task_id=task_id,
                                 ):
-                                    raise RuntimeError(
-                                        "SMS 接码池卡密恢复状态保存失败"
-                                    )
+                                    raise RuntimeError("SMS 接码池卡密恢复状态保存失败")
                                 sms_pool_consumed = False
                                 sms_pool_restoration_confirmed = True
 
-                        try:
-                            phone_result = _complete_chatgpt_leadbee_verification(
-                                task_id=task_id,
-                                account_id=int(account_id),
-                                leadbee_code=(
-                                    "" if _leadbee_api else active_leadbee_code
-                                ),
-                                leadbee_base_url=active_leadbee_base_url,
-                                leadbee_api=_leadbee_api,
-                                client_order_id=client_order_id,
-                                on_provider_start=(
-                                    _mark_sms_pool_active
-                                    if active_pool_item_id
-                                    else None
-                                ),
-                                on_exchange_code_consumed=(
-                                    _mark_sms_pool_consumed
-                                    if active_pool_item_id
-                                    else None
-                                ),
-                                on_exchange_code_restored=(
-                                    _mark_sms_pool_restored
-                                    if active_pool_item_id
-                                    else None
-                                ),
-                                control=control,
-                                attempt_id=attempt_id,
-                            )
-                        except (SkipCurrentAttemptRequested, StopTaskRequested):
-                            raise
-                        except Exception as exc:
-                            phone_result = {
-                                "status": "failed",
-                                "message": _redact_task_secret(
-                                    exc,
-                                    active_leadbee_code,
-                                ),
-                            }
+                        if preflight_result_pending:
+                            preflight_result_pending = False
+                        else:
+                            try:
+                                phone_result = _complete_chatgpt_leadbee_verification(
+                                    task_id=task_id,
+                                    account_id=int(account_id),
+                                    leadbee_code=(
+                                        ""
+                                        if active_leadbee_api
+                                        else active_leadbee_code
+                                    ),
+                                    leadbee_base_url=(
+                                        ""
+                                        if active_leadbee_api
+                                        else active_leadbee_base_url
+                                    ),
+                                    leadbee_api=active_leadbee_api,
+                                    client_order_id=(
+                                        client_order_id if active_leadbee_api else ""
+                                    ),
+                                    leadbee_capacity_lease=(
+                                        capacity_lease if active_leadbee_api else None
+                                    ),
+                                    on_provider_start=(
+                                        _mark_sms_pool_active
+                                        if active_pool_item_id
+                                        else None
+                                    ),
+                                    on_exchange_code_consumed=(
+                                        _mark_sms_pool_consumed
+                                        if active_pool_item_id
+                                        else None
+                                    ),
+                                    on_exchange_code_restored=(
+                                        _mark_sms_pool_restored
+                                        if active_pool_item_id
+                                        else None
+                                    ),
+                                    control=control,
+                                    attempt_id=attempt_id,
+                                )
+                            except (
+                                SkipCurrentAttemptRequested,
+                                StopTaskRequested,
+                            ):
+                                raise
+                            except Exception as exc:
+                                phone_result = {
+                                    "status": "failed",
+                                    "message": _redact_task_secret(
+                                        exc,
+                                        active_leadbee_code,
+                                    ),
+                                }
 
-                        if _leadbee_api:
+                        if active_leadbee_api:
                             actual_client_order_id = str(
                                 phone_result.get("client_order_id") or ""
                             ).strip()
@@ -4090,16 +4297,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 r"aar_[0-9a-f]{32}",
                                 actual_client_order_id,
                             ):
-                                raise RuntimeError(
-                                    "LeadBee API 返回的订单标识无效"
-                                )
+                                raise RuntimeError("LeadBee API 返回的订单标识无效")
                             if (
                                 bool(phone_result.get("reused", False))
                                 and not actual_client_order_id
                             ):
-                                raise RuntimeError(
-                                    "LeadBee API 复用会话缺少订单标识"
-                                )
+                                raise RuntimeError("LeadBee API 复用会话缺少订单标识")
                             if (
                                 actual_client_order_id
                                 and actual_client_order_id != client_order_id
@@ -4115,9 +4318,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                     stage=current_stage,
                                     status="running",
                                     mailbox_context=_sms_pool_binding_context(
-                                        account.extra.get(
-                                            "mailbox_login_context"
-                                        )
+                                        account.extra.get("mailbox_login_context")
                                         if isinstance(
                                             getattr(account, "extra", None),
                                             dict,
@@ -4127,12 +4328,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                     parent_binding_id=parent_binding_id,
                                 )
 
-                        phone_status = str(
-                            phone_result.get("status") or ""
-                        ).lower()
+                        phone_status = str(phone_result.get("status") or "").lower()
                         phone_message = _redact_task_secret(
-                            phone_result.get("message")
-                            or "LeadBee 自动接码失败",
+                            phone_result.get("message") or "LeadBee 自动接码失败",
                             active_leadbee_code,
                         )
                         sms_pool_restoration_confirmed = bool(
@@ -4142,9 +4340,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 False,
                             )
                         )
-                        exchange_code_settlement = str(
-                            phone_result.get("exchange_code_settlement") or ""
-                        ).strip().lower()
+                        exchange_code_settlement = (
+                            str(phone_result.get("exchange_code_settlement") or "")
+                            .strip()
+                            .lower()
+                        )
                         sms_pool_settlement_pending = (
                             exchange_code_settlement == "active_unknown"
                             or (
@@ -4174,14 +4374,41 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             )
                         )
                         sms_pool_consumed = exchange_code_consumed
-                        provider_error_code = str(
-                            phone_result.get("provider_error_code") or ""
-                        ).strip().upper()
+                        provider_error_code = (
+                            str(phone_result.get("provider_error_code") or "")
+                            .strip()
+                            .upper()
+                        )
                         if phone_status != "completed":
                             # The stop/skip request may arrive while the provider
                             # is still polling.  Observe it before any retry,
                             # replacement reservation, or binding rewrite.
                             control.checkpoint(attempt_id=attempt_id)
+
+                        can_fallback_after_api_rejection = bool(
+                            phone_status != "completed"
+                            and active_leadbee_api
+                            and _api_fallback_pool
+                            and not capacity_preflight_failure
+                            and provider_error_code == "LEADBEE_API_CAPACITY_EXHAUSTED"
+                        )
+                        if can_fallback_after_api_rejection:
+                            release_capacity = getattr(
+                                capacity_lease,
+                                "release",
+                                None,
+                            )
+                            if callable(release_capacity):
+                                release_capacity()
+                            capacity_lease = None
+                            if _activate_sms_pool_fallback():
+                                phone_result = {}
+                                phone_status = ""
+                                phone_message = ""
+                                phone_background_ownership_pending = False
+                                continue
+                            phone_message = "API 余额不足且卡密池无可用卡密"
+                            break
 
                         can_retry_same_card = bool(
                             phone_status != "completed"
@@ -4205,7 +4432,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
 
                         can_switch_pool_card = bool(
                             phone_status != "completed"
-                            and _use_sms_pool
+                            and _uses_sms_pool_lifecycle
+                            and not active_leadbee_api
                             and active_pool_item_id
                             and provider_error_code
                             in _LEADBEE_POOL_REPLACEMENT_ERROR_CODES
@@ -4242,9 +4470,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 item_id=active_pool_item_id,
                                 task_id=task_id,
                                 consumed=sms_pool_consumed,
-                                restoration_confirmed=(
-                                    sms_pool_restoration_confirmed
-                                ),
+                                restoration_confirmed=(sms_pool_restoration_confirmed),
                                 account_email=current_email,
                             )
                             if not finalized:
@@ -4258,9 +4484,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 )
 
                         leadbee_code = str(replacement.code or "").strip()
-                        leadbee_base_url = str(
-                            replacement.base_url or ""
-                        ).strip()
+                        leadbee_base_url = str(replacement.base_url or "").strip()
                         sms_pool_item_id = int(replacement.id or 0)
                         sms_pool_consumed = False
                         sms_pool_restoration_confirmed = False
@@ -4331,9 +4555,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         saved_account or account,
                     )
                     if not chatgpt_account_refresh_token(final_account):
-                        failure = (
-                            "手机验证流程已结束，但本地账号未保存 Refresh Token"
-                        )
+                        failure = "手机验证流程已结束，但本地账号未保存 Refresh Token"
                         _log(task_id, f"[FAIL] {failure}: {account.email}")
                         _save_task_log(
                             req.platform,
@@ -4548,6 +4770,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "[WARN] 未获取 Refresh Token 的半成品账号清理失败"
                                 f"（{type(exc).__name__}）",
                             )
+                release_capacity = getattr(capacity_lease, "release", None)
+                if callable(release_capacity):
+                    release_capacity()
                 if sms_pool_item_id and not sms_pool_settlement_pending:
                     try:
                         sms_pool_service.finalize(
@@ -4560,8 +4785,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     except Exception as exc:
                         _log(
                             task_id,
-                            "[WARN] SMS 接码池状态更新失败"
-                            f"（{type(exc).__name__}）",
+                            f"[WARN] SMS 接码池状态更新失败（{type(exc).__name__}）",
                         )
                 elif sms_pool_item_id and sms_pool_settlement_pending:
                     _log(

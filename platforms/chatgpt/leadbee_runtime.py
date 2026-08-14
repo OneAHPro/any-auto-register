@@ -300,6 +300,9 @@ class LeadBeeCapacityCoordinator:
 
     def _release(self, reference: str) -> None:
         with self._lock:
+            record = self._records.get(reference)
+            if record is None or record.state != "pending":
+                return
             self._records.pop(reference, None)
             self._handles.pop(reference, None)
 

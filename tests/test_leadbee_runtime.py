@@ -89,6 +89,7 @@ def test_release_restores_capacity_and_commit_counts_until_refresh():
         balance=_balance("1.30"),
     )
     second.commit()
+    second.release()
 
     with pytest.raises(LeadBeeCapacityExhausted):
         coordinator.reserve(

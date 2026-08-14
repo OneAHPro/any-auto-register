@@ -104,6 +104,7 @@ class InteractivePhoneVerificationBroker:
         on_provider_start: Optional[Callable[[], None]] = None,
         on_exchange_code_consumed: Optional[Callable[[], None]] = None,
         on_exchange_code_restored: Optional[Callable[[], None]] = None,
+        leadbee_capacity_lease: object | None = None,
     ):
         self.session_id = uuid.uuid4().hex
         self.account_id = int(account_id)
@@ -111,6 +112,9 @@ class InteractivePhoneVerificationBroker:
         self.provider = str(provider or "manual").strip().lower() or "manual"
         self.leadbee_api = bool(leadbee_api)
         self.client_order_id = str(client_order_id or "").strip()
+        self.leadbee_capacity_lease = (
+            leadbee_capacity_lease if self.leadbee_api else None
+        )
         if self.leadbee_api and not LEADBEE_API_CLIENT_ORDER_RE.fullmatch(
             self.client_order_id
         ):
@@ -303,7 +307,7 @@ class InteractivePhoneVerificationBroker:
         normalized_code = str(error_code or "").strip().upper()
         normalized_message = str(message or "").strip()
         if self.leadbee_api:
-            if normalized_code:
+            if normalized_code not in {"", "LEADBEE_API_CAPACITY_EXHAUSTED"}:
                 normalized_code = "LEADBEE_API_ERROR"
             if normalized_message:
                 normalized_message = "LeadBee API 服务返回错误"
@@ -855,7 +859,10 @@ class ChatGPTPhoneVerificationManager:
         finally:
             with self._lock:
                 current = self._account_sessions.get(broker.account_id)
-                if current == broker.session_id and broker.status in {"completed", "failed"}:
+                if current == broker.session_id and broker.status in {
+                    "completed",
+                    "failed",
+                }:
                     self._account_sessions.pop(broker.account_id, None)
                 self._prune_locked()
 
@@ -880,6 +887,13 @@ class ChatGPTPhoneVerificationManager:
             if provider_lock_owned:
                 provider_lock.release()
                 provider_lock_owned = False
+            release_capacity = getattr(
+                broker.leadbee_capacity_lease,
+                "release",
+                None,
+            )
+            if callable(release_capacity):
+                release_capacity()
             settlement = broker.snapshot()
             if (
                 not broker.leadbee_api
@@ -935,7 +949,10 @@ class ChatGPTPhoneVerificationManager:
                 # LeadBee slot if either downstream operation blocks.
                 settle_provider_cleanup()
             broker.raise_if_cancelled()
-            if not isinstance(tokens, dict) or not str(tokens.get("refresh_token") or "").strip():
+            if (
+                not isinstance(tokens, dict)
+                or not str(tokens.get("refresh_token") or "").strip()
+            ):
                 raise RuntimeError("手机验证完成后未获取 Refresh Token")
             completed_tokens = broker.attach_outcome(tokens)
             broker.raise_if_cancelled()
@@ -958,10 +975,10 @@ class ChatGPTPhoneVerificationManager:
             settle_provider_cleanup()
             with self._lock:
                 current = self._account_sessions.get(broker.account_id)
-                if (
-                    current == broker.session_id
-                    and broker.status in {"completed", "failed"}
-                ):
+                if current == broker.session_id and broker.status in {
+                    "completed",
+                    "failed",
+                }:
                     self._account_sessions.pop(broker.account_id, None)
                 self._prune_locked()
 
@@ -977,6 +994,7 @@ class ChatGPTPhoneVerificationManager:
         on_provider_start: Optional[Callable[[], None]] = None,
         on_exchange_code_consumed: Optional[Callable[[], None]] = None,
         on_exchange_code_restored: Optional[Callable[[], None]] = None,
+        leadbee_capacity_lease: object | None = None,
         provider_lock_already_held: bool = False,
         on_provider_lock_handoff: Optional[Callable[[str], None]] = None,
     ) -> dict[str, Any]:
@@ -1076,6 +1094,7 @@ class ChatGPTPhoneVerificationManager:
                 on_provider_start=on_provider_start,
                 on_exchange_code_consumed=on_exchange_code_consumed,
                 on_exchange_code_restored=on_exchange_code_restored,
+                leadbee_capacity_lease=(leadbee_capacity_lease if api_mode else None),
             )
             broker.leadbee_base_url = receive_base_url
             self._sessions[broker.session_id] = broker
@@ -1097,13 +1116,24 @@ class ChatGPTPhoneVerificationManager:
             # blocked by an uncleanable `starting` session forever.
             broker.mark_failed("手机验证后台线程启动失败")
             if automatic:
+                release_capacity = getattr(
+                    broker.leadbee_capacity_lease,
+                    "release",
+                    None,
+                )
+                if callable(release_capacity):
+                    release_capacity()
                 broker.mark_provider_cleanup_settled()
             with self._lock:
                 self._sessions.pop(broker.session_id, None)
                 if self._account_sessions.get(account_key) == broker.session_id:
                     self._account_sessions.pop(account_key, None)
             raise
-        if automatic and provider_lock_already_held and callable(on_provider_lock_handoff):
+        if (
+            automatic
+            and provider_lock_already_held
+            and callable(on_provider_lock_handoff)
+        ):
             # From this point onward the worker owns the pre-acquired permit
             # and releases it before publishing cleanup settlement.
             on_provider_lock_handoff(broker.session_id)
@@ -1388,8 +1418,12 @@ def run_interactive_phone_oauth_flow(
         }
     )
     proxy = str(account_extra.get("proxy_used") or "").strip() or None
-    oauth_client = OAuthClient(config, proxy=proxy, verbose=False, browser_mode="protocol")
-    resume_context, resume_source = _take_phone_oauth_resume_context(email, account_extra)
+    oauth_client = OAuthClient(
+        config, proxy=proxy, verbose=False, browser_mode="protocol"
+    )
+    resume_context, resume_source = _take_phone_oauth_resume_context(
+        email, account_extra
+    )
     if resume_source == "memory":
         broker.mark_progress("正在续接登录时预建的手机授权事务并请求短信验证码")
     else:
@@ -1474,6 +1508,11 @@ def run_leadbee_phone_oauth_flow(
             {
                 "leadbee_api_enabled": "1",
                 "leadbee_api_client_order_id": client_order_id,
+                "leadbee_capacity_lease": getattr(
+                    broker,
+                    "leadbee_capacity_lease",
+                    None,
+                ),
             }
         )
     else:

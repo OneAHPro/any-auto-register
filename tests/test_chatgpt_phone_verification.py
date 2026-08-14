@@ -630,6 +630,41 @@ class PhoneOAuthResumeTests(unittest.TestCase):
 
 
 class PhoneVerificationManagerTests(unittest.TestCase):
+    def test_api_capacity_lease_is_attached_only_to_internal_broker(self):
+        lease = object()
+        observed = []
+
+        def runner(_account_id, _client_order_id, broker):
+            observed.append(getattr(broker, "leadbee_capacity_lease", None))
+            return {"refresh_token": "fixture-rt"}
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ):
+            snapshot = manager.start(
+                200,
+                leadbee_api=True,
+                leadbee_capacity_lease=lease,
+            )
+
+        self.assertEqual(snapshot["status"], "completed")
+        self.assertEqual(observed, [lease])
+        self.assertNotIn("capacity", repr(snapshot).lower())
+
     def test_api_and_exchange_cards_use_independent_provider_slots(self):
         class TrackingSlot:
             def __init__(self):

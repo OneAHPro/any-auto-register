@@ -30,6 +30,15 @@ from .leadbee_open_api import (
 )
 from .leadbee_runtime import leadbee_api_rate_limiter
 
+_LEADBEE_API_CAPACITY_ERROR_CODES = frozenset(
+    {
+        "NO_BALANCE",
+        "INSUFFICIENT_BALANCE",
+        "BALANCE_INSUFFICIENT",
+        "INSUFFICIENT_FUNDS",
+    }
+)
+
 
 def _to_positive_int(value, default: int, *, minimum: int = 1) -> int:
     try:
@@ -926,6 +935,8 @@ class LeadBeeOpenAPIPhoneService:
         self._sleep = sleep_fn or time.sleep
         self._monotonic = monotonic or time.monotonic
         self._progress_broker = self.config.get("chatgpt_phone_progress_broker")
+        self._capacity_lease = self.config.get("leadbee_capacity_lease")
+        self._capacity_lease_settlement = ""
         self._provider_started = False
         production_client = client is None
         self._client = client
@@ -1073,6 +1084,22 @@ class LeadBeeOpenAPIPhoneService:
         if callable(marker):
             marker()
         self._provider_started = True
+
+    def _settle_capacity_lease(self, action: str) -> None:
+        if self._capacity_lease_settlement:
+            return
+        callback = getattr(self._capacity_lease, action, None)
+        if callable(callback):
+            callback()
+        self._capacity_lease_settlement = action
+
+    def _publish_capacity_exhausted(self) -> None:
+        marker = getattr(self._progress_broker, "mark_provider_error", None)
+        if callable(marker):
+            marker(
+                "LEADBEE_API_CAPACITY_EXHAUSTED",
+                "LeadBee API 当前可用余额不足",
+            )
 
     def _remaining_request_timeout(self, deadline: float, phase: str) -> float:
         remaining = float(deadline) - self._monotonic()
@@ -1267,18 +1294,31 @@ class LeadBeeOpenAPIPhoneService:
         except LeadBeeAPIError as exc:
             self._create_ambiguous = self._create_failure_is_ambiguous(exc)
             self._create_failed = True
+            if self._create_ambiguous:
+                self._settle_capacity_lease("quarantine")
+            else:
+                self._settle_capacity_lease("release")
+                if exc.error_code in _LEADBEE_API_CAPACITY_ERROR_CODES:
+                    self._publish_capacity_exhausted()
             raise
         except RuntimeError:
             if self._create_attempted:
                 self._create_ambiguous = True
                 self._create_failed = True
+                self._settle_capacity_lease("quarantine")
+            else:
+                self._settle_capacity_lease("release")
             raise
         try:
             order = self._accept_order(data, require_order_id=True)
         except RuntimeError:
             self._create_failed = True
+            self._settle_capacity_lease(
+                "quarantine" if self.card_at_risk else "release"
+            )
             raise
         self._create_ambiguous = False
+        self._settle_capacity_lease("commit")
         return order
 
     def _poll_order(
