@@ -258,6 +258,37 @@ class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
             ["legacy-one", "legacy-two"],
         )
 
+    def test_prepare_config_read_failure_keeps_legacy_cards(self):
+        with patch(
+            "core.config_store.config_store.get_all",
+            side_effect=RuntimeError("fixture config unavailable"),
+        ):
+            prepared = _prepare_register_request(
+                self._request(codes=["legacy-one", "legacy-two"])
+            )
+
+        self.assertNotIn("chatgpt_existing_account_leadbee_api", prepared.extra)
+        self.assertEqual(
+            prepared.extra["chatgpt_existing_account_leadbee_codes"],
+            ["legacy-one", "legacy-two"],
+        )
+
+    def test_prepare_config_read_failure_rejects_explicit_api_mode(self):
+        request = self._request(codes=[])
+        request.extra["chatgpt_existing_account_leadbee_api"] = True
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                side_effect=RuntimeError("fixture config unavailable"),
+            ),
+            self.assertRaises(HTTPException) as ctx,
+        ):
+            _prepare_register_request(request)
+
+        self.assertEqual(ctx.exception.status_code, 409)
+
     def test_prepare_api_mode_rejects_incomplete_config(self):
         request = self._request(codes=[])
         request.extra["chatgpt_existing_account_leadbee_api"] = True

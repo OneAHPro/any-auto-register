@@ -425,14 +425,13 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
             )
         item = {
             "id": binding_id,
-            "account_id": account_id,
             "email": email,
             "leadbee_code": leadbee_code,
-            "leadbee_api": bool(
-                leadbee_api
-                or leadbee_code.startswith("aar_")
-            ),
         }
+        if account_id:
+            item["account_id"] = account_id
+        if leadbee_api or leadbee_code.startswith("aar_"):
+            item["leadbee_api"] = True
         if _is_truthy(
             source.get("use_sms_pool") or source.get("sms_pool_managed")
         ):
@@ -1080,7 +1079,12 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra.get(CHATGPT_USE_SMS_POOL_FLAG)
     )
     if bind_phone_requested:
-        global_config = config_store.get_all()
+        try:
+            global_config = config_store.get_all()
+        except Exception:
+            global_config = {}
+        if not isinstance(global_config, dict):
+            global_config = {}
         global_api_enabled = _is_truthy(global_config.get("leadbee_api_enabled"))
         if (
             prepared.platform != "chatgpt"
@@ -2791,7 +2795,7 @@ def _retryable_chatgpt_bindings(task_id: str) -> list[ChatGPTAttemptBindingModel
 
 def _chatgpt_binding_public(row: ChatGPTAttemptBindingModel) -> dict:
     code = str(row.leadbee_code or "").strip()
-    context = _json_loads(row.mailbox_context_json, {})
+    context = _json_loads(getattr(row, "mailbox_context_json", ""), {})
     api_mode = bool(isinstance(context, dict) and _is_truthy(context.get("leadbee_api")))
     code_hint = "LeadBee API" if api_mode else (mask_sms_code(code) if code else "")
     return {
