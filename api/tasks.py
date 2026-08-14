@@ -37,6 +37,8 @@ MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
 CHATGPT_BIND_PHONE_FLAG = "chatgpt_existing_account_bind_phone_and_get_rt"
 CHATGPT_LEADBEE_CODES_KEY = "chatgpt_existing_account_leadbee_codes"
+CHATGPT_LEADBEE_API_KEY = "chatgpt_existing_account_leadbee_api"
+CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY = "chatgpt_existing_account_leadbee_client_order_ids"
 CHATGPT_USE_SMS_POOL_FLAG = "chatgpt_existing_account_use_sms_pool"
 CHATGPT_LEADBEE_BASE_URLS_KEY = "chatgpt_existing_account_leadbee_base_urls"
 CHATGPT_SMS_POOL_ITEM_IDS_KEY = "chatgpt_sms_pool_item_ids"
@@ -82,6 +84,12 @@ _CHATGPT_LEADBEE_SECRET_KEYS = {
     "_chatgpt_attempt_binding_callback",
     "leadbee_code",
     "chatgpt_leadbee_code",
+    CHATGPT_LEADBEE_API_KEY,
+    CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY,
+    "leadbee_api_enabled",
+    "leadbee_api_key",
+    "leadbee_api_secret",
+    "leadbee_api_product_id",
 }
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
@@ -308,6 +316,35 @@ def _normalize_leadbee_codes(value) -> list[str]:
     return normalized
 
 
+def _normalize_leadbee_client_order_ids(value) -> list[str]:
+    if value in (None, ""):
+        return []
+    if not isinstance(value, (list, tuple)):
+        raise HTTPException(400, "LeadBee API 客户端订单标识格式无效")
+    normalized = [str(item or "").strip() for item in value if str(item or "").strip()]
+    if len(normalized) != len(set(normalized)):
+        raise HTTPException(400, "LeadBee API 客户端订单标识不能重复")
+    import re as _re
+    if any(not _re.fullmatch(r"aar_[0-9a-f]{32}", item) for item in normalized):
+        raise HTTPException(400, "LeadBee API 客户端订单标识格式无效")
+    return normalized
+
+
+def _chatgpt_leadbee_api_config_ready(config: dict | None = None) -> bool:
+    if config is None:
+        from core.config_store import config_store
+
+        config = config_store.get_all()
+    return _is_truthy(config.get("leadbee_api_enabled")) and all(
+        str(config.get(key) or "").strip()
+        for key in ("leadbee_api_key", "leadbee_api_secret", "leadbee_api_product_id")
+    )
+
+
+def _chatgpt_leadbee_api_mode(req: RegisterTaskRequest) -> bool:
+    return _is_truthy(req.extra.get(CHATGPT_LEADBEE_API_KEY))
+
+
 def _normalize_leadbee_base_urls(value) -> list[str]:
     if value in (None, ""):
         return []
@@ -341,6 +378,7 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
             mailbox_context = _json_loads(raw.mailbox_context_json, {})
             source = {
                 "id": raw.id,
+                "account_id": raw.account_id,
                 "email": raw.email,
                 "leadbee_code": raw.leadbee_code,
                 "use_sms_pool": (
@@ -353,23 +391,47 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
                     if isinstance(mailbox_context, dict)
                     else ""
                 ),
+                "leadbee_api": (
+                    _is_truthy(mailbox_context.get("leadbee_api"))
+                    if isinstance(mailbox_context, dict)
+                    else False
+                ),
             }
         elif isinstance(raw, dict):
             source = raw
         else:
             raise HTTPException(400, "失败账号绑定格式无效")
         email = str(source.get("email") or "").strip()
-        leadbee_code = str(source.get("leadbee_code") or "").strip()
+        leadbee_api = _is_truthy(source.get("leadbee_api"))
+        leadbee_code = str(
+            source.get("leadbee_code")
+            or source.get("client_order_id")
+            or ""
+        ).strip()
         try:
             binding_id = int(source.get("id") or source.get("binding_id") or 0)
         except (TypeError, ValueError):
             binding_id = 0
-        if not email or not leadbee_code:
-            raise HTTPException(400, "失败账号缺少邮箱或对应 LeadBee 卡密")
+        try:
+            account_id = int(source.get("account_id") or 0)
+        except (TypeError, ValueError):
+            account_id = 0
+        if not email or (not leadbee_code and not leadbee_api):
+            raise HTTPException(
+                400,
+                "失败账号缺少邮箱或对应 LeadBee API 订单"
+                if leadbee_api
+                else "失败账号缺少邮箱或对应 LeadBee 卡密",
+            )
         item = {
             "id": binding_id,
+            "account_id": account_id,
             "email": email,
             "leadbee_code": leadbee_code,
+            "leadbee_api": bool(
+                leadbee_api
+                or leadbee_code.startswith("aar_")
+            ),
         }
         if _is_truthy(
             source.get("use_sms_pool") or source.get("sms_pool_managed")
@@ -418,6 +480,10 @@ def _build_chatgpt_retry_request(
     if any(pool_modes) and not all(pool_modes):
         raise HTTPException(409, "手填卡密与 SMS 接码池任务不能混合重试")
     use_sms_pool = all(pool_modes)
+    api_modes = [bool(item.get("leadbee_api")) for item in normalized]
+    if any(api_modes) and not all(api_modes):
+        raise HTTPException(409, "LeadBee API 与卡密绑定不能混合重试")
+    api_mode = bool(api_modes and all(api_modes))
     extra = {
         "chatgpt_registration_mode": "refresh_token",
         "chatgpt_has_refresh_token_solution": True,
@@ -427,7 +493,11 @@ def _build_chatgpt_retry_request(
         CHATGPT_BIND_PHONE_FLAG: True,
         CHATGPT_RETRY_BINDINGS_KEY: normalized,
     }
-    if use_sms_pool:
+    if str(config.get("mail_provider") or "").strip():
+        extra["mail_provider"] = str(config.get("mail_provider") or "").strip()
+    if api_mode:
+        extra[CHATGPT_LEADBEE_API_KEY] = True
+    elif use_sms_pool:
         extra[CHATGPT_USE_SMS_POOL_FLAG] = True
     else:
         extra[CHATGPT_LEADBEE_CODES_KEY] = [
@@ -457,7 +527,22 @@ def _redact_task_secret(message, secret: str) -> str:
     text = str(message or "").strip()
     normalized_secret = str(secret or "").strip()
     if normalized_secret:
-        text = text.replace(normalized_secret, "[卡密已隐藏]")
+        replacement = (
+            "[LeadBee API ref 已隐藏]"
+            if normalized_secret.startswith("aar_")
+            else "[卡密已隐藏]"
+        )
+        text = text.replace(normalized_secret, replacement)
+    try:
+        from core.config_store import config_store
+
+        config = config_store.get_all()
+        for key in ("leadbee_api_key", "leadbee_api_secret"):
+            credential = str(config.get(key) or "").strip()
+            if credential:
+                text = text.replace(credential, "[LeadBee API 凭证已隐藏]")
+    except Exception:
+        pass
     return text
 
 
@@ -995,6 +1080,8 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
         prepared.extra.get(CHATGPT_USE_SMS_POOL_FLAG)
     )
     if bind_phone_requested:
+        global_config = config_store.get_all()
+        global_api_enabled = _is_truthy(global_config.get("leadbee_api_enabled"))
         if (
             prepared.platform != "chatgpt"
             or not _is_truthy(
@@ -1002,7 +1089,23 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
             )
         ):
             raise HTTPException(400, "登录并接码仅支持 ChatGPT 已有账号登录任务")
-        if use_sms_pool_requested:
+        api_marker_requested = _chatgpt_leadbee_api_mode(prepared)
+        api_mode_requested = api_marker_requested or global_api_enabled
+        if api_mode_requested:
+            if not _chatgpt_leadbee_api_config_ready(global_config):
+                raise HTTPException(409, "LeadBee API 未启用或配置不完整")
+            if use_sms_pool_requested:
+                raise HTTPException(400, "LeadBee API 模式不能与 SMS 接码池混用")
+            prepared.extra[CHATGPT_LEADBEE_API_KEY] = True
+            prepared.extra.pop(CHATGPT_LEADBEE_CODES_KEY, None)
+            prepared.extra.pop(CHATGPT_LEADBEE_BASE_URLS_KEY, None)
+            prepared.extra.pop(CHATGPT_SMS_POOL_ITEM_IDS_KEY, None)
+            prepared.extra[CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY] = [
+                f"aar_{uuid.uuid4().hex}" for _ in range(prepared.count)
+            ]
+            use_sms_pool_requested = False
+            codes = []
+        elif use_sms_pool_requested:
             codes = []
             prepared.extra.pop(CHATGPT_LEADBEE_CODES_KEY, None)
             prepared.extra.pop(CHATGPT_LEADBEE_BASE_URLS_KEY, None)
@@ -1029,14 +1132,18 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
                     "失败账号绑定数量需与重试数量一致",
                 )
             bound_codes = [item["leadbee_code"] for item in retry_bindings]
-            if not use_sms_pool_requested and bound_codes != codes:
+            if (
+                not use_sms_pool_requested
+                and not api_mode_requested
+                and bound_codes != codes
+            ):
                 raise HTTPException(400, "失败账号与 LeadBee 卡密顺序不一致")
             prepared.extra[CHATGPT_RETRY_BINDINGS_KEY] = retry_bindings
         else:
             prepared.extra.pop(CHATGPT_RETRY_BINDINGS_KEY, None)
         prepared.extra[CHATGPT_BIND_PHONE_FLAG] = True
         prepared.extra[CHATGPT_USE_SMS_POOL_FLAG] = use_sms_pool_requested
-        if not use_sms_pool_requested:
+        if not use_sms_pool_requested and not api_mode_requested:
             prepared.extra[CHATGPT_LEADBEE_CODES_KEY] = codes
         # 先走已经实测稳定的 AT 登录，再续接同一授权事务完成手机验证。
         prepared.extra["chatgpt_existing_account_login_stage"] = "access_token"
@@ -2684,7 +2791,9 @@ def _retryable_chatgpt_bindings(task_id: str) -> list[ChatGPTAttemptBindingModel
 
 def _chatgpt_binding_public(row: ChatGPTAttemptBindingModel) -> dict:
     code = str(row.leadbee_code or "").strip()
-    code_hint = mask_sms_code(code) if code else ""
+    context = _json_loads(row.mailbox_context_json, {})
+    api_mode = bool(isinstance(context, dict) and _is_truthy(context.get("leadbee_api")))
+    code_hint = "LeadBee API" if api_mode else (mask_sms_code(code) if code else "")
     return {
         "id": row.id,
         "task_id": row.task_id,
@@ -2695,8 +2804,28 @@ def _chatgpt_binding_public(row: ChatGPTAttemptBindingModel) -> dict:
         "status": row.status,
         "error": _redact_task_secret(row.error, code),
         "leadbee_code_hint": code_hint,
+        "leadbee_api": api_mode,
         "retry_count": row.retry_count,
     }
+
+
+def _resolve_chatgpt_retry_account_id(
+    bound_account_id: int,
+    saved_account,
+    email: str,
+) -> int:
+    """Prefer the persisted account identity when a retry binding is stale."""
+    bound_id = int(bound_account_id or 0)
+    saved_id = int(getattr(saved_account, "id", 0) or 0)
+    if not saved_id:
+        return bound_id
+    if not bound_id:
+        return saved_id
+    saved_email = str(getattr(saved_account, "email", "") or "").strip().lower()
+    requested_email = str(email or "").strip().lower()
+    if saved_id == bound_id and saved_email == requested_email:
+        return bound_id
+    return saved_id
 
 
 def _auto_upload_integrations(task_id: str, account):
@@ -2727,6 +2856,8 @@ def _complete_chatgpt_leadbee_verification(
     account_id: int,
     leadbee_code: str,
     leadbee_base_url: str = "",
+    leadbee_api: bool = False,
+    client_order_id: str = "",
     on_provider_start=None,
     on_exchange_code_consumed=None,
     on_exchange_code_restored=None,
@@ -2734,6 +2865,9 @@ def _complete_chatgpt_leadbee_verification(
     attempt_id: int | None,
 ) -> dict:
     """Enter one of LeadBee's five provider slots and wait for completion."""
+    if leadbee_api:
+        on_exchange_code_consumed = None
+        on_exchange_code_restored = None
     from services.chatgpt_phone_verification import (
         LEADBEE_PROVIDER_SLOT_WAIT_SECONDS,
         leadbee_phone_flow_lock,
@@ -2749,7 +2883,9 @@ def _complete_chatgpt_leadbee_verification(
         remaining = slot_deadline - time.monotonic()
         if remaining <= 0:
             raise RuntimeError(
-                "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
+                "LeadBee API 服务并发槽位排队超时"
+                if leadbee_api
+                else "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
             )
         acquired_provider_slot = leadbee_phone_flow_lock.acquire(
             timeout=min(0.25, remaining)
@@ -2783,6 +2919,8 @@ def _complete_chatgpt_leadbee_verification(
             account_id=account_id,
             leadbee_code=leadbee_code,
             leadbee_base_url=leadbee_base_url,
+            leadbee_api=leadbee_api,
+            client_order_id=client_order_id,
             on_provider_start=(
                 _tracked_provider_start if callable(on_provider_start) else None
             ),
@@ -2853,6 +2991,8 @@ def _complete_chatgpt_leadbee_verification_serialized(
     account_id: int,
     leadbee_code: str,
     leadbee_base_url: str = "",
+    leadbee_api: bool = False,
+    client_order_id: str = "",
     on_provider_start=None,
     on_exchange_code_consumed=None,
     on_exchange_code_restored=None,
@@ -2865,15 +3005,23 @@ def _complete_chatgpt_leadbee_verification_serialized(
     from services.chatgpt_phone_verification import phone_verification_manager
 
     start_kwargs = {
-        "leadbee_code": str(leadbee_code or "").strip(),
         "leadbee_base_url": str(leadbee_base_url or "").strip(),
         "provider_lock_already_held": True,
     }
-    if callable(on_exchange_code_consumed):
+    if leadbee_api:
+        start_kwargs.update(
+            {
+                "leadbee_api": True,
+                "client_order_id": str(client_order_id or "").strip(),
+            }
+        )
+    else:
+        start_kwargs["leadbee_code"] = str(leadbee_code or "").strip()
+    if not leadbee_api and callable(on_exchange_code_consumed):
         start_kwargs["on_exchange_code_consumed"] = on_exchange_code_consumed
     if callable(on_provider_start):
         start_kwargs["on_provider_start"] = on_provider_start
-    if callable(on_exchange_code_restored):
+    if not leadbee_api and callable(on_exchange_code_restored):
         start_kwargs["on_exchange_code_restored"] = on_exchange_code_restored
     if callable(on_provider_lock_handoff):
         start_kwargs["on_provider_lock_handoff"] = on_provider_lock_handoff
@@ -2946,11 +3094,22 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 "session_id": session_id,
                 "status": "failed",
                 "message": (
-                    "同一 LeadBee 卡密已有独立会话在运行；"
-                    + (
-                        "当前任务的卡密副本已隔离，未接管旧会话"
-                        if must_quarantine
-                        else "当前任务已按旧会话的已知卡密终态安全结算"
+                    (
+                        "同一 LeadBee API 订单已有独立会话在运行；"
+                        + (
+                            "当前任务未接管旧订单"
+                            if must_quarantine
+                            else "当前任务已按旧订单的已知终态安全结算"
+                        )
+                    )
+                    if leadbee_api
+                    else (
+                        "同一 LeadBee 卡密已有独立会话在运行；"
+                        + (
+                            "当前任务的卡密副本已隔离，未接管旧会话"
+                            if must_quarantine
+                            else "当前任务已按旧会话的已知卡密终态安全结算"
+                        )
                     )
                 ),
                 "provider_started": effective_provider_started,
@@ -3036,7 +3195,11 @@ def _complete_chatgpt_leadbee_verification_serialized(
                     _log(
                         task_id,
                         "  [接码] 已收到任务控制请求；Refresh Token 正在提交，"
-                        "为避免把已消费卡密误判失败，将等待本次保存确认或达到保存期限",
+                        + (
+                            "为避免把 API 订单误判失败，将等待本次保存确认或达到保存期限"
+                            if leadbee_api
+                            else "为避免把已消费卡密误判失败，将等待本次保存确认或达到保存期限"
+                        ),
                     )
                     control_request_deferred = True
             waiting_for_finalization = True
@@ -3098,7 +3261,11 @@ def _complete_chatgpt_leadbee_verification_serialized(
             _log(
                 task_id,
                 "  [接码] 已请求结束超时会话，继续等待服务端清理确认；"
-                "期间不会释放卡密或并发槽位",
+                + (
+                    "期间不会释放 API 订单或并发槽位"
+                    if leadbee_api
+                    else "期间不会释放卡密或并发槽位"
+                ),
             )
             continue
 
@@ -3114,7 +3281,11 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 _log(
                     task_id,
                     f"  [接码] 已收到{action}请求；LeadBee 激活后排队任务可能不可取消，"
-                    "为避免烧掉卡密，当前卡继续等待到终态，其余账号不再启动接码",
+                    + (
+                        "为避免重复 API 订单，当前请求继续等待到终态，其余账号不再启动接码"
+                        if leadbee_api
+                        else "为避免烧掉卡密，当前卡继续等待到终态，其余账号不再启动接码"
+                    ),
                 )
                 control_request_deferred = True
                 continue
@@ -3146,8 +3317,9 @@ def _complete_chatgpt_leadbee_verification_serialized(
                 fallback["exchange_code_settlement"] = "active_unknown"
                 fallback["exchange_code_unusable"] = False
                 fallback["message"] = (
-                    "LeadBee 会话记录已结束，但服务端卡密终态不可确认；"
-                    "卡密保持隔离等待人工核对"
+                    "LeadBee API 会话记录已结束，但服务端订单终态不可确认"
+                    if leadbee_api
+                    else "LeadBee 会话记录已结束，但服务端卡密终态不可确认；卡密保持隔离等待人工核对"
                 )
             return fallback
 
@@ -3301,12 +3473,23 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         # 预先计算 merged_extra，所有线程共享只读副本，避免每线程重复调用 config_store
         from core.config_store import config_store as _cs
         _bind_phone_and_get_rt = _chatgpt_bind_phone_enabled(req)
+        _leadbee_api = _chatgpt_leadbee_api_mode(req) and _bind_phone_and_get_rt
         _leadbee_codes = (
             _normalize_leadbee_codes(req.extra.get(CHATGPT_LEADBEE_CODES_KEY))
-            if _bind_phone_and_get_rt
+            if _bind_phone_and_get_rt and not _leadbee_api
             else []
         )
-        _use_sms_pool = _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
+        _leadbee_client_order_ids = (
+            _normalize_leadbee_client_order_ids(
+                req.extra.get(CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY)
+            )
+            if _leadbee_api
+            else []
+        )
+        _use_sms_pool = (
+            _is_truthy(req.extra.get(CHATGPT_USE_SMS_POOL_FLAG))
+            and not _leadbee_api
+        )
         _leadbee_base_urls = (
             _normalize_leadbee_base_urls(
                 req.extra.get(CHATGPT_LEADBEE_BASE_URLS_KEY)
@@ -3331,7 +3514,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         _mail_provider_plan = _normalize_chatgpt_mail_provider_plan(
             req.extra.get(CHATGPT_MAIL_PROVIDER_PLAN_KEY)
         )
-        if _bind_phone_and_get_rt and len(_leadbee_codes) != req.count:
+        if _leadbee_api and len(_leadbee_client_order_ids) != req.count:
+            raise RuntimeError("LeadBee API 客户端订单标识数量与登录数量不一致")
+        if _bind_phone_and_get_rt and not _leadbee_api and len(_leadbee_codes) != req.count:
             raise RuntimeError(
                 "卡密数量需与登录数量一致"
                 f"（需要 {req.count} 个，当前 {len(_leadbee_codes)} 个）"
@@ -3411,18 +3596,35 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
 
         def _persist_binding(**kwargs):
             if binding_persistence_disabled.is_set():
+                if _leadbee_api:
+                    raise RuntimeError(
+                        "LeadBee API 订单绑定无法持久化，未启动接码"
+                    )
                 return None
             try:
-                return _upsert_chatgpt_attempt_binding(**kwargs)
+                row = _upsert_chatgpt_attempt_binding(**kwargs)
             except Exception as exc:
+                if _leadbee_api:
+                    raise RuntimeError(
+                        "LeadBee API 订单绑定保存失败，未启动接码"
+                    ) from None
                 if not binding_persistence_disabled.is_set():
                     binding_persistence_disabled.set()
                     _log(
                         task_id,
-                        "[WARN] 邮箱与接码卡密绑定暂未写入数据库，"
-                        f"本次登录继续执行（{type(exc).__name__}）",
+                        (
+                            "[WARN] 邮箱与 LeadBee API 订单绑定暂未写入数据库，"
+                            if _leadbee_api
+                            else "[WARN] 邮箱与接码卡密绑定暂未写入数据库，"
+                        )
+                        + f"本次登录继续执行（{type(exc).__name__}）",
                     )
                 return None
+            if _leadbee_api and row is None:
+                raise RuntimeError(
+                    "LeadBee API 订单绑定保存失败，未启动接码"
+                )
+            return row
 
         def _do_one(i: int):
             nonlocal next_start_time
@@ -3436,10 +3638,18 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             phone_background_ownership_pending = False
             retry_binding = _retry_bindings[i] if _retry_bindings else {}
             bound_email = str(retry_binding.get("email") or "").strip()
+            bound_account_id = int(retry_binding.get("account_id") or 0)
             bound_mail_provider = str(
                 retry_binding.get("mail_provider") or ""
             ).strip()
-            leadbee_code = _leadbee_codes[i] if _bind_phone_and_get_rt else ""
+            client_order_id = (
+                _leadbee_client_order_ids[i] if _leadbee_api else ""
+            )
+            leadbee_code = (
+                client_order_id
+                if _leadbee_api
+                else (_leadbee_codes[i] if _bind_phone_and_get_rt else "")
+            )
             leadbee_base_url = _leadbee_base_urls[i] if _use_sms_pool else ""
             sms_pool_item_id = _sms_pool_item_ids[i] if _use_sms_pool else 0
             sms_pool_consumed = False
@@ -3447,11 +3657,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             sms_pool_settlement_pending = False
             parent_binding_id = int(retry_binding.get("id") or 0)
             current_email = bound_email or req.email or ""
+            current_account_id = bound_account_id
             current_stage = "login"
             attempt_id: int | None = None
 
             def _sms_pool_binding_context(value=None):
                 context = dict(value) if isinstance(value, dict) else {}
+                if _leadbee_api:
+                    context["leadbee_api"] = True
                 if sms_pool_item_id:
                     context["sms_pool_managed"] = True
                     context["sms_pool_item_id"] = sms_pool_item_id
@@ -3467,6 +3680,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         attempt_index=i,
                         leadbee_code=leadbee_code,
                         email=current_email,
+                        account_id=current_account_id,
                         stage=current_stage,
                         status="running",
                         mailbox_context=_sms_pool_binding_context(),
@@ -3529,6 +3743,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             attempt_index=i,
                             leadbee_code=leadbee_code,
                             email=current_email,
+                            account_id=current_account_id,
                             stage="login",
                             status="running",
                             mailbox_context=mailbox_context,
@@ -3660,13 +3875,21 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     _proxy_pool.report_success(_proxy)
 
                 if _bind_phone_and_get_rt:
+                    saved_account_id = int(
+                        getattr(saved_account, "id", 0) or 0
+                    )
+                    current_account_id = _resolve_chatgpt_retry_account_id(
+                        bound_account_id,
+                        saved_account,
+                        account.email,
+                    )
                     current_stage = "phone"
                     _persist_binding(
                         task_id=task_id,
                         attempt_index=i,
                         leadbee_code=leadbee_code,
                         email=account.email,
-                        account_id=int(getattr(saved_account, "id", 0) or 0),
+                        account_id=current_account_id,
                         stage=current_stage,
                         status="running",
                         mailbox_context=_sms_pool_binding_context(
@@ -3700,7 +3923,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             attempt_index=i,
                             leadbee_code=leadbee_code,
                             email=account.email,
-                            account_id=int(getattr(saved_account, "id", 0) or 0),
+                            account_id=current_account_id,
                             stage=current_stage,
                             status="failed",
                             error=failure,
@@ -3708,7 +3931,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         )
                         return AttemptResult.failed(failure)
 
-                    account_id = getattr(saved_account, "id", None)
+                    account_id = current_account_id
                     if not account_id:
                         failure = "邮箱登录成功，但账号保存后缺少 ID，无法开始接码"
                         _log(task_id, f"[FAIL] {failure}: {account.email}")
@@ -3728,6 +3951,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             attempt_index=i,
                             leadbee_code=leadbee_code,
                             email=account.email,
+                            account_id=current_account_id,
                             stage=current_stage,
                             status="failed",
                             error=failure,
@@ -3812,8 +4036,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             phone_result = _complete_chatgpt_leadbee_verification(
                                 task_id=task_id,
                                 account_id=int(account_id),
-                                leadbee_code=active_leadbee_code,
+                                leadbee_code=(
+                                    "" if _leadbee_api else active_leadbee_code
+                                ),
                                 leadbee_base_url=active_leadbee_base_url,
+                                leadbee_api=_leadbee_api,
+                                client_order_id=client_order_id,
                                 on_provider_start=(
                                     _mark_sms_pool_active
                                     if active_pool_item_id
@@ -3842,6 +4070,51 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                     active_leadbee_code,
                                 ),
                             }
+
+                        if _leadbee_api:
+                            actual_client_order_id = str(
+                                phone_result.get("client_order_id") or ""
+                            ).strip()
+                            if actual_client_order_id and not re.fullmatch(
+                                r"aar_[0-9a-f]{32}",
+                                actual_client_order_id,
+                            ):
+                                raise RuntimeError(
+                                    "LeadBee API 返回的订单标识无效"
+                                )
+                            if (
+                                bool(phone_result.get("reused", False))
+                                and not actual_client_order_id
+                            ):
+                                raise RuntimeError(
+                                    "LeadBee API 复用会话缺少订单标识"
+                                )
+                            if (
+                                actual_client_order_id
+                                and actual_client_order_id != client_order_id
+                            ):
+                                client_order_id = actual_client_order_id
+                                leadbee_code = actual_client_order_id
+                                _persist_binding(
+                                    task_id=task_id,
+                                    attempt_index=i,
+                                    leadbee_code=leadbee_code,
+                                    email=account.email,
+                                    account_id=current_account_id,
+                                    stage=current_stage,
+                                    status="running",
+                                    mailbox_context=_sms_pool_binding_context(
+                                        account.extra.get(
+                                            "mailbox_login_context"
+                                        )
+                                        if isinstance(
+                                            getattr(account, "extra", None),
+                                            dict,
+                                        )
+                                        else None
+                                    ),
+                                    parent_binding_id=parent_binding_id,
+                                )
 
                         phone_status = str(
                             phone_result.get("status") or ""
@@ -4173,7 +4446,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         attempt_index=i,
                         leadbee_code=leadbee_code,
                         email=current_email,
-                        account_id=int(getattr(saved_account, "id", 0) or 0),
+                        account_id=current_account_id,
                         stage=current_stage,
                         status="failed",
                         error=str(e),
@@ -4194,7 +4467,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         attempt_index=i,
                         leadbee_code=leadbee_code,
                         email=current_email,
-                        account_id=int(getattr(saved_account, "id", 0) or 0),
+                        account_id=current_account_id,
                         stage=current_stage,
                         status="failed",
                         error=str(e),
@@ -4223,7 +4496,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         attempt_index=i,
                         leadbee_code=leadbee_code,
                         email=current_email,
-                        account_id=int(getattr(saved_account, "id", 0) or 0),
+                        account_id=current_account_id,
                         stage=current_stage,
                         status="failed",
                         error=str(e),

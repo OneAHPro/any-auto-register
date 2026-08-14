@@ -10,6 +10,7 @@ from fastapi import HTTPException
 from api.tasks import (
     RegisterTaskRequest,
     _complete_chatgpt_leadbee_verification,
+    _build_chatgpt_retry_request,
     _prepare_register_request,
     _run_register,
     _task_action_terms,
@@ -116,6 +117,11 @@ class _ExistingAccountPlatform(BasePlatform):
 
 
 class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
+    def setUp(self):
+        config = patch("core.config_store.config_store.get_all", return_value={})
+        config.start()
+        self.addCleanup(config.stop)
+
     def _request(self, *, count=2, codes=None, enabled=True):
         return RegisterTaskRequest(
             platform="chatgpt",
@@ -165,8 +171,157 @@ class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
             prepared.extra,
         )
 
+    def test_prepare_api_mode_allows_missing_codes_and_generates_refs(self):
+        request = self._request(codes=[])
+        request.extra["chatgpt_existing_account_leadbee_api"] = True
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "leadbee_api_enabled": "yes",
+                "leadbee_api_key": "fixture-key",
+                "leadbee_api_secret": "fixture-secret",
+                "leadbee_api_product_id": "fixture-product",
+            },
+        ):
+            prepared = _prepare_register_request(request)
+
+        self.assertTrue(prepared.extra["chatgpt_existing_account_leadbee_api"])
+        refs = prepared.extra["chatgpt_existing_account_leadbee_client_order_ids"]
+        self.assertEqual(len(refs), request.count)
+        self.assertEqual(len(set(refs)), request.count)
+        self.assertTrue(all(__import__("re").fullmatch(r"aar_[0-9a-f]{32}", ref) for ref in refs))
+        self.assertNotIn("chatgpt_existing_account_leadbee_codes", prepared.extra)
+
+    def test_prepare_auto_selects_complete_global_api_without_request_marker(self):
+        request = self._request(codes=[])
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "leadbee_api_enabled": "1",
+                "leadbee_api_key": "fixture-key",
+                "leadbee_api_secret": "fixture-secret",
+                "leadbee_api_product_id": "fixture-product",
+            },
+        ):
+            prepared = _prepare_register_request(request)
+
+        self.assertTrue(prepared.extra["chatgpt_existing_account_leadbee_api"])
+        refs = prepared.extra["chatgpt_existing_account_leadbee_client_order_ids"]
+        self.assertEqual(len(refs), request.count)
+        self.assertEqual(len(set(refs)), request.count)
+        self.assertNotIn("chatgpt_existing_account_leadbee_codes", prepared.extra)
+
+    def test_prepare_global_api_rejects_sms_pool_without_reserving(self):
+        request = self._request(codes=[])
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+        request.extra["chatgpt_existing_account_use_sms_pool"] = True
+        with (
+            patch(
+                "core.config_store.config_store.get_all",
+                return_value={
+                    "leadbee_api_enabled": "1",
+                    "leadbee_api_key": "fixture-key",
+                    "leadbee_api_secret": "fixture-secret",
+                    "leadbee_api_product_id": "fixture-product",
+                },
+            ),
+            patch("api.tasks.sms_pool_service.reserve") as reserve,
+            self.assertRaisesRegex(HTTPException, "不能与 SMS 接码池混用") as ctx,
+        ):
+            _prepare_register_request(request)
+        self.assertEqual(ctx.exception.status_code, 400)
+        reserve.assert_not_called()
+
+    def test_prepare_global_api_enabled_but_incomplete_is_not_legacy(self):
+        request = self._request(codes=[])
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"leadbee_api_enabled": "1", "leadbee_api_key": "fixture-key"},
+        ), self.assertRaises(HTTPException) as ctx:
+            _prepare_register_request(request)
+        self.assertEqual(ctx.exception.status_code, 409)
+
+    def test_prepare_disabled_global_api_keeps_legacy_cards(self):
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"leadbee_api_enabled": "0"},
+        ):
+            prepared = _prepare_register_request(
+                self._request(codes=["legacy-one", "legacy-two"])
+            )
+        self.assertNotIn("chatgpt_existing_account_leadbee_api", prepared.extra)
+        self.assertEqual(
+            prepared.extra["chatgpt_existing_account_leadbee_codes"],
+            ["legacy-one", "legacy-two"],
+        )
+
+    def test_prepare_api_mode_rejects_incomplete_config(self):
+        request = self._request(codes=[])
+        request.extra["chatgpt_existing_account_leadbee_api"] = True
+        request.extra.pop("chatgpt_existing_account_leadbee_codes", None)
+        with patch(
+            "core.config_store.config_store.get_all",
+            return_value={"leadbee_api_enabled": "1", "leadbee_api_key": "fixture-key"},
+        ), self.assertRaises(HTTPException):
+            _prepare_register_request(request)
+
+    def test_api_retry_keeps_mailbox_binding_but_reissues_refs(self):
+        old_refs = ["aar_" + "1" * 32, "aar_" + "2" * 32]
+        bindings = [
+            {"id": 11, "email": "same-1@example.com", "leadbee_code": old_refs[0]},
+            {"id": 12, "email": "same-2@example.com", "leadbee_code": old_refs[1]},
+        ]
+        config = {
+            "leadbee_api_enabled": "true",
+            "leadbee_api_key": "fixture-key",
+            "leadbee_api_secret": "fixture-secret",
+            "leadbee_api_product_id": "fixture-product",
+            "mail_provider": "microsoft",
+        }
+        with patch("core.config_store.config_store.get_all", return_value=config):
+            retry = _build_chatgpt_retry_request(bindings)
+            prepared = _prepare_register_request(retry)
+        refs = prepared.extra["chatgpt_existing_account_leadbee_client_order_ids"]
+        self.assertEqual(len(refs), 2)
+        self.assertTrue(set(refs).isdisjoint(old_refs))
+        self.assertEqual(
+            [item["email"] for item in prepared.extra["chatgpt_retry_bindings"]],
+            ["same-1@example.com", "same-2@example.com"],
+        )
+
 
 class LeadBeeTaskCancellationTests(unittest.TestCase):
+    def test_api_completion_passes_client_order_without_card_code(self):
+        manager = Mock()
+        manager.start.return_value = {
+            "session_id": "api-session",
+            "status": "completed",
+            "provider_cleanup_settled": True,
+            "logs": [],
+            "expires_in": 600,
+        }
+        with patch(
+            "services.chatgpt_phone_verification.phone_verification_manager",
+            manager,
+        ):
+            result = _complete_chatgpt_leadbee_verification(
+                task_id="task-api-completion",
+                account_id=101,
+                leadbee_code="",
+                leadbee_api=True,
+                client_order_id="aar_" + "a" * 32,
+                control=Mock(),
+                attempt_id=101,
+            )
+        self.assertEqual(result["status"], "completed")
+        kwargs = manager.start.call_args.kwargs
+        self.assertTrue(kwargs["leadbee_api"])
+        self.assertEqual(kwargs["client_order_id"], "aar_" + "a" * 32)
+        self.assertNotIn("leadbee_code", kwargs)
+
     def test_phone_flows_use_parallel_provider_slots(self):
         first_started = threading.Event()
         second_started = threading.Event()
@@ -462,6 +617,9 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         account_was_created=True,
         persist_refresh_token_on_completion=True,
         count=2,
+        api_mode=False,
+        retry_bindings=None,
+        saved_account_ids=None,
     ):
         req = RegisterTaskRequest(
             platform="chatgpt",
@@ -473,13 +631,21 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
                 "chatgpt_existing_account_login_only": True,
                 "chatgpt_existing_account_login_stage": "access_token",
                 "chatgpt_existing_account_bind_phone_and_get_rt": True,
-                "chatgpt_existing_account_leadbee_codes": (
-                    ["card-secret-one", "card-secret-two"]
-                    if count == 2
-                    else [f"card-secret-{index + 1}" for index in range(count)]
-                ),
             },
         )
+        if api_mode:
+            req.extra["chatgpt_existing_account_leadbee_api"] = True
+            req.extra["chatgpt_existing_account_leadbee_client_order_ids"] = [
+                "aar_" + f"{index + 1:032x}" for index in range(count)
+            ]
+        else:
+            req.extra["chatgpt_existing_account_leadbee_codes"] = (
+                ["card-secret-one", "card-secret-two"]
+                if count == 2
+                else [f"card-secret-{index + 1}" for index in range(count)]
+            )
+        if retry_bindings:
+            req.extra["chatgpt_retry_bindings"] = retry_bindings
         _task_store.create(
             task_id,
             platform="chatgpt",
@@ -490,7 +656,11 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         saved = []
 
         def save_account(account):
-            account_id = len(saved) + 1
+            account_id = (
+                saved_account_ids[len(saved)]
+                if saved_account_ids is not None
+                else len(saved) + 1
+            )
             extra = dict(account.extra or {})
             row = SimpleNamespace(
                 id=account_id,
@@ -529,10 +699,19 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
                 "core.db.delete_incomplete_chatgpt_account",
                 return_value=True,
             ) as cleanup_incomplete,
-            patch("core.config_store.config_store.get_all", return_value={
-                "leadbee_code": "global-card-that-must-not-leak",
-                "chatgpt_leadbee_code": "global-card-alias-that-must-not-leak",
-            }),
+            patch("core.config_store.config_store.get_all", return_value=(
+                {
+                    "leadbee_api_enabled": "1",
+                    "leadbee_api_key": "api-key-secret",
+                    "leadbee_api_secret": "api-secret-secret",
+                    "leadbee_api_product_id": "api-product",
+                }
+                if api_mode
+                else {
+                    "leadbee_code": "global-card-that-must-not-leak",
+                    "chatgpt_leadbee_code": "global-card-alias-that-must-not-leak",
+                }
+            )),
             patch(
                 "api.tasks._complete_chatgpt_leadbee_verification",
                 side_effect=complete_and_persist,
@@ -557,6 +736,213 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             save_task_log,
             cleanup_incomplete,
         )
+
+    def test_api_batch_uses_unique_refs_without_sms_pool_calls(self):
+        with (
+            patch("api.tasks.sms_pool_service.reserve") as reserve,
+            patch("api.tasks.sms_pool_service.mark_active") as mark_active,
+            patch("api.tasks.sms_pool_service.mark_restored") as mark_restored,
+            patch("api.tasks.sms_pool_service.finalize") as finalize,
+            patch("api.tasks.sms_pool_service.release_task") as release_task,
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-login-phone-api",
+                api_mode=True,
+                completion=lambda **kwargs: {
+                    "status": "completed",
+                    "message": "LeadBee API 状态已更新 api-secret-secret",
+                    "phone_verified": True,
+                    "exchange_code_consumed": False,
+                    "account_id": kwargs["account_id"],
+                },
+            )
+        for method in (reserve, mark_active, mark_restored, finalize, release_task):
+            method.assert_not_called()
+        refs = [call.kwargs["client_order_id"] for call in complete.call_args_list]
+        self.assertEqual(len(refs), 2)
+        self.assertEqual(len(set(refs)), 2)
+        self.assertTrue(all(ref.startswith("aar_") for ref in refs))
+        self.assertTrue(all(call.kwargs["leadbee_api"] for call in complete.call_args_list))
+        self.assertTrue(all("leadbee_code" not in call.kwargs or not call.kwargs["leadbee_code"] for call in complete.call_args_list))
+        self.assertEqual(snapshot["success"], 2)
+        self.assertNotIn("api-secret-secret", str(snapshot))
+
+    def test_api_binding_persistence_failure_blocks_all_provider_orders(self):
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=RuntimeError("fixture database unavailable"),
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-api-binding-fail-closed",
+                api_mode=True,
+                completion=lambda **_: {
+                    "status": "completed",
+                    "message": "LeadBee API 状态已更新",
+                },
+            )
+
+        complete.assert_not_called()
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(snapshot["errors"]), 2)
+
+    def test_legacy_card_binding_persistence_failure_still_runs_provider(self):
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=RuntimeError("fixture database unavailable"),
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-card-binding-best-effort",
+                api_mode=False,
+                count=1,
+                completion=lambda **kwargs: {
+                    "status": "completed",
+                    "message": "手机验证完成",
+                    "account_id": kwargs["account_id"],
+                },
+            )
+
+        self.assertEqual(complete.call_count, 1)
+        self.assertEqual(snapshot["success"], 1)
+
+    def test_api_partial_binding_failure_blocks_only_undurable_ref(self):
+        persisted = []
+
+        def persist(**kwargs):
+            if kwargs["attempt_index"] == 1:
+                raise RuntimeError("fixture partial persistence failure")
+            persisted.append(dict(kwargs))
+            return SimpleNamespace()
+
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=persist,
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-api-binding-partial-failure",
+                api_mode=True,
+                completion=lambda **kwargs: {
+                    "status": "completed",
+                    "message": "LeadBee API 状态已更新",
+                    "account_id": kwargs["account_id"],
+                },
+            )
+
+        self.assertEqual(complete.call_count, 1)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertTrue(any(item["attempt_index"] == 0 for item in persisted))
+
+    def test_api_retry_binding_preserves_original_account_id(self):
+        persisted = []
+
+        def persist(**kwargs):
+            persisted.append(dict(kwargs))
+            return SimpleNamespace()
+
+        retry = [{
+            "id": 7,
+            "account_id": 42,
+            "email": "retry-42@example.com",
+            "leadbee_api": True,
+            "leadbee_code": "aar_" + "f" * 32,
+        }]
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=persist,
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-api-retry-account-id",
+                api_mode=True,
+                count=1,
+                retry_bindings=retry,
+                persist_refresh_token_on_completion=False,
+                completion=lambda **_: {
+                    "status": "failed",
+                    "message": "LeadBee API fixture failure",
+                },
+            )
+
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(complete.call_args.kwargs["account_id"], 1)
+        self.assertTrue(persisted)
+        terminal_rows = [
+            item
+            for item in persisted
+            if item.get("stage") in {"phone", "completed"}
+            or item.get("status") in {"failed", "success"}
+        ]
+        self.assertTrue(terminal_rows)
+        self.assertEqual(
+            {int(item.get("account_id") or 0) for item in terminal_rows},
+            {1},
+        )
+
+    def test_retry_account_id_is_retained_when_saved_identity_matches(self):
+        persisted = []
+
+        def persist(**kwargs):
+            persisted.append(dict(kwargs))
+            return SimpleNamespace()
+
+        retry = [{
+            "id": 7,
+            "account_id": 42,
+            "email": "retry-42@example.com",
+            "leadbee_api": True,
+            "leadbee_code": "aar_" + "f" * 32,
+        }]
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=persist,
+        ):
+            _snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-api-retry-account-id-valid",
+                api_mode=True,
+                count=1,
+                retry_bindings=retry,
+                saved_account_ids=[42],
+                persist_refresh_token_on_completion=False,
+                completion=lambda **_: {
+                    "status": "failed",
+                    "message": "LeadBee API fixture failure",
+                },
+            )
+
+        self.assertEqual(complete.call_args.kwargs["account_id"], 42)
+        self.assertEqual(
+            {int(item.get("account_id") or 0) for item in persisted},
+            {42},
+        )
+
+    def test_api_reused_session_reconciles_actual_client_order_id(self):
+        persisted = []
+        actual_ref = "aar_" + "a" * 32
+
+        def persist(**kwargs):
+            persisted.append(dict(kwargs))
+            return SimpleNamespace()
+
+        with patch(
+            "api.tasks._upsert_chatgpt_attempt_binding",
+            side_effect=persist,
+        ):
+            snapshot, _saved, complete, _logs, _cleanup = self._run(
+                "task-chatgpt-api-reused-session-ref",
+                api_mode=True,
+                count=1,
+                completion=lambda **kwargs: {
+                    "status": "completed",
+                    "message": "LeadBee API 状态已更新",
+                    "account_id": kwargs["account_id"],
+                    "reused": True,
+                    "client_order_id": actual_ref,
+                },
+            )
+
+        self.assertEqual(snapshot["success"], 1)
+        success_rows = [item for item in persisted if item.get("status") == "success"]
+        self.assertEqual(len(success_rows), 1)
+        self.assertEqual(success_rows[0]["leadbee_code"], actual_ref)
 
     def test_concurrent_attempts_receive_distinct_codes_without_exposing_them(self):
         def completion(**kwargs):
