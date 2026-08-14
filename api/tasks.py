@@ -2868,20 +2868,32 @@ def _complete_chatgpt_leadbee_verification(
     control,
     attempt_id: int | None,
 ) -> dict:
-    """Enter one of LeadBee's five provider slots and wait for completion."""
+    """Enter the selected LeadBee provider queue and wait for completion."""
     if leadbee_api:
         on_exchange_code_consumed = None
         on_exchange_code_restored = None
     from services.chatgpt_phone_verification import (
-        LEADBEE_PROVIDER_SLOT_WAIT_SECONDS,
+        LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS,
+        leadbee_api_phone_flow_lock,
         leadbee_phone_flow_lock,
         phone_verification_manager,
     )
 
-    slot_deadline = (
-        time.monotonic() + LEADBEE_PROVIDER_SLOT_WAIT_SECONDS
+    provider_lock = (
+        leadbee_api_phone_flow_lock if leadbee_api else leadbee_phone_flow_lock
     )
-    acquired_provider_slot = leadbee_phone_flow_lock.acquire(blocking=False)
+    try:
+        manager_ttl_seconds = float(
+            getattr(phone_verification_manager, "ttl_seconds", 600.0)
+        )
+    except (TypeError, ValueError):
+        manager_ttl_seconds = 600.0
+    slot_wait_seconds = max(
+        0.0,
+        manager_ttl_seconds - LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS,
+    )
+    slot_deadline = time.monotonic() + slot_wait_seconds
+    acquired_provider_slot = provider_lock.acquire(blocking=False)
     while not acquired_provider_slot:
         control.checkpoint(attempt_id=attempt_id)
         remaining = slot_deadline - time.monotonic()
@@ -2891,9 +2903,7 @@ def _complete_chatgpt_leadbee_verification(
                 if leadbee_api
                 else "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
             )
-        acquired_provider_slot = leadbee_phone_flow_lock.acquire(
-            timeout=min(0.25, remaining)
-        )
+        acquired_provider_slot = provider_lock.acquire(timeout=min(0.25, remaining))
     provider_slot_handed_off = False
     provider_slot_released = False
     provider_session_id = ""
@@ -2911,7 +2921,7 @@ def _complete_chatgpt_leadbee_verification(
     def _release_reused_provider_slot() -> None:
         nonlocal provider_slot_released
         if acquired_provider_slot and not provider_slot_released:
-            leadbee_phone_flow_lock.release()
+            provider_lock.release()
             provider_slot_released = True
 
     try:
@@ -2956,9 +2966,7 @@ def _complete_chatgpt_leadbee_verification(
                 provider_session_id,
                 timeout=0.25,
             )
-            cleanup_status = str(
-                cleanup.get("status") or ""
-            ).strip().lower()
+            cleanup_status = str(cleanup.get("status") or "").strip().lower()
             if cleanup_status == "persisting":
                 now = time.monotonic()
                 if fallback_finalization_deadline is None:
@@ -2975,10 +2983,9 @@ def _complete_chatgpt_leadbee_verification(
                         ),
                         "finalization_pending": True,
                     }
-            if (
-                bool(cleanup.get("provider_cleanup_settled", False))
-                and cleanup_status in {"completed", "failed", "expired"}
-            ):
+            if bool(
+                cleanup.get("provider_cleanup_settled", False)
+            ) and cleanup_status in {"completed", "failed", "expired"}:
                 return dict(cleanup)
     finally:
         if (
@@ -2986,7 +2993,7 @@ def _complete_chatgpt_leadbee_verification(
             and not provider_slot_handed_off
             and not provider_slot_released
         ):
-            leadbee_phone_flow_lock.release()
+            provider_lock.release()
 
 
 def _complete_chatgpt_leadbee_verification_serialized(

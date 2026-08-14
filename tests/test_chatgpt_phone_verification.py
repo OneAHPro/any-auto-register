@@ -630,6 +630,56 @@ class PhoneOAuthResumeTests(unittest.TestCase):
 
 
 class PhoneVerificationManagerTests(unittest.TestCase):
+    def test_api_and_exchange_cards_use_independent_provider_slots(self):
+        class TrackingSlot:
+            def __init__(self):
+                self.acquire_calls = 0
+                self.release_calls = 0
+
+            def acquire(self, **_kwargs):
+                self.acquire_calls += 1
+                return True
+
+            def release(self):
+                self.release_calls += 1
+
+        api_slot = TrackingSlot()
+        card_slot = TrackingSlot()
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=lambda *_args: {"refresh_token": "fixture-rt"},
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+
+        with (
+            mock.patch(
+                "services.chatgpt_phone_verification.leadbee_api_phone_flow_lock",
+                api_slot,
+            ),
+            mock.patch(
+                "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                card_slot,
+            ),
+            mock.patch(
+                "core.config_store.config_store.get_all",
+                return_value=config,
+            ),
+        ):
+            manager.start(201, leadbee_api=True)
+            manager.start(202, leadbee_code="fixture-card")
+
+        self.assertEqual(api_slot.acquire_calls, 1)
+        self.assertEqual(api_slot.release_calls, 1)
+        self.assertEqual(card_slot.acquire_calls, 1)
+        self.assertEqual(card_slot.release_calls, 1)
+
     def test_leadbee_api_start_generates_unique_stable_server_references(self):
         observed = []
 

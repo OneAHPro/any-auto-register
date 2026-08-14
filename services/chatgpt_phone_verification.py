@@ -16,15 +16,14 @@ from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger(__name__)
-# LeadBee's own page supports at most five active card tasks.  Keep that
-# provider limit while allowing the user's mailbox-login concurrency to flow
-# through instead of serializing every card behind a single global lock.
-leadbee_phone_flow_lock = threading.BoundedSemaphore(5)
+# Formal API orders and legacy web-card sessions have independent provider
+# limits.  Keep the historical name as a card-slot compatibility alias for
+# tests and integrations that patch it directly.
+leadbee_api_phone_flow_lock = threading.BoundedSemaphore(50)
+leadbee_card_phone_flow_lock = threading.BoundedSemaphore(5)
+leadbee_phone_flow_lock = leadbee_card_phone_flow_lock
 LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS = 60.0
-LEADBEE_PROVIDER_SLOT_WAIT_SECONDS = 30.0
-KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset(
-    {"restored", "consumed", "unusable"}
-)
+KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset({"restored", "consumed", "unusable"})
 LEADBEE_API_CLIENT_ORDER_RE = re.compile(r"^aar_[0-9a-f]{32}$")
 
 
@@ -866,6 +865,11 @@ class ChatGPTPhoneVerificationManager:
         exchange_code: str,
         provider_lock_already_held: bool = False,
     ) -> None:
+        provider_lock = (
+            leadbee_api_phone_flow_lock
+            if broker.leadbee_api
+            else leadbee_phone_flow_lock
+        )
         provider_lock_owned = bool(provider_lock_already_held)
         provider_cleanup_published = False
 
@@ -874,7 +878,7 @@ class ChatGPTPhoneVerificationManager:
             if provider_cleanup_published:
                 return
             if provider_lock_owned:
-                leadbee_phone_flow_lock.release()
+                provider_lock.release()
                 provider_lock_owned = False
             settlement = broker.snapshot()
             if (
@@ -892,17 +896,12 @@ class ChatGPTPhoneVerificationManager:
 
         try:
             if not provider_lock_already_held:
-                provider_lock_owned = leadbee_phone_flow_lock.acquire(
-                    blocking=False
-                )
-                slot_wait_seconds = min(
-                    LEADBEE_PROVIDER_SLOT_WAIT_SECONDS,
-                    max(
-                        0.0,
-                        float(broker.expires_at)
-                        - time.time()
-                        - LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS,
-                    ),
+                provider_lock_owned = provider_lock.acquire(blocking=False)
+                slot_wait_seconds = max(
+                    0.0,
+                    float(broker.expires_at)
+                    - time.time()
+                    - LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS,
                 )
                 slot_deadline = time.monotonic() + slot_wait_seconds
                 while not provider_lock_owned:
@@ -911,8 +910,10 @@ class ChatGPTPhoneVerificationManager:
                     if remaining <= 0:
                         if broker.leadbee_api:
                             raise RuntimeError("LeadBee API 服务并发槽位排队超时")
-                        raise RuntimeError("LeadBee 服务并发槽位排队超时，兑换码尚未激活")
-                    provider_lock_owned = leadbee_phone_flow_lock.acquire(
+                        raise RuntimeError(
+                            "LeadBee 服务并发槽位排队超时，兑换码尚未激活"
+                        )
+                    provider_lock_owned = provider_lock.acquire(
                         timeout=min(0.25, remaining)
                     )
                 broker.raise_if_cancelled()

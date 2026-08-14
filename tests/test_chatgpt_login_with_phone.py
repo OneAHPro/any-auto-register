@@ -436,6 +436,63 @@ class LeadBeeTaskCancellationTests(unittest.TestCase):
         self.assertEqual(results[101]["status"], "completed")
         self.assertEqual(results[102]["status"], "completed")
 
+    def test_card_provider_wait_can_continue_beyond_former_thirty_second_limit(self):
+        clock = {"now": 0.0}
+
+        class DelayedProviderSlot:
+            def __init__(self):
+                self.calls = 0
+                self.releases = 0
+
+            def acquire(self, **_kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    return False
+                clock["now"] = 31.0
+                return True
+
+            def release(self):
+                self.releases += 1
+
+        class Manager:
+            ttl_seconds = 600
+
+            @staticmethod
+            def start(_account_id, **_kwargs):
+                return {
+                    "session_id": "phone-session-queued-card",
+                    "status": "completed",
+                    "provider_cleanup_settled": True,
+                    "reused": True,
+                    "logs": [],
+                    "expires_in": 569,
+                }
+
+        provider_slot = DelayedProviderSlot()
+        with (
+            patch(
+                "services.chatgpt_phone_verification.phone_verification_manager",
+                Manager(),
+            ),
+            patch(
+                "services.chatgpt_phone_verification.leadbee_phone_flow_lock",
+                provider_slot,
+            ),
+            patch("api.tasks.time.monotonic", side_effect=lambda: clock["now"]),
+        ):
+            result = _complete_chatgpt_leadbee_verification(
+                task_id="task-queued-card",
+                account_id=303,
+                leadbee_code="fixture-card",
+                control=Mock(),
+                attempt_id=1,
+            )
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(provider_slot.calls, 2)
+        self.assertEqual(provider_slot.releases, 1)
+        self.assertEqual(clock["now"], 31.0)
+
     def test_stop_request_finishes_an_activated_card_instead_of_burning_it(self):
         manager = Mock()
         manager.start.return_value = {
