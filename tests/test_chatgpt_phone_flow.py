@@ -8,8 +8,13 @@ from unittest import mock
 
 from curl_cffi import requests as cffi_requests
 
+from platforms.chatgpt.leadbee_open_api import (
+    LeadBeeAPIError,
+    LeadBeeTransportError,
+)
 from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.phone_service import (
+    LeadBeeOpenAPIPhoneService,
     LeadBeePhoneService,
     SMSToMePhoneService,
     create_phone_service,
@@ -855,6 +860,578 @@ def _leadbee_card(**overrides):
     }
     card.update(overrides)
     return card
+
+
+class _OpenAPIClock:
+    def __init__(self):
+        self.now = 0.0
+        self.sleeps = []
+
+    def monotonic(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+class _OpenAPIClient:
+    def __init__(
+        self,
+        *,
+        create=(),
+        get=(),
+        replace=(),
+        cancel=(),
+    ):
+        self.results = {
+            "create": list(create),
+            "get": list(get),
+            "replace": list(replace),
+            "cancel": list(cancel),
+        }
+        self.calls = []
+
+    def _result(self, operation):
+        if not self.results[operation]:
+            raise AssertionError(f"unexpected {operation} call")
+        result = self.results[operation].pop(0)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def create_order(
+        self,
+        client_order_id,
+        product_id,
+        quantity=1,
+        *,
+        idempotency_key,
+    ):
+        self.calls.append(
+            (
+                "create",
+                client_order_id,
+                product_id,
+                quantity,
+                idempotency_key,
+            )
+        )
+        return self._result("create")
+
+    def get_order(self, order_id):
+        self.calls.append(("get", order_id))
+        return self._result("get")
+
+    def replace_order(self, order_id, *, idempotency_key):
+        self.calls.append(("replace", order_id, idempotency_key))
+        return self._result("replace")
+
+    def cancel_order(self, order_id, *, idempotency_key):
+        self.calls.append(("cancel", order_id, idempotency_key))
+        return self._result("cancel")
+
+
+def _open_api_config(**overrides):
+    config = {
+        "leadbee_api_enabled": True,
+        "leadbee_api_key": "ak_test_phone_fixture",
+        "leadbee_api_secret": "secret_test_phone_fixture",
+        "leadbee_api_product_id": "product_phone_fixture",
+        "leadbee_api_client_order_id": "client_order_phone_fixture",
+        "leadbee_phone_timeout_seconds": 30,
+        "leadbee_total_timeout_seconds": 60,
+        "leadbee_otp_timeout_seconds": 30,
+        "leadbee_poll_interval_seconds": 1,
+    }
+    config.update(overrides)
+    return config
+
+
+def _open_api_service(client, *, clock=None, logs=None, **config):
+    resolved_clock = clock or _OpenAPIClock()
+    resolved_logs = logs if logs is not None else []
+    service = LeadBeeOpenAPIPhoneService(
+        _open_api_config(**config),
+        log_fn=resolved_logs.append,
+        client=client,
+        sleep_fn=resolved_clock.sleep,
+        monotonic=resolved_clock.monotonic,
+    )
+    return service, resolved_clock, resolved_logs
+
+
+class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
+    def test_factory_api_flag_is_truthy_and_uses_fixed_client_configuration(self):
+        for enabled in (True, 1, "1", "true", "yes", "on", " TRUE "):
+            with (
+                self.subTest(enabled=enabled),
+                mock.patch(
+                    "platforms.chatgpt.phone_service.LeadBeeOpenAPIClient"
+                ) as client_class,
+            ):
+                service = create_phone_service(
+                    _open_api_config(leadbee_api_enabled=enabled)
+                )
+
+                self.assertIsInstance(service, LeadBeeOpenAPIPhoneService)
+                self.assertTrue(service.enabled)
+                client_class.assert_called_once_with(
+                    api_key="ak_test_phone_fixture",
+                    api_secret="secret_test_phone_fixture",
+                )
+
+    def test_factory_enabled_but_incomplete_returns_disabled_api_service(self):
+        service = create_phone_service(
+            {
+                "leadbee_api_enabled": True,
+                "leadbee_code": "bei-sms-LEGACY-FIXTURE",
+            }
+        )
+
+        self.assertIsInstance(service, LeadBeeOpenAPIPhoneService)
+        self.assertFalse(service.enabled)
+
+    def test_factory_disabled_preserves_legacy_and_smstome_selection(self):
+        for disabled in (False, 0, "0", "false", "off", ""):
+            with self.subTest(disabled=disabled):
+                legacy = create_phone_service(
+                    {
+                        "leadbee_api_enabled": disabled,
+                        "leadbee_code": "bei-sms-LEGACY-FIXTURE",
+                    }
+                )
+                fallback = create_phone_service({"leadbee_api_enabled": disabled})
+
+                self.assertIsInstance(legacy, LeadBeePhoneService)
+                self.assertIsInstance(fallback, SMSToMePhoneService)
+
+    def test_processing_to_waiting_phone_then_completed_code(self):
+        phone = "+12025550123"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_001",
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 2,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_001",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 3,
+                },
+                {
+                    "order_id": "order_fixture_001",
+                    "status": "COMPLETED",
+                    "phone": phone,
+                    "code": "654321",
+                },
+            ],
+        )
+        service, clock, _logs = _open_api_service(client)
+
+        entry = service.acquire_phone()
+        code = service.wait_for_code(entry)
+
+        self.assertEqual(entry.country_slug, "leadbee-api")
+        self.assertEqual(entry.phone, phone)
+        self.assertIn("order_fixture_001", entry.detail_url)
+        self.assertNotIn(phone, entry.detail_url)
+        self.assertEqual(code, "654321")
+        self.assertEqual(clock.sleeps, [2.0, 3.0])
+        self.assertEqual(
+            [call[0] for call in client.calls],
+            ["create", "get", "get"],
+        )
+
+    def test_create_retries_reuse_client_reference_body_and_idempotency_key(self):
+        client = _OpenAPIClient(
+            create=[
+                LeadBeeTransportError("fixture transport"),
+                LeadBeeAPIError(
+                    "fixture rate limit",
+                    code="RATE_LIMITED",
+                    status_code=429,
+                    retry_after=4,
+                ),
+                {
+                    "order_id": "order_fixture_retry",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ]
+        )
+        service, clock, _logs = _open_api_service(client)
+
+        service.acquire_phone()
+
+        create_calls = [call for call in client.calls if call[0] == "create"]
+        self.assertEqual(len(create_calls), 3)
+        self.assertEqual(len(set(create_calls)), 1)
+        self.assertEqual(create_calls[0][3], 1)
+        self.assertEqual(clock.sleeps, [1.0, 4.0])
+
+    def test_create_retries_plain_503_with_the_same_request_identity(self):
+        client = _OpenAPIClient(
+            create=[
+                LeadBeeAPIError(
+                    "fixture unavailable",
+                    code="HTTP_ERROR",
+                    status_code=503,
+                ),
+                {
+                    "order_id": "order_fixture_503",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ]
+        )
+        service, clock, _logs = _open_api_service(client)
+
+        service.acquire_phone()
+
+        create_calls = [call for call in client.calls if call[0] == "create"]
+        self.assertEqual(len(create_calls), 2)
+        self.assertEqual(create_calls[0], create_calls[1])
+        self.assertEqual(clock.sleeps, [1.0])
+
+    def test_nonretryable_create_failure_is_not_posted_again_on_same_service(self):
+        client = _OpenAPIClient(
+            create=[
+                LeadBeeAPIError(
+                    "fixture authentication rejected",
+                    code="AUTHENTICATION_FAILED",
+                    status_code=401,
+                )
+            ]
+        )
+        service, _clock, _logs = _open_api_service(client)
+
+        with self.assertRaises(LeadBeeAPIError):
+            service.acquire_phone()
+        with self.assertRaises(RuntimeError):
+            service.acquire_phone()
+
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            1,
+        )
+
+    def test_auth_permission_product_and_conflict_errors_override_retryable_http(self):
+        cases = (
+            ("AUTHENTICATION_FAILED", 429),
+            ("SIGNATURE_INVALID", 503),
+            ("PERMISSION_DENIED", 429),
+            ("IP_NOT_ALLOWED", 503),
+            ("PRODUCT_NOT_FOUND", 429),
+            ("IDEMPOTENCY_CONFLICT", 503),
+        )
+        for error_code, status_code in cases:
+            with self.subTest(error_code=error_code, status_code=status_code):
+                client = _OpenAPIClient(
+                    create=[
+                        LeadBeeAPIError(
+                            "fixture rejected",
+                            code=error_code,
+                            status_code=status_code,
+                            retry_after=1,
+                        )
+                    ]
+                )
+                service, clock, _logs = _open_api_service(client)
+
+                with self.assertRaises(LeadBeeAPIError):
+                    service.acquire_phone()
+
+                self.assertEqual(
+                    [call[0] for call in client.calls].count("create"),
+                    1,
+                )
+                self.assertEqual(clock.sleeps, [])
+
+    def test_create_response_without_order_id_never_starts_a_second_order(self):
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 1,
+                }
+            ]
+        )
+        service, _clock, _logs = _open_api_service(client)
+
+        with self.assertRaisesRegex(RuntimeError, "订单编号"):
+            service.acquire_phone()
+        with self.assertRaises(RuntimeError):
+            service.acquire_phone()
+
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            1,
+        )
+
+    def test_replace_retries_then_acquire_polls_same_order_for_different_phone(self):
+        old_phone = "+12025550123"
+        new_phone = "+14155550199"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_replace",
+                    "status": "WAITING_CODE",
+                    "phone": old_phone,
+                }
+            ],
+            replace=[
+                LeadBeeTransportError("fixture transport"),
+                {
+                    "order_id": "order_fixture_replace",
+                    "status": "REPLACING",
+                    "next_poll_after_seconds": 2,
+                },
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_replace",
+                    "status": "WAITING_CODE",
+                    "phone": old_phone,
+                    "next_poll_after_seconds": 3,
+                },
+                {
+                    "order_id": "order_fixture_replace",
+                    "status": "WAITING_CODE",
+                    "phone": new_phone,
+                },
+            ],
+        )
+        service, clock, _logs = _open_api_service(client)
+        first_entry = service.acquire_phone()
+
+        self.assertTrue(
+            service.request_replacement(first_entry.phone, reason="openai_rejected")
+        )
+        replacement_entry = service.acquire_phone()
+
+        self.assertEqual(replacement_entry.phone, new_phone)
+        self.assertEqual(service.order_id, "order_fixture_replace")
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            1,
+        )
+        replace_calls = [call for call in client.calls if call[0] == "replace"]
+        self.assertEqual(len(replace_calls), 2)
+        self.assertEqual(replace_calls[0], replace_calls[1])
+        self.assertEqual(clock.sleeps, [1.0, 2.0, 3.0])
+
+    def test_cancel_retries_then_polls_canceling_to_canceled(self):
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_cancel",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ],
+            cancel=[
+                LeadBeeAPIError(
+                    "fixture replay unavailable",
+                    code="REPLAY_PROTECTION_UNAVAILABLE",
+                    status_code=503,
+                ),
+                {
+                    "order_id": "order_fixture_cancel",
+                    "status": "CANCELING",
+                    "next_poll_after_seconds": 2,
+                },
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_cancel",
+                    "status": "CANCELED",
+                }
+            ],
+        )
+        service, clock, _logs = _open_api_service(client)
+        service.acquire_phone()
+
+        self.assertTrue(service.cancel_active())
+        self.assertFalse(service.card_at_risk)
+        self.assertEqual(service.last_cancel_error, "")
+        cancel_calls = [call for call in client.calls if call[0] == "cancel"]
+        self.assertEqual(len(cancel_calls), 2)
+        self.assertEqual(cancel_calls[0], cancel_calls[1])
+        self.assertEqual(clock.sleeps, [1.0, 2.0])
+
+    def test_cancel_without_order_is_safe_and_completed_order_is_not_recanceled(self):
+        empty_service, _clock, _logs = _open_api_service(_OpenAPIClient())
+        self.assertFalse(empty_service.cancel_active())
+
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_completed",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_completed",
+                    "status": "COMPLETED",
+                    "code": "654321",
+                }
+            ],
+        )
+        service, _clock, _logs = _open_api_service(client)
+        entry = service.acquire_phone()
+        self.assertEqual(service.wait_for_code(entry), "654321")
+
+        self.assertFalse(service.cancel_active())
+        self.assertFalse(service.card_at_risk)
+        self.assertNotIn("cancel", [call[0] for call in client.calls])
+
+    def test_expired_and_canceled_are_settled_terminal_states(self):
+        for status in ("EXPIRED", "CANCELED"):
+            with self.subTest(status=status):
+                client = _OpenAPIClient(
+                    create=[
+                        {
+                            "order_id": f"order_fixture_{status.lower()}",
+                            "status": status,
+                        }
+                    ]
+                )
+                service, _clock, _logs = _open_api_service(client)
+
+                with self.assertRaises(RuntimeError):
+                    service.acquire_phone()
+
+                self.assertFalse(service.card_at_risk)
+                self.assertEqual(
+                    [call[0] for call in client.calls].count("create"),
+                    1,
+                )
+
+    def test_unknown_manual_review_and_unrecognized_states_are_quarantined(self):
+        for status in ("UNKNOWN", "MANUAL_REVIEW", "FUTURE_STATE"):
+            with self.subTest(status=status):
+                client = _OpenAPIClient(
+                    create=[
+                        {
+                            "order_id": f"order_fixture_{status.lower()}",
+                            "status": status,
+                        }
+                    ]
+                )
+                service, _clock, _logs = _open_api_service(client)
+
+                with self.assertRaisesRegex(RuntimeError, "隔离"):
+                    service.acquire_phone()
+                with self.assertRaisesRegex(RuntimeError, "隔离"):
+                    service.acquire_phone()
+
+                self.assertEqual(
+                    service.order_id,
+                    f"order_fixture_{status.lower()}",
+                )
+                self.assertTrue(service.card_at_risk)
+                self.assertEqual(
+                    [call[0] for call in client.calls].count("create"),
+                    1,
+                )
+
+    def test_unrecognized_status_text_is_not_copied_to_logs_or_exceptions(self):
+        echoed_status = (
+            "ak_test_phone_fixture-secret_test_phone_fixture-+12025550123-654321"
+        )
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_echoed_status",
+                    "status": echoed_status,
+                }
+            ]
+        )
+        logs = []
+        service, _clock, _logs = _open_api_service(client, logs=logs)
+
+        with self.assertRaises(RuntimeError) as caught:
+            service.acquire_phone()
+
+        rendered = f"{caught.exception}\n" + "\n".join(logs)
+        self.assertNotIn(echoed_status, rendered)
+        self.assertNotIn("ak_test_phone_fixture", rendered)
+        self.assertNotIn("secret_test_phone_fixture", rendered)
+        self.assertNotIn("+12025550123", rendered)
+        self.assertNotIn("654321", rendered)
+        self.assertIn("UNRECOGNIZED", rendered)
+
+    def test_invalid_phone_is_not_returned_and_invalid_completed_code_is_ignored(self):
+        phone = "+12025550123"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_validation",
+                    "status": "WAITING_CODE",
+                    "phone": "202-555-0123",
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_validation",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 1,
+                },
+                {
+                    "order_id": "order_fixture_validation",
+                    "status": "COMPLETED",
+                    "code": "12A456",
+                },
+            ],
+        )
+        service, _clock, _logs = _open_api_service(client)
+
+        entry = service.acquire_phone()
+
+        self.assertEqual(entry.phone, phone)
+        self.assertIsNone(service.wait_for_code(entry))
+
+    def test_logs_exclude_credentials_full_phone_and_verification_code(self):
+        phone = "+12025550123"
+        code = "654321"
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_redaction",
+                    "status": "WAITING_CODE",
+                    "phone": phone,
+                    "next_poll_after_seconds": 1,
+                }
+            ],
+            get=[
+                {
+                    "order_id": "order_fixture_redaction",
+                    "status": "COMPLETED",
+                    "code": code,
+                }
+            ],
+        )
+        logs = []
+        service, _clock, _logs = _open_api_service(client, logs=logs)
+
+        entry = service.acquire_phone()
+        self.assertEqual(service.wait_for_code(entry), code)
+
+        rendered = "\n".join(logs)
+        self.assertNotIn("ak_test_phone_fixture", rendered)
+        self.assertNotIn("secret_test_phone_fixture", rendered)
+        self.assertNotIn(phone, rendered)
+        self.assertNotIn(code, rendered)
+        self.assertIn("***", rendered)
 
 
 class LeadBeePhoneServiceTests(unittest.TestCase):

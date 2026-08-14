@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import hashlib
+import math
 import re
 import time
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
+from urllib.parse import quote
 
 try:
     from curl_cffi import requests as http_requests
@@ -19,6 +22,12 @@ from smstome_tool import (
     wait_for_otp,
 )
 
+from .leadbee_open_api import (
+    LeadBeeAPIError,
+    LeadBeeOpenAPIClient,
+    LeadBeeTransportError,
+)
+
 
 def _to_positive_int(value, default: int, *, minimum: int = 1) -> int:
     try:
@@ -31,6 +40,12 @@ def _to_positive_int(value, default: int, *, minimum: int = 1) -> int:
 def _prefix_hint(phone: str, width: int = 7) -> str:
     value = str(phone or "").strip()
     return value[: min(len(value), width)] if value else ""
+
+
+def _truthy(value: Any) -> bool:
+    if value is True or value == 1:
+        return True
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 class SMSToMePhoneService:
@@ -849,17 +864,510 @@ class LeadBeePhoneService:
         self.request_replacement(phone, reason="openai_rejected")
 
 
+class LeadBeeOpenAPIPhoneService:
+    """Order-backed LeadBee phone service using the signed Open API client."""
+
+    provider_name = "LeadBee API"
+    supports_resend = False
+    supports_blacklist = True
+    requires_explicit_replacement = True
+    supports_cancellation = True
+
+    _ACTIVE_STATUSES = frozenset(
+        {"PROCESSING", "WAITING_CODE", "REPLACING", "CANCELING"}
+    )
+    _SETTLED_STATUSES = frozenset({"COMPLETED", "EXPIRED", "CANCELED"})
+    _QUARANTINE_STATUSES = frozenset({"UNKNOWN", "MANUAL_REVIEW"})
+
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+        log_fn: Optional[Callable[[str], None]] = None,
+        *,
+        client=None,
+        sleep_fn: Optional[Callable[[float], None]] = None,
+        monotonic: Optional[Callable[[], float]] = None,
+    ) -> None:
+        self.config = dict(config or {})
+        self.log_fn = log_fn or (lambda _msg: None)
+        self.api_enabled = _truthy(self.config.get("leadbee_api_enabled"))
+        self.api_key = str(self.config.get("leadbee_api_key") or "").strip()
+        self.api_secret = str(self.config.get("leadbee_api_secret") or "").strip()
+        self.product_id = str(self.config.get("leadbee_api_product_id") or "").strip()
+        self.client_order_id = str(
+            self.config.get("leadbee_api_client_order_id") or ""
+        ).strip()
+        self.max_attempts = _to_positive_int(
+            self.config.get("leadbee_phone_attempts"), 3
+        )
+        self.phone_timeout_seconds = _to_positive_int(
+            self.config.get("leadbee_phone_timeout_seconds"), 120, minimum=5
+        )
+        self.total_timeout_seconds = min(
+            _to_positive_int(
+                self.config.get("leadbee_total_timeout_seconds"),
+                540,
+                minimum=5,
+            ),
+            540,
+        )
+        self.otp_timeout_seconds = _to_positive_int(
+            self.config.get("leadbee_otp_timeout_seconds"), 120, minimum=10
+        )
+        self.poll_interval_seconds = _to_positive_int(
+            self.config.get("leadbee_poll_interval_seconds"), 4, minimum=1
+        )
+        self._sleep = sleep_fn or time.sleep
+        self._monotonic = monotonic or time.monotonic
+        self._client = client
+        if self._client is None and self._configuration_complete:
+            # Production always uses the client's fixed official default base.
+            self._client = LeadBeeOpenAPIClient(
+                api_key=self.api_key,
+                api_secret=self.api_secret,
+            )
+
+        self.order_id = ""
+        self._order: dict[str, Any] = {}
+        self._current_phone = ""
+        self._rejected_phone = ""
+        self._replacement_pending = False
+        self._replacement_sequence = 0
+        self._flow_deadline: float | None = None
+        self._create_attempted = False
+        self._create_failed = False
+        self._create_ambiguous = False
+        self._quarantined = False
+        self._settled_status = ""
+        self.last_cancel_error = ""
+
+        reference = self.client_order_id or "disabled"
+        self._reference_digest = hashlib.sha256(reference.encode("utf-8")).hexdigest()[
+            :32
+        ]
+        self._create_idempotency_key = f"leadbee-create-{self._reference_digest}"
+        self._cancel_idempotency_key = f"leadbee-cancel-{self._reference_digest}"
+
+    @property
+    def _configuration_complete(self) -> bool:
+        return bool(
+            self.api_enabled
+            and self.api_key
+            and self.api_secret
+            and self.product_id
+            and self.client_order_id
+        )
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self._configuration_complete and self._client is not None)
+
+    @property
+    def card_at_risk(self) -> bool:
+        if self._settled_status in self._SETTLED_STATUSES:
+            return False
+        return bool(
+            self._quarantined
+            or self.order_id
+            or (self._create_attempted and self._create_ambiguous)
+        )
+
+    def prefix_hint(self, phone: str) -> str:
+        return _prefix_hint(phone)
+
+    @staticmethod
+    def _phone(value: Any) -> str:
+        phone = str(value or "").strip()
+        return phone if re.fullmatch(r"\+[1-9]\d{7,14}", phone) else ""
+
+    @staticmethod
+    def _code(order: dict[str, Any]) -> str:
+        for key in ("code", "sms_code", "verification_code"):
+            code = str(order.get(key) or "").strip()
+            if re.fullmatch(r"\d{4,8}", code):
+                return code
+        return ""
+
+    @staticmethod
+    def _masked_phone(phone: str) -> str:
+        normalized = str(phone or "").strip()
+        if len(normalized) <= 7:
+            return "***"
+        return f"{normalized[:3]}***{normalized[-4:]}"
+
+    @staticmethod
+    def _status(order: dict[str, Any]) -> str:
+        return str(order.get("status") or "").strip().upper()
+
+    @staticmethod
+    def _order_payload(data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise RuntimeError("LeadBee API 返回的订单格式无效")
+        nested = data.get("order")
+        return dict(nested) if isinstance(nested, dict) else dict(data)
+
+    @staticmethod
+    def _positive_delay(value: Any) -> float | None:
+        if isinstance(value, bool):
+            return None
+        try:
+            delay = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(delay) or delay <= 0:
+            return None
+        return delay
+
+    def _poll_delay(self, order: dict[str, Any]) -> float:
+        return self._positive_delay(order.get("next_poll_after_seconds")) or float(
+            self.poll_interval_seconds
+        )
+
+    def _ensure_enabled(self) -> None:
+        if not self.enabled:
+            raise RuntimeError("LeadBee API 配置不完整")
+
+    def _ensure_flow_deadline(self) -> float:
+        if self._flow_deadline is None:
+            self._flow_deadline = self._monotonic() + float(self.total_timeout_seconds)
+        return self._flow_deadline
+
+    def _phase_deadline(self, timeout_seconds: int) -> float:
+        now = self._monotonic()
+        return min(
+            self._ensure_flow_deadline(),
+            now + float(timeout_seconds),
+        )
+
+    def _sleep_before(self, delay: float, deadline: float, phase: str) -> None:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+        self._sleep(min(float(delay), remaining))
+        if self._monotonic() >= deadline:
+            raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+
+    @staticmethod
+    def _retryable(exc: LeadBeeAPIError) -> bool:
+        error_code = exc.error_code
+        if (
+            error_code.startswith(("AUTH", "PERMISSION", "PRODUCT"))
+            or "SIGNATURE" in error_code
+            or error_code.endswith("_CONFLICT")
+            or error_code == "IP_NOT_ALLOWED"
+        ):
+            return False
+        if isinstance(exc, LeadBeeTransportError):
+            return True
+        if exc.http_status == 429 or error_code == "RATE_LIMITED":
+            return True
+        return exc.http_status == 503 or error_code == "REPLAY_PROTECTION_UNAVAILABLE"
+
+    def _retry_delay(self, exc: LeadBeeAPIError) -> float:
+        if exc.http_status == 429:
+            retry_after = self._positive_delay(exc.retry_after)
+            if retry_after is not None:
+                return retry_after
+        return float(self.poll_interval_seconds)
+
+    def _write_with_retry(
+        self,
+        operation: Callable[[], dict[str, Any]],
+        *,
+        deadline: float,
+        phase: str,
+    ) -> dict[str, Any]:
+        while True:
+            if self._monotonic() >= deadline:
+                raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+            try:
+                return operation()
+            except LeadBeeAPIError as exc:
+                if not self._retryable(exc):
+                    raise
+                self._sleep_before(
+                    self._retry_delay(exc),
+                    deadline,
+                    phase,
+                )
+            except Exception:  # noqa: BLE001 - sanitize injected client failures
+                raise RuntimeError("LeadBee API 请求失败") from None
+
+    def _read_order(self, *, deadline: float, phase: str) -> dict[str, Any]:
+        while True:
+            if self._monotonic() >= deadline:
+                raise RuntimeError(f"LeadBee API {phase}超过本地期限")
+            try:
+                return self._client.get_order(self.order_id)
+            except LeadBeeAPIError as exc:
+                if not self._retryable(exc):
+                    raise
+                self._sleep_before(
+                    self._retry_delay(exc),
+                    deadline,
+                    phase,
+                )
+            except Exception:  # noqa: BLE001 - sanitize injected client failures
+                raise RuntimeError("LeadBee API 请求失败") from None
+
+    def _quarantine(self, status: str) -> None:
+        self._quarantined = True
+        self._settled_status = ""
+        safe_status = (
+            status
+            if status in self._QUARANTINE_STATUSES | {"ORDER_ID_MISMATCH"}
+            else "UNRECOGNIZED"
+        )
+        raise RuntimeError(f"LeadBee API 订单状态需隔离: {safe_status}")
+
+    def _accept_order(
+        self,
+        data: Any,
+        *,
+        require_order_id: bool = False,
+    ) -> dict[str, Any]:
+        order = self._order_payload(data)
+        returned_order_id = str(order.get("order_id") or order.get("id") or "").strip()
+        if require_order_id and not returned_order_id:
+            self._create_ambiguous = True
+            raise RuntimeError("LeadBee API 未返回订单编号")
+        if returned_order_id:
+            if self.order_id and returned_order_id != self.order_id:
+                self._quarantine("ORDER_ID_MISMATCH")
+            self.order_id = returned_order_id
+
+        status = self._status(order)
+        if status not in self._ACTIVE_STATUSES | self._SETTLED_STATUSES:
+            self._order = order
+            self._quarantine(status)
+        self._order = order
+        self.log_fn(f"[LeadBee API] 订单状态: {status}")
+        if status in self._SETTLED_STATUSES:
+            self._settled_status = status
+            self._quarantined = False
+        return order
+
+    def _create_order(self, *, deadline: float) -> dict[str, Any]:
+        if self.order_id:
+            return self._order
+        if self._quarantined:
+            self._quarantine(self._status(self._order))
+        if self._create_failed:
+            raise RuntimeError("LeadBee API 创建订单已失败，未重复提交")
+        self._create_attempted = True
+        try:
+            data = self._write_with_retry(
+                lambda: self._client.create_order(
+                    self.client_order_id,
+                    self.product_id,
+                    1,
+                    idempotency_key=self._create_idempotency_key,
+                ),
+                deadline=deadline,
+                phase="创建订单",
+            )
+        except LeadBeeAPIError:
+            self._create_ambiguous = False
+            self._create_failed = True
+            raise
+        except RuntimeError:
+            self._create_ambiguous = True
+            self._create_failed = True
+            raise
+        try:
+            order = self._accept_order(data, require_order_id=True)
+        except RuntimeError:
+            self._create_failed = True
+            raise
+        self._create_ambiguous = False
+        return order
+
+    def _poll_order(self, *, deadline: float, phase: str) -> dict[str, Any]:
+        self._sleep_before(
+            self._poll_delay(self._order),
+            deadline,
+            phase,
+        )
+        return self._accept_order(self._read_order(deadline=deadline, phase=phase))
+
+    def _entry(self, phone: str) -> PhoneEntry:
+        self._current_phone = phone
+        self.log_fn(f"[LeadBee API] 已获取手机号 {self._masked_phone(phone)}")
+        return PhoneEntry(
+            country_slug="leadbee-api",
+            phone=phone,
+            detail_url=(f"leadbee-api://order/{quote(self.order_id, safe='')}"),
+        )
+
+    def acquire_phone(
+        self, *, exclude_prefixes: Optional[Iterable[str]] = None
+    ) -> Optional[PhoneEntry]:
+        del exclude_prefixes
+        self._ensure_enabled()
+        if self._quarantined:
+            self._quarantine(self._status(self._order))
+        replacing = self._replacement_pending
+        deadline = self._phase_deadline(self.phone_timeout_seconds)
+        order = self._order if self.order_id else self._create_order(deadline=deadline)
+
+        while True:
+            status = self._status(order)
+            if status in {"CANCELED", "EXPIRED"}:
+                raise RuntimeError(f"LeadBee API 订单已{status.lower()}")
+            phone = self._phone(order.get("phone") or order.get("phone_number"))
+            if (
+                status in {"WAITING_CODE", "COMPLETED"}
+                and phone
+                and (not replacing or phone != self._rejected_phone)
+            ):
+                self._replacement_pending = False
+                self._rejected_phone = ""
+                return self._entry(phone)
+            if status == "COMPLETED":
+                raise RuntimeError("LeadBee API 订单已完成但未返回有效手机号")
+            order = self._poll_order(deadline=deadline, phase="获取手机号")
+
+    def wait_for_code(
+        self, entry: PhoneEntry, *, timeout: Optional[int] = None
+    ) -> Optional[str]:
+        self._ensure_enabled()
+        if not self.order_id:
+            raise RuntimeError("LeadBee API 订单尚未创建")
+        if self._quarantined:
+            self._quarantine(self._status(self._order))
+        entry_phone = self._phone(entry.phone)
+        if not entry_phone or entry_phone != self._current_phone:
+            raise RuntimeError("LeadBee API 手机号与当前订单不匹配")
+        wait_seconds = _to_positive_int(
+            timeout,
+            self.otp_timeout_seconds,
+            minimum=10,
+        )
+        deadline = self._phase_deadline(wait_seconds)
+        order = self._order
+
+        while True:
+            status = self._status(order)
+            if status == "COMPLETED":
+                code = self._code(order)
+                if code:
+                    self.log_fn(
+                        "[LeadBee API] 已收到手机号 "
+                        f"{self._masked_phone(entry_phone)} 的短信验证码"
+                    )
+                return code or None
+            if status in {"CANCELED", "EXPIRED"}:
+                return None
+            try:
+                order = self._poll_order(
+                    deadline=deadline,
+                    phase="等待短信验证码",
+                )
+            except RuntimeError as exc:
+                if "超过本地期限" in str(exc):
+                    self.log_fn(
+                        "[LeadBee API] 等待手机号 "
+                        f"{self._masked_phone(entry_phone)} 的短信验证码超时"
+                    )
+                    return None
+                raise
+
+    def request_replacement(self, phone: str, *, reason: str = "") -> bool:
+        del reason
+        self._ensure_enabled()
+        if not self.order_id or self._quarantined:
+            return False
+        status = self._status(self._order)
+        if status in self._SETTLED_STATUSES:
+            return False
+        rejected_phone = self._phone(phone)
+        if not rejected_phone or rejected_phone != self._current_phone:
+            raise RuntimeError("LeadBee API 换号请求与当前手机号不匹配")
+
+        self._replacement_sequence += 1
+        idempotency_key = (
+            f"leadbee-replace-{self._replacement_sequence}-{self._reference_digest}"
+        )
+        deadline = self._ensure_flow_deadline()
+        data = self._write_with_retry(
+            lambda: self._client.replace_order(
+                self.order_id,
+                idempotency_key=idempotency_key,
+            ),
+            deadline=deadline,
+            phase="更换手机号",
+        )
+        order = self._accept_order(data)
+        if self._status(order) in self._SETTLED_STATUSES:
+            return False
+        self._rejected_phone = rejected_phone
+        self._replacement_pending = True
+        self.log_fn("[LeadBee API] 换号请求已提交")
+        return True
+
+    def mark_blacklisted(self, phone: str) -> None:
+        self.request_replacement(phone, reason="openai_rejected")
+
+    def cancel_active(self) -> bool:
+        self.last_cancel_error = ""
+        if not self.order_id:
+            return False
+        status = self._status(self._order)
+        if status in self._SETTLED_STATUSES:
+            self._settled_status = status
+            self._quarantined = False
+            return False
+        if self._quarantined:
+            self.last_cancel_error = "LeadBee API 订单状态需人工核对"
+            return False
+
+        deadline = self._ensure_flow_deadline()
+        try:
+            data = self._write_with_retry(
+                lambda: self._client.cancel_order(
+                    self.order_id,
+                    idempotency_key=self._cancel_idempotency_key,
+                ),
+                deadline=deadline,
+                phase="取消订单",
+            )
+            order = self._accept_order(data)
+            while True:
+                status = self._status(order)
+                if status == "CANCELED":
+                    self._settled_status = status
+                    self.log_fn("[LeadBee API] 订单已取消")
+                    return True
+                if status in {"COMPLETED", "EXPIRED"}:
+                    self._settled_status = status
+                    return False
+                order = self._poll_order(
+                    deadline=deadline,
+                    phase="确认取消状态",
+                )
+        except LeadBeeAPIError as exc:
+            self.last_cancel_error = str(exc)
+        except RuntimeError as exc:
+            self.last_cancel_error = (
+                "LeadBee API 取消状态未在期限内确认"
+                if "超过本地期限" in str(exc)
+                else str(exc)
+            )
+        self._quarantined = True
+        return False
+
+
 def create_phone_service(
     config: Optional[dict] = None,
     log_fn: Optional[Callable[[str], None]] = None,
 ):
     resolved = dict(config or {})
+    if _truthy(resolved.get("leadbee_api_enabled")):
+        return LeadBeeOpenAPIPhoneService(resolved, log_fn=log_fn)
     provider = str(resolved.get("chatgpt_phone_provider") or "auto").strip().lower()
     has_leadbee_code = bool(
         str(
-            resolved.get("leadbee_code")
-            or resolved.get("chatgpt_leadbee_code")
-            or ""
+            resolved.get("leadbee_code") or resolved.get("chatgpt_leadbee_code") or ""
         ).strip()
     )
     if provider == "leadbee" or (provider in {"", "auto"} and has_leadbee_code):
