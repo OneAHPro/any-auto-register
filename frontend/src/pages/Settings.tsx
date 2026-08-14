@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
-import type { FormInstance } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -590,64 +589,6 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value as Record<string, unknown>
 }
 
-interface LeadBeeTestMetadata {
-  productIds: string[]
-  configuredProductAvailable: boolean | null
-  balanceAvailable: string
-  currency: string
-}
-
-interface LeadBeeTestSnapshot {
-  leadbee_api_enabled: boolean
-  leadbee_api_key: string
-  leadbee_api_secret: string
-  leadbee_api_product_id: string
-}
-
-function readLeadBeeTestSnapshot(form: FormInstance): LeadBeeTestSnapshot {
-  return {
-    leadbee_api_enabled: parseBooleanConfigValue(form.getFieldValue('leadbee_api_enabled')),
-    leadbee_api_key: String(form.getFieldValue('leadbee_api_key') ?? ''),
-    leadbee_api_secret: String(form.getFieldValue('leadbee_api_secret') ?? ''),
-    leadbee_api_product_id: String(form.getFieldValue('leadbee_api_product_id') ?? ''),
-  }
-}
-
-function leadBeeTestSnapshotsMatch(left: LeadBeeTestSnapshot, right: LeadBeeTestSnapshot): boolean {
-  return left.leadbee_api_enabled === right.leadbee_api_enabled
-    && left.leadbee_api_key === right.leadbee_api_key
-    && left.leadbee_api_secret === right.leadbee_api_secret
-    && left.leadbee_api_product_id === right.leadbee_api_product_id
-}
-
-function sanitizeLeadBeeText(value: unknown): string {
-  if (typeof value === 'string') return value.trim().slice(0, 200)
-  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
-  return ''
-}
-
-function sanitizeLeadBeeTestMetadata(value: unknown): LeadBeeTestMetadata | null {
-  const data = asRecord(value)
-  if (!data || data.ok !== true) return null
-
-  const productIds = Array.isArray(data.product_ids)
-    ? data.product_ids
-      .map(sanitizeLeadBeeText)
-      .filter(Boolean)
-      .slice(0, 50)
-    : []
-
-  return {
-    productIds,
-    configuredProductAvailable:
-      typeof data.configured_product_available === 'boolean'
-        ? data.configured_product_available
-        : null,
-    balanceAvailable: sanitizeLeadBeeText(data.balance_available),
-    currency: sanitizeLeadBeeText(data.currency),
-  }
-}
-
 function pickRecord(value: Record<string, unknown> | null, keys: string[]): Record<string, unknown> | null {
   if (!value) return null
   for (const key of keys) {
@@ -739,150 +680,6 @@ function ConfigSection({ section }: { section: SectionConfig }) {
       {section.fields.map((field) => (
         <ConfigField key={field.key} field={field} />
       ))}
-    </Card>
-  )
-}
-
-function LeadBeeOpenApiSection({ form }: { form: FormInstance }) {
-  const [testing, setTesting] = useState(false)
-  const [result, setResult] = useState<LeadBeeTestMetadata | null>(null)
-  const [testError, setTestError] = useState('')
-  const watchedEnabled = Form.useWatch('leadbee_api_enabled', form)
-  const watchedApiKey = Form.useWatch('leadbee_api_key', form)
-  const watchedApiSecret = Form.useWatch('leadbee_api_secret', form)
-  const watchedProductId = Form.useWatch('leadbee_api_product_id', form)
-  const requestGenerationRef = useRef(0)
-  const mountedRef = useRef(true)
-  const observedSnapshotRef = useRef<LeadBeeTestSnapshot | null>(null)
-
-  useEffect(() => {
-    mountedRef.current = true
-    return () => {
-      mountedRef.current = false
-      requestGenerationRef.current += 1
-    }
-  }, [])
-
-  useEffect(() => {
-    const snapshot = readLeadBeeTestSnapshot(form)
-    const previousSnapshot = observedSnapshotRef.current
-    observedSnapshotRef.current = snapshot
-    if (!previousSnapshot || leadBeeTestSnapshotsMatch(previousSnapshot, snapshot)) return
-
-    const invalidationGeneration = ++requestGenerationRef.current
-    const timer = window.setTimeout(() => {
-      if (!mountedRef.current || requestGenerationRef.current !== invalidationGeneration) return
-      setTesting(false)
-      setResult(null)
-      setTestError('')
-    }, 0)
-    return () => window.clearTimeout(timer)
-  }, [form, watchedEnabled, watchedApiKey, watchedApiSecret, watchedProductId])
-
-  const invalidateTest = () => {
-    requestGenerationRef.current += 1
-    setTesting(false)
-    setResult(null)
-    setTestError('')
-  }
-
-  const testConnection = async () => {
-    const snapshot = readLeadBeeTestSnapshot(form)
-    const requestGeneration = ++requestGenerationRef.current
-    const ownsLatestGeneration = () => (
-      mountedRef.current
-      && requestGenerationRef.current === requestGeneration
-    )
-    const canCommitResponse = () => (
-      ownsLatestGeneration()
-      && leadBeeTestSnapshotsMatch(snapshot, readLeadBeeTestSnapshot(form))
-    )
-
-    setTesting(true)
-    setResult(null)
-    setTestError('')
-    try {
-      const response = await apiFetch('/config/leadbee/test', {
-        method: 'POST',
-        body: JSON.stringify({
-          data: snapshot,
-        }),
-      })
-      if (!canCommitResponse()) return
-      const metadata = sanitizeLeadBeeTestMetadata(response)
-      if (!metadata) throw new Error('LeadBee test failed')
-      setResult(metadata)
-    } catch {
-      if (!canCommitResponse()) return
-      setTestError('LeadBee 连接测试失败，请检查凭证和产品 ID')
-    } finally {
-      if (ownsLatestGeneration()) setTesting(false)
-    }
-  }
-
-  const balanceText = result
-    ? [result.balanceAvailable, result.currency].filter(Boolean).join(' ') || '未返回'
-    : ''
-
-  return (
-    <Card
-      title="LeadBee Open API"
-      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>测试使用当前表单内容，不会保存配置</span>}
-      style={{ marginBottom: 16 }}
-    >
-      <Form.Item name="leadbee_api_enabled" label="启用 LeadBee Open API" valuePropName="checked">
-        <Switch checkedChildren="开启" unCheckedChildren="关闭" onChange={invalidateTest} />
-      </Form.Item>
-      <Form.Item name="leadbee_api_key" label="LeadBee API Key">
-        <Input.Password placeholder="留空则保留已保存值" autoComplete="new-password" onChange={invalidateTest} />
-      </Form.Item>
-      <Form.Item name="leadbee_api_secret" label="LeadBee API Secret">
-        <Input.Password placeholder="留空则保留已保存值" autoComplete="new-password" onChange={invalidateTest} />
-      </Form.Item>
-      <Form.Item name="leadbee_api_product_id" label="LeadBee 产品 ID">
-        <Input placeholder="例如 prod-1" onChange={invalidateTest} />
-      </Form.Item>
-      <Space direction="vertical" style={{ width: '100%' }}>
-        <Button htmlType="button" loading={testing} onClick={() => { void testConnection() }}>
-          测试 LeadBee API
-        </Button>
-        {result ? (
-          <div role="status" aria-label="LeadBee API 连接成功" aria-live="polite">
-            <Alert
-              type="success"
-              showIcon
-              message="LeadBee API 连接成功"
-              description={(
-                <Space direction="vertical" size={2}>
-                  <Typography.Text>
-                    产品 ID：{result.productIds.length > 0 ? result.productIds.join('、') : '未返回'}
-                  </Typography.Text>
-                  <Typography.Text>
-                    已配置产品：{
-                      result.configuredProductAvailable === null
-                        ? '未知'
-                        : result.configuredProductAvailable
-                          ? '可用'
-                          : '不可用'
-                    }
-                  </Typography.Text>
-                  <Typography.Text>余额：{balanceText}</Typography.Text>
-                </Space>
-              )}
-            />
-          </div>
-        ) : null}
-        {testError ? (
-          <Alert
-            role="alert"
-            aria-live="assertive"
-            type="error"
-            showIcon
-            message="LeadBee 连接测试失败"
-            description={testError}
-          />
-        ) : null}
-      </Space>
     </Card>
   )
 }
@@ -2108,9 +1905,10 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       data.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
         data.codex2api_delete_on_account_remove_enabled,
       )
-      data.leadbee_api_enabled = parseBooleanConfigValue(data.leadbee_api_enabled)
-      data.leadbee_api_key = ''
-      data.leadbee_api_secret = ''
+      delete data.leadbee_api_enabled
+      delete data.leadbee_api_key
+      delete data.leadbee_api_secret
+      delete data.leadbee_api_product_id
       data.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(data.chatgpt_auto_relogin_enabled)
       data.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_interval_minutes,
@@ -2233,10 +2031,10 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       values.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
         values.codex2api_delete_on_account_remove_enabled,
       )
-      values.leadbee_api_enabled = parseBooleanConfigValue(values.leadbee_api_enabled)
-      values.leadbee_api_key = String(values.leadbee_api_key ?? '')
-      values.leadbee_api_secret = String(values.leadbee_api_secret ?? '')
-      values.leadbee_api_product_id = String(values.leadbee_api_product_id ?? '')
+      delete values.leadbee_api_enabled
+      delete values.leadbee_api_key
+      delete values.leadbee_api_secret
+      delete values.leadbee_api_product_id
       values.chatgpt_auto_relogin_enabled = parseBooleanConfigValue(values.chatgpt_auto_relogin_enabled)
       values.chatgpt_auto_relogin_interval_minutes = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_interval_minutes,
@@ -2292,10 +2090,6 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
         sub2api_enabled: values.sub2api_enabled,
         codex2api_enabled: values.codex2api_enabled,
         codex2api_delete_on_account_remove_enabled: values.codex2api_delete_on_account_remove_enabled,
-        leadbee_api_enabled: values.leadbee_api_enabled,
-        leadbee_api_key: '',
-        leadbee_api_secret: '',
-        leadbee_api_product_id: values.leadbee_api_product_id,
         chatgpt_auto_relogin_enabled: values.chatgpt_auto_relogin_enabled,
         chatgpt_auto_relogin_interval_minutes: values.chatgpt_auto_relogin_interval_minutes,
         chatgpt_auto_relogin_concurrency: values.chatgpt_auto_relogin_concurrency,
@@ -2478,7 +2272,6 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
                       {currentTab.sections.map((section) => (
                         <ConfigSection key={section.title} section={section} />
                       ))}
-                      {effectiveTab === 'chatgpt' ? <LeadBeeOpenApiSection form={form} /> : null}
                       {effectiveTab === 'codex2api' ? <ChatGPTAutoReloginSection /> : null}
                     </>
                   )}

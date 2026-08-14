@@ -99,7 +99,8 @@ describe('SmsPool', () => {
   it('shows full cards, receive URLs, counts and usage states', async () => {
     render(<SmsPool />)
 
-    expect(await screen.findByText('SMS接码池')).toBeTruthy()
+    expect(await screen.findByRole('heading', { name: 'SMS接码' })).toBeTruthy()
+    expect(await screen.findByText('LeadBee API 接码')).toBeTruthy()
     expect(await screen.findByText('bei-sms-FULL-SECRET-0001')).toBeTruthy()
     expect(screen.getByText('bei-sms-FULL-SECRET-0002')).toBeTruthy()
     expect(screen.queryByText('bei-****-0001')).toBeNull()

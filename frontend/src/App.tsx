@@ -142,7 +142,7 @@ function AppContent() {
     {
       key: '/sms-pool',
       icon: <MobileOutlined />,
-      label: 'SMS接码池',
+      label: 'SMS接码',
     },
     {
       key: '/codex2api',

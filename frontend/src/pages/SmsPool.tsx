@@ -19,6 +19,7 @@ import {
   UploadOutlined,
 } from '@ant-design/icons'
 
+import LeadBeeApiSettingsCard from '@/components/LeadBeeApiSettingsCard'
 import { apiFetch } from '@/lib/utils'
 
 
@@ -202,10 +203,10 @@ export default function SmsPool() {
       >
         <div>
           <Typography.Title level={2} style={{ margin: 0, fontSize: 24 }}>
-            SMS接码池
+            SMS接码
           </Typography.Title>
           <Typography.Paragraph type="secondary" style={{ margin: '4px 0 0' }}>
-            集中管理登录接码卡密与接码地址，任务仅领取未使用卡密。
+            管理 LeadBee API 接码与备用卡密池，登录任务可按所选模式自动取号。
           </Typography.Paragraph>
         </div>
         <Space wrap>
@@ -217,6 +218,8 @@ export default function SmsPool() {
           <Button icon={<ReloadOutlined />} loading={loading} onClick={() => load()}>刷新</Button>
         </Space>
       </div>
+
+      <LeadBeeApiSettingsCard />
 
       <Card title="导入接码卡密">
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
