@@ -98,7 +98,7 @@ export default function SmsPool() {
       setTotal(Number(response.total || 0))
     } catch (error) {
       if (!silent) {
-        message.error(`读取 SMS 接码池失败: ${error instanceof Error ? error.message : '请求失败'}`)
+        message.error(`读取 SMS 接码失败: ${error instanceof Error ? error.message : '请求失败'}`)
       }
     } finally {
       if (!silent) setLoading(false)

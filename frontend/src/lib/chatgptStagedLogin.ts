@@ -1,5 +1,7 @@
 type ConfigRecord = Record<string, unknown>
 
+export type ChatGPTSmsMode = 'api_fallback_pool' | 'pool' | 'none'
+
 type ExistingAccountLoginTaskInput = {
   count: number
   concurrency: number
@@ -7,6 +9,7 @@ type ExistingAccountLoginTaskInput = {
   executorType: string
   captchaSolver: string
   bindPhoneAndGetRefreshToken: boolean
+  smsMode?: ChatGPTSmsMode
   leadbeeApi?: boolean
   useSmsPool?: boolean
   leadbeeCodes: string[]
@@ -81,7 +84,10 @@ export function resolveMailboxSnapshotType(config: ConfigRecord): 'microsoft' | 
 }
 
 export function buildExistingAccountLoginTaskPayload(input: ExistingAccountLoginTaskInput) {
-  const bindPhoneAndGetRefreshToken = Boolean(input.bindPhoneAndGetRefreshToken)
+  const explicitSmsMode = input.smsMode
+  const bindPhoneAndGetRefreshToken = explicitSmsMode
+    ? explicitSmsMode !== 'none'
+    : Boolean(input.bindPhoneAndGetRefreshToken)
   const leadbeeApi = bindPhoneAndGetRefreshToken && Boolean(input.leadbeeApi)
   const useSmsPool = bindPhoneAndGetRefreshToken && !leadbeeApi && Boolean(input.useSmsPool)
   const extra: ConfigRecord = {
@@ -93,17 +99,21 @@ export function buildExistingAccountLoginTaskPayload(input: ExistingAccountLogin
       ? 'access_token'
       : 'refresh_token',
     chatgpt_existing_account_allow_phone_verification: false,
-    chatgpt_existing_account_bind_phone_and_get_rt: bindPhoneAndGetRefreshToken,
   }
-  if (leadbeeApi) {
-    extra.chatgpt_existing_account_leadbee_api = true
+  if (explicitSmsMode) {
+    extra.chatgpt_existing_account_sms_mode = explicitSmsMode
   } else {
-    extra.chatgpt_existing_account_use_sms_pool = useSmsPool
-  }
-  if (bindPhoneAndGetRefreshToken && !leadbeeApi && !useSmsPool) {
-    extra.chatgpt_existing_account_leadbee_codes = input.leadbeeCodes
-      .map(code => String(code || '').trim())
-      .filter(Boolean)
+    extra.chatgpt_existing_account_bind_phone_and_get_rt = bindPhoneAndGetRefreshToken
+    if (leadbeeApi) {
+      extra.chatgpt_existing_account_leadbee_api = true
+    } else {
+      extra.chatgpt_existing_account_use_sms_pool = useSmsPool
+    }
+    if (bindPhoneAndGetRefreshToken && !leadbeeApi && !useSmsPool) {
+      extra.chatgpt_existing_account_leadbee_codes = input.leadbeeCodes
+        .map(code => String(code || '').trim())
+        .filter(Boolean)
+    }
   }
   const mailProviderPlan = (input.mailProviderPlan || [])
     .map(provider => String(provider || '').trim().toLowerCase())

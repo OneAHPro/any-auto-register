@@ -164,4 +164,43 @@ describe('chatgpt staged login helpers', () => {
     expect(JSON.stringify(payload)).not.toContain('fixture-config-secret')
     expect(JSON.stringify(payload)).not.toContain('fixture-client-reference')
   })
+
+  it.each([
+    ['api_fallback_pool', true, 'access_token'],
+    ['pool', true, 'access_token'],
+    ['none', false, 'refresh_token'],
+  ] as const)(
+    'sends the explicit SMS mode %s without legacy routing fields',
+    (smsMode, expectsPhoneVerification, expectedStage) => {
+      const payload = buildExistingAccountLoginTaskPayload({
+        count: 50,
+        concurrency: 50,
+        registerDelaySeconds: 0,
+        executorType: 'protocol',
+        captchaSolver: 'yescaptcha',
+        bindPhoneAndGetRefreshToken: expectsPhoneVerification,
+        smsMode,
+        leadbeeApi: true,
+        useSmsPool: true,
+        leadbeeCodes: ['fixture-card-secret'],
+        config: {
+          mail_provider: 'microsoft',
+          leadbee_api_key: 'fixture-config-key',
+          leadbee_api_secret: 'fixture-config-secret',
+          leadbee_api_client_order_id: 'fixture-client-reference',
+        },
+      })
+
+      expect(payload.concurrency).toBe(50)
+      expect(payload.extra.chatgpt_existing_account_sms_mode).toBe(smsMode)
+      expect(payload.extra.chatgpt_existing_account_login_stage).toBe(expectedStage)
+      expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_api')
+      expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
+      expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
+      expect(JSON.stringify(payload)).not.toContain('fixture-card-secret')
+      expect(JSON.stringify(payload)).not.toContain('fixture-config-key')
+      expect(JSON.stringify(payload)).not.toContain('fixture-config-secret')
+      expect(JSON.stringify(payload)).not.toContain('fixture-client-reference')
+    },
+  )
 })

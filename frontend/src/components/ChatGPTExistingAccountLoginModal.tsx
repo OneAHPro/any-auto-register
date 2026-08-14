@@ -4,26 +4,26 @@ import {
   Button,
   Col,
   Form,
-  Input,
   InputNumber,
   Modal,
+  Radio,
   Row,
   Skeleton,
-  Switch,
+  Space,
   Tag,
   Typography,
   message,
   theme,
 } from 'antd'
 
-import { apiFetch } from '@/lib/utils'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import {
   buildExistingAccountLoginTaskPayload,
-  parseLeadBeeCodes,
   resolveMailboxSnapshotType,
 } from '@/lib/chatgptStagedLogin'
+import type { ChatGPTSmsMode } from '@/lib/chatgptStagedLogin'
+import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from './TaskLogPanel'
 
 type Props = {
@@ -36,12 +36,22 @@ type LoginFormValues = {
   count: number
   concurrency: number
   register_delay_seconds: number
-  bind_phone_and_get_rt: boolean
-  use_sms_pool: boolean
-  leadbee_codes: string
+  sms_mode: ChatGPTSmsMode
 }
 
 type ImportedMailProvider = 'microsoft' | 'applemail'
+
+type CapacitySummary = {
+  balanceAvailable: number | null
+  unitPrice: number | null
+  estimatedOrderCapacity: number | null
+  currency: string
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  return value as Record<string, unknown>
+}
 
 function errorMessage(error: unknown, fallback: string) {
   if (error && typeof error === 'object' && 'message' in error) {
@@ -51,6 +61,56 @@ function errorMessage(error: unknown, fallback: string) {
   return fallback
 }
 
+function safeDecimal(value: unknown): number | null {
+  if (typeof value !== 'number' && typeof value !== 'string') return null
+  const text = String(value).trim()
+  if (!/^\d+(?:\.\d{1,8})?$/.test(text)) return null
+  const parsed = Number(text)
+  return Number.isFinite(parsed) && parsed >= 0 && parsed <= 1_000_000_000
+    ? parsed
+    : null
+}
+
+function safeCapacity(value: unknown): number | null {
+  const parsed = typeof value === 'number' ? value : Number(String(value ?? '').trim())
+  return Number.isSafeInteger(parsed) && parsed >= 0 && parsed <= 1_000_000_000
+    ? parsed
+    : null
+}
+
+function sanitizeCapacity(value: unknown): CapacitySummary | null {
+  const data = asRecord(value)
+  if (!data || data.ok !== true) return null
+  const currencyText = String(data.currency ?? '').trim().toUpperCase()
+  return {
+    balanceAvailable: safeDecimal(data.balance_available),
+    unitPrice: safeDecimal(data.unit_price),
+    estimatedOrderCapacity: safeCapacity(data.estimated_order_capacity),
+    currency: /^[A-Z]{3}$/.test(currencyText) ? currencyText : '',
+  }
+}
+
+function moneySymbol(currency: string): string {
+  if (currency === 'CNY') return '¥'
+  if (currency === 'USD') return '$'
+  if (currency === 'EUR') return '€'
+  return currency ? `${currency} ` : ''
+}
+
+function formatMoney(value: number | null, currency: string): string {
+  if (value === null) return '暂未获取'
+  return `${moneySymbol(currency)}${value.toFixed(2)}`
+}
+
+function sanitizeLoginConfig(value: unknown): Record<string, unknown> {
+  const config = { ...(asRecord(value) ?? {}) }
+  delete config.leadbee_api_key
+  delete config.leadbee_api_secret
+  delete config.leadbee_api_client_order_id
+  delete config.leadbee_api_client_order_ids
+  return config
+}
+
 export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Props) {
   const [form] = Form.useForm<LoginFormValues>()
   const { token } = theme.useToken()
@@ -58,77 +118,83 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
   const [poolCount, setPoolCount] = useState<number | null>(null)
   const [mailProviderPlan, setMailProviderPlan] = useState<ImportedMailProvider[]>([])
   const [smsPoolAvailable, setSmsPoolAvailable] = useState<number | null>(null)
+  const [apiConfigured, setApiConfigured] = useState(false)
+  const [capacity, setCapacity] = useState<CapacitySummary | null>(null)
   const [loadingConfig, setLoadingConfig] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
-  const bindPhoneAndGetRefreshToken = Boolean(
-    Form.useWatch('bind_phone_and_get_rt', form),
-  )
-  const useSmsPool = Boolean(Form.useWatch('use_sms_pool', form))
+  const smsMode = Form.useWatch('sms_mode', form) || 'none'
   const watchedCount = Math.max(1, Number(Form.useWatch('count', form) || 1))
-  const leadbeeCodes = parseLeadBeeCodes(Form.useWatch('leadbee_codes', form))
-  const leadbeeApiEnabled = parseBooleanConfigValue(config?.leadbee_api_enabled)
 
   useEffect(() => {
     if (!open) return
     let cancelled = false
-    setTaskId(null)
-    setPoolCount(null)
-    setMailProviderPlan([])
-    setSmsPoolAvailable(null)
-    setConfig(null)
-    form.resetFields()
-    setLoadingConfig(true)
 
     const loadContext = async () => {
       try {
-        const nextConfig = await apiFetch('/config')
-        const nextLeadBeeApiEnabled = parseBooleanConfigValue(nextConfig?.leadbee_api_enabled)
-        const smsStats = nextLeadBeeApiEnabled
-          ? null
-          : await apiFetch('/sms-pool/stats').catch(() => null)
-        if (cancelled) return
-        setConfig(nextConfig)
-        setSmsPoolAvailable(smsStats === null ? null : Math.max(0, Number(smsStats?.unused || 0)))
+        const rawConfig = await apiFetch('/config')
+        const rawConfigRecord = asRecord(rawConfig) ?? {}
+        const nextApiConfigured = Boolean(
+          parseBooleanConfigValue(rawConfigRecord.leadbee_api_enabled)
+          && String(rawConfigRecord.leadbee_api_product_id ?? '').trim(),
+        )
+        const nextConfig = sanitizeLoginConfig(rawConfigRecord)
         const snapshotType = resolveMailboxSnapshotType(nextConfig)
-        if (!snapshotType) {
-          form.setFieldsValue({
-            count: 1,
-            concurrency: 1,
-            register_delay_seconds: 0,
-            bind_phone_and_get_rt: false,
-            use_sms_pool: false,
-            leadbee_codes: '',
-          })
-          return
-        }
-        const snapshotTypes: ImportedMailProvider[] = ['microsoft', 'applemail']
-        const snapshots = await Promise.all(snapshotTypes.map(async (type) => {
-          const params = new URLSearchParams({ type, preview_limit: '1' })
-          if (type === 'applemail') {
-            if (nextConfig.applemail_pool_dir) params.set('pool_dir', String(nextConfig.applemail_pool_dir))
-            if (nextConfig.applemail_pool_file) params.set('pool_file', String(nextConfig.applemail_pool_file))
-          }
-          try {
-            const snapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`)
-            return { type, count: Math.max(0, Number(snapshot?.count || 0)) }
-          } catch {
-            return { type, count: 0 }
-          }
-        }))
+        const snapshotTypes: ImportedMailProvider[] = snapshotType
+          ? ['microsoft', 'applemail']
+          : []
+
+        const [smsStats, apiCapacityResponse, snapshots] = await Promise.all([
+          apiFetch('/sms-pool/stats').catch(() => null),
+          nextApiConfigured
+            ? apiFetch('/config/leadbee/test', {
+              method: 'POST',
+              body: JSON.stringify({ data: {} }),
+            }).catch(() => null)
+            : Promise.resolve(null),
+          Promise.all(snapshotTypes.map(async (type) => {
+            const params = new URLSearchParams({ type, preview_limit: '1' })
+            if (type === 'applemail') {
+              if (nextConfig.applemail_pool_dir) {
+                params.set('pool_dir', String(nextConfig.applemail_pool_dir))
+              }
+              if (nextConfig.applemail_pool_file) {
+                params.set('pool_file', String(nextConfig.applemail_pool_file))
+              }
+            }
+            try {
+              const snapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`)
+              return { type, count: Math.max(0, Number(snapshot?.count || 0)) }
+            } catch {
+              return { type, count: 0 }
+            }
+          })),
+        ])
         if (cancelled) return
+
         const providerPlan = snapshots.flatMap(({ type, count }) =>
           Array.from({ length: count }, () => type))
-        const count = providerPlan.length
+        const count = snapshotType ? providerPlan.length : 1
+        const nextSmsPoolAvailable = smsStats === null
+          ? null
+          : Math.max(0, Number(smsStats?.unused || 0))
+        const defaultSmsMode: ChatGPTSmsMode = nextApiConfigured
+          ? 'api_fallback_pool'
+          : nextSmsPoolAvailable && nextSmsPoolAvailable > 0
+            ? 'pool'
+            : 'none'
+
+        setConfig(nextConfig)
+        setApiConfigured(nextApiConfigured)
+        setCapacity(sanitizeCapacity(apiCapacityResponse))
+        setSmsPoolAvailable(nextSmsPoolAvailable)
         setMailProviderPlan(providerPlan)
-        setPoolCount(count)
+        setPoolCount(snapshotType ? count : null)
         form.setFieldsValue({
           count: Math.max(1, count),
           concurrency: 1,
           register_delay_seconds: 0,
-          bind_phone_and_get_rt: false,
-          use_sms_pool: false,
-          leadbee_codes: '',
+          sms_mode: defaultSmsMode,
         })
       } catch (error) {
         if (!cancelled) {
@@ -137,9 +203,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
             count: 1,
             concurrency: 1,
             register_delay_seconds: 0,
-            bind_phone_and_get_rt: false,
-            use_sms_pool: false,
-            leadbee_codes: '',
+            sms_mode: 'none',
           })
         }
       } finally {
@@ -147,9 +211,21 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
       }
     }
 
-    loadContext()
+    const startTimer = window.setTimeout(() => {
+      setTaskId(null)
+      setPoolCount(null)
+      setMailProviderPlan([])
+      setSmsPoolAvailable(null)
+      setApiConfigured(false)
+      setCapacity(null)
+      setConfig(null)
+      form.resetFields()
+      setLoadingConfig(true)
+      void loadContext()
+    }, 0)
     return () => {
       cancelled = true
+      window.clearTimeout(startTimer)
     }
   }, [form, open])
 
@@ -164,12 +240,14 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
         count: values.count,
         concurrency: values.concurrency,
         registerDelaySeconds: values.register_delay_seconds || 0,
-        executorType: normalizeExecutorForPlatform('chatgpt', String(config.default_executor || 'protocol')),
+        executorType: normalizeExecutorForPlatform(
+          'chatgpt',
+          String(config.default_executor || 'protocol'),
+        ),
         captchaSolver: String(config.default_captcha_solver || 'yescaptcha'),
-        bindPhoneAndGetRefreshToken: values.bind_phone_and_get_rt,
-        leadbeeApi: leadbeeApiEnabled,
-        useSmsPool: values.use_sms_pool,
-        leadbeeCodes: parseLeadBeeCodes(values.leadbee_codes),
+        bindPhoneAndGetRefreshToken: values.sms_mode !== 'none',
+        smsMode: values.sms_mode,
+        leadbeeCodes: [],
         mailProviderPlan: mailProviderPlan.slice(0, values.count),
         config,
       })
@@ -192,13 +270,18 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
     onClose()
   }
 
+  const apiSummary = capacity
+    ? `API 可用余额 ${formatMoney(capacity.balanceAvailable, capacity.currency)} · 单价 ${formatMoney(capacity.unitPrice, capacity.currency)}/次 · 预计可接 ${capacity.estimatedOrderCapacity ?? '暂未获取'} 次`
+    : '余额暂未获取'
+  const usesPhoneVerification = smsMode !== 'none'
+
   return (
     <Modal
       title="登录已有 ChatGPT 账号"
       open={open}
       onCancel={close}
       footer={null}
-      width={600}
+      width={640}
       style={{ top: 48 }}
       styles={{
         body: {
@@ -211,35 +294,20 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
       destroyOnHidden
     >
       {loadingConfig ? (
-        <Skeleton active paragraph={{ rows: 4 }} />
+        <Skeleton active paragraph={{ rows: 5 }} />
       ) : taskId ? (
-        <TaskLogPanel
-          taskId={taskId}
-          mode="login"
-          onDone={() => {
-            onDone()
-          }}
-        />
+        <TaskLogPanel taskId={taskId} mode="login" onDone={onDone} />
       ) : (
         <>
           <Alert
             type={poolCount === 0 ? 'warning' : 'info'}
             showIcon
             message={poolCount === null ? '当前邮箱来源不提供池数量' : `可用邮箱 ${poolCount} 个`}
-            description={bindPhoneAndGetRefreshToken
-              ? '仅未绑定手机号的账号需要此模式：系统会先保存 AT，再使用 LeadBee 完成手机验证并获取 RT。'
-              : '系统会直接完成已有账号 OAuth 登录并保存 AT + RT；已绑定手机号的账号无需卡密。'}
+            description={usesPhoneVerification
+              ? '系统会先保存 AT，再按所选接码方式完成手机验证并获取 RT。'
+              : '适用于已绑定手机号的账号，系统会直接完成 OAuth 登录并保存 AT + RT。'}
             style={{ marginBottom: 16 }}
           />
-          {leadbeeApiEnabled ? (
-            <Alert
-              type="info"
-              showIcon
-              message="LeadBee API 已启用"
-              description="需要手机验证时，服务端会自动取号，无需填写卡密或使用 SMS 接码池。"
-              style={{ marginBottom: 16 }}
-            />
-          ) : null}
           <Form
             form={form}
             layout="vertical"
@@ -247,14 +315,12 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               count: 1,
               concurrency: 1,
               register_delay_seconds: 0,
-              bind_phone_and_get_rt: false,
-              use_sms_pool: false,
-              leadbee_codes: '',
+              sms_mode: 'none',
             }}
             onFinish={handleStart}
           >
             <Row gutter={12}>
-              <Col span={8}>
+              <Col xs={24} sm={8}>
                 <Form.Item
                   name="count"
                   label="登录数量"
@@ -263,16 +329,20 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                   <InputNumber min={1} max={poolCount || undefined} style={{ width: '100%' }} />
                 </Form.Item>
               </Col>
-              <Col span={8}>
+              <Col xs={24} sm={8}>
                 <Form.Item
                   name="concurrency"
                   label="并发数"
                   rules={[{ required: true, message: '请输入并发数' }]}
                 >
-                  <InputNumber min={1} max={watchedCount} style={{ width: '100%' }} />
+                  <InputNumber
+                    min={1}
+                    max={Math.min(50, watchedCount)}
+                    style={{ width: '100%' }}
+                  />
                 </Form.Item>
               </Col>
-              <Col span={8}>
+              <Col xs={24} sm={8}>
                 <Form.Item name="register_delay_seconds" label="启动间隔（秒）">
                   <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} />
                 </Form.Item>
@@ -281,43 +351,74 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
 
             <div
               style={{
-                border: `1px solid ${bindPhoneAndGetRefreshToken ? token.colorPrimaryBorder : token.colorBorderSecondary}`,
+                border: `1px solid ${token.colorBorderSecondary}`,
                 borderRadius: token.borderRadiusLG,
-                background: bindPhoneAndGetRefreshToken
-                  ? token.colorPrimaryBg
-                  : token.colorFillAlter,
+                background: token.colorFillAlter,
                 padding: 16,
-                marginBottom: bindPhoneAndGetRefreshToken ? 16 : 20,
-                transition: 'border-color 160ms ease, background 160ms ease',
+                marginBottom: 20,
               }}
             >
-              <div
-                style={{
-                  display: 'flex',
-                  alignItems: 'flex-start',
-                  justifyContent: 'space-between',
-                  gap: 16,
-                }}
+              <Typography.Title level={5} style={{ margin: 0 }}>
+                接码方式
+              </Typography.Title>
+              <Typography.Paragraph
+                type="secondary"
+                style={{ margin: '4px 0 14px', fontSize: 13 }}
               >
-                <div>
-                  <Typography.Text strong>
-                    未绑定手机号时自动接码
-                  </Typography.Text>
-                  <Typography.Paragraph
-                    type="secondary"
-                    style={{ margin: '4px 0 0', fontSize: 13, lineHeight: 1.55 }}
-                  >
-                    仅用于未绑定手机号的账号；已绑定手机号请保持关闭，普通登录会直接获取 RT。
-                  </Typography.Paragraph>
-                </div>
-                <Form.Item
-                  name="bind_phone_and_get_rt"
-                  valuePropName="checked"
-                  noStyle
+                一般使用 API 优先。余额不足时只切换该账号，卡密队列不会阻塞其他 API 订单。
+              </Typography.Paragraph>
+
+              <Space direction="vertical" size={6} style={{ width: '100%', marginBottom: 14 }}>
+                {apiConfigured ? (
+                  <Typography.Text>{apiSummary}</Typography.Text>
+                ) : (
+                  <Typography.Text type="secondary">LeadBee API 尚未启用</Typography.Text>
+                )}
+                <Typography.Text>
+                  {smsPoolAvailable === null
+                    ? '卡密池余量暂未获取'
+                    : `卡密池可用 ${smsPoolAvailable} 张`}
+                </Typography.Text>
+              </Space>
+
+              <Form.Item name="sms_mode" style={{ marginBottom: 0 }}>
+                <Radio.Group
+                  style={{ display: 'flex', flexDirection: 'column', gap: 10, width: '100%' }}
                 >
-                  <Switch aria-label="未绑定手机号时自动接码" />
-                </Form.Item>
-              </div>
+                  <Radio
+                    value="api_fallback_pool"
+                    aria-label="API优先"
+                    disabled={!apiConfigured}
+                  >
+                    <Space direction="vertical" size={0}>
+                      <Typography.Text strong>API优先</Typography.Text>
+                      <Typography.Text type="secondary">
+                        API 余额不足时，自动改用卡密池。
+                      </Typography.Text>
+                    </Space>
+                  </Radio>
+                  <Radio
+                    value="pool"
+                    aria-label="仅卡密池"
+                    disabled={smsPoolAvailable === 0}
+                  >
+                    <Space direction="vertical" size={0}>
+                      <Typography.Text strong>仅卡密池</Typography.Text>
+                      <Typography.Text type="secondary">
+                        跳过 API，直接从已导入卡密中分配。
+                      </Typography.Text>
+                    </Space>
+                  </Radio>
+                  <Radio value="none" aria-label="无需接码">
+                    <Space direction="vertical" size={0}>
+                      <Typography.Text strong>无需接码</Typography.Text>
+                      <Typography.Text type="secondary">
+                        已绑定手机号的账号直接登录并获取 RT。
+                      </Typography.Text>
+                    </Space>
+                  </Radio>
+                </Radio.Group>
+              </Form.Item>
 
               <div
                 style={{
@@ -330,132 +431,35 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               >
                 <Tag color="blue" bordered={false}>邮箱登录</Tag>
                 <Typography.Text type="secondary">→</Typography.Text>
-                {bindPhoneAndGetRefreshToken ? (
+                {usesPhoneVerification ? (
                   <>
                     <Tag color="purple" bordered={false}>手机验证</Tag>
                     <Typography.Text type="secondary">→</Typography.Text>
-                    <Tag color="green" bordered={false}>保存 AT + RT</Tag>
                   </>
-                ) : (
-                  <Tag color="green" bordered={false}>保存 AT + RT</Tag>
-                )}
+                ) : null}
+                <Tag color="green" bordered={false}>保存 AT + RT</Tag>
               </div>
-
-              {bindPhoneAndGetRefreshToken && !leadbeeApiEnabled && (
-                <div
-                  style={{
-                    borderTop: `1px solid ${token.colorBorderSecondary}`,
-                    marginTop: 14,
-                    paddingTop: 14,
-                  }}
-                >
-                  <div
-                    style={{
-                      display: 'flex',
-                      alignItems: 'center',
-                      justifyContent: 'space-between',
-                      gap: 16,
-                    }}
-                  >
-                    <div>
-                      <Typography.Text strong>使用 SMS 接码池</Typography.Text>
-                      <Typography.Paragraph
-                        type="secondary"
-                        style={{ margin: '3px 0 0', fontSize: 12 }}
-                      >
-                        后端自动领取未使用卡密，并使用卡片绑定的接码地址。
-                      </Typography.Paragraph>
-                    </div>
-                    <Form.Item name="use_sms_pool" valuePropName="checked" noStyle>
-                      <Switch aria-label="使用 SMS 接码池" />
-                    </Form.Item>
-                  </div>
-                  {useSmsPool && (
-                    <Alert
-                      type={smsPoolAvailable !== null && smsPoolAvailable < watchedCount ? 'warning' : 'success'}
-                      showIcon
-                      message={smsPoolAvailable === null ? '正在读取接码池余量' : `可用卡密 ${smsPoolAvailable} 个`}
-                      description={smsPoolAvailable !== null && smsPoolAvailable < watchedCount
-                        ? `当前登录需要 ${watchedCount} 张卡密，请先到 SMS接码池补充。`
-                        : '卡密仅在后端分配，登录任务不会在浏览器中暴露卡密原文。'}
-                      style={{ marginTop: 12 }}
-                    />
-                  )}
-                </div>
-              )}
             </div>
 
-            {bindPhoneAndGetRefreshToken && !leadbeeApiEnabled && !useSmsPool && (
-              <Form.Item
-                name="leadbee_codes"
-                preserve={false}
-                label="LeadBee 接码卡密"
-                dependencies={['count']}
-                extra={(
-                  <div
-                    style={{
-                      display: 'flex',
-                      justifyContent: 'space-between',
-                      gap: 12,
-                      marginTop: 4,
-                    }}
-                  >
-                    <span>一行一个卡密，按登录顺序分配</span>
-                    <span
-                      style={{
-                        color: leadbeeCodes.length === watchedCount
-                          ? token.colorSuccess
-                          : token.colorTextSecondary,
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      已填写 {leadbeeCodes.length} / 需要 {watchedCount}
-                    </span>
-                  </div>
-                )}
-                rules={[
-                  {
-                    validator: (_, value) => {
-                      const codes = parseLeadBeeCodes(value)
-                      const count = Math.max(1, Number(form.getFieldValue('count') || 1))
-                      if (codes.length !== count) {
-                        return Promise.reject(new Error(
-                          `卡密数量需与登录数量一致（需要 ${count} 个，当前 ${codes.length} 个）`,
-                        ))
-                      }
-                      return Promise.resolve()
-                    },
-                  },
-                ]}
-              >
-                <Input.TextArea
-                  aria-label="LeadBee 接码卡密"
-                  placeholder={'例如：\nbei-sms-xxxx-xxxx\nbei-sms-yyyy-yyyy'}
-                  autoSize={{ minRows: 3, maxRows: 7 }}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-              </Form.Item>
-            )}
-
-            <Button
-              type="primary"
-              htmlType="submit"
-              block
-              loading={submitting}
-              disabled={
-                poolCount === 0
-                || (
-                  bindPhoneAndGetRefreshToken
-                  && !leadbeeApiEnabled
-                  && useSmsPool
-                  && smsPoolAvailable !== null
-                  && smsPoolAvailable < watchedCount
-                )
-              }
+            <div
+              style={{
+                position: 'sticky',
+                bottom: 0,
+                zIndex: 1,
+                padding: '12px 0 2px',
+                background: token.colorBgElevated,
+              }}
             >
-              {bindPhoneAndGetRefreshToken ? '开始登录并接码' : '开始登录'}
-            </Button>
+              <Button
+                type="primary"
+                htmlType="submit"
+                block
+                loading={submitting}
+                disabled={poolCount === 0}
+              >
+                {usesPhoneVerification ? '开始登录并接码' : '开始登录'}
+              </Button>
+            </div>
           </Form>
         </>
       )}

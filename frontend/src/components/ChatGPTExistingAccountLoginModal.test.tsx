@@ -1,8 +1,8 @@
 // @vitest-environment jsdom
 
-import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import { cleanup, render, screen } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { apiFetch } from '@/lib/utils'
 import { ChatGPTExistingAccountLoginModal } from './ChatGPTExistingAccountLoginModal'
@@ -41,6 +41,21 @@ beforeAll(() => {
   vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => getComputedStyle(element))
 })
 
+function renderModal() {
+  return render(
+    <ChatGPTExistingAccountLoginModal
+      open
+      onClose={() => {}}
+      onDone={() => {}}
+    />,
+  )
+}
+
+function taskPayload() {
+  const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
+  return JSON.parse(String(taskCall?.[1]?.body || '{}'))
+}
+
 describe('ChatGPTExistingAccountLoginModal', () => {
   beforeEach(() => {
     vi.mocked(apiFetch).mockReset()
@@ -56,255 +71,219 @@ describe('ChatGPTExistingAccountLoginModal', () => {
         return { count: path.includes('type=applemail') ? 0 : 5 }
       }
       if (path === '/sms-pool/stats') {
-        return { total: 8, unused: 5, reserved: 1, used: 2 }
+        return { total: 8, unused: 5, reserved: 1, active: 0, used: 2 }
       }
-      if (path === '/tasks/register') {
-        return { task_id: 'login-task-1' }
-      }
+      if (path === '/tasks/register') return { task_id: 'login-task-1' }
       throw new Error(`unexpected path: ${path}`)
     })
   })
 
-  afterEach(() => {
-    cleanup()
-  })
+  afterEach(() => cleanup())
 
-  it('loads the imported mailbox count and gets AT plus RT in the first login pass', async () => {
+  it('defaults to the card pool when API is not configured', async () => {
     const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
+    renderModal()
 
     expect(await screen.findByText('可用邮箱 5 个')).toBeTruthy()
-    expect(apiFetch).toHaveBeenCalledWith(
-      '/mail-imports/snapshot?type=microsoft&preview_limit=1',
-    )
-    expect(screen.getByText('系统会直接完成已有账号 OAuth 登录并保存 AT + RT；已绑定手机号的账号无需卡密。')).toBeTruthy()
+    expect((screen.getByRole('radio', { name: '仅卡密池' }) as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText('卡密池可用 5 张')).toBeTruthy()
     expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
-    await user.click(screen.getByRole('button', { name: '开始登录' }))
 
-    await waitFor(() => {
-      expect(apiFetch).toHaveBeenCalledWith('/tasks/register', expect.objectContaining({
-        method: 'POST',
-      }))
-    })
-    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
-    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
-    expect(payload.count).toBe(5)
-    expect(payload.extra.chatgpt_existing_account_login_stage).toBe('refresh_token')
-    expect(payload.extra.chatgpt_existing_account_bind_phone_and_get_rt).toBe(false)
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
     expect(await screen.findByText('任务 login-task-1')).toBeTruthy()
-    expect(screen.getByText('任务模式 login')).toBeTruthy()
-  })
 
-  it('combines Microsoft and AppleMail imports into one login batch', async () => {
-    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
-      if (path === '/config') {
-        return {
-          mail_provider: 'microsoft',
-          applemail_pool_dir: '/runtime/mail',
-          applemail_pool_file: 'active-applemail.json',
-          default_executor: 'protocol',
-          default_captcha_solver: 'yescaptcha',
-        }
-      }
-      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) {
-        return { count: 10 }
-      }
-      if (path.startsWith('/mail-imports/snapshot?type=applemail')) {
-        return { count: 1 }
-      }
-      if (path === '/sms-pool/stats') {
-        return { total: 0, unused: 0, reserved: 0, used: 0 }
-      }
-      if (path === '/tasks/register') {
-        return { task_id: 'combined-login-task' }
-      }
-      throw new Error(`unexpected path: ${path}`)
-    })
-
-    const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
-
-    expect(await screen.findByText('可用邮箱 11 个')).toBeTruthy()
-    expect(vi.mocked(apiFetch).mock.calls.some(([path]) =>
-      String(path).startsWith('/mail-imports/snapshot?type=microsoft'))).toBe(true)
-    expect(vi.mocked(apiFetch).mock.calls.some(([path]) =>
-      String(path).startsWith('/mail-imports/snapshot?type=applemail'))).toBe(true)
-
-    await user.click(screen.getByRole('button', { name: '开始登录' }))
-    await screen.findByText('任务 combined-login-task')
-
-    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
-    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
-    expect(payload.count).toBe(11)
-    expect(payload.extra.chatgpt_existing_account_mail_provider_plan).toEqual([
-      ...Array(10).fill('microsoft'),
-      'applemail',
-    ])
-  })
-
-  it('reveals one-code-per-line input and starts login plus phone verification', async () => {
-    const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
-
-    expect(await screen.findByText('可用邮箱 5 个')).toBeTruthy()
-    await user.click(screen.getByRole('switch', {
-      name: '未绑定手机号时自动接码',
-    }))
-
-    expect(screen.getByText('已填写 0 / 需要 5')).toBeTruthy()
-    await user.type(
-      screen.getByLabelText('LeadBee 接码卡密'),
-      'card-1\ncard-2\ncard-3\ncard-4\ncard-5',
-    )
-    expect(screen.getByText('已填写 5 / 需要 5')).toBeTruthy()
-    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
-
-    await waitFor(() => {
-      expect(screen.getByText('任务 login-task-1')).toBeTruthy()
-    })
-    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
-    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
-    expect(payload.extra).toMatchObject({
-      chatgpt_existing_account_login_stage: 'access_token',
-      chatgpt_existing_account_allow_phone_verification: false,
-      chatgpt_existing_account_bind_phone_and_get_rt: true,
-      chatgpt_existing_account_leadbee_codes: [
-        'card-1',
-        'card-2',
-        'card-3',
-        'card-4',
-        'card-5',
-      ],
-    })
-  })
-
-  it('blocks submission when the LeadBee card count differs from the login count', async () => {
-    const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
-
-    await screen.findByText('可用邮箱 5 个')
-    await user.click(screen.getByRole('switch', {
-      name: '未绑定手机号时自动接码',
-    }))
-    await user.type(screen.getByLabelText('LeadBee 接码卡密'), 'card-1\ncard-2')
-    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
-
-    expect(await screen.findByText('卡密数量需与登录数量一致（需要 5 个，当前 2 个）')).toBeTruthy()
-    expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/tasks/register')).toBe(false)
-  })
-
-  it('uses the SMS pool without rendering or submitting card secrets', async () => {
-    const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
-
-    await screen.findByText('可用邮箱 5 个')
-    await user.click(screen.getByRole('switch', {
-      name: '未绑定手机号时自动接码',
-    }))
-    await user.click(screen.getByRole('switch', { name: '使用 SMS 接码池' }))
-
-    expect(screen.getByText('可用卡密 5 个')).toBeTruthy()
-    expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
-    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
-
-    await waitFor(() => {
-      expect(screen.getByText('任务 login-task-1')).toBeTruthy()
-    })
-    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
-    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
-    expect(payload.extra.chatgpt_existing_account_use_sms_pool).toBe(true)
+    const payload = taskPayload()
+    expect(payload.extra.chatgpt_existing_account_sms_mode).toBe('pool')
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
   })
 
-  it('uses the server-side LeadBee API without loading or gating on legacy card inventory', async () => {
-    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+  it('defaults to API priority, shows capacity, and allows 50 concurrent logins', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
       if (path === '/config') {
         return {
           mail_provider: 'microsoft',
           default_executor: 'protocol',
           default_captcha_solver: 'yescaptcha',
           leadbee_api_enabled: 'yes',
-          leadbee_api_key: 'fixture-config-key',
-          leadbee_api_secret: 'fixture-config-secret',
-          leadbee_api_product_id: 'fixture-product',
-          leadbee_api_client_order_id: 'fixture-client-reference',
+          leadbee_api_key: 'RETURNED_KEY_MUST_NOT_RENDER',
+          leadbee_api_secret: 'RETURNED_SECRET_MUST_NOT_RENDER',
+          leadbee_api_product_id: 'prod-capacity',
+          leadbee_api_client_order_id: 'RETURNED_REF_MUST_NOT_RENDER',
         }
       }
-      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) {
-        return { count: 2 }
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          configured_product_available: true,
+          balance_available: '35.70',
+          balance_reserved: '0.00',
+          unit_price: '1.30',
+          estimated_order_capacity: 27,
+          currency: 'CNY',
+          signature: 'HIDDEN_SIGNATURE',
+          phone: 'HIDDEN_PHONE',
+          sms_code: 'HIDDEN_SMS',
+        }
       }
-      if (path.startsWith('/mail-imports/snapshot?type=applemail')) {
-        return { count: 0 }
+      if (path.startsWith('/mail-imports/snapshot')) {
+        return { count: path.includes('type=applemail') ? 0 : 50 }
       }
       if (path === '/sms-pool/stats') {
-        throw new Error('legacy inventory request must be skipped')
+        return { total: 20, unused: 18, reserved: 2, active: 0, used: 0 }
       }
-      if (path === '/tasks/register') {
-        return { task_id: 'leadbee-api-login-task' }
-      }
+      if (path === '/tasks/register') return { task_id: 'api-priority-task' }
       throw new Error(`unexpected path: ${path}`)
     })
     const user = userEvent.setup()
-    render(
-      <ChatGPTExistingAccountLoginModal
-        open
-        onClose={() => {}}
-        onDone={() => {}}
-      />,
-    )
+    renderModal()
 
-    expect(await screen.findByText('可用邮箱 2 个')).toBeTruthy()
-    expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/sms-pool/stats')).toBe(false)
-    expect(screen.getByText(/LeadBee API 已启用/)).toBeTruthy()
-    await user.click(screen.getByRole('switch', {
-      name: '未绑定手机号时自动接码',
-    }))
+    expect(await screen.findByText('可用邮箱 50 个')).toBeTruthy()
+    expect((screen.getByRole('radio', { name: 'API优先' }) as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText('API 可用余额 ¥35.70 · 单价 ¥1.30/次 · 预计可接 27 次')).toBeTruthy()
+    expect(screen.getByText('卡密池可用 18 张')).toBeTruthy()
+    expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/sms-pool/stats')).toBe(true)
+    expect(vi.mocked(apiFetch).mock.calls.some(
+      ([path, options]) => path === '/config/leadbee/test' && options?.method === 'POST',
+    )).toBe(true)
 
-    expect(screen.queryByRole('switch', { name: '使用 SMS 接码池' })).toBeNull()
-    expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
-    expect(document.body.textContent).not.toContain('fixture-config-key')
-    expect(document.body.textContent).not.toContain('fixture-config-secret')
-
+    const concurrency = screen.getByRole('spinbutton', { name: '并发数' }) as HTMLInputElement
+    expect(concurrency.getAttribute('aria-valuemax')).toBe('50')
+    expect(screen.getByRole('button', { name: '开始登录并接码' }).parentElement?.style.position)
+      .toBe('sticky')
+    await user.clear(concurrency)
+    await user.type(concurrency, '50')
     await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
-    expect(await screen.findByText('任务 leadbee-api-login-task')).toBeTruthy()
+    expect(await screen.findByText('任务 api-priority-task')).toBeTruthy()
 
-    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
-    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
-    expect(payload.extra.chatgpt_existing_account_leadbee_api).toBe(true)
+    const payload = taskPayload()
+    expect(payload.concurrency).toBe(50)
+    expect(payload.extra.chatgpt_existing_account_sms_mode).toBe('api_fallback_pool')
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_api')
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
-    expect(JSON.stringify(payload)).not.toContain('fixture-config-key')
-    expect(JSON.stringify(payload)).not.toContain('fixture-config-secret')
-    expect(JSON.stringify(payload)).not.toContain('fixture-client-reference')
+    expect(JSON.stringify(payload)).not.toContain('RETURNED_KEY_MUST_NOT_RENDER')
+    expect(JSON.stringify(payload)).not.toContain('RETURNED_SECRET_MUST_NOT_RENDER')
+    expect(JSON.stringify(payload)).not.toContain('RETURNED_REF_MUST_NOT_RENDER')
+    expect(document.body.textContent).not.toContain('HIDDEN_SIGNATURE')
+    expect(document.body.textContent).not.toContain('HIDDEN_PHONE')
+    expect(document.body.textContent).not.toContain('HIDDEN_SMS')
+  })
+
+  it('keeps API priority selected when live balance cannot be loaded', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config') {
+        return {
+          mail_provider: 'microsoft',
+          leadbee_api_enabled: true,
+          leadbee_api_product_id: 'prod-ready',
+        }
+      }
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        throw new Error('PRIVATE_PROVIDER_FAILURE')
+      }
+      if (path.startsWith('/mail-imports/snapshot')) {
+        return { count: path.includes('type=applemail') ? 0 : 3 }
+      }
+      if (path === '/sms-pool/stats') return { total: 2, unused: 2 }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    renderModal()
+
+    expect(await screen.findByText('余额暂未获取')).toBeTruthy()
+    expect((screen.getByRole('radio', { name: 'API优先' }) as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText('卡密池可用 2 张')).toBeTruthy()
+    expect(document.body.textContent).not.toContain('PRIVATE_PROVIDER_FAILURE')
+  })
+
+  it('allows choosing only the card pool even when global API is enabled', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config') {
+        return {
+          mail_provider: 'microsoft',
+          leadbee_api_enabled: true,
+          leadbee_api_product_id: 'prod-ready',
+        }
+      }
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          configured_product_available: true,
+          balance_available: '10.00',
+          unit_price: '1.00',
+          estimated_order_capacity: 10,
+          currency: 'CNY',
+        }
+      }
+      if (path.startsWith('/mail-imports/snapshot')) {
+        return { count: path.includes('type=applemail') ? 0 : 2 }
+      }
+      if (path === '/sms-pool/stats') return { total: 2, unused: 2 }
+      if (path === '/tasks/register') return { task_id: 'pool-only-task' }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    renderModal()
+    await screen.findByText('API 可用余额 ¥10.00 · 单价 ¥1.00/次 · 预计可接 10 次')
+
+    await user.click(screen.getByRole('radio', { name: '仅卡密池' }))
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    expect(await screen.findByText('任务 pool-only-task')).toBeTruthy()
+
+    const payload = taskPayload()
+    expect(payload.extra.chatgpt_existing_account_sms_mode).toBe('pool')
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_api')
+  })
+
+  it('allows choosing no phone verification for already verified accounts', async () => {
+    const user = userEvent.setup()
+    renderModal()
+    await screen.findByText('可用邮箱 5 个')
+
+    await user.click(screen.getByRole('radio', { name: '无需接码' }))
+    await user.click(screen.getByRole('button', { name: '开始登录' }))
+    expect(await screen.findByText('任务 login-task-1')).toBeTruthy()
+
+    const payload = taskPayload()
+    expect(payload.extra.chatgpt_existing_account_sms_mode).toBe('none')
+    expect(payload.extra.chatgpt_existing_account_login_stage).toBe('refresh_token')
+  })
+
+  it('defaults to no phone verification when neither API nor cards are available', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/config') return { mail_provider: 'microsoft' }
+      if (path.startsWith('/mail-imports/snapshot')) {
+        return { count: path.includes('type=applemail') ? 0 : 1 }
+      }
+      if (path === '/sms-pool/stats') return { total: 0, unused: 0 }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    renderModal()
+
+    await screen.findByText('可用邮箱 1 个')
+    expect((screen.getByRole('radio', { name: '无需接码' }) as HTMLInputElement).checked).toBe(true)
+    expect(screen.getByText('卡密池可用 0 张')).toBeTruthy()
+  })
+
+  it('keeps the Microsoft and AppleMail provider plan in one batch', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/config') return { mail_provider: 'microsoft' }
+      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) return { count: 2 }
+      if (path.startsWith('/mail-imports/snapshot?type=applemail')) return { count: 1 }
+      if (path === '/sms-pool/stats') return { total: 0, unused: 0 }
+      if (path === '/tasks/register') return { task_id: 'combined-task' }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    renderModal()
+    await screen.findByText('可用邮箱 3 个')
+    await user.click(screen.getByRole('button', { name: '开始登录' }))
+    await screen.findByText('任务 combined-task')
+
+    expect(taskPayload().extra.chatgpt_existing_account_mail_provider_plan).toEqual([
+      'microsoft',
+      'microsoft',
+      'applemail',
+    ])
   })
 })
