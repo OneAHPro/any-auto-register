@@ -7,6 +7,7 @@ type ExistingAccountLoginTaskInput = {
   executorType: string
   captchaSolver: string
   bindPhoneAndGetRefreshToken: boolean
+  leadbeeApi?: boolean
   useSmsPool?: boolean
   leadbeeCodes: string[]
   mailProviderPlan?: Array<'microsoft' | 'applemail'>
@@ -81,7 +82,8 @@ export function resolveMailboxSnapshotType(config: ConfigRecord): 'microsoft' | 
 
 export function buildExistingAccountLoginTaskPayload(input: ExistingAccountLoginTaskInput) {
   const bindPhoneAndGetRefreshToken = Boolean(input.bindPhoneAndGetRefreshToken)
-  const useSmsPool = bindPhoneAndGetRefreshToken && Boolean(input.useSmsPool)
+  const leadbeeApi = bindPhoneAndGetRefreshToken && Boolean(input.leadbeeApi)
+  const useSmsPool = bindPhoneAndGetRefreshToken && !leadbeeApi && Boolean(input.useSmsPool)
   const extra: ConfigRecord = {
     ...compactConfig(input.config),
     chatgpt_registration_mode: 'refresh_token',
@@ -92,9 +94,13 @@ export function buildExistingAccountLoginTaskPayload(input: ExistingAccountLogin
       : 'refresh_token',
     chatgpt_existing_account_allow_phone_verification: false,
     chatgpt_existing_account_bind_phone_and_get_rt: bindPhoneAndGetRefreshToken,
-    chatgpt_existing_account_use_sms_pool: useSmsPool,
   }
-  if (bindPhoneAndGetRefreshToken && !useSmsPool) {
+  if (leadbeeApi) {
+    extra.chatgpt_existing_account_leadbee_api = true
+  } else {
+    extra.chatgpt_existing_account_use_sms_pool = useSmsPool
+  }
+  if (bindPhoneAndGetRefreshToken && !leadbeeApi && !useSmsPool) {
     extra.chatgpt_existing_account_leadbee_codes = input.leadbeeCodes
       .map(code => String(code || '').trim())
       .filter(Boolean)

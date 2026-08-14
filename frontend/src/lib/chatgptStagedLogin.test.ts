@@ -131,4 +131,37 @@ describe('chatgpt staged login helpers', () => {
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
     expect(JSON.stringify(payload)).not.toContain('browser-secret')
   })
+
+  it('requests server-side LeadBee API allocation without card, pool, or credential fields', () => {
+    const payload = buildExistingAccountLoginTaskPayload({
+      count: 2,
+      concurrency: 2,
+      registerDelaySeconds: 0,
+      executorType: 'protocol',
+      captchaSolver: 'yescaptcha',
+      bindPhoneAndGetRefreshToken: true,
+      leadbeeApi: true,
+      useSmsPool: true,
+      leadbeeCodes: ['fixture-card-one', 'fixture-card-two'],
+      config: {
+        mail_provider: 'microsoft',
+        leadbee_api_enabled: 'yes',
+        leadbee_api_key: 'fixture-config-key',
+        leadbee_api_secret: 'fixture-config-secret',
+        leadbee_api_product_id: 'fixture-product',
+        leadbee_api_client_order_id: 'fixture-client-reference',
+      },
+    })
+
+    expect(payload.extra).toMatchObject({
+      chatgpt_existing_account_bind_phone_and_get_rt: true,
+      chatgpt_existing_account_leadbee_api: true,
+    })
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
+    expect(JSON.stringify(payload)).not.toContain('fixture-card')
+    expect(JSON.stringify(payload)).not.toContain('fixture-config-key')
+    expect(JSON.stringify(payload)).not.toContain('fixture-config-secret')
+    expect(JSON.stringify(payload)).not.toContain('fixture-client-reference')
+  })
 })

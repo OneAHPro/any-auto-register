@@ -22,6 +22,8 @@ type PhoneSession = {
   session_id: string
   phone?: string
   provider?: 'manual' | 'leadbee'
+  provider_mode?: string
+  leadbee_api?: boolean
   automatic?: boolean
   status: 'starting' | 'code_sent' | 'verifying' | 'resending' | 'persisting' | 'completed' | 'failed' | 'expired'
   message: string
@@ -33,8 +35,63 @@ type PhoneSession = {
   logs?: string[]
 }
 
-function normalizePhone(value: string) {
+function normalizePhone(value: unknown) {
   return String(value || '').replace(/[\s()-]+/g, '')
+}
+
+function normalizeTruthy(value: unknown) {
+  if (value === true) return true
+  if (typeof value !== 'string' && typeof value !== 'number') return false
+  return ['1', 'true', 'yes', 'on'].includes(String(value).trim().toLowerCase())
+}
+
+const exchangeLifecyclePattern = /卡密|兑换码|exchange[\s_-]*(?:code|card)|redemption[\s_-]*(?:code|card)|leadbee[\s_-]*code/i
+
+function isLeadBeeApiSession(session: PhoneSession | null, configuredApiMode = false) {
+  return configuredApiMode
+    || normalizeTruthy(session?.leadbee_api)
+    || String(session?.provider_mode || '').trim().toLowerCase() === 'api'
+}
+
+function leadBeeApiStatusMessage(session: PhoneSession) {
+  switch (session.status) {
+    case 'starting':
+      return 'LeadBee API 正在自动接码'
+    case 'code_sent':
+      return 'LeadBee API 已收到短信验证码，正在继续验证'
+    case 'verifying':
+      return 'LeadBee API 正在提交短信验证码'
+    case 'resending':
+      return 'LeadBee API 正在重新获取短信验证码'
+    case 'persisting':
+      return 'LeadBee API 手机验证已完成，正在保存 Refresh Token'
+    case 'completed':
+      return session.phone_verified
+        ? 'LeadBee API 手机验证完成，Refresh Token 已保存'
+        : 'LeadBee API 流程完成，Refresh Token 已保存'
+    case 'expired':
+      return 'LeadBee API 自动接码会话已过期'
+    default:
+      return 'LeadBee API 自动接码失败'
+  }
+}
+
+function visibleSessionMessage(session: PhoneSession, leadBeeApiSession: boolean) {
+  const rawMessage = String(session.message || '').trim()
+  if (!leadBeeApiSession) return rawMessage
+  return rawMessage && !exchangeLifecyclePattern.test(rawMessage)
+    ? rawMessage
+    : leadBeeApiStatusMessage(session)
+}
+
+function visibleSessionLogs(session: PhoneSession | null, leadBeeApiSession: boolean) {
+  const logs = Array.isArray(session?.logs) ? session.logs : []
+  if (!leadBeeApiSession) return logs
+  return logs.map((line) => {
+    if (!exchangeLifecyclePattern.test(line)) return line
+    const timestamp = line.match(/^\[[^\]]+\]\s*/)?.[0] || ''
+    return `${timestamp}LeadBee API 手机验证进度已更新`
+  })
 }
 
 function errorMessage(error: unknown, fallback: string) {
@@ -60,6 +117,7 @@ export function ChatGPTPhoneVerificationModal({
 }: Props) {
   const [form] = Form.useForm()
   const [mode, setMode] = useState<'manual' | 'leadbee'>('manual')
+  const [leadBeeApiEnabled, setLeadBeeApiEnabled] = useState<boolean | null>(null)
   const [session, setSession] = useState<PhoneSession | null>(null)
   const [sending, setSending] = useState(false)
   const [submitting, setSubmitting] = useState(false)
@@ -69,6 +127,7 @@ export function ChatGPTPhoneVerificationModal({
   const pollTimer = useRef<number | null>(null)
   const logBox = useRef<HTMLDivElement | null>(null)
   const completedSession = useRef('')
+  const lifecycleGeneration = useRef(0)
 
   const stopPolling = () => {
     if (pollTimer.current !== null) {
@@ -78,10 +137,13 @@ export function ChatGPTPhoneVerificationModal({
   }
 
   useEffect(() => {
-    if (!open) return
+    const generation = lifecycleGeneration.current + 1
+    lifecycleGeneration.current = generation
     stopPolling()
+    if (!open) return
     form.resetFields()
     setMode('manual')
+    setLeadBeeApiEnabled(null)
     setSession(null)
     setSending(false)
     setSubmitting(false)
@@ -89,7 +151,25 @@ export function ChatGPTPhoneVerificationModal({
     setCountdown(0)
     setRequestError('')
     completedSession.current = ''
-    return stopPolling
+
+    const loadConfig = async () => {
+      try {
+        const config = await apiFetch('/config') as Record<string, unknown> | null
+        if (lifecycleGeneration.current === generation) {
+          setLeadBeeApiEnabled(normalizeTruthy(config?.leadbee_api_enabled))
+        }
+      } catch {
+        if (lifecycleGeneration.current === generation) setLeadBeeApiEnabled(false)
+      }
+    }
+    void loadConfig()
+
+    return () => {
+      if (lifecycleGeneration.current === generation) {
+        lifecycleGeneration.current += 1
+      }
+      stopPolling()
+    }
   }, [account?.id, form, open])
 
   useEffect(() => {
@@ -110,7 +190,11 @@ export function ChatGPTPhoneVerificationModal({
     setSession(result)
     if (completedSession.current !== result.session_id) {
       completedSession.current = result.session_id
-      message.success(result.message || 'Refresh Token 已保存')
+      const apiSession = isLeadBeeApiSession(
+        result,
+        mode === 'leadbee' && leadBeeApiEnabled === true,
+      )
+      message.success(visibleSessionMessage(result, apiSession) || 'Refresh Token 已保存')
       onSuccess()
     }
   }
@@ -126,24 +210,40 @@ export function ChatGPTPhoneVerificationModal({
     }
     if (result.status === 'failed' || result.status === 'expired') {
       stopPolling()
-      message.error(result.message || '手机验证失败')
+      const apiSession = isLeadBeeApiSession(
+        result,
+        mode === 'leadbee' && leadBeeApiEnabled === true,
+      )
+      message.error(visibleSessionMessage(result, apiSession) || '手机验证失败')
     }
   }
 
-  const pollSession = (sessionId: string) => {
+  const pollSession = (
+    sessionId: string,
+    generation = lifecycleGeneration.current,
+    leadBeeApiMode = mode === 'leadbee' && leadBeeApiEnabled === true,
+  ) => {
     stopPolling()
     pollTimer.current = window.setTimeout(async () => {
-      if (!account?.id) return
+      if (generation !== lifecycleGeneration.current || !account?.id) return
       try {
         const result = await apiFetch(
           `/chatgpt/${account.id}/phone-verification/${sessionId}`,
         ) as PhoneSession
+        if (generation !== lifecycleGeneration.current) return
         applySession(result)
         if (shouldPollSession(result.status)) {
-          pollSession(sessionId)
+          pollSession(
+            sessionId,
+            generation,
+            isLeadBeeApiSession(result, leadBeeApiMode),
+          )
         }
       } catch (error) {
-        const detail = errorMessage(error, '读取手机验证状态失败')
+        if (generation !== lifecycleGeneration.current) return
+        const detail = leadBeeApiMode
+          ? '读取 LeadBee API 手机验证状态失败'
+          : errorMessage(error, '读取手机验证状态失败')
         setRequestError(detail)
         message.error(detail)
       }
@@ -152,14 +252,24 @@ export function ChatGPTPhoneVerificationModal({
 
   const handleSend = async () => {
     if (!account?.id) return
-    let values
+    if (mode === 'leadbee' && leadBeeApiEnabled === null) return
+    const generation = lifecycleGeneration.current
+    const leadBeeApiMode = mode === 'leadbee' && leadBeeApiEnabled === true
+    let values: Record<string, unknown> = {}
     try {
-      values = await form.validateFields([mode === 'leadbee' ? 'leadbee_code' : 'phone'])
+      if (mode === 'manual') {
+        values = await form.validateFields(['phone'])
+      } else if (!leadBeeApiMode) {
+        values = await form.validateFields(['leadbee_code'])
+      }
     } catch {
       return
     }
+    if (generation !== lifecycleGeneration.current) return
     const body = mode === 'leadbee'
-      ? { leadbee_code: String(values.leadbee_code || '').trim() }
+      ? leadBeeApiMode
+        ? { leadbee_api: true }
+        : { leadbee_code: String(values.leadbee_code || '').trim() }
       : { phone: normalizePhone(values.phone) }
     setRequestError('')
     setSending(true)
@@ -171,25 +281,37 @@ export function ChatGPTPhoneVerificationModal({
           body: JSON.stringify(body),
         },
       ) as PhoneSession
+      if (generation !== lifecycleGeneration.current) return
       applySession(result)
-      if (shouldPollSession(result.status)) pollSession(result.session_id)
+      if (shouldPollSession(result.status)) {
+        pollSession(
+          result.session_id,
+          generation,
+          isLeadBeeApiSession(result, leadBeeApiMode),
+        )
+      }
     } catch (error) {
-      const detail = errorMessage(error, '短信验证码发送失败')
+      if (generation !== lifecycleGeneration.current) return
+      const detail = leadBeeApiMode
+        ? 'LeadBee API 自动接码启动失败'
+        : errorMessage(error, '短信验证码发送失败')
       setRequestError(detail)
       message.error(detail)
     } finally {
-      setSending(false)
+      if (generation === lifecycleGeneration.current) setSending(false)
     }
   }
 
   const handleSubmit = async () => {
     if (!account?.id || !session?.session_id) return
+    const generation = lifecycleGeneration.current
     let values
     try {
       values = await form.validateFields(['code'])
     } catch {
       return
     }
+    if (generation !== lifecycleGeneration.current) return
     setSubmitting(true)
     try {
       const result = await apiFetch(
@@ -199,42 +321,52 @@ export function ChatGPTPhoneVerificationModal({
           body: JSON.stringify({ code: String(values.code || '').trim() }),
         },
       ) as PhoneSession
+      if (generation !== lifecycleGeneration.current) return
       applySession(result)
       if (result.status === 'code_sent' && result.message) {
         message.error(result.message)
       } else if (shouldPollSession(result.status)) {
-        pollSession(result.session_id)
+        pollSession(
+          result.session_id,
+          generation,
+          isLeadBeeApiSession(result, leadBeeApiSession),
+        )
       }
     } catch (error) {
+      if (generation !== lifecycleGeneration.current) return
       const detail = errorMessage(error, '短信验证码提交失败')
       setRequestError(detail)
       message.error(detail)
     } finally {
-      setSubmitting(false)
+      if (generation === lifecycleGeneration.current) setSubmitting(false)
     }
   }
 
   const handleResend = async () => {
     if (!account?.id || !session?.session_id || countdown > 0) return
+    const generation = lifecycleGeneration.current
     setResending(true)
     try {
       const result = await apiFetch(
         `/chatgpt/${account.id}/phone-verification/${session.session_id}/resend`,
         { method: 'POST', body: JSON.stringify({}) },
       ) as PhoneSession
+      if (generation !== lifecycleGeneration.current) return
       applySession(result)
       if (result.status === 'code_sent') message.success(result.message || '验证码已重新发送')
     } catch (error) {
+      if (generation !== lifecycleGeneration.current) return
       const detail = errorMessage(error, '重新发送失败')
       setRequestError(detail)
       message.error(detail)
     } finally {
-      setResending(false)
+      if (generation === lifecycleGeneration.current) setResending(false)
     }
   }
 
   const close = () => {
     if (sending || submitting || resending) return
+    lifecycleGeneration.current += 1
     stopPolling()
     form.resetFields()
     setSession(null)
@@ -243,7 +375,11 @@ export function ChatGPTPhoneVerificationModal({
   }
 
   const copyLogs = async () => {
-    const logs = Array.isArray(session?.logs) ? session.logs : []
+    const apiSession = isLeadBeeApiSession(
+      session,
+      mode === 'leadbee' && leadBeeApiEnabled === true,
+    )
+    const logs = visibleSessionLogs(session, apiSession)
     if (!logs.length) return
     try {
       await navigator.clipboard.writeText(logs.join('\n'))
@@ -254,7 +390,20 @@ export function ChatGPTPhoneVerificationModal({
   }
 
   const codeReady = session?.status === 'code_sent'
-  const automatic = Boolean(session?.automatic || session?.provider === 'leadbee' || mode === 'leadbee')
+  const leadBeeApiSession = isLeadBeeApiSession(
+    session,
+    mode === 'leadbee' && leadBeeApiEnabled === true,
+  )
+  const sessionMessage = session
+    ? visibleSessionMessage(session, leadBeeApiSession)
+    : ''
+  const sessionLogs = visibleSessionLogs(session, leadBeeApiSession)
+  const automatic = Boolean(
+    session?.automatic
+      || session?.provider === 'leadbee'
+      || mode === 'leadbee'
+      || leadBeeApiSession,
+  )
   const resumeContext = account?.extra?.oauth_resume_context
   const resumeRecord = resumeContext && typeof resumeContext === 'object'
     ? resumeContext as Record<string, unknown>
@@ -303,14 +452,16 @@ export function ChatGPTPhoneVerificationModal({
           type="warning"
           showIcon
           message="当前账号缺少可续接的手机授权事务"
-          description="请先关闭窗口，点击页面顶部“登录”重新登录该邮箱。登录成功后会同时准备手机授权事务；准备完成前系统不会获取手机号、使用 LeadBee 兑换码或发送短信。"
+          description={leadBeeApiEnabled === false
+            ? '请先关闭窗口，点击页面顶部“登录”重新登录该邮箱。登录成功后会同时准备手机授权事务；准备完成前系统不会获取手机号、使用 LeadBee 兑换码或发送短信。'
+            : '请先关闭窗口，点击页面顶部“登录”重新登录该邮箱。登录成功后会同时准备手机授权事务；准备完成前系统不会启动 LeadBee API 自动接码或发送短信。'}
         />
       ) : (
       <Form form={form} layout="vertical">
         <Form.Item label="接码方式">
           <Radio.Group
             value={mode}
-            disabled={Boolean(session)}
+            disabled={Boolean(session) || sending}
             onChange={(event) => {
               setMode(event.target.value)
               form.resetFields(['phone', 'leadbee_code', 'code'])
@@ -318,7 +469,12 @@ export function ChatGPTPhoneVerificationModal({
             }}
           >
             <Radio value="manual">手动填写手机号</Radio>
-            <Radio value="leadbee">LeadBee 自动接码</Radio>
+            <Radio
+              value="leadbee"
+              disabled={leadBeeApiEnabled === null || Boolean(session) || sending}
+            >
+              {leadBeeApiEnabled ? 'LeadBee API 自动接码' : 'LeadBee 自动接码'}
+            </Radio>
           </Radio.Group>
         </Form.Item>
 
@@ -339,13 +495,13 @@ export function ChatGPTPhoneVerificationModal({
           >
             <Input
               placeholder="+447456344799"
-              disabled={Boolean(session)}
+              disabled={Boolean(session) || sending}
               autoComplete="tel"
             />
           </Form.Item>
         ) : null}
 
-        {!session && mode === 'leadbee' ? (
+        {!session && mode === 'leadbee' && leadBeeApiEnabled === false ? (
           <Form.Item
             name="leadbee_code"
             label="LeadBee 兑换码"
@@ -357,6 +513,7 @@ export function ChatGPTPhoneVerificationModal({
             <Input.Password
               placeholder="bei-sms-XXXX-XXXX"
               autoComplete="off"
+              disabled={sending}
             />
           </Form.Item>
         ) : null}
@@ -366,7 +523,7 @@ export function ChatGPTPhoneVerificationModal({
             <Alert
               type={session.phone_verified ? 'success' : 'warning'}
               showIcon
-              message={session.message || 'Refresh Token 已保存'}
+              message={sessionMessage || 'Refresh Token 已保存'}
               description={
                 session.phone_verified
                   ? '本次已实际提交并通过手机号验证码。'
@@ -392,7 +549,7 @@ export function ChatGPTPhoneVerificationModal({
             <Alert
               type={session.status === 'failed' || session.status === 'expired' ? 'error' : 'info'}
               showIcon
-              message={session.message || '正在自动接码'}
+              message={sessionMessage || '正在自动接码'}
               style={{ marginBottom: 16 }}
             />
             {session.phone ? (
@@ -406,7 +563,7 @@ export function ChatGPTPhoneVerificationModal({
             <Alert
               type={session.status === 'failed' || session.status === 'expired' ? 'error' : 'success'}
               showIcon
-              message={session.message || '正在处理手机验证'}
+              message={sessionMessage || '正在处理手机验证'}
               style={{ marginBottom: 16 }}
             />
             <Form.Item
@@ -451,7 +608,7 @@ export function ChatGPTPhoneVerificationModal({
             </Space>
           </>
         )}
-        {Array.isArray(session?.logs) && session.logs.length > 0 ? (
+        {sessionLogs.length > 0 ? (
           <div style={{ marginTop: 16 }}>
             <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
               <Typography.Text strong>接码日志</Typography.Text>
@@ -477,7 +634,7 @@ export function ChatGPTPhoneVerificationModal({
                 wordBreak: 'break-word',
               }}
             >
-              {session.logs.map((line, index) => (
+              {sessionLogs.map((line, index) => (
                 <div key={`${index}-${line}`}>{line}</div>
               ))}
             </div>

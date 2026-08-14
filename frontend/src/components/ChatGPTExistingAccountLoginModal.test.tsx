@@ -245,4 +245,66 @@ describe('ChatGPTExistingAccountLoginModal', () => {
     expect(payload.extra.chatgpt_existing_account_use_sms_pool).toBe(true)
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
   })
+
+  it('uses the server-side LeadBee API without loading or gating on legacy card inventory', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/config') {
+        return {
+          mail_provider: 'microsoft',
+          default_executor: 'protocol',
+          default_captcha_solver: 'yescaptcha',
+          leadbee_api_enabled: 'yes',
+          leadbee_api_key: 'fixture-config-key',
+          leadbee_api_secret: 'fixture-config-secret',
+          leadbee_api_product_id: 'fixture-product',
+          leadbee_api_client_order_id: 'fixture-client-reference',
+        }
+      }
+      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) {
+        return { count: 2 }
+      }
+      if (path.startsWith('/mail-imports/snapshot?type=applemail')) {
+        return { count: 0 }
+      }
+      if (path === '/sms-pool/stats') {
+        throw new Error('legacy inventory request must be skipped')
+      }
+      if (path === '/tasks/register') {
+        return { task_id: 'leadbee-api-login-task' }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(
+      <ChatGPTExistingAccountLoginModal
+        open
+        onClose={() => {}}
+        onDone={() => {}}
+      />,
+    )
+
+    expect(await screen.findByText('可用邮箱 2 个')).toBeTruthy()
+    expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/sms-pool/stats')).toBe(false)
+    expect(screen.getByText(/LeadBee API 已启用/)).toBeTruthy()
+    await user.click(screen.getByRole('switch', {
+      name: '未绑定手机号时自动接码',
+    }))
+
+    expect(screen.queryByRole('switch', { name: '使用 SMS 接码池' })).toBeNull()
+    expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
+    expect(document.body.textContent).not.toContain('fixture-config-key')
+    expect(document.body.textContent).not.toContain('fixture-config-secret')
+
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    expect(await screen.findByText('任务 leadbee-api-login-task')).toBeTruthy()
+
+    const taskCall = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/tasks/register')
+    const payload = JSON.parse(String(taskCall?.[1]?.body || '{}'))
+    expect(payload.extra.chatgpt_existing_account_leadbee_api).toBe(true)
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
+    expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
+    expect(JSON.stringify(payload)).not.toContain('fixture-config-key')
+    expect(JSON.stringify(payload)).not.toContain('fixture-config-secret')
+    expect(JSON.stringify(payload)).not.toContain('fixture-client-reference')
+  })
 })

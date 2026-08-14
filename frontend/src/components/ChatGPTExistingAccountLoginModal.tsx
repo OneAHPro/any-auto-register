@@ -17,6 +17,7 @@ import {
 } from 'antd'
 
 import { apiFetch } from '@/lib/utils'
+import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import {
   buildExistingAccountLoginTaskPayload,
@@ -66,6 +67,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
   const useSmsPool = Boolean(Form.useWatch('use_sms_pool', form))
   const watchedCount = Math.max(1, Number(Form.useWatch('count', form) || 1))
   const leadbeeCodes = parseLeadBeeCodes(Form.useWatch('leadbee_codes', form))
+  const leadbeeApiEnabled = parseBooleanConfigValue(config?.leadbee_api_enabled)
 
   useEffect(() => {
     if (!open) return
@@ -80,10 +82,11 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
 
     const loadContext = async () => {
       try {
-        const [nextConfig, smsStats] = await Promise.all([
-          apiFetch('/config'),
-          apiFetch('/sms-pool/stats').catch(() => null),
-        ])
+        const nextConfig = await apiFetch('/config')
+        const nextLeadBeeApiEnabled = parseBooleanConfigValue(nextConfig?.leadbee_api_enabled)
+        const smsStats = nextLeadBeeApiEnabled
+          ? null
+          : await apiFetch('/sms-pool/stats').catch(() => null)
         if (cancelled) return
         setConfig(nextConfig)
         setSmsPoolAvailable(smsStats === null ? null : Math.max(0, Number(smsStats?.unused || 0)))
@@ -164,6 +167,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
         executorType: normalizeExecutorForPlatform('chatgpt', String(config.default_executor || 'protocol')),
         captchaSolver: String(config.default_captcha_solver || 'yescaptcha'),
         bindPhoneAndGetRefreshToken: values.bind_phone_and_get_rt,
+        leadbeeApi: leadbeeApiEnabled,
         useSmsPool: values.use_sms_pool,
         leadbeeCodes: parseLeadBeeCodes(values.leadbee_codes),
         mailProviderPlan: mailProviderPlan.slice(0, values.count),
@@ -227,6 +231,15 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               : '系统会直接完成已有账号 OAuth 登录并保存 AT + RT；已绑定手机号的账号无需卡密。'}
             style={{ marginBottom: 16 }}
           />
+          {leadbeeApiEnabled ? (
+            <Alert
+              type="info"
+              showIcon
+              message="LeadBee API 已启用"
+              description="需要手机验证时，服务端会自动取号，无需填写卡密或使用 SMS 接码池。"
+              style={{ marginBottom: 16 }}
+            />
+          ) : null}
           <Form
             form={form}
             layout="vertical"
@@ -328,7 +341,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 )}
               </div>
 
-              {bindPhoneAndGetRefreshToken && (
+              {bindPhoneAndGetRefreshToken && !leadbeeApiEnabled && (
                 <div
                   style={{
                     borderTop: `1px solid ${token.colorBorderSecondary}`,
@@ -372,7 +385,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               )}
             </div>
 
-            {bindPhoneAndGetRefreshToken && !useSmsPool && (
+            {bindPhoneAndGetRefreshToken && !leadbeeApiEnabled && !useSmsPool && (
               <Form.Item
                 name="leadbee_codes"
                 preserve={false}
@@ -434,6 +447,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 poolCount === 0
                 || (
                   bindPhoneAndGetRefreshToken
+                  && !leadbeeApiEnabled
                   && useSmsPool
                   && smsPoolAvailable !== null
                   && smsPoolAvailable < watchedCount

@@ -327,4 +327,454 @@ describe('Settings ChatGPT automatic relogin config', () => {
     await user.click(screen.getByText('邮箱服务'))
     expect(screen.queryByRole('button', { name: '确认导入' })).toBeNull()
   })
+
+  it('renders write-only LeadBee Open API fields and discards credentials returned by config', async () => {
+    configResponse = {
+      ...configResponse,
+      leadbee_api_enabled: 'yes',
+      leadbee_api_key: 'BUGGY_KEY_VALUE',
+      leadbee_api_secret: 'BUGGY_SECRET_VALUE',
+      leadbee_api_product_id: 'prod-saved',
+    }
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+
+    expect(await screen.findByText('LeadBee Open API')).toBeTruthy()
+    const enabled = screen.getByRole('switch', { name: '启用 LeadBee Open API' })
+    const apiKey = screen.getByLabelText('LeadBee API Key') as HTMLInputElement
+    const apiSecret = screen.getByLabelText('LeadBee API Secret') as HTMLInputElement
+    const productId = screen.getByLabelText('LeadBee 产品 ID') as HTMLInputElement
+    await waitFor(() => expect(enabled.getAttribute('aria-checked')).toBe('true'))
+    expect(enabled.id).toBe('leadbee_api_enabled')
+    expect(apiKey.id).toBe('leadbee_api_key')
+    expect(apiSecret.id).toBe('leadbee_api_secret')
+    expect(productId.id).toBe('leadbee_api_product_id')
+    expect(apiKey.type).toBe('password')
+    expect(apiSecret.type).toBe('password')
+    expect(apiKey.placeholder).toBe('留空则保留已保存值')
+    expect(apiSecret.placeholder).toBe('留空则保留已保存值')
+    expect(apiKey.value).toBe('')
+    expect(apiSecret.value).toBe('')
+    expect(productId.value).toBe('prod-saved')
+    expect(document.body.innerHTML).not.toContain('BUGGY_KEY_VALUE')
+    expect(document.body.innerHTML).not.toContain('BUGGY_SECRET_VALUE')
+    expect(screen.getByRole('button', { name: '测试 LeadBee API' })).toBeTruthy()
+  })
+
+  it.each([true, '1', 'true', 'yes', 'on'])(
+    'normalizes the LeadBee enabled value %s to on',
+    async (enabledValue) => {
+      configResponse = {
+        ...configResponse,
+        leadbee_api_enabled: enabledValue,
+      }
+      const user = userEvent.setup()
+      render(<Settings />)
+
+      await user.click(await screen.findByText('ChatGPT'))
+
+      const enabled = await screen.findByRole('switch', { name: '启用 LeadBee Open API' })
+      await waitFor(() => expect(enabled.getAttribute('aria-checked')).toBe('true'))
+    },
+  )
+
+  it('tests LeadBee with only the current unsaved form values', async () => {
+    configResponse = {
+      ...configResponse,
+      leadbee_api_enabled: false,
+      leadbee_api_product_id: 'prod-saved',
+    }
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          product_ids: ['prod-unsaved'],
+          configured_product_available: true,
+          balance_available: '12.50',
+          currency: 'USD',
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    const enabled = await screen.findByRole('switch', { name: '启用 LeadBee Open API' })
+    await user.click(enabled)
+    await user.type(screen.getByLabelText('LeadBee API Key'), 'KEY_INPUT')
+    await user.type(screen.getByLabelText('LeadBee API Secret'), 'SECRET_INPUT')
+    const productId = screen.getByLabelText('LeadBee 产品 ID')
+    await user.clear(productId)
+    await user.type(productId, 'prod-unsaved')
+    await user.click(screen.getByRole('button', { name: '测试 LeadBee API' }))
+
+    await waitFor(() => {
+      expect(
+        vi.mocked(apiFetch).mock.calls.some(
+          ([path, options]) => path === '/config/leadbee/test' && options?.method === 'POST',
+        ),
+      ).toBe(true)
+    })
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      ([path, options]) => path === '/config/leadbee/test' && options?.method === 'POST',
+    )
+    expect(call?.[1]).toEqual({
+      method: 'POST',
+      body: JSON.stringify({
+        data: {
+          leadbee_api_enabled: true,
+          leadbee_api_key: 'KEY_INPUT',
+          leadbee_api_secret: 'SECRET_INPUT',
+          leadbee_api_product_id: 'prod-unsaved',
+        },
+      }),
+    })
+    expect(
+      vi.mocked(apiFetch).mock.calls.some(
+        ([path, options]) => path === '/config' && options?.method === 'PUT',
+      ),
+    ).toBe(false)
+  })
+
+  it('keeps blank LeadBee credentials in the normal save payload', async () => {
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    expect((await screen.findByLabelText('LeadBee API Key') as HTMLInputElement).value).toBe('')
+    await user.click(screen.getByText('注册设置'))
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+
+    await waitFor(() => {
+      expect(
+        vi.mocked(apiFetch).mock.calls.some(
+          ([path, options]) => path === '/config' && options?.method === 'PUT',
+        ),
+      ).toBe(true)
+    })
+    const call = vi.mocked(apiFetch).mock.calls.find(
+      ([path, options]) => path === '/config' && options?.method === 'PUT',
+    )
+    const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+    expect(payload.data).toMatchObject({
+      leadbee_api_key: '',
+      leadbee_api_secret: '',
+    })
+    expect(Object.prototype.hasOwnProperty.call(payload.data, 'leadbee_api_key')).toBe(true)
+    expect(Object.prototype.hasOwnProperty.call(payload.data, 'leadbee_api_secret')).toBe(true)
+  })
+
+  it('blanks newly submitted LeadBee credentials after a successful normal save', async () => {
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    const apiKey = await screen.findByLabelText('LeadBee API Key') as HTMLInputElement
+    const apiSecret = screen.getByLabelText('LeadBee API Secret') as HTMLInputElement
+    await user.type(apiKey, 'NEW_KEY')
+    await user.type(apiSecret, 'NEW_SECRET')
+    await user.click(screen.getByText('注册设置'))
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+
+    await waitFor(() => {
+      const call = vi.mocked(apiFetch).mock.calls.find(
+        ([path, options]) => path === '/config' && options?.method === 'PUT',
+      )
+      const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+      expect(payload.data).toMatchObject({
+        leadbee_api_key: 'NEW_KEY',
+        leadbee_api_secret: 'NEW_SECRET',
+      })
+    })
+    await user.click(screen.getByText('ChatGPT'))
+    await waitFor(() => {
+      expect((screen.getByLabelText('LeadBee API Key') as HTMLInputElement).value).toBe('')
+      expect((screen.getByLabelText('LeadBee API Secret') as HTMLInputElement).value).toBe('')
+    })
+  })
+
+  it('clears a successful LeadBee test result when any tested field changes', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          product_ids: ['prod-checked'],
+          configured_product_available: true,
+          balance_available: '1.00',
+          currency: 'USD',
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    const testButton = await screen.findByRole('button', { name: '测试 LeadBee API' })
+    const edits = [
+      () => user.click(screen.getByRole('switch', { name: '启用 LeadBee Open API' })),
+      () => user.type(screen.getByLabelText('LeadBee API Key'), 'K'),
+      () => user.type(screen.getByLabelText('LeadBee API Secret'), 'S'),
+      () => user.type(screen.getByLabelText('LeadBee 产品 ID'), 'P'),
+    ]
+
+    for (const edit of edits) {
+      await user.click(testButton)
+      expect(await screen.findByRole('status', { name: 'LeadBee API 连接成功' })).toBeTruthy()
+
+      await edit()
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status', { name: 'LeadBee API 连接成功' })).toBeNull()
+      })
+    }
+  })
+
+  it('ignores a pending LeadBee response after the tested fields change', async () => {
+    const testRequest = deferred<Record<string, unknown>>()
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config/leadbee/test' && options?.method === 'POST') return testRequest.promise
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    await user.click(await screen.findByRole('button', { name: '测试 LeadBee API' }))
+    await waitFor(() => {
+      expect(
+        vi.mocked(apiFetch).mock.calls.some(
+          ([path, options]) => path === '/config/leadbee/test' && options?.method === 'POST',
+        ),
+      ).toBe(true)
+    })
+    await user.type(screen.getByLabelText('LeadBee 产品 ID'), 'prod-changed')
+
+    await act(async () => {
+      testRequest.resolve({
+        ok: true,
+        product_ids: ['prod-stale'],
+        configured_product_available: true,
+        balance_available: '1.00',
+        currency: 'USD',
+      })
+      await testRequest.promise
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'LeadBee API 连接成功' })).toBeNull()
+    })
+    expect(document.body.textContent).not.toContain('prod-stale')
+  })
+
+  it('clears a successful LeadBee result after delayed config hydration changes the fields', async () => {
+    const configRequest = deferred<Record<string, unknown>>()
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configRequest.promise
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          product_ids: ['prod-before-hydration'],
+          configured_product_available: true,
+          balance_available: '1.00',
+          currency: 'USD',
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    await user.click(await screen.findByRole('button', { name: '测试 LeadBee API' }))
+    expect(await screen.findByRole('status', { name: 'LeadBee API 连接成功' })).toBeTruthy()
+
+    await act(async () => {
+      configRequest.resolve({
+        ...configResponse,
+        leadbee_api_enabled: true,
+        leadbee_api_product_id: 'prod-hydrated',
+      })
+      await configRequest.promise
+    })
+
+    await waitFor(() => {
+      expect((screen.getByLabelText('LeadBee 产品 ID') as HTMLInputElement).value).toBe('prod-hydrated')
+      expect(screen.queryByRole('status', { name: 'LeadBee API 连接成功' })).toBeNull()
+    })
+  })
+
+  it('discards a pending LeadBee result and stops loading after delayed config hydration', async () => {
+    const configRequest = deferred<Record<string, unknown>>()
+    const testRequest = deferred<Record<string, unknown>>()
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configRequest.promise
+      if (path === '/config/leadbee/test' && options?.method === 'POST') return testRequest.promise
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    const testButton = await screen.findByRole('button', { name: '测试 LeadBee API' })
+    await user.click(testButton)
+    await waitFor(() => expect(testButton.classList.contains('ant-btn-loading')).toBe(true))
+
+    await act(async () => {
+      configRequest.resolve({
+        ...configResponse,
+        leadbee_api_enabled: true,
+        leadbee_api_product_id: 'prod-hydrated',
+      })
+      await configRequest.promise
+    })
+    await waitFor(() => {
+      expect((screen.getByLabelText('LeadBee 产品 ID') as HTMLInputElement).value).toBe('prod-hydrated')
+    })
+
+    await act(async () => {
+      testRequest.resolve({
+        ok: true,
+        product_ids: ['prod-stale-hydration'],
+        configured_product_available: true,
+        balance_available: '1.00',
+        currency: 'USD',
+      })
+      await testRequest.promise
+    })
+
+    await waitFor(() => {
+      expect(screen.queryByRole('status', { name: 'LeadBee API 连接成功' })).toBeNull()
+      expect(testButton.classList.contains('ant-btn-loading')).toBe(false)
+    })
+    expect(document.body.textContent).not.toContain('prod-stale-hydration')
+  })
+
+  it('stops a pending LeadBee test when a successful save clears its credentials', async () => {
+    const testRequest = deferred<Record<string, unknown>>()
+    const boundsSpy = vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      width: 800,
+      height: 600,
+      top: 0,
+      right: 800,
+      bottom: 600,
+      left: 0,
+      toJSON: () => ({}),
+    })
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config' && options?.method === 'PUT') return { ok: true }
+      if (path === '/config/leadbee/test' && options?.method === 'POST') return testRequest.promise
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+
+    try {
+      render(<Settings />)
+      await user.click(await screen.findByText('ChatGPT'))
+      const apiKey = await screen.findByLabelText('LeadBee API Key') as HTMLInputElement
+      const apiSecret = screen.getByLabelText('LeadBee API Secret') as HTMLInputElement
+      await user.type(apiKey, 'SAVE_KEY')
+      await user.type(apiSecret, 'SAVE_SECRET')
+      const testButton = screen.getByRole('button', { name: '测试 LeadBee API' })
+      await user.click(testButton)
+      await waitFor(() => expect(testButton.classList.contains('ant-btn-loading')).toBe(true))
+
+      const saveButton = await screen.findByRole('button', { name: /保存配置/ }) as HTMLButtonElement
+      await waitFor(() => expect(saveButton.disabled).toBe(false))
+      await user.click(saveButton)
+      await waitFor(() => {
+        expect(
+          vi.mocked(apiFetch).mock.calls.some(
+            ([path, options]) => path === '/config' && options?.method === 'PUT',
+          ),
+        ).toBe(true)
+        expect(apiKey.value).toBe('')
+        expect(apiSecret.value).toBe('')
+      })
+
+      await act(async () => {
+        testRequest.resolve({
+          ok: true,
+          product_ids: ['prod-stale-save'],
+          configured_product_available: true,
+          balance_available: '1.00',
+          currency: 'USD',
+        })
+        await testRequest.promise
+      })
+
+      await waitFor(() => {
+        expect(screen.queryByRole('status', { name: 'LeadBee API 连接成功' })).toBeNull()
+        expect(testButton.classList.contains('ant-btn-loading')).toBe(false)
+      })
+      expect(document.body.textContent).not.toContain('prod-stale-save')
+    } finally {
+      boundsSpy.mockRestore()
+    }
+  })
+
+  it('renders only whitelisted LeadBee test metadata from a successful response', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        return {
+          ok: true,
+          product_ids: ['prod-1'],
+          configured_product_available: true,
+          balance_available: '12.50',
+          currency: 'USD',
+          credential: 'HIDDEN_CREDENTIAL',
+          signature: 'HIDDEN_SIGNATURE',
+          phone: 'HIDDEN_PHONE',
+          sms_code: 'HIDDEN_SMS',
+        }
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    await user.click(await screen.findByRole('button', { name: '测试 LeadBee API' }))
+
+    const result = await screen.findByRole('status', { name: 'LeadBee API 连接成功' })
+    expect(result.textContent).toContain('产品 ID：prod-1')
+    expect(result.textContent).toContain('已配置产品：可用')
+    expect(result.textContent).toContain('余额：12.50 USD')
+    expect(document.body.textContent).not.toContain('HIDDEN_CREDENTIAL')
+    expect(document.body.textContent).not.toContain('HIDDEN_SIGNATURE')
+    expect(document.body.textContent).not.toContain('HIDDEN_PHONE')
+    expect(document.body.textContent).not.toContain('HIDDEN_SMS')
+  })
+
+  it('shows a fixed generic LeadBee failure without provider error details', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path === '/config' && !options) return configResponse
+      if (path === '/config/leadbee/test' && options?.method === 'POST') {
+        throw new Error('PROVIDER_PRIVATE_ERROR')
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Settings />)
+
+    await user.click(await screen.findByText('ChatGPT'))
+    await user.click(await screen.findByRole('button', { name: '测试 LeadBee API' }))
+
+    const alert = await screen.findByRole('alert')
+    expect(alert.textContent).toContain('LeadBee 连接测试失败，请检查凭证和产品 ID')
+    expect(document.body.textContent).not.toContain('PROVIDER_PRIVATE_ERROR')
+
+    await user.type(screen.getByLabelText('LeadBee 产品 ID'), 'P')
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull())
+  })
 })
