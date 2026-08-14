@@ -932,6 +932,19 @@ class LeadBeeOpenAPIPhoneService:
         self.request_timeout_seconds = _to_positive_int(
             self.config.get("leadbee_request_timeout_seconds"), 20, minimum=5
         )
+        self.request_max_attempts = min(
+            _to_positive_int(
+                self.config.get("leadbee_request_max_attempts"),
+                3,
+            ),
+            3,
+        )
+        self.request_retry_base_seconds = float(
+            _to_positive_int(
+                self.config.get("leadbee_request_retry_base_seconds"),
+                1,
+            )
+        )
         self._sleep = sleep_fn or time.sleep
         self._monotonic = monotonic or time.monotonic
         self._progress_broker = self.config.get("chatgpt_phone_progress_broker")
@@ -965,6 +978,7 @@ class LeadBeeOpenAPIPhoneService:
         self._quarantined = False
         self._settled_status = ""
         self.last_cancel_error = ""
+        self._provider_retry_count = 0
 
         reference = self.client_order_id or "disabled"
         self._reference_digest = hashlib.sha256(reference.encode("utf-8")).hexdigest()[
@@ -1101,6 +1115,47 @@ class LeadBeeOpenAPIPhoneService:
                 "LeadBee API 当前可用余额不足",
             )
 
+    @staticmethod
+    def _diagnostic_stage(phase: str) -> str:
+        normalized = str(phase or "")
+        if "创建" in normalized:
+            return "leadbee_create"
+        if "对账" in normalized:
+            return "leadbee_reconcile"
+        if "更换" in normalized:
+            return "leadbee_replace"
+        if "取消" in normalized:
+            return "leadbee_cancel"
+        return "leadbee_read"
+
+    def _publish_provider_diagnostic(self, **diagnostic: Any) -> None:
+        marker = getattr(self._progress_broker, "mark_provider_diagnostic", None)
+        if not callable(marker):
+            return
+        order_status = self._status(self._order)
+        billing_status = str(
+            self._order.get("billing_status") or ""
+        ).strip().upper()
+        try:
+            provider_replacements = int(
+                self._order.get("replacement_count") or 0
+            )
+        except (TypeError, ValueError):
+            provider_replacements = 0
+        payload = {
+            "provider_retry_count": self._provider_retry_count,
+            "replacement_count": max(
+                self._replacement_sequence,
+                provider_replacements,
+            ),
+        }
+        if order_status:
+            payload["order_status"] = order_status
+        if billing_status:
+            payload["billing_status"] = billing_status
+        payload.update(diagnostic)
+        marker(**payload)
+
     def _remaining_request_timeout(self, deadline: float, phase: str) -> float:
         remaining = float(deadline) - self._monotonic()
         if remaining <= 0:
@@ -1134,20 +1189,50 @@ class LeadBeeOpenAPIPhoneService:
             or "SIGNATURE" in error_code
             or error_code.endswith("_CONFLICT")
             or error_code == "IP_NOT_ALLOWED"
+            or error_code in _LEADBEE_API_CAPACITY_ERROR_CODES
         ):
             return False
         if isinstance(exc, LeadBeeTransportError):
             return True
-        if exc.http_status == 429 or error_code == "RATE_LIMITED":
+        if exc.http_status in {408, 425, 429, 500, 502, 503, 504}:
             return True
-        return exc.http_status == 503 or error_code == "REPLAY_PROTECTION_UNAVAILABLE"
+        return error_code in {
+            "RATE_LIMITED",
+            "REPLAY_PROTECTION_UNAVAILABLE",
+        }
 
-    def _retry_delay(self, exc: LeadBeeAPIError) -> float:
+    def _retry_delay(self, exc: LeadBeeAPIError, retry_number: int) -> float:
         if exc.http_status == 429:
             retry_after = self._positive_delay(exc.retry_after)
             if retry_after is not None:
                 return retry_after
-        return float(self.poll_interval_seconds)
+        return min(
+            8.0,
+            self.request_retry_base_seconds * (2 ** max(0, retry_number - 1)),
+        )
+
+    @staticmethod
+    def _diagnostic_error_code(exc: LeadBeeAPIError) -> str:
+        error_code = str(exc.error_code or "").strip().upper()
+        if error_code in _LEADBEE_API_CAPACITY_ERROR_CODES:
+            return "LEADBEE_API_CAPACITY_EXHAUSTED"
+        if isinstance(exc, LeadBeeTransportError):
+            return "LEADBEE_TRANSPORT"
+        if error_code.startswith("AUTH") or "SIGNATURE" in error_code:
+            return "LEADBEE_AUTH_ERROR"
+        if error_code.startswith("PERMISSION") or error_code == "IP_NOT_ALLOWED":
+            return "LEADBEE_PERMISSION_ERROR"
+        if error_code.startswith("PRODUCT"):
+            return "LEADBEE_PRODUCT_ERROR"
+        if error_code == "IDEMPOTENCY_CONFLICT":
+            return "LEADBEE_IDEMPOTENCY_CONFLICT"
+        if exc.http_status == 429 or error_code == "RATE_LIMITED":
+            return "LEADBEE_RATE_LIMITED"
+        if isinstance(exc, LeadBeeResponseError):
+            return "LEADBEE_RESPONSE_ERROR"
+        if exc.http_status in {408, 425, 500, 502, 503, 504}:
+            return "LEADBEE_REQUEST_RETRY_EXHAUSTED"
+        return "LEADBEE_REQUEST_FAILED"
 
     def _write_with_retry(
         self,
@@ -1158,7 +1243,9 @@ class LeadBeeOpenAPIPhoneService:
         check_cancellation: bool = True,
         create: bool = False,
     ) -> dict[str, Any]:
-        while True:
+        attempt = 0
+        while attempt < self.request_max_attempts:
+            attempt += 1
             if check_cancellation:
                 self._raise_if_cancelled()
             if self._rate_limiter is not None:
@@ -1178,15 +1265,33 @@ class LeadBeeOpenAPIPhoneService:
             try:
                 result = operation(request_timeout)
             except LeadBeeAPIError as exc:
-                if not self._retryable(exc):
+                if not self._retryable(exc) or attempt >= self.request_max_attempts:
+                    self._publish_provider_diagnostic(
+                        failure_stage=self._diagnostic_stage(phase),
+                        safe_error_code=self._diagnostic_error_code(exc),
+                        http_status=exc.http_status,
+                        recovery_status="failed",
+                    )
                     raise
-                retry_delay = self._retry_delay(exc)
+                self._provider_retry_count += 1
+                retry_delay = self._retry_delay(
+                    exc,
+                    attempt,
+                )
+                self._publish_provider_diagnostic(
+                    recovery_status="retrying",
+                )
             except Exception:  # noqa: BLE001 - sanitize injected client failures
                 unexpected_failure = True
 
             if unexpected_failure:
                 # Raise after leaving the handler so the injected exception is
                 # not retained as either __context__ or __cause__.
+                self._publish_provider_diagnostic(
+                    failure_stage=self._diagnostic_stage(phase),
+                    safe_error_code="LEADBEE_CLIENT_ERROR",
+                    recovery_status="failed",
+                )
                 raise RuntimeError("LeadBee API 请求失败") from None
             if retry_delay is not None:
                 self._sleep_before(
@@ -1201,6 +1306,7 @@ class LeadBeeOpenAPIPhoneService:
             if self._monotonic() >= deadline:
                 raise RuntimeError(f"LeadBee API {phase}超过本地期限")
             return result
+        raise RuntimeError("LeadBee API 请求重试次数已耗尽")
 
     def _read_order(
         self,
@@ -1254,17 +1360,82 @@ class LeadBeeOpenAPIPhoneService:
         if status in self._SETTLED_STATUSES:
             self._settled_status = status
             self._quarantined = False
+        billing_status = str(order.get("billing_status") or "").strip().upper()
+        recovery_status = ""
+        if status in {"CANCELED", "EXPIRED"} and billing_status == "RELEASED":
+            recovery_status = "released"
+        elif status == "COMPLETED" and billing_status == "CAPTURED":
+            recovery_status = "captured"
+        self._publish_provider_diagnostic(
+            **(
+                {"recovery_status": recovery_status}
+                if recovery_status
+                else {}
+            )
+        )
         return order
 
     @staticmethod
     def _create_failure_is_ambiguous(exc: LeadBeeAPIError) -> bool:
+        error_code = exc.error_code
+        if error_code == "IDEMPOTENCY_CONFLICT":
+            return True
+        if (
+            error_code.startswith(("AUTH", "PERMISSION", "PRODUCT"))
+            or "SIGNATURE" in error_code
+            or error_code == "IP_NOT_ALLOWED"
+            or error_code in _LEADBEE_API_CAPACITY_ERROR_CODES
+        ):
+            return False
         if isinstance(exc, LeadBeeTransportError):
             return True
         if isinstance(exc, LeadBeeResponseError) and 200 <= exc.http_status < 300:
             return True
         if exc.http_status >= 500:
             return True
-        return exc.error_code == "IDEMPOTENCY_CONFLICT"
+        return False
+
+    def _reconcile_ambiguous_create(
+        self,
+        *,
+        deadline: float,
+    ) -> dict[str, Any] | None:
+        finder = getattr(
+            self._client,
+            "find_order_by_client_order_id",
+            None,
+        )
+        if not callable(finder):
+            return None
+        self._publish_provider_diagnostic(recovery_status="pending")
+        try:
+            data = self._write_with_retry(
+                lambda request_timeout: finder(
+                    self.client_order_id,
+                    request_timeout=request_timeout,
+                ),
+                deadline=deadline,
+                phase="对账订单",
+                check_cancellation=False,
+            )
+        except (LeadBeeAPIError, RuntimeError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        returned_reference = str(
+            data.get("client_order_id") or ""
+        ).strip()
+        if returned_reference != self.client_order_id:
+            return None
+        try:
+            order = self._accept_order(data, require_order_id=True)
+        except RuntimeError:
+            return None
+        self._create_ambiguous = False
+        self._create_failed = False
+        self._settle_capacity_lease("commit")
+        self._publish_provider_diagnostic(recovery_status="reconciled")
+        return order
 
     def _create_order(self, *, deadline: float) -> dict[str, Any]:
         if self.order_id:
@@ -1293,10 +1464,17 @@ class LeadBeeOpenAPIPhoneService:
             )
         except LeadBeeAPIError as exc:
             self._create_ambiguous = self._create_failure_is_ambiguous(exc)
-            self._create_failed = True
             if self._create_ambiguous:
+                reconciled = self._reconcile_ambiguous_create(deadline=deadline)
+                if reconciled is not None:
+                    return reconciled
+                self._create_failed = True
                 self._settle_capacity_lease("quarantine")
+                self._publish_provider_diagnostic(
+                    recovery_status="quarantined"
+                )
             else:
+                self._create_failed = True
                 self._settle_capacity_lease("release")
                 if exc.error_code in _LEADBEE_API_CAPACITY_ERROR_CODES:
                     self._publish_capacity_exhausted()
@@ -1304,14 +1482,24 @@ class LeadBeeOpenAPIPhoneService:
         except RuntimeError:
             if self._create_attempted:
                 self._create_ambiguous = True
+                reconciled = self._reconcile_ambiguous_create(deadline=deadline)
+                if reconciled is not None:
+                    return reconciled
                 self._create_failed = True
                 self._settle_capacity_lease("quarantine")
+                self._publish_provider_diagnostic(
+                    recovery_status="quarantined"
+                )
             else:
                 self._settle_capacity_lease("release")
             raise
         try:
             order = self._accept_order(data, require_order_id=True)
         except RuntimeError:
+            self._create_ambiguous = True
+            reconciled = self._reconcile_ambiguous_create(deadline=deadline)
+            if reconciled is not None:
+                return reconciled
             self._create_failed = True
             self._settle_capacity_lease(
                 "quarantine" if self.card_at_risk else "release"
@@ -1444,6 +1632,7 @@ class LeadBeeOpenAPIPhoneService:
             raise RuntimeError("LeadBee API 换号请求与当前手机号不匹配")
 
         self._replacement_sequence += 1
+        self._publish_provider_diagnostic()
         idempotency_key = (
             f"leadbee-replace-{self._replacement_sequence}-{self._reference_digest}"
         )
@@ -1476,6 +1665,7 @@ class LeadBeeOpenAPIPhoneService:
         if status in self._SETTLED_STATUSES:
             self._settled_status = status
             self._quarantined = False
+            self._publish_provider_diagnostic()
             return False
         if self._quarantined:
             self.last_cancel_error = "LeadBee API 订单状态需人工核对"
@@ -1499,6 +1689,16 @@ class LeadBeeOpenAPIPhoneService:
                 if status == "CANCELED":
                     self._settled_status = status
                     self.log_fn("[LeadBee API] 订单已取消")
+                    self._publish_provider_diagnostic(
+                        recovery_status=(
+                            "released"
+                            if str(
+                                order.get("billing_status") or ""
+                            ).strip().upper()
+                            == "RELEASED"
+                            else "pending"
+                        )
+                    )
                     return True
                 if status in {"COMPLETED", "EXPIRED"}:
                     self._settled_status = status

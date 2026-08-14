@@ -135,6 +135,8 @@ class OAuthClient:
         self.sec_ch_ua = ""
         self.impersonate = ""
         self.last_prepared_oauth_context = None
+        self.last_phone_send_diagnostic = {}
+        self.last_phone_validate_diagnostic = {}
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -210,6 +212,49 @@ class OAuthClient:
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
         if self.browser_mode == "headed":
             random_delay(low, high)
+
+    def _record_phone_provider_diagnostic(
+        self,
+        *,
+        failure_stage,
+        safe_error_code="",
+        http_status=0,
+        retry_count=0,
+        recovery_status="failed",
+    ):
+        try:
+            normalized_status = int(http_status or 0)
+        except (TypeError, ValueError):
+            normalized_status = 0
+        if not 0 <= normalized_status <= 599:
+            normalized_status = 0
+        try:
+            normalized_retry_count = int(retry_count or 0)
+        except (TypeError, ValueError):
+            normalized_retry_count = 0
+        normalized_retry_count = min(max(0, normalized_retry_count), 100)
+        normalized_code = str(safe_error_code or "").strip().upper()
+        if normalized_code and not re.fullmatch(r"[A-Z0-9_]{1,64}", normalized_code):
+            normalized_code = "OPENAI_PROVIDER_ERROR"
+        payload = {
+            "failure_stage": str(failure_stage or "").strip().lower(),
+            "safe_error_code": normalized_code,
+            "http_status": normalized_status,
+            "provider_retry_count": normalized_retry_count,
+            "recovery_status": str(recovery_status or "").strip().lower(),
+        }
+        if payload["failure_stage"] == "openai_send":
+            self.last_phone_send_diagnostic = dict(payload)
+        elif payload["failure_stage"] == "openai_validate":
+            self.last_phone_validate_diagnostic = dict(payload)
+        broker = self.config.get("chatgpt_phone_progress_broker")
+        marker = getattr(broker, "mark_provider_diagnostic", None)
+        if callable(marker):
+            try:
+                marker(**payload)
+            except Exception:
+                pass
+        return payload
 
     @staticmethod
     def _random_chrome_fingerprint():
@@ -342,6 +387,10 @@ class OAuthClient:
             "号码无效",
             "号码不支持",
             "手机号不支持",
+            "openai_phone_invalid",
+            "openai_phone_unsupported",
+            "openai_phone_already_used",
+            "openai_phone_similar_rejected",
         )
         if any(marker in combined for marker in blacklist_markers):
             return True
@@ -3938,51 +3987,242 @@ class OAuthClient:
         if impersonate:
             kwargs["impersonate"] = impersonate
 
-        max_tls_attempts = 3
-        for attempt in range(max_tls_attempts):
+        # Keep the browser session, request body and phone stable across a
+        # bounded retry window.  The upstream response body and exception text
+        # are intentionally never copied into diagnostics or task logs.
+        max_attempts = 3
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        self.last_phone_send_diagnostic = {}
+
+        def publish_diagnostic(
+            *,
+            safe_error_code="",
+            http_status=0,
+            retry_count=0,
+            recovery_status="failed",
+        ):
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_send",
+                safe_error_code=safe_error_code,
+                http_status=http_status,
+                retry_count=retry_count,
+                recovery_status=recovery_status,
+            )
+
+        def retry_after_seconds(resp):
+            try:
+                raw = getattr(resp, "headers", {}) or {}
+                value = raw.get("Retry-After")
+                if value is None:
+                    value = raw.get("retry-after")
+                value = float(value)
+            except (AttributeError, TypeError, ValueError):
+                return None
+            if value < 0:
+                return None
+            return min(value, 60.0)
+
+        def response_strings(value):
+            if isinstance(value, str):
+                return [value]
+            if isinstance(value, dict):
+                values = []
+                for nested in value.values():
+                    values.extend(response_strings(nested))
+                return values
+            if isinstance(value, (list, tuple)):
+                values = []
+                for nested in value:
+                    values.extend(response_strings(nested))
+                return values
+            return []
+
+        def explicit_rejection_code(resp):
+            try:
+                payload = resp.json()
+            except Exception:
+                return ""
+            if not isinstance(payload, (dict, list, tuple)):
+                return ""
+            combined = " ".join(response_strings(payload)).lower()
+            if any(
+                marker in combined
+                for marker in (
+                    "already_use",
+                    "already-use",
+                    "already in use",
+                    "phone_already",
+                    "phone number already",
+                )
+            ):
+                return "OPENAI_PHONE_ALREADY_USED"
+            if any(
+                marker in combined
+                for marker in (
+                    "similar to yours",
+                    "similar_phone",
+                    "phone_similar",
+                    "similar phone",
+                )
+            ):
+                return "OPENAI_PHONE_SIMILAR_REJECTED"
+            if any(
+                marker in combined
+                for marker in (
+                    "unsupported_phone",
+                    "phone_unsupported",
+                    "unsupported phone",
+                    "phone number not supported",
+                    "carrier not supported",
+                )
+            ):
+                return "OPENAI_PHONE_UNSUPPORTED"
+            if any(
+                marker in combined
+                for marker in (
+                    "invalid_phone",
+                    "phone_invalid",
+                    "invalid phone",
+                    "phone number is invalid",
+                    "not a valid mobile number",
+                )
+            ):
+                return "OPENAI_PHONE_INVALID"
+            return ""
+
+        for attempt in range(1, max_attempts + 1):
             try:
                 self._browser_pause(0.12, 0.25)
                 resp = self.session.post(request_url, **kwargs)
-                break
-            except Exception as e:
-                ssl_error_type = getattr(
-                    getattr(curl_requests, "exceptions", None),
-                    "SSLError",
-                    (),
-                )
-                retryable_tls_error = bool(
-                    ssl_error_type
-                    and isinstance(e, ssl_error_type)
-                    and type(e).__module__.startswith("curl_cffi.")
-                    and getattr(e, "code", None) == 35
-                )
-                if retryable_tls_error and attempt < max_tls_attempts - 1:
-                    self._log(
-                        "add-phone/send TLS 握手失败，"
-                        f"使用同一会话重试 {attempt + 2}/{max_tls_attempts}"
+            except Exception:
+                retry_count = attempt - 1
+                if attempt < max_attempts:
+                    publish_diagnostic(
+                        safe_error_code="OPENAI_SEND_TRANSPORT",
+                        retry_count=retry_count + 1,
+                        recovery_status="retrying",
                     )
-                    time.sleep(0.25 * (attempt + 1))
+                    self._log(
+                        "add-phone/send 网络请求失败，"
+                        f"使用同一会话重试 {attempt + 1}/{max_attempts}"
+                    )
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
                     continue
-                return False, None, f"add-phone/send 异常: {e}"
+                publish_diagnostic(
+                    safe_error_code="OPENAI_SEND_TRANSPORT",
+                    retry_count=retry_count,
+                    recovery_status="failed",
+                )
+                return False, None, "add-phone/send 请求失败: OPENAI_SEND_TRANSPORT"
 
-        self._log(f"/add-phone/send -> {resp.status_code}")
-        if resp.status_code != 200:
-            return (
-                False,
-                None,
-                f"add-phone/send 失败: {resp.status_code} - {resp.text[:180]}",
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+            except (TypeError, ValueError):
+                status_code = 0
+            self.last_http_status = status_code
+            self._log(f"/add-phone/send -> {status_code}")
+
+            if status_code != 200:
+                rejection_code = ""
+                if status_code < 500 and status_code not in {408, 425, 429}:
+                    rejection_code = explicit_rejection_code(resp)
+                if rejection_code:
+                    publish_diagnostic(
+                        safe_error_code=rejection_code,
+                        http_status=status_code,
+                        retry_count=attempt - 1,
+                        recovery_status="failed",
+                    )
+                    return (
+                        False,
+                        None,
+                        f"add-phone/send 被拒绝: {rejection_code} (HTTP {status_code})",
+                    )
+
+                if status_code in retryable_statuses and attempt < max_attempts:
+                    retry_delay = (
+                        retry_after_seconds(resp)
+                        if status_code == 429
+                        else None
+                    )
+                    if retry_delay is None:
+                        retry_delay = 0.25 * (2 ** (attempt - 1))
+                    publish_diagnostic(
+                        safe_error_code="OPENAI_SEND_HTTP_RETRY",
+                        http_status=status_code,
+                        retry_count=attempt,
+                        recovery_status="retrying",
+                    )
+                    self._log(
+                        "add-phone/send 暂时失败，"
+                        f"使用同一会话重试 {attempt + 1}/{max_attempts}"
+                    )
+                    time.sleep(float(retry_delay))
+                    continue
+
+                safe_code = (
+                    "OPENAI_SEND_RETRY_EXHAUSTED"
+                    if status_code in retryable_statuses
+                    else "OPENAI_SEND_HTTP_ERROR"
+                )
+                publish_diagnostic(
+                    safe_error_code=safe_code,
+                    http_status=status_code,
+                    retry_count=attempt - 1,
+                    recovery_status="failed",
+                )
+                return (
+                    False,
+                    None,
+                    f"add-phone/send 请求失败: {safe_code} (HTTP {status_code})",
+                )
+
+            try:
+                data = resp.json()
+            except Exception:
+                publish_diagnostic(
+                    safe_error_code="OPENAI_SEND_INVALID_JSON",
+                    http_status=status_code,
+                    retry_count=attempt - 1,
+                    recovery_status="failed",
+                )
+                return False, None, "add-phone/send 响应不是有效 JSON"
+
+            if not isinstance(data, (dict, list, tuple)):
+                publish_diagnostic(
+                    safe_error_code="OPENAI_SEND_INVALID_PAYLOAD",
+                    http_status=status_code,
+                    retry_count=attempt - 1,
+                    recovery_status="failed",
+                )
+                return False, None, "add-phone/send 响应格式无效"
+
+            try:
+                next_state = self._state_from_payload(
+                    data,
+                    current_url=str(getattr(resp, "url", "") or request_url),
+                )
+            except Exception:
+                publish_diagnostic(
+                    safe_error_code="OPENAI_SEND_INVALID_PAYLOAD",
+                    http_status=status_code,
+                    retry_count=attempt - 1,
+                    recovery_status="failed",
+                )
+                return False, None, "add-phone/send 未返回有效状态"
+            publish_diagnostic(
+                http_status=status_code,
+                retry_count=attempt - 1,
+                recovery_status="reconciled" if attempt > 1 else "captured",
             )
+            self._log(f"add-phone/send {describe_flow_state(next_state)}")
+            return True, next_state, ""
 
-        try:
-            data = resp.json()
-        except Exception:
-            return False, None, "add-phone/send 响应不是 JSON"
-
-        next_state = self._state_from_payload(
-            data, current_url=str(resp.url) or request_url
+        publish_diagnostic(
+            safe_error_code="OPENAI_SEND_RETRY_EXHAUSTED",
+            recovery_status="failed",
         )
-        self._log(f"add-phone/send {describe_flow_state(next_state)}")
-        return True, next_state, ""
+        return False, None, "add-phone/send 请求失败: OPENAI_SEND_RETRY_EXHAUSTED"
 
     def _resend_phone_otp(
         self,
@@ -4009,24 +4249,96 @@ class OAuthClient:
         )
         headers.update(generate_datadog_trace())
 
-        try:
-            kwargs = {
-                "json": {"phone_number": phone_number},
-                "headers": headers,
-                "timeout": 30,
-                "allow_redirects": False,
-            }
-            if impersonate:
-                kwargs["impersonate"] = impersonate
-            self._browser_pause(0.12, 0.25)
-            resp = self.session.post(request_url, **kwargs)
-        except Exception as e:
-            return False, f"add-phone/send 重发异常: {e}"
+        kwargs = {
+            "json": {"phone_number": phone_number},
+            "headers": headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            kwargs["impersonate"] = impersonate
 
-        self._log(f"/add-phone/send(resend) -> {resp.status_code}")
-        if resp.status_code == 200:
-            return True, ""
-        return False, f"add-phone/send 重发失败: {resp.status_code} - {resp.text[:180]}"
+        retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+        max_attempts = 3
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self._browser_pause(0.12, 0.25)
+                resp = self.session.post(request_url, **kwargs)
+            except Exception:
+                if attempt < max_attempts:
+                    self._record_phone_provider_diagnostic(
+                        failure_stage="openai_send",
+                        safe_error_code="OPENAI_SEND_TRANSPORT",
+                        retry_count=attempt,
+                        recovery_status="retrying",
+                    )
+                    time.sleep(0.25 * (2 ** (attempt - 1)))
+                    continue
+                self._record_phone_provider_diagnostic(
+                    failure_stage="openai_send",
+                    safe_error_code="OPENAI_SEND_TRANSPORT",
+                    retry_count=attempt - 1,
+                    recovery_status="failed",
+                )
+                return False, "add-phone/send 重发失败: OPENAI_SEND_TRANSPORT"
+
+            try:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+            except (TypeError, ValueError):
+                status_code = 0
+            self.last_http_status = status_code
+            self._log(f"/add-phone/send(resend) -> {status_code}")
+            if status_code == 200:
+                self._record_phone_provider_diagnostic(
+                    failure_stage="openai_send",
+                    http_status=status_code,
+                    retry_count=attempt - 1,
+                    recovery_status=(
+                        "reconciled" if attempt > 1 else "captured"
+                    ),
+                )
+                return True, ""
+            if status_code in retryable_statuses and attempt < max_attempts:
+                retry_delay = None
+                if status_code == 429:
+                    try:
+                        retry_delay = float(
+                            (getattr(resp, "headers", {}) or {}).get(
+                                "Retry-After"
+                            )
+                        )
+                    except (AttributeError, TypeError, ValueError):
+                        retry_delay = None
+                    if retry_delay is not None:
+                        retry_delay = min(max(0.0, retry_delay), 60.0)
+                if retry_delay is None:
+                    retry_delay = 0.25 * (2 ** (attempt - 1))
+                self._record_phone_provider_diagnostic(
+                    failure_stage="openai_send",
+                    safe_error_code="OPENAI_SEND_HTTP_RETRY",
+                    http_status=status_code,
+                    retry_count=attempt,
+                    recovery_status="retrying",
+                )
+                time.sleep(float(retry_delay))
+                continue
+            safe_code = (
+                "OPENAI_SEND_RETRY_EXHAUSTED"
+                if status_code in retryable_statuses
+                else "OPENAI_SEND_HTTP_ERROR"
+            )
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_send",
+                safe_error_code=safe_code,
+                http_status=status_code,
+                retry_count=attempt - 1,
+                recovery_status="failed",
+            )
+            return (
+                False,
+                f"add-phone/send 重发失败: {safe_code} (HTTP {status_code})",
+            )
+        return False, "add-phone/send 重发失败: OPENAI_SEND_RETRY_EXHAUSTED"
 
     def _get_config_value(self, *keys):
         for key in keys:
@@ -4090,26 +4402,74 @@ class OAuthClient:
                 kwargs["impersonate"] = impersonate
             self._browser_pause(0.12, 0.25)
             resp = self.session.post(request_url, **kwargs)
-        except Exception as e:
-            return False, None, f"phone-otp/validate 异常: {e}"
-
-        self._log(f"/phone-otp/validate -> {resp.status_code}")
-        if resp.status_code != 200:
-            if resp.status_code == 401:
-                return False, None, "手机号验证码错误"
+        except Exception:
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_validate",
+                safe_error_code="OPENAI_VALIDATE_TRANSPORT",
+                recovery_status="failed",
+            )
             return (
                 False,
                 None,
-                f"phone-otp/validate 失败: {resp.status_code} - {resp.text[:180]}",
+                "phone-otp/validate 失败: OPENAI_VALIDATE_TRANSPORT",
+            )
+
+        try:
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status_code = 0
+        self.last_http_status = status_code
+        self._log(f"/phone-otp/validate -> {status_code}")
+        if status_code != 200:
+            if status_code == 401:
+                self._record_phone_provider_diagnostic(
+                    failure_stage="openai_validate",
+                    safe_error_code="OPENAI_OTP_INVALID",
+                    http_status=status_code,
+                    recovery_status="failed",
+                )
+                return False, None, "手机号验证码错误"
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_validate",
+                safe_error_code="OPENAI_VALIDATE_HTTP_ERROR",
+                http_status=status_code,
+                recovery_status="failed",
+            )
+            return (
+                False,
+                None,
+                "phone-otp/validate 失败: "
+                f"OPENAI_VALIDATE_HTTP_ERROR (HTTP {status_code})",
             )
 
         try:
             data = resp.json()
         except Exception:
-            return False, None, "phone-otp/validate 响应不是 JSON"
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_validate",
+                safe_error_code="OPENAI_VALIDATE_INVALID_JSON",
+                http_status=status_code,
+                recovery_status="failed",
+            )
+            return False, None, "phone-otp/validate 响应不是有效 JSON"
 
-        next_state = self._state_from_payload(
-            data, current_url=str(resp.url) or request_url
+        try:
+            next_state = self._state_from_payload(
+                data,
+                current_url=str(getattr(resp, "url", "") or request_url),
+            )
+        except Exception:
+            self._record_phone_provider_diagnostic(
+                failure_stage="openai_validate",
+                safe_error_code="OPENAI_VALIDATE_INVALID_PAYLOAD",
+                http_status=status_code,
+                recovery_status="failed",
+            )
+            return False, None, "phone-otp/validate 未返回有效状态"
+        self._record_phone_provider_diagnostic(
+            failure_stage="openai_validate",
+            http_status=status_code,
+            recovery_status="captured",
         )
         self._log(f"手机号 OTP 验证通过 {describe_flow_state(next_state)}")
         return True, next_state, ""

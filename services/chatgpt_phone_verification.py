@@ -25,6 +25,31 @@ leadbee_phone_flow_lock = leadbee_card_phone_flow_lock
 LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS = 60.0
 KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset({"restored", "consumed", "unusable"})
 LEADBEE_API_CLIENT_ORDER_RE = re.compile(r"^aar_[0-9a-f]{32}$")
+_PROVIDER_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "oauth_prepare",
+        "leadbee_create",
+        "leadbee_reconcile",
+        "leadbee_read",
+        "leadbee_replace",
+        "leadbee_cancel",
+        "openai_send",
+        "openai_validate",
+    }
+)
+_PROVIDER_RECOVERY_STATUSES = frozenset(
+    {
+        "pending",
+        "retrying",
+        "reconciled",
+        "released",
+        "captured",
+        "quarantined",
+        "failed",
+    }
+)
+_SAFE_PROVIDER_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
+_SAFE_PROVIDER_STATUS_RE = re.compile(r"^[A-Z0-9_]{1,32}$")
 
 
 def _truthy_config(value: Any) -> bool:
@@ -140,6 +165,7 @@ class InteractivePhoneVerificationBroker:
         self.provider_started = False
         self.provider_error_code = ""
         self.provider_error_message = ""
+        self.provider_diagnostic: dict[str, Any] = {}
         self.exchange_code_consumed = False
         self.exchange_code_unusable = False
         self.exchange_code_unusable_reason = ""
@@ -214,6 +240,7 @@ class InteractivePhoneVerificationBroker:
                 "provider_started": self.provider_started,
                 "provider_error_code": self.provider_error_code,
                 "provider_error_message": self.provider_error_message,
+                "provider_diagnostic": dict(self.provider_diagnostic),
                 "exchange_code_consumed": self.exchange_code_consumed,
                 "exchange_code_unusable": self.exchange_code_unusable,
                 "exchange_code_unusable_reason": self.exchange_code_unusable_reason,
@@ -316,6 +343,62 @@ class InteractivePhoneVerificationBroker:
                 self.provider_error_code = normalized_code
             if normalized_message and not self.provider_error_message:
                 self.provider_error_message = normalized_message
+            if (
+                normalized_code
+                and _SAFE_PROVIDER_CODE_RE.fullmatch(normalized_code)
+                and "safe_error_code" not in self.provider_diagnostic
+            ):
+                self.provider_diagnostic["safe_error_code"] = normalized_code
+            self._condition.notify_all()
+
+    def mark_provider_diagnostic(self, **diagnostic: Any) -> None:
+        """Merge only bounded, non-secret fields into the public provider snapshot."""
+        safe: dict[str, Any] = {}
+        stage = str(diagnostic.get("failure_stage") or "").strip().lower()
+        if stage in _PROVIDER_DIAGNOSTIC_STAGES:
+            safe["failure_stage"] = stage
+        error_code = str(diagnostic.get("safe_error_code") or "").strip().upper()
+        if _SAFE_PROVIDER_CODE_RE.fullmatch(error_code):
+            safe["safe_error_code"] = error_code
+        for key, maximum in (
+            ("http_status", 599),
+            ("provider_retry_count", 100),
+            ("replacement_count", 100),
+        ):
+            try:
+                value = int(diagnostic.get(key))
+            except (TypeError, ValueError):
+                continue
+            if 0 <= value <= maximum:
+                safe[key] = value
+        for key in ("order_status", "billing_status"):
+            value = str(diagnostic.get(key) or "").strip().upper()
+            if _SAFE_PROVIDER_STATUS_RE.fullmatch(value):
+                safe[key] = value
+        recovery_status = str(
+            diagnostic.get("recovery_status") or ""
+        ).strip().lower()
+        if recovery_status in _PROVIDER_RECOVERY_STATUSES:
+            safe["recovery_status"] = recovery_status
+
+        with self._condition:
+            terminal_failure = safe.get("recovery_status") in {
+                "failed",
+                "quarantined",
+            }
+            for key, value in safe.items():
+                if key in {"failure_stage", "safe_error_code", "http_status"}:
+                    if terminal_failure:
+                        self.provider_diagnostic[key] = value
+                    else:
+                        self.provider_diagnostic.setdefault(key, value)
+                elif key in {"provider_retry_count", "replacement_count"}:
+                    self.provider_diagnostic[key] = max(
+                        int(self.provider_diagnostic.get(key) or 0),
+                        int(value),
+                    )
+                else:
+                    self.provider_diagnostic[key] = value
             self._condition.notify_all()
 
     def mark_exchange_code_restored(self) -> None:

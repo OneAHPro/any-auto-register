@@ -1440,6 +1440,89 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
         self.assertEqual(create_calls[0], create_calls[1])
         self.assertEqual(clock.sleeps, [1.0])
 
+    def test_get_order_retries_500_502_and_504_on_the_same_order(self):
+        for status_code in (500, 502, 504):
+            with self.subTest(status_code=status_code):
+                client = _OpenAPIClient(
+                    create=[
+                        {
+                            "order_id": f"order_fixture_read_{status_code}",
+                            "status": "PROCESSING",
+                            "next_poll_after_seconds": 1,
+                        }
+                    ],
+                    get=[
+                        LeadBeeHTTPError(
+                            "fixture upstream failure",
+                            code="HTTP_ERROR",
+                            status_code=status_code,
+                        ),
+                        {
+                            "order_id": f"order_fixture_read_{status_code}",
+                            "status": "WAITING_CODE",
+                            "phone": "+12025550123",
+                        },
+                    ],
+                )
+                service, clock, _logs = _open_api_service(client)
+
+                service.acquire_phone()
+
+                get_calls = [call for call in client.calls if call[0] == "get"]
+                self.assertEqual(len(get_calls), 2)
+                self.assertEqual(get_calls[0][1], get_calls[1][1])
+                self.assertEqual(clock.sleeps, [4.0, 1.0])
+
+    def test_retryable_request_stops_after_three_total_attempts(self):
+        failure = lambda: LeadBeeHTTPError(
+            "fixture unavailable",
+            code="HTTP_ERROR",
+            status_code=503,
+        )
+        client = _OpenAPIClient(create=[failure(), failure(), failure()])
+        service, clock, _logs = _open_api_service(client)
+
+        with self.assertRaises(LeadBeeHTTPError):
+            service.acquire_phone()
+
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            3,
+        )
+        self.assertEqual(clock.sleeps, [1.0, 2.0])
+
+    def test_retry_attempt_configuration_cannot_exceed_three(self):
+        failure = lambda: LeadBeeHTTPError(
+            "fixture unavailable",
+            code="HTTP_ERROR",
+            status_code=503,
+        )
+        client = _OpenAPIClient(
+            create=[
+                failure(),
+                failure(),
+                failure(),
+                {
+                    "order_id": "order_fixture_fourth_attempt",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ]
+        )
+        service, clock, _logs = _open_api_service(
+            client,
+            leadbee_request_max_attempts=99,
+        )
+
+        with self.assertRaises(LeadBeeHTTPError):
+            service.acquire_phone()
+
+        self.assertEqual(
+            [call[0] for call in client.calls].count("create"),
+            3,
+        )
+        self.assertEqual(clock.sleeps, [1.0, 2.0])
+
     def test_nonretryable_create_failure_is_not_posted_again_on_same_service(self):
         client = _OpenAPIClient(
             create=[
@@ -1490,13 +1573,53 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
                     1,
                 )
 
+    def test_malformed_create_reconciles_by_client_reference_before_new_order(self):
+        class ReconcilingClient(_OpenAPIClient):
+            def find_order_by_client_order_id(
+                self,
+                client_order_id,
+                *,
+                request_timeout=None,
+            ):
+                self.calls.append(
+                    ("reconcile", client_order_id, request_timeout)
+                )
+                return {
+                    "order_id": "order_fixture_reconciled",
+                    "client_order_id": client_order_id,
+                    "status": "WAITING_CODE",
+                    "billing_status": "RESERVED",
+                    "phone": "+12025550123",
+                }
+
+        client = ReconcilingClient(
+            create=[
+                LeadBeeResponseError(
+                    "fixture malformed response",
+                    code="INVALID_JSON",
+                    status_code=200,
+                )
+            ]
+        )
+        lease = _RecordingCapacityLease()
+        service, _clock, _logs = _open_api_service(
+            client,
+            leadbee_capacity_lease=lease,
+        )
+
+        entry = service.acquire_phone()
+
+        self.assertEqual(entry.phone, "+12025550123")
+        self.assertEqual(service.order_id, "order_fixture_reconciled")
+        self.assertFalse(service._create_ambiguous)
+        self.assertEqual(lease.events, ["commit"])
+        self.assertEqual(
+            [call[0] for call in client.calls],
+            ["create", "reconcile"],
+        )
+
     def test_5xx_and_idempotency_conflict_create_failures_are_ambiguous(self):
         failures = (
-            LeadBeeHTTPError(
-                "fixture server failure",
-                code="AUTH_REQUIRED",
-                status_code=500,
-            ),
             LeadBeeAPIError(
                 "fixture server envelope failure",
                 code="API_ERROR",
@@ -1510,7 +1633,8 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
         )
         for failure in failures:
             with self.subTest(error_code=failure.error_code):
-                client = _OpenAPIClient(create=[failure])
+                attempts = 3 if failure.error_code == "API_ERROR" else 1
+                client = _OpenAPIClient(create=[failure] * attempts)
                 service, _clock, _logs = _open_api_service(client)
 
                 with self.assertRaises(LeadBeeAPIError):
@@ -1518,6 +1642,21 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
 
                 self.assertTrue(service._create_ambiguous)
                 self.assertTrue(service.card_at_risk)
+
+    def test_explicit_auth_code_is_not_ambiguous_even_with_5xx_status(self):
+        failure = LeadBeeHTTPError(
+            "fixture server failure",
+            code="AUTH_REQUIRED",
+            status_code=500,
+        )
+        client = _OpenAPIClient(create=[failure])
+        service, _clock, _logs = _open_api_service(client)
+
+        with self.assertRaises(LeadBeeAPIError):
+            service.acquire_phone()
+
+        self.assertFalse(service._create_ambiguous)
+        self.assertFalse(service.card_at_risk)
 
     def test_explicit_4xx_create_rejections_are_not_marked_ambiguous(self):
         failures = (
@@ -4190,33 +4329,111 @@ class OAuthPhoneSendRetryTests(unittest.TestCase):
             second_call.kwargs["json"],
         )
 
-    def test_send_phone_number_does_not_retry_timeout(self):
+    def test_send_phone_number_retries_timeout_on_same_session_and_phone(self):
         client = self._client()
-        client.session.post = mock.Mock(
-            side_effect=cffi_requests.exceptions.Timeout("request timed out")
+        secret = "transport-secret-must-not-leak"
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/add-phone/send",
+            text="{}",
         )
-
-        sent, state, detail = client._send_phone_number(
-            "+447000000001",
-            "device-id",
-            "Mozilla/5.0",
-            None,
-            None,
-        )
-
-        self.assertFalse(sent)
-        self.assertIsNone(state)
-        self.assertIn("timed out", detail)
-        client.session.post.assert_called_once()
-
-    def test_send_phone_number_does_not_retry_http_failure(self):
-        client = self._client()
+        response.json.return_value = {"page": {"type": "phone_otp_verification"}}
         client.session.post = mock.Mock(
-            return_value=mock.Mock(
-                status_code=500,
-                text="temporary upstream failure",
+            side_effect=[
+                cffi_requests.exceptions.Timeout(secret),
+                response,
+            ]
+        )
+        next_state = FlowState(page_type="phone_otp_verification")
+
+        with mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=next_state,
+        ), mock.patch("platforms.chatgpt.oauth_client.time.sleep"):
+            sent, state, detail = client._send_phone_number(
+                "+447000000001",
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
             )
+
+        self.assertTrue(sent)
+        self.assertIs(state, next_state)
+        self.assertEqual(detail, "")
+        self.assertNotIn(secret, str(client.last_phone_send_diagnostic))
+        self.assertEqual(client.session.post.call_count, 2)
+        first_call, second_call = client.session.post.call_args_list
+        self.assertEqual(first_call.kwargs["json"], second_call.kwargs["json"])
+
+    def test_send_phone_number_retries_500_502_504_then_reports_safe_failure(self):
+        client = self._client()
+        secret = "raw-upstream-body-must-not-leak"
+        client.session.post = mock.Mock(
+            side_effect=[
+                mock.Mock(status_code=status, text=secret, headers={})
+                for status in (500, 502, 504)
+            ]
         )
+
+        with mock.patch("platforms.chatgpt.oauth_client.time.sleep") as sleep:
+            sent, state, detail = client._send_phone_number(
+                "+447000000001",
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+            )
+
+        self.assertFalse(sent)
+        self.assertIsNone(state)
+        self.assertIn("OPENAI_SEND_RETRY_EXHAUSTED", detail)
+        self.assertIn("504", detail)
+        self.assertNotIn(secret, detail)
+        self.assertNotIn(secret, str(client.last_phone_send_diagnostic))
+        self.assertEqual(client.session.post.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(0.25), mock.call(0.5)])
+
+    def test_send_phone_number_honors_retry_after_for_429(self):
+        client = self._client()
+        limited = mock.Mock(status_code=429, text="ignored", headers={"Retry-After": "3"})
+        success = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/add-phone/send",
+            text="{}",
+        )
+        success.json.return_value = {"page": {"type": "phone_otp_verification"}}
+        client.session.post = mock.Mock(side_effect=[limited, success])
+
+        with mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=FlowState(page_type="phone_otp_verification"),
+        ), mock.patch("platforms.chatgpt.oauth_client.time.sleep") as sleep:
+            sent, _state, detail = client._send_phone_number(
+                "+447000000001",
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(detail, "")
+        sleep.assert_called_once_with(3.0)
+
+    def test_send_phone_number_maps_explicit_invalid_phone_without_raw_body(self):
+        client = self._client()
+        secret = "private-provider-debug-value"
+        response = mock.Mock(status_code=400, text=secret, headers={})
+        response.json.return_value = {
+            "error": {
+                "code": "invalid_phone_number",
+                "message": f"phone number is invalid {secret}",
+            }
+        }
+        client.session.post = mock.Mock(return_value=response)
 
         sent, state, detail = client._send_phone_number(
             "+447000000001",
@@ -4228,8 +4445,75 @@ class OAuthPhoneSendRetryTests(unittest.TestCase):
 
         self.assertFalse(sent)
         self.assertIsNone(state)
-        self.assertIn("500", detail)
-        client.session.post.assert_called_once()
+        self.assertEqual(detail, "add-phone/send 被拒绝: OPENAI_PHONE_INVALID (HTTP 400)")
+        self.assertNotIn(secret, detail)
+        self.assertTrue(OAuthClient._should_blacklist_phone_failure(detail))
+
+    def test_resend_phone_otp_retries_without_exposing_response_body(self):
+        client = self._client()
+        secret = "resend-upstream-secret"
+        client.session.post = mock.Mock(
+            side_effect=[
+                mock.Mock(status_code=503, text=secret, headers={}),
+                mock.Mock(status_code=200, text="{}", headers={}),
+            ]
+        )
+
+        with mock.patch("platforms.chatgpt.oauth_client.time.sleep") as sleep:
+            sent, detail = client._resend_phone_otp(
+                "+447000000001",
+                "device-id",
+                "Mozilla/5.0",
+                None,
+                None,
+                FlowState(page_type="phone_otp_verification"),
+            )
+
+        self.assertTrue(sent)
+        self.assertEqual(detail, "")
+        self.assertNotIn(secret, str(client.last_phone_send_diagnostic))
+        self.assertEqual(client.session.post.call_count, 2)
+        sleep.assert_called_once_with(0.25)
+
+    def test_validate_phone_otp_reports_safe_http_failure(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=201,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_" + "c" * 32,
+        )
+        client = OAuthClient(
+            {"chatgpt_phone_progress_broker": broker},
+            verbose=False,
+        )
+        secret = "validate-upstream-secret"
+        client.session.post = mock.Mock(
+            return_value=mock.Mock(status_code=500, text=secret, headers={})
+        )
+
+        valid, state, detail = client._validate_phone_otp(
+            "654321",
+            "device-id",
+            "Mozilla/5.0",
+            None,
+            None,
+            FlowState(page_type="phone_otp_verification"),
+        )
+
+        self.assertFalse(valid)
+        self.assertIsNone(state)
+        self.assertEqual(
+            detail,
+            "phone-otp/validate 失败: OPENAI_VALIDATE_HTTP_ERROR (HTTP 500)",
+        )
+        self.assertNotIn(secret, detail)
+        diagnostic = broker.snapshot()["provider_diagnostic"]
+        self.assertEqual(diagnostic["failure_stage"], "openai_validate")
+        self.assertEqual(
+            diagnostic["safe_error_code"],
+            "OPENAI_VALIDATE_HTTP_ERROR",
+        )
+        self.assertEqual(diagnostic["http_status"], 500)
 
 
 class OAuthPhoneBlacklistTests(unittest.TestCase):

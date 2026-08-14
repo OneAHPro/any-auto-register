@@ -210,6 +210,64 @@ def test_get_products_uses_default_base_and_byte_exact_signature():
     assert call.timeout == 20.0
 
 
+def test_list_orders_uses_canonical_get_without_query_or_idempotency():
+    session = FakeSession(
+        FakeResponse(
+            payload={
+                "success": True,
+                "data": {
+                    "orders": [
+                        {
+                            "order_id": "order-fixture-1",
+                            "client_order_id": "client-fixture-1",
+                            "status": "PROCESSING",
+                        }
+                    ]
+                },
+            }
+        )
+    )
+
+    result = make_client(session).list_orders()
+
+    assert result["orders"][0]["client_order_id"] == "client-fixture-1"
+    call = session.calls[0]
+    assert call.method == "GET"
+    assert call.url == f"{LEADBEE_API_BASE}/orders"
+    assert call.body == b""
+    assert "?" not in call.url
+    assert "Idempotency-Key" not in call.headers
+
+
+def test_find_order_by_client_order_id_matches_exactly():
+    session = FakeSession(
+        FakeResponse(
+            payload={
+                "success": True,
+                "data": {
+                    "orders": [
+                        {
+                            "order_id": "wrong-order",
+                            "client_order_id": "client-fixture-10",
+                        },
+                        {
+                            "order_id": "right-order",
+                            "client_order_id": "client-fixture-1",
+                        },
+                    ]
+                },
+            }
+        )
+    )
+
+    result = make_client(session).find_order_by_client_order_id("client-fixture-1")
+
+    assert result == {
+        "order_id": "right-order",
+        "client_order_id": "client-fixture-1",
+    }
+
+
 def test_create_order_signs_and_sends_the_exact_serialized_json_once():
     session = FakeSession(
         FakeResponse(status_code=201, payload={"success": True, "data": {"id": "1"}})

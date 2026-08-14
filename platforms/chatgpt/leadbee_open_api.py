@@ -188,6 +188,39 @@ class LeadBeeOpenAPIClient:
             request_timeout=request_timeout,
         )
 
+    def list_orders(
+        self,
+        *,
+        request_timeout: _RequestTimeout | None = None,
+    ) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            "/orders",
+            request_timeout=request_timeout,
+        )
+
+    def find_order_by_client_order_id(
+        self,
+        client_order_id: str,
+        *,
+        request_timeout: _RequestTimeout | None = None,
+    ) -> dict[str, Any] | None:
+        expected = _require_non_empty("client_order_id", client_order_id).strip()
+        data = self.list_orders(request_timeout=request_timeout)
+        orders = data.get("orders")
+        if not isinstance(orders, list):
+            raise LeadBeeResponseError(
+                "LeadBee order list was invalid",
+                code="INVALID_ORDER_LIST",
+                status_code=200,
+            )
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            if str(order.get("client_order_id") or "").strip() == expected:
+                return dict(order)
+        return None
+
     def replace_order(
         self,
         order_id: str,

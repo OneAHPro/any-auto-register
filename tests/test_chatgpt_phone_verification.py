@@ -73,6 +73,44 @@ class PhoneValidationTests(unittest.TestCase):
         self.assertTrue(any("短信验证码已发送" in line for line in logs))
         self.assertTrue(any("已自动获取短信验证码" in line for line in logs))
 
+    def test_provider_diagnostic_whitelists_safe_fields_and_redacts_unknown_values(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=1,
+            phone="",
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_" + "a" * 32,
+        )
+
+        broker.mark_provider_diagnostic(
+            failure_stage="openai_send",
+            safe_error_code="OPENAI_SEND_RETRY_EXHAUSTED",
+            http_status=504,
+            provider_retry_count=2,
+            order_status="CANCELED",
+            billing_status="RELEASED",
+            replacement_count=0,
+            recovery_status="released",
+            raw_body="secret-body",
+            order_id="secret-order-id",
+        )
+
+        diagnostic = broker.snapshot()["provider_diagnostic"]
+        self.assertEqual(
+            diagnostic,
+            {
+                "failure_stage": "openai_send",
+                "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+                "http_status": 504,
+                "provider_retry_count": 2,
+                "order_status": "CANCELED",
+                "billing_status": "RELEASED",
+                "replacement_count": 0,
+                "recovery_status": "released",
+            },
+        )
+        self.assertNotIn("secret", str(broker.snapshot()))
+
     def test_unusable_exchange_code_is_structured_and_notified_once(self):
         settled = mock.Mock()
         broker = InteractivePhoneVerificationBroker(
