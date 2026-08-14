@@ -23,11 +23,11 @@
 - Test: `tests/test_mail_imports_service.py`
 - Test: `frontend/src/components/settings/MailImportPanel.test.tsx`
 
-- [ ] Add RED tests for three/four-dash mixed rows and embedded one/two-dash values.
-- [ ] Run the three focused test files and confirm failures are caused by four-dash-only parsing.
-- [ ] Implement `split_mail_import_fields()` and `mail_import_row_pattern()` around `(?<!-)-{3,4}(?!-)`.
-- [ ] Replace duplicated Python split/regex logic and update UI help text.
-- [ ] Run focused tests and retain existing Tab/JSON/four-dash behavior.
+- [x] Add RED tests for three/four-dash mixed rows and embedded one/two-dash values.
+- [x] Run the three focused test files and confirm failures are caused by four-dash-only parsing.
+- [x] Implement `split_mail_import_fields()` and `mail_import_row_pattern()` around `(?<!-)-{3,4}(?!-)`.
+- [x] Replace duplicated Python split/regex logic and update UI help text.
+- [x] Run focused tests and retain existing Tab/JSON/four-dash behavior.
 
 ### Task 2: OAuth prebuild recovery
 
@@ -45,12 +45,12 @@
 - Test: `tests/test_chatgpt_login_with_phone.py`
 - Test: `tests/test_accounts_api_sanitization.py`
 
-- [ ] Add RED tests proving `page=log_in` is retried after backoff, browser fallback skips email submit, and 14 concurrent contexts do not share state/session.
-- [ ] Persist a v1 authenticated browser snapshot independently of the v2 prepared transaction.
-- [ ] Stage prebuild attempts around Access Token completion and publish safe recovered/deferred diagnostics.
-- [ ] Restore the v1 snapshot and prepare one fresh PKCE transaction before the phone provider starts.
-- [ ] Remove task-level mailbox requeue as the normal OAuth prebuild fallback.
-- [ ] Sanitize both snapshot types from account API responses and run focused tests.
+- [x] Add RED tests proving `page=log_in` is retried after backoff, browser fallback skips email submit, and 14 concurrent contexts do not share state/session.
+- [x] Persist a v1 authenticated browser snapshot independently of the v2 prepared transaction.
+- [x] Stage prebuild attempts around Access Token completion and publish safe recovered/deferred diagnostics.
+- [x] Restore the v1 snapshot and prepare one fresh PKCE transaction before the phone provider starts.
+- [x] Remove task-level mailbox requeue as the normal OAuth prebuild fallback.
+- [x] Sanitize both snapshot types from account API responses and run focused tests.
 
 ### Task 3: Safe provider diagnostics and request retry
 
@@ -65,12 +65,12 @@
 - Test: `tests/test_chatgpt_phone_verification.py`
 - Test: `tests/test_chatgpt_retry_bindings.py`
 
-- [ ] Add RED tests for GET 500/502/504, Retry-After, OpenAI send transport/429/5xx, invalid-phone replacement, malformed create reconciliation, and diagnostic redaction.
-- [ ] Add `GET /orders` and exact `client_order_id` reconciliation to the signed client.
-- [ ] Bound LeadBee retries to three attempts with exponential backoff and stable request identity.
-- [ ] Bound OpenAI send retries on the same phone/session and replace only explicit phone rejection.
-- [ ] Add broker whitelist diagnostics and persist only those fields in task/binding details.
-- [ ] Run focused provider and sanitization tests.
+- [x] Add RED tests for GET 500/502/504, Retry-After, OpenAI send transport/429/5xx, invalid-phone replacement, malformed create reconciliation, and diagnostic redaction.
+- [x] Add `GET /orders` and exact `client_order_id` reconciliation to the signed client.
+- [x] Bound LeadBee retries to three attempts with exponential backoff and stable request identity.
+- [x] Bound OpenAI send retries on the same phone/session and replace only explicit phone rejection.
+- [x] Add broker whitelist diagnostics and persist only those fields in task/binding details.
+- [x] Run focused provider and sanitization tests.
 
 ### Task 4: One safe account retry
 
@@ -79,20 +79,20 @@
 - Test: `tests/test_chatgpt_login_with_phone.py`
 - Test: `tests/test_chatgpt_retry_bindings.py`
 
-- [ ] Add RED tests for one retry after `CANCELED/RELEASED`, no retry for `CAPTURED`/ambiguous state, and ref persistence before provider start.
-- [ ] Gate retry on the safe diagnostic tuple and `phone_verified=false`.
-- [ ] Persist a fresh `aar_<uuid>` before capacity/OAuth/provider execution.
-- [ ] Limit automatic account retry to one and preserve the manual retry binding on final failure.
-- [ ] Run task routing and retry-binding tests.
+- [x] Add RED tests for one retry after `CANCELED/RELEASED`, no retry for `CAPTURED`/ambiguous state, and ref persistence before provider start.
+- [x] Gate retry on the safe diagnostic tuple and `phone_verified=false`.
+- [x] Persist a fresh `aar_<uuid>` before capacity/OAuth/provider execution.
+- [x] Limit automatic account retry to one and preserve the manual retry binding on final failure.
+- [x] Run task routing and retry-binding tests.
 
 ### Task 5: Verification, commit, deploy, live regression
 
 **Files:**
 - Verify all modified files and deployment scripts/process only.
 
-- [ ] Run the focused backend suite from the task prompt.
-- [ ] Run `PYTHONPATH="$PWD" /tmp/any-auto-register-py311/bin/python -m pytest -q`.
-- [ ] Run frontend tests, `npm run build`, compileall, diff check and credential scan.
+- [x] Run the focused backend suite from the task prompt.
+- [x] Run `PYTHONPATH="$PWD" /tmp/any-auto-register-py311/bin/python -m pytest -q`.
+- [x] Run frontend tests, `npm run build`, compileall, diff check and credential scan.
 - [ ] Commit on `codex/oauth-leadbee-retry-hardening`, push, and fast-forward `main` only after clean verification.
 - [ ] Confirm production has no pending/running task, back up the database, publish an immutable release, atomically switch, restart and health-check.
 - [ ] Retry the two failed bindings from `task_3e91c78a80654eb8a7dd53b1affef754`; verify old/new order settlement and zero leaked secrets.

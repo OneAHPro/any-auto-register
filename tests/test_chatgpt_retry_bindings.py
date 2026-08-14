@@ -22,6 +22,116 @@ from core.db import ChatGPTAttemptBindingModel, _recover_chatgpt_attempt_binding
 
 
 class ChatGPTRetryBindingTests(unittest.TestCase):
+    def test_api_phone_auto_retry_requires_released_terminal_order(self):
+        result = {
+            "status": "failed",
+            "provider_cleanup_settled": True,
+            "phone_verified": False,
+            "provider_error_code": "",
+        }
+        diagnostic = {
+            "failure_stage": "openai_send",
+            "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+            "http_status": 504,
+            "provider_retry_count": 2,
+            "order_status": "CANCELED",
+            "billing_status": "RELEASED",
+            "replacement_count": 0,
+            "recovery_status": "released",
+        }
+
+        self.assertTrue(
+            tasks_module._chatgpt_api_phone_retry_allowed(
+                result,
+                diagnostic,
+                retry_count=0,
+            )
+        )
+        unsafe_cases = (
+            ({**result, "provider_cleanup_settled": False}, diagnostic, 0),
+            ({**result, "phone_verified": True}, diagnostic, 0),
+            ({**result, "ownership_conflict": True}, diagnostic, 0),
+            ({**result, "finalization_pending": True}, diagnostic, 0),
+            (result, {**diagnostic, "order_status": "WAITING_CODE"}, 0),
+            (result, {**diagnostic, "billing_status": "CAPTURED"}, 0),
+            (result, {**diagnostic, "recovery_status": "pending"}, 0),
+            (
+                {
+                    **result,
+                    "provider_error_code": "LEADBEE_API_CAPACITY_EXHAUSTED",
+                },
+                diagnostic,
+                0,
+            ),
+            (result, diagnostic, 1),
+        )
+        for unsafe_result, unsafe_diagnostic, retry_count in unsafe_cases:
+            with self.subTest(
+                result=unsafe_result,
+                diagnostic=unsafe_diagnostic,
+                retry_count=retry_count,
+            ):
+                self.assertFalse(
+                    tasks_module._chatgpt_api_phone_retry_allowed(
+                        unsafe_result,
+                        unsafe_diagnostic,
+                        retry_count=retry_count,
+                    )
+                )
+
+    def test_provider_diagnostic_is_sanitized_before_persist_and_exposed(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        secret = "raw-provider-secret"
+
+        with mock.patch("api.tasks.engine", test_engine):
+            row = _upsert_chatgpt_attempt_binding(
+                task_id="task-diagnostic",
+                attempt_index=0,
+                email="bound@example.com",
+                leadbee_code="aar_" + "a" * 32,
+                stage="phone",
+                status="failed",
+                mailbox_context={
+                    "provider": "microsoft",
+                    "leadbee_api": True,
+                    "phone_auto_retry_count": 1,
+                    "phone_diagnostic": {
+                        "failure_stage": "openai_send",
+                        "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+                        "http_status": 504,
+                        "provider_retry_count": 2,
+                        "order_status": "CANCELED",
+                        "billing_status": "RELEASED",
+                        "replacement_count": 0,
+                        "recovery_status": "released",
+                        "raw_body": secret,
+                        "order_id": secret,
+                    },
+                },
+            )
+
+        self.assertNotIn(secret, row.mailbox_context_json)
+        public = tasks_module._chatgpt_binding_public(row)
+        self.assertEqual(public["phone_auto_retry_count"], 1)
+        self.assertEqual(
+            public["provider_diagnostic"],
+            {
+                "failure_stage": "openai_send",
+                "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+                "http_status": 504,
+                "provider_retry_count": 2,
+                "order_status": "CANCELED",
+                "billing_status": "RELEASED",
+                "replacement_count": 0,
+                "recovery_status": "released",
+            },
+        )
+
     def test_build_retry_request_preserves_email_card_order(self):
         bindings = [
             {

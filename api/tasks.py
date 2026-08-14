@@ -96,6 +96,31 @@ _CHATGPT_LEADBEE_SECRET_KEYS = {
     "leadbee_api_secret",
     "leadbee_api_product_id",
 }
+_CHATGPT_PHONE_DIAGNOSTIC_STAGES = frozenset(
+    {
+        "oauth_prepare",
+        "leadbee_create",
+        "leadbee_reconcile",
+        "leadbee_read",
+        "leadbee_replace",
+        "leadbee_cancel",
+        "openai_send",
+        "openai_validate",
+    }
+)
+_CHATGPT_PHONE_RECOVERY_STATUSES = frozenset(
+    {
+        "pending",
+        "retrying",
+        "reconciled",
+        "released",
+        "captured",
+        "quarantined",
+        "failed",
+    }
+)
+_CHATGPT_PHONE_SAFE_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
+_CHATGPT_PHONE_SAFE_STATUS_RE = re.compile(r"^[A-Z0-9_]{1,32}$")
 _task_store = RegisterTaskStore(
     max_finished_tasks=MAX_FINISHED_TASKS,
     cleanup_threshold=CLEANUP_THRESHOLD,
@@ -2750,6 +2775,112 @@ def _ensure_chatgpt_attempt_binding_table() -> None:
         _chatgpt_binding_table_ready[engine] = True
 
 
+def _safe_chatgpt_phone_diagnostic(value) -> dict:
+    """Return the task-visible subset of an internal provider diagnostic."""
+    if not isinstance(value, dict):
+        return {}
+    safe: dict = {}
+    stage = str(value.get("failure_stage") or "").strip().lower()
+    if stage in _CHATGPT_PHONE_DIAGNOSTIC_STAGES:
+        safe["failure_stage"] = stage
+    error_code = str(value.get("safe_error_code") or "").strip().upper()
+    if _CHATGPT_PHONE_SAFE_CODE_RE.fullmatch(error_code):
+        safe["safe_error_code"] = error_code
+    for key, maximum in (
+        ("http_status", 599),
+        ("provider_retry_count", 100),
+        ("replacement_count", 100),
+    ):
+        raw = value.get(key)
+        if isinstance(raw, bool):
+            continue
+        try:
+            normalized = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= normalized <= maximum:
+            safe[key] = normalized
+    for key in ("order_status", "billing_status"):
+        normalized = str(value.get(key) or "").strip().upper()
+        if _CHATGPT_PHONE_SAFE_STATUS_RE.fullmatch(normalized):
+            safe[key] = normalized
+    recovery_status = str(value.get("recovery_status") or "").strip().lower()
+    if recovery_status in _CHATGPT_PHONE_RECOVERY_STATUSES:
+        safe["recovery_status"] = recovery_status
+    return safe
+
+
+def _safe_chatgpt_binding_context(value) -> dict:
+    context = deepcopy(value) if isinstance(value, dict) else {}
+    for key in ("phone_diagnostic", "previous_phone_diagnostic"):
+        safe = _safe_chatgpt_phone_diagnostic(context.get(key))
+        if safe:
+            context[key] = safe
+        else:
+            context.pop(key, None)
+    raw_retry_count = context.get("phone_auto_retry_count")
+    if isinstance(raw_retry_count, bool):
+        context.pop("phone_auto_retry_count", None)
+    else:
+        try:
+            retry_count = int(raw_retry_count)
+        except (TypeError, ValueError):
+            context.pop("phone_auto_retry_count", None)
+        else:
+            if 0 <= retry_count <= 1:
+                context["phone_auto_retry_count"] = retry_count
+            else:
+                context.pop("phone_auto_retry_count", None)
+    return context
+
+
+def _chatgpt_api_phone_retry_allowed(
+    phone_result,
+    diagnostic=None,
+    *,
+    retry_count: int,
+) -> bool:
+    """Allow one new API order only after explicit terminal release."""
+    if not isinstance(phone_result, dict):
+        return False
+    try:
+        normalized_retry_count = int(retry_count)
+    except (TypeError, ValueError):
+        return False
+    if normalized_retry_count != 0:
+        return False
+    if str(phone_result.get("status") or "").strip().lower() not in {
+        "failed",
+        "expired",
+    }:
+        return False
+    if not _is_truthy(phone_result.get("provider_cleanup_settled")):
+        return False
+    if _is_truthy(phone_result.get("phone_verified")):
+        return False
+    if _is_truthy(phone_result.get("ownership_conflict")) or _is_truthy(
+        phone_result.get("finalization_pending")
+    ):
+        return False
+    provider_error_code = str(
+        phone_result.get("provider_error_code") or ""
+    ).strip().upper()
+    if provider_error_code == "LEADBEE_API_CAPACITY_EXHAUSTED":
+        return False
+    safe = _safe_chatgpt_phone_diagnostic(
+        diagnostic
+        if isinstance(diagnostic, dict)
+        else phone_result.get("provider_diagnostic")
+    )
+    if safe.get("safe_error_code") == "LEADBEE_API_CAPACITY_EXHAUSTED":
+        return False
+    return bool(
+        safe.get("order_status") in {"CANCELED", "EXPIRED"}
+        and safe.get("billing_status") == "RELEASED"
+        and safe.get("recovery_status") == "released"
+    )
+
+
 def _upsert_chatgpt_attempt_binding(
     *,
     task_id: str,
@@ -2791,7 +2922,10 @@ def _upsert_chatgpt_attempt_binding(
                 row.status = str(status or "").strip()
             row.error = str(error or "")[:2000]
             if isinstance(mailbox_context, dict) and mailbox_context:
-                row.mailbox_context_json = _json_dumps(mailbox_context, {})
+                row.mailbox_context_json = _json_dumps(
+                    _safe_chatgpt_binding_context(mailbox_context),
+                    {},
+                )
             row.updated_at = _utcnow()
             s.add(row)
             s.commit()
@@ -2860,7 +2994,21 @@ def _chatgpt_binding_public(row: ChatGPTAttemptBindingModel) -> dict:
     context = _json_loads(getattr(row, "mailbox_context_json", ""), {})
     api_mode = bool(isinstance(context, dict) and _is_truthy(context.get("leadbee_api")))
     code_hint = "LeadBee API" if api_mode else (mask_sms_code(code) if code else "")
-    return {
+    provider_diagnostic = _safe_chatgpt_phone_diagnostic(
+        context.get("phone_diagnostic") if isinstance(context, dict) else None
+    )
+    previous_provider_diagnostic = _safe_chatgpt_phone_diagnostic(
+        context.get("previous_phone_diagnostic")
+        if isinstance(context, dict)
+        else None
+    )
+    try:
+        phone_auto_retry_count = int(
+            context.get("phone_auto_retry_count") if isinstance(context, dict) else 0
+        )
+    except (TypeError, ValueError):
+        phone_auto_retry_count = 0
+    public = {
         "id": row.id,
         "task_id": row.task_id,
         "attempt_index": row.attempt_index,
@@ -2872,7 +3020,15 @@ def _chatgpt_binding_public(row: ChatGPTAttemptBindingModel) -> dict:
         "leadbee_code_hint": code_hint,
         "leadbee_api": api_mode,
         "retry_count": row.retry_count,
+        "phone_auto_retry_count": (
+            phone_auto_retry_count if 0 <= phone_auto_retry_count <= 1 else 0
+        ),
     }
+    if provider_diagnostic:
+        public["provider_diagnostic"] = provider_diagnostic
+    if previous_provider_diagnostic:
+        public["previous_provider_diagnostic"] = previous_provider_diagnostic
+    return public
 
 
 def _resolve_chatgpt_retry_account_id(
@@ -3744,6 +3900,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             attempt_id: int | None = None
             active_leadbee_api = _leadbee_api
             capacity_lease = None
+            phone_diagnostic: dict = {}
+            previous_phone_diagnostic: dict = {}
+            api_order_auto_retry_count = 0
 
             def _sms_pool_binding_context(value=None):
                 context = dict(value) if isinstance(value, dict) else {}
@@ -3756,6 +3915,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 if sms_pool_item_id:
                     context["sms_pool_managed"] = True
                     context["sms_pool_item_id"] = sms_pool_item_id
+                if phone_diagnostic:
+                    context["phone_diagnostic"] = dict(phone_diagnostic)
+                if previous_phone_diagnostic:
+                    context["previous_phone_diagnostic"] = dict(
+                        previous_phone_diagnostic
+                    )
+                if api_order_auto_retry_count:
+                    context["phone_auto_retry_count"] = api_order_auto_retry_count
                 return context or None
 
             try:
@@ -4322,6 +4489,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             phone_result.get("message") or "LeadBee 自动接码失败",
                             active_leadbee_code,
                         )
+                        phone_diagnostic = _safe_chatgpt_phone_diagnostic(
+                            phone_result.get("provider_diagnostic")
+                        )
                         sms_pool_restoration_confirmed = bool(
                             sms_pool_restoration_confirmed
                             or phone_result.get(
@@ -4398,6 +4568,152 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 continue
                             phone_message = "API 余额不足且卡密池无可用卡密"
                             break
+
+                        can_retry_released_api_order = bool(
+                            active_leadbee_api
+                            and _chatgpt_api_phone_retry_allowed(
+                                phone_result,
+                                phone_diagnostic,
+                                retry_count=api_order_auto_retry_count,
+                            )
+                        )
+                        if can_retry_released_api_order:
+                            previous_phone_diagnostic = dict(phone_diagnostic)
+                            api_order_auto_retry_count += 1
+                            replacement_client_order_id = f"aar_{uuid.uuid4().hex}"
+                            if replacement_client_order_id == client_order_id:
+                                raise RuntimeError(
+                                    "LeadBee API 自动重试订单标识生成失败"
+                                )
+                            release_capacity = getattr(
+                                capacity_lease,
+                                "release",
+                                None,
+                            )
+                            if callable(release_capacity):
+                                release_capacity()
+                            capacity_lease = None
+                            client_order_id = replacement_client_order_id
+                            leadbee_code = replacement_client_order_id
+                            phone_diagnostic = {}
+                            _persist_binding(
+                                task_id=task_id,
+                                attempt_index=i,
+                                leadbee_code=leadbee_code,
+                                email=account.email,
+                                account_id=int(account_id),
+                                stage=current_stage,
+                                status="running",
+                                error=phone_message,
+                                mailbox_context=_sms_pool_binding_context(
+                                    account.extra.get("mailbox_login_context")
+                                    if isinstance(
+                                        getattr(account, "extra", None),
+                                        dict,
+                                    )
+                                    else None
+                                ),
+                                parent_binding_id=parent_binding_id,
+                            )
+                            _log(
+                                task_id,
+                                "  [接码] LeadBee API 旧订单已释放；"
+                                "已持久化新订单标识，自动恢复 OAuth 上下文重试一次",
+                            )
+                            control.checkpoint(attempt_id=attempt_id)
+                            from platforms.chatgpt.leadbee_runtime import (
+                                LeadBeeCapacityExhausted,
+                            )
+
+                            try:
+                                capacity_lease = (
+                                    _reserve_chatgpt_leadbee_api_capacity(
+                                        config=_leadbee_api_runtime_config,
+                                        client_order_id=client_order_id,
+                                        checkpoint=lambda: control.checkpoint(
+                                            attempt_id=attempt_id
+                                        ),
+                                    )
+                                )
+                            except (
+                                SkipCurrentAttemptRequested,
+                                StopTaskRequested,
+                            ):
+                                raise
+                            except LeadBeeCapacityExhausted:
+                                capacity_preflight_failure = (
+                                    "LeadBee API 可用余额不足"
+                                )
+                                if (
+                                    _api_fallback_pool
+                                    and _activate_sms_pool_fallback()
+                                ):
+                                    capacity_preflight_failure = ""
+                                    phone_result = {}
+                                    phone_status = ""
+                                    phone_message = ""
+                                    phone_background_ownership_pending = False
+                                    continue
+                                if _api_fallback_pool:
+                                    capacity_preflight_failure = (
+                                        "API 余额不足且卡密池无可用卡密"
+                                    )
+                                phone_status = "failed"
+                                phone_message = capacity_preflight_failure
+                                phone_result = {
+                                    "status": "failed",
+                                    "message": phone_message,
+                                    "provider_error_code": (
+                                        "LEADBEE_API_CAPACITY_EXHAUSTED"
+                                    ),
+                                    "provider_cleanup_settled": True,
+                                    "phone_verified": False,
+                                    "provider_diagnostic": {
+                                        "failure_stage": "leadbee_create",
+                                        "safe_error_code": (
+                                            "LEADBEE_API_CAPACITY_EXHAUSTED"
+                                        ),
+                                        "recovery_status": "failed",
+                                    },
+                                }
+                                phone_diagnostic = (
+                                    _safe_chatgpt_phone_diagnostic(
+                                        phone_result["provider_diagnostic"]
+                                    )
+                                )
+                                break
+                            except Exception:
+                                capacity_preflight_failure = (
+                                    "LeadBee API 容量检查失败"
+                                )
+                                phone_status = "failed"
+                                phone_message = capacity_preflight_failure
+                                phone_result = {
+                                    "status": "failed",
+                                    "message": phone_message,
+                                    "provider_error_code": "LEADBEE_API_ERROR",
+                                    "provider_cleanup_settled": True,
+                                    "phone_verified": False,
+                                    "provider_diagnostic": {
+                                        "failure_stage": "leadbee_create",
+                                        "safe_error_code": (
+                                            "LEADBEE_API_CAPACITY_CHECK_FAILED"
+                                        ),
+                                        "recovery_status": "failed",
+                                    },
+                                }
+                                phone_diagnostic = (
+                                    _safe_chatgpt_phone_diagnostic(
+                                        phone_result["provider_diagnostic"]
+                                    )
+                                )
+                                break
+                            capacity_preflight_failure = ""
+                            phone_result = {}
+                            phone_status = ""
+                            phone_message = ""
+                            phone_background_ownership_pending = False
+                            continue
 
                         can_retry_same_card = bool(
                             phone_status != "completed"
@@ -4516,6 +4832,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "access_token_saved": True,
                                 "phone_status": phone_status or "failed",
                                 "exchange_code_consumed": exchange_code_consumed,
+                                "provider_diagnostic": dict(phone_diagnostic),
+                                "phone_auto_retry_count": (
+                                    api_order_auto_retry_count
+                                ),
                             },
                         )
                         if phone_background_ownership_pending:
@@ -4535,6 +4855,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             stage=current_stage,
                             status="failed",
                             error=failure,
+                            mailbox_context=_sms_pool_binding_context(
+                                account.extra.get("mailbox_login_context")
+                                if isinstance(
+                                    getattr(account, "extra", None),
+                                    dict,
+                                )
+                                else None
+                            ),
                             parent_binding_id=parent_binding_id,
                         )
                         return AttemptResult.failed(failure)
@@ -4618,6 +4946,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 phone_result.get("phone_verified", False)
                             ),
                             "exchange_code_consumed": exchange_code_consumed,
+                            "provider_diagnostic": dict(phone_diagnostic),
+                            "phone_auto_retry_count": api_order_auto_retry_count,
                         },
                     )
                     _persist_binding(
@@ -4628,6 +4958,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         account_id=int(account_id),
                         stage="completed",
                         status="success",
+                        mailbox_context=_sms_pool_binding_context(
+                            account.extra.get("mailbox_login_context")
+                            if isinstance(
+                                getattr(account, "extra", None),
+                                dict,
+                            )
+                            else None
+                        ),
                         parent_binding_id=parent_binding_id,
                     )
                     _schedule_external_sync(final_account)

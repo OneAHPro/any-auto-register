@@ -1443,6 +1443,96 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         self.assertEqual(len(success_rows), 1)
         self.assertEqual(success_rows[0]["leadbee_code"], actual_ref)
 
+    def test_api_released_failure_persists_new_ref_before_one_automatic_retry(self):
+        events = []
+        replacement_ref = "aar_" + "b" * 32
+
+        def persist(**kwargs):
+            events.append(
+                (
+                    "persist",
+                    kwargs.get("leadbee_code"),
+                    kwargs.get("status"),
+                    dict(kwargs.get("mailbox_context") or {}),
+                )
+            )
+            return SimpleNamespace()
+
+        def completion(**kwargs):
+            client_order_id = kwargs["client_order_id"]
+            events.append(("provider", client_order_id))
+            if sum(event[0] == "provider" for event in events) == 1:
+                return {
+                    "status": "failed",
+                    "message": "LeadBee API 自动接码失败",
+                    "phone_verified": False,
+                    "provider_cleanup_settled": True,
+                    "provider_diagnostic": {
+                        "failure_stage": "openai_send",
+                        "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+                        "http_status": 504,
+                        "provider_retry_count": 2,
+                        "order_status": "CANCELED",
+                        "billing_status": "RELEASED",
+                        "replacement_count": 0,
+                        "recovery_status": "released",
+                    },
+                }
+            return {
+                "status": "completed",
+                "message": "手机验证完成",
+                "phone_verified": True,
+                "provider_cleanup_settled": True,
+                "provider_diagnostic": {
+                    "order_status": "COMPLETED",
+                    "billing_status": "CAPTURED",
+                    "recovery_status": "captured",
+                },
+            }
+
+        with (
+            patch(
+                "api.tasks._upsert_chatgpt_attempt_binding",
+                side_effect=persist,
+            ),
+            patch("api.tasks.uuid.uuid4", return_value=SimpleNamespace(hex="b" * 32)),
+        ):
+            snapshot, _saved, provider, save_logs, _cleanup = self._run(
+                "task-chatgpt-api-auto-retry",
+                api_mode=True,
+                count=1,
+                completion=completion,
+            )
+
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(provider.call_count, 2)
+        provider_refs = [call.kwargs["client_order_id"] for call in provider.call_args_list]
+        self.assertEqual(provider_refs[1], replacement_ref)
+        self.assertNotEqual(provider_refs[0], provider_refs[1])
+        new_ref_persist_index = next(
+            index
+            for index, event in enumerate(events)
+            if event[0] == "persist" and event[1] == replacement_ref
+        )
+        new_ref_provider_index = next(
+            index
+            for index, event in enumerate(events)
+            if event == ("provider", replacement_ref)
+        )
+        self.assertLess(new_ref_persist_index, new_ref_provider_index)
+        new_ref_context = events[new_ref_persist_index][3]
+        self.assertEqual(new_ref_context["phone_auto_retry_count"], 1)
+        self.assertEqual(
+            new_ref_context["previous_phone_diagnostic"]["billing_status"],
+            "RELEASED",
+        )
+        success_detail = save_logs.call_args.kwargs["detail"]
+        self.assertEqual(
+            success_detail["provider_diagnostic"]["order_status"],
+            "COMPLETED",
+        )
+        self.assertIn("旧订单已释放", str(snapshot["logs"]))
+
     def test_concurrent_attempts_receive_distinct_codes_without_exposing_them(self):
         def completion(**kwargs):
             return {
