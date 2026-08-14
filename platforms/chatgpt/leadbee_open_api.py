@@ -20,6 +20,13 @@ LEADBEE_API_BASE = f"{LEADBEE_API_ORIGIN}{LEADBEE_API_PREFIX}"
 
 _SAFE_DIAGNOSTIC = re.compile(r"^[A-Za-z0-9_.:/-]{1,160}$")
 _IDEMPOTENCY_KEY = re.compile(r"^[!-~]{16,128}$")
+_SENSITIVE_DIAGNOSTIC_LABELS = (
+    "authorization",
+    "x-api-key",
+    "x-signature",
+    "api_secret",
+    "api-secret",
+)
 
 
 class LeadBeeAPIError(RuntimeError):
@@ -112,6 +119,7 @@ class LeadBeeOpenAPIClient:
             )
 
         self._api_key = api_key
+        self._api_secret_text = api_secret
         self._api_secret = api_secret.encode("utf-8")
         self._base_url = normalized_base
         self._session = session if session is not None else requests.Session()
@@ -202,6 +210,12 @@ class LeadBeeOpenAPIClient:
             )
         ).encode("utf-8")
         signature = hmac.new(self._api_secret, canonical, hashlib.sha256).hexdigest()
+        sensitive_values = _request_sensitive_values(
+            api_key=self._api_key,
+            api_secret=self._api_secret_text,
+            signature=signature,
+            body=body,
+        )
         headers = {
             "Accept": "application/json",
             "X-API-Key": self._api_key,
@@ -229,7 +243,10 @@ class LeadBeeOpenAPIClient:
         status_code = int(response.status_code)
         retry_after = _retry_after_seconds(getattr(response, "headers", {}))
         if not 200 <= status_code < 300:
-            error_code, request_id = _response_diagnostics(response)
+            error_code, request_id = _response_diagnostics(
+                response,
+                sensitive_values=sensitive_values,
+            )
             raise LeadBeeHTTPError(
                 "LeadBee HTTP request failed",
                 code=error_code or "HTTP_ERROR",
@@ -249,7 +266,10 @@ class LeadBeeOpenAPIClient:
 
         if not isinstance(envelope, dict) or envelope.get("success") is not True:
             if isinstance(envelope, dict) and envelope.get("success") is False:
-                error_code, request_id = _payload_diagnostics(envelope)
+                error_code, request_id = _payload_diagnostics(
+                    envelope,
+                    sensitive_values=sensitive_values,
+                )
                 raise LeadBeeAPIError(
                     "LeadBee API rejected the request",
                     code=error_code or "API_ERROR",
@@ -299,30 +319,92 @@ def _path_segment(value: Any) -> str:
     return quote(_require_non_empty("path segment", value), safe="")
 
 
-def _safe_diagnostic(value: Any) -> str:
+def _safe_diagnostic(
+    value: Any,
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> str:
     if not isinstance(value, str) or not _SAFE_DIAGNOSTIC.fullmatch(value):
         return ""
+    folded_value = value.casefold()
+    if any(label in folded_value for label in _SENSITIVE_DIAGNOSTIC_LABELS):
+        return ""
+    for sensitive_value in sensitive_values:
+        folded_sensitive = sensitive_value.casefold()
+        if folded_value in folded_sensitive or folded_sensitive in folded_value:
+            return ""
     return value
 
 
-def _payload_diagnostics(payload: dict[str, Any]) -> tuple[str, str]:
+def _request_sensitive_values(
+    *,
+    api_key: str,
+    api_secret: str,
+    signature: str,
+    body: bytes,
+) -> tuple[str, ...]:
+    values = {api_key, api_secret, signature}
+    if body:
+        try:
+            decoded_body = body.decode("utf-8")
+        except UnicodeDecodeError:
+            decoded_body = ""
+        if decoded_body:
+            values.add(decoded_body)
+            try:
+                payload = json.loads(decoded_body)
+            except (TypeError, ValueError):
+                payload = None
+            values.update(_nested_string_values(payload))
+    return tuple(value for value in values if value)
+
+
+def _nested_string_values(value: Any) -> set[str]:
+    if isinstance(value, str):
+        return {value} if value else set()
+    if isinstance(value, dict):
+        nested_values: set[str] = set()
+        for nested_value in value.values():
+            nested_values.update(_nested_string_values(nested_value))
+        return nested_values
+    if isinstance(value, list):
+        nested_values = set()
+        for nested_value in value:
+            nested_values.update(_nested_string_values(nested_value))
+        return nested_values
+    return set()
+
+
+def _payload_diagnostics(
+    payload: dict[str, Any],
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> tuple[str, str]:
     error = payload.get("error")
     error_data = error if isinstance(error, dict) else {}
-    error_code = _safe_diagnostic(error_data.get("code") or payload.get("code"))
+    error_code = _safe_diagnostic(
+        error_data.get("code") or payload.get("code"),
+        sensitive_values=sensitive_values,
+    )
     request_id = _safe_diagnostic(
-        payload.get("request_id") or error_data.get("request_id")
+        payload.get("request_id") or error_data.get("request_id"),
+        sensitive_values=sensitive_values,
     )
     return error_code, request_id
 
 
-def _response_diagnostics(response: Any) -> tuple[str, str]:
+def _response_diagnostics(
+    response: Any,
+    *,
+    sensitive_values: tuple[str, ...] = (),
+) -> tuple[str, str]:
     try:
         payload = response.json()
     except Exception:  # noqa: BLE001 - error parsing must not mask the HTTP error
         return "", ""
     if not isinstance(payload, dict):
         return "", ""
-    return _payload_diagnostics(payload)
+    return _payload_diagnostics(payload, sensitive_values=sensitive_values)
 
 
 def _retry_after_seconds(headers: Any) -> float | None:

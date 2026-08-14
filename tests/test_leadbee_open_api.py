@@ -58,6 +58,45 @@ class FakeSession:
         return result
 
 
+class EchoDiagnosticSession:
+    def __init__(self, *, field_name: str, value_source: str):
+        self.field_name = field_name
+        self.value_source = value_source
+        self.calls: list[RequestCall] = []
+        self.echoed_value = ""
+
+    def request(
+        self,
+        method: str,
+        url: str,
+        *,
+        headers: dict[str, str],
+        data: bytes,
+    ) -> FakeResponse:
+        self.calls.append(RequestCall(method, url, headers, data))
+        values = {
+            "api_key": API_KEY,
+            "api_secret": API_SECRET,
+            "signature": headers["X-Signature"],
+            "body_value": "body_fixture_private_value",
+            "wrapped_body_value": "echo_body_fixture_private_value_suffix",
+            "body_fragment": "fixture_private",
+            "header_name": "X-Signature",
+        }
+        self.echoed_value = values[self.value_source]
+        error = {"code": "NORMAL_ERROR", "message": "ignored"}
+        payload = {
+            "success": False,
+            "error": error,
+            "request_id": "normal_request_id",
+        }
+        if self.field_name == "error_code":
+            error["code"] = self.echoed_value
+        else:
+            payload["request_id"] = self.echoed_value
+        return FakeResponse(status_code=400, payload=payload)
+
+
 def make_client(session: FakeSession) -> LeadBeeOpenAPIClient:
     return LeadBeeOpenAPIClient(
         api_key=API_KEY,
@@ -317,6 +356,39 @@ def test_remote_error_message_cannot_leak_secrets_or_body_values():
     assert API_SECRET not in rendered
     assert body_value not in rendered
     assert "X-Signature" not in rendered
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value_source"),
+    [
+        ("error_code", "api_key"),
+        ("error_code", "api_secret"),
+        ("request_id", "signature"),
+        ("error_code", "body_value"),
+        ("error_code", "wrapped_body_value"),
+        ("request_id", "body_fragment"),
+        ("error_code", "header_name"),
+    ],
+)
+def test_echoed_request_values_are_removed_from_structured_diagnostics(
+    field_name: str,
+    value_source: str,
+):
+    session = EchoDiagnosticSession(
+        field_name=field_name,
+        value_source=value_source,
+    )
+    client = make_client(session)
+
+    with pytest.raises(LeadBeeAPIError) as captured:
+        client.create_order(
+            "body_fixture_private_value",
+            "product_fixture",
+            idempotency_key="create_fixture_0001",
+        )
+
+    rendered = f"{captured.value!s}\n{captured.value!r}"
+    assert session.echoed_value not in rendered
 
 
 @pytest.mark.parametrize(
