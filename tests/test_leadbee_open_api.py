@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any, ClassVar
 
 import pytest
 
 from platforms.chatgpt.leadbee_open_api import (
     LEADBEE_API_BASE,
     LeadBeeAPIError,
+    LeadBeeHTTPError,
     LeadBeeOpenAPIClient,
 )
 
@@ -36,6 +41,8 @@ class RequestCall:
     url: str
     headers: dict[str, str]
     body: bytes
+    allow_redirects: bool | None = None
+    timeout: Any = None
 
 
 class FakeSession:
@@ -50,8 +57,12 @@ class FakeSession:
         *,
         headers: dict[str, str],
         data: bytes,
+        allow_redirects: bool | None = None,
+        timeout: Any = None,
     ) -> FakeResponse:
-        self.calls.append(RequestCall(method, url, headers, data))
+        self.calls.append(
+            RequestCall(method, url, headers, data, allow_redirects, timeout)
+        )
         result = self.results.pop(0)
         if isinstance(result, Exception):
             raise result
@@ -72,8 +83,12 @@ class EchoDiagnosticSession:
         *,
         headers: dict[str, str],
         data: bytes,
+        allow_redirects: bool | None = None,
+        timeout: Any = None,
     ) -> FakeResponse:
-        self.calls.append(RequestCall(method, url, headers, data))
+        self.calls.append(
+            RequestCall(method, url, headers, data, allow_redirects, timeout)
+        )
         values = {
             "api_key": API_KEY,
             "api_secret": API_SECRET,
@@ -95,6 +110,67 @@ class EchoDiagnosticSession:
         else:
             payload["request_id"] = self.echoed_value
         return FakeResponse(status_code=400, payload=payload)
+
+
+class RedirectHandler(BaseHTTPRequestHandler):
+    redirect_status = 302
+    redirect_url = ""
+
+    def _redirect(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        if content_length:
+            self.rfile.read(content_length)
+        self.send_response(self.redirect_status)
+        self.send_header("Location", self.redirect_url)
+        self.end_headers()
+
+    def do_GET(self) -> None:
+        self._redirect()
+
+    def do_POST(self) -> None:
+        self._redirect()
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        return None
+
+
+class RedirectTargetHandler(BaseHTTPRequestHandler):
+    received_requests: ClassVar[list[tuple[str, dict[str, str], bytes]]] = []
+
+    def _respond(self) -> None:
+        content_length = int(self.headers.get("Content-Length", "0"))
+        body = self.rfile.read(content_length) if content_length else b""
+        self.received_requests.append((self.command, dict(self.headers), body))
+        response_body = b'{"success":true,"data":{}}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(response_body)))
+        self.end_headers()
+        self.wfile.write(response_body)
+
+    def do_GET(self) -> None:
+        self._respond()
+
+    def do_POST(self) -> None:
+        self._respond()
+
+    def log_message(self, _format: str, *args: Any) -> None:
+        return None
+
+
+@contextmanager
+def running_server(
+    handler: type[BaseHTTPRequestHandler],
+) -> Iterator[ThreadingHTTPServer]:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield server
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def make_client(session: FakeSession) -> LeadBeeOpenAPIClient:
@@ -130,6 +206,8 @@ def test_get_products_uses_default_base_and_byte_exact_signature():
         ),
     }
     assert "Idempotency-Key" not in call.headers
+    assert call.allow_redirects is False
+    assert call.timeout == 20.0
 
 
 def test_create_order_signs_and_sends_the_exact_serialized_json_once():
@@ -433,3 +511,135 @@ def test_write_call_makes_one_attempt_and_keeps_caller_idempotency_key():
 
     assert len(session.calls) == 1
     assert session.calls[0].headers["Idempotency-Key"] == "stable_fixture_key"
+
+
+@pytest.mark.parametrize(
+    ("redirect_status", "operation"),
+    [(302, "read"), (307, "write")],
+)
+def test_real_session_does_not_follow_cross_origin_redirects(
+    redirect_status: int,
+    operation: str,
+):
+    RedirectTargetHandler.received_requests = []
+    with running_server(RedirectTargetHandler) as target_server:
+        target_port = target_server.server_address[1]
+        RedirectHandler.redirect_status = redirect_status
+        RedirectHandler.redirect_url = f"http://127.0.0.1:{target_port}/capture"
+        with running_server(RedirectHandler) as redirect_server:
+            redirect_port = redirect_server.server_address[1]
+            client = LeadBeeOpenAPIClient(
+                api_key=API_KEY,
+                api_secret=API_SECRET,
+                base_url=f"http://127.0.0.1:{redirect_port}/api/open/v1",
+                clock=lambda: TIMESTAMP,
+                nonce_factory=lambda: NONCE,
+            )
+
+            with pytest.raises(LeadBeeHTTPError) as captured:
+                if operation == "read":
+                    client.get_products()
+                else:
+                    client.create_order(
+                        "body_fixture_private_value",
+                        "product_fixture",
+                        idempotency_key="create_fixture_0001",
+                    )
+
+    assert captured.value.http_status == redirect_status
+    assert RedirectTargetHandler.received_requests == []
+
+
+@pytest.mark.parametrize("request_timeout", [3, 2.5, (1, 4.5)])
+def test_request_timeout_is_forwarded_to_session(request_timeout: Any):
+    session = FakeSession()
+    client = LeadBeeOpenAPIClient(
+        api_key=API_KEY,
+        api_secret=API_SECRET,
+        session=session,
+        request_timeout=request_timeout,
+        clock=lambda: TIMESTAMP,
+        nonce_factory=lambda: NONCE,
+    )
+
+    client.get_products()
+
+    assert session.calls[0].timeout == request_timeout
+    assert session.calls[0].allow_redirects is False
+
+
+@pytest.mark.parametrize(
+    "request_timeout",
+    [
+        None,
+        True,
+        0,
+        -1,
+        float("inf"),
+        float("nan"),
+        (),
+        (1,),
+        (0, 1),
+        (1, 0),
+        (1, float("inf")),
+        (1, "2"),
+        [1, 2],
+    ],
+)
+def test_constructor_rejects_invalid_request_timeout(request_timeout: Any):
+    with pytest.raises(ValueError):
+        LeadBeeOpenAPIClient(
+            api_key=API_KEY,
+            api_secret=API_SECRET,
+            request_timeout=request_timeout,
+        )
+
+
+def test_transport_exception_discards_sensitive_exception_context():
+    sensitive_body_value = "body_fixture_private_value"
+    session = FakeSession(
+        RuntimeError(f"{API_KEY} {API_SECRET} {sensitive_body_value}")
+    )
+    client = make_client(session)
+
+    with pytest.raises(LeadBeeAPIError) as captured:
+        client.create_order(
+            sensitive_body_value,
+            "product_fixture",
+            idempotency_key="create_fixture_0001",
+        )
+
+    rendered = f"{captured.value!s}\n{captured.value!r}"
+    assert API_KEY not in rendered
+    assert API_SECRET not in rendered
+    assert sensitive_body_value not in rendered
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_json_decoder_exception_discards_sensitive_exception_context():
+    sensitive_body_value = "body_fixture_private_value"
+    session = FakeSession(
+        FakeResponse(
+            status_code=201,
+            json_error=ValueError(
+                f"{API_KEY} {API_SECRET} X-Signature {sensitive_body_value}"
+            ),
+        )
+    )
+    client = make_client(session)
+
+    with pytest.raises(LeadBeeAPIError) as captured:
+        client.create_order(
+            sensitive_body_value,
+            "product_fixture",
+            idempotency_key="create_fixture_0001",
+        )
+
+    rendered = f"{captured.value!s}\n{captured.value!r}"
+    assert API_KEY not in rendered
+    assert API_SECRET not in rendered
+    assert sensitive_body_value not in rendered
+    assert "X-Signature" not in rendered
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None

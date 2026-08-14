@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import time
 import uuid
@@ -96,6 +97,7 @@ class LeadBeeOpenAPIClient:
         api_secret: str,
         base_url: str = LEADBEE_API_BASE,
         session: Any | None = None,
+        request_timeout: float | tuple[float, float] = 20.0,
         clock: Callable[[], float] | None = None,
         nonce_factory: Callable[[], str] | None = None,
     ) -> None:
@@ -123,6 +125,7 @@ class LeadBeeOpenAPIClient:
         self._api_secret = api_secret.encode("utf-8")
         self._base_url = normalized_base
         self._session = session if session is not None else requests.Session()
+        self._request_timeout = _validate_request_timeout(request_timeout)
         self._clock = clock if clock is not None else time.time
         self._nonce_factory = (
             nonce_factory if nonce_factory is not None else lambda: uuid.uuid4().hex
@@ -227,18 +230,23 @@ class LeadBeeOpenAPIClient:
             headers["Content-Type"] = "application/json"
             headers["Idempotency-Key"] = idempotency_key
 
+        transport_error: LeadBeeTransportError | None = None
         try:
             response = self._session.request(
                 method,
                 url,
                 headers=headers,
                 data=body,
+                allow_redirects=False,
+                timeout=self._request_timeout,
             )
         except Exception:  # noqa: BLE001 - injected sessions may use other errors
-            raise LeadBeeTransportError(
+            transport_error = LeadBeeTransportError(
                 "LeadBee transport failure",
                 code="TRANSPORT_ERROR",
-            ) from None
+            )
+        if transport_error is not None:
+            raise transport_error from None
 
         status_code = int(response.status_code)
         retry_after = _retry_after_seconds(getattr(response, "headers", {}))
@@ -255,14 +263,18 @@ class LeadBeeOpenAPIClient:
                 status_code=status_code,
             )
 
+        response_error: LeadBeeResponseError | None = None
+        envelope: Any = None
         try:
             envelope = response.json()
         except Exception:  # noqa: BLE001 - response JSON decoders vary by session
-            raise LeadBeeResponseError(
+            response_error = LeadBeeResponseError(
                 "LeadBee response was not valid JSON",
                 code="INVALID_JSON",
                 status_code=status_code,
-            ) from None
+            )
+        if response_error is not None:
+            raise response_error from None
 
         if not isinstance(envelope, dict) or envelope.get("success") is not True:
             if isinstance(envelope, dict) and envelope.get("success") is False:
@@ -313,6 +325,31 @@ def _validate_idempotency_key(value: Any) -> str:
             "idempotency_key must contain 16 to 128 visible ASCII characters"
         )
     return value
+
+
+def _validate_request_timeout(
+    value: Any,
+) -> float | tuple[float, float]:
+    if _is_positive_finite_number(value):
+        return value
+    if (
+        isinstance(value, tuple)
+        and len(value) == 2
+        and all(_is_positive_finite_number(part) for part in value)
+    ):
+        return value
+    raise ValueError(
+        "request_timeout must be a positive finite number or a two-number tuple"
+    )
+
+
+def _is_positive_finite_number(value: Any) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and math.isfinite(value)
+        and value > 0
+    )
 
 
 def _path_segment(value: Any) -> str:
