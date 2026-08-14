@@ -3,6 +3,7 @@ import json
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
 
@@ -325,6 +326,46 @@ class OAuthEntryRetryTests(unittest.TestCase):
             "post-otp-session",
         )
         bootstrap.assert_called_once()
+
+    def test_concurrent_phone_transactions_isolate_sessions_pkce_and_state(self):
+        def prepare(index: int):
+            client = OAuthClient({}, verbose=False)
+            original_session = client.session
+            original_session.cookies.set(
+                "login_session",
+                f"post-otp-session-{index}",
+                domain=".openai.com",
+                path="/",
+            )
+            with mock.patch.object(
+                client,
+                "_bootstrap_oauth_session",
+                return_value="https://auth.openai.com/add-phone",
+            ):
+                context = client.prepare_phone_verification_transaction(
+                    email=f"account-{index}@example.com",
+                    device_id=f"device-{index}",
+                    user_agent=f"UA-{index}",
+                    sec_ch_ua='"Chromium";v="136"',
+                    accept_language="en-US,en;q=0.9",
+                    impersonate="chrome136",
+                )
+            return original_session, context
+
+        with ThreadPoolExecutor(max_workers=14) as executor:
+            prepared = list(executor.map(prepare, range(14)))
+
+        contexts = [context for _, context in prepared]
+        self.assertTrue(all(context is not None for context in contexts))
+        self.assertEqual(len({id(context.session) for context in contexts}), 14)
+        self.assertEqual(len({context.code_verifier for context in contexts}), 14)
+        self.assertEqual(len({context.oauth_state for context in contexts}), 14)
+        self.assertTrue(
+            all(
+                context.session is not original_session
+                for original_session, context in prepared
+            )
+        )
 
     def test_email_otp_prefers_http_pow_before_browser_sentinel(self):
         client = OAuthClient(

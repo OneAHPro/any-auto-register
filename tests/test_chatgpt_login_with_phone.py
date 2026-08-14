@@ -60,6 +60,7 @@ class _ExistingAccountPlatform(BasePlatform):
     phone_oauth_ready = True
     phone_oauth_ready_sequence = []
     phone_oauth_prepare_error = ""
+    phone_oauth_browser_context_available = True
     register_emails = []
 
     @classmethod
@@ -70,6 +71,7 @@ class _ExistingAccountPlatform(BasePlatform):
             cls.phone_oauth_ready = True
             cls.phone_oauth_ready_sequence = []
             cls.phone_oauth_prepare_error = ""
+            cls.phone_oauth_browser_context_available = True
             cls.register_emails = []
 
     def __init__(self, config=None, mailbox=None):
@@ -101,7 +103,26 @@ class _ExistingAccountPlatform(BasePlatform):
                 "phone_oauth_ready": ready,
                 "phone_oauth_prepare_error": type(self).phone_oauth_prepare_error,
                 "oauth_resume_context": (
-                    {"version": 1, "attempt": index} if ready else {}
+                    {
+                        "version": 2,
+                        "attempt": index,
+                        "code_verifier": f"verifier-{index}",
+                        "oauth_state": f"state-{index}",
+                        "flow_state": {"page_type": "add_phone"},
+                    }
+                    if ready
+                    else {}
+                ),
+                "oauth_browser_context": (
+                    {
+                        "version": 1,
+                        "attempt": index,
+                        "cookies": [
+                            {"name": "login_session", "value": f"cookie-{index}"}
+                        ],
+                    }
+                    if type(self).phone_oauth_browser_context_available
+                    else {}
                 ),
                 "mailbox_login_context": {
                     "provider": "microsoft",
@@ -1550,6 +1571,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
 
     def test_unprepared_phone_oauth_saves_access_token_without_starting_leadbee(self):
         _ExistingAccountPlatform.phone_oauth_ready = False
+        _ExistingAccountPlatform.phone_oauth_browser_context_available = False
         _ExistingAccountPlatform.phone_oauth_prepare_error = (
             "OAuth bootstrap did not reach an authenticated state"
         )
@@ -1586,8 +1608,8 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             self.assertTrue(call.kwargs["detail"]["access_token_saved"])
             self.assertFalse(call.kwargs["detail"]["exchange_code_consumed"])
 
-    def test_unprepared_phone_oauth_retries_fresh_login_once(self):
-        _ExistingAccountPlatform.phone_oauth_ready_sequence = [False, True]
+    def test_unprepared_phone_oauth_uses_browser_snapshot_without_fresh_login(self):
+        _ExistingAccountPlatform.phone_oauth_ready = False
 
         snapshot, saved, complete, _save_task_log, cleanup_incomplete = self._run(
             "task-chatgpt-login-phone-oauth-recovery",
@@ -1602,16 +1624,16 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
 
         self.assertEqual(snapshot["success"], 1)
         self.assertEqual(len(saved), 1)
-        self.assertEqual(_ExistingAccountPlatform._counter, 2)
+        self.assertEqual(_ExistingAccountPlatform._counter, 1)
         self.assertEqual(
             _ExistingAccountPlatform.register_emails,
-            [None, "existing-1@example.com"],
+            [None],
         )
-        self.assertEqual(_LoginMailbox.requeued, ["existing-1@example.com"])
+        self.assertEqual(_LoginMailbox.requeued, [])
         complete.assert_called_once()
         cleanup_incomplete.assert_not_called()
         joined_logs = "\n".join(snapshot["logs"])
-        self.assertIn("重新建立一次 OAuth 登录会话", joined_logs)
+        self.assertNotIn("重新建立一次 OAuth 登录会话", joined_logs)
 
 
 if __name__ == "__main__":

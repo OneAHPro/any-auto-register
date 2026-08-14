@@ -43,6 +43,19 @@ class AccountApiSanitizationTests(unittest.TestCase):
                     ],
                     "flow_state": {"page_type": "add_phone"},
                 },
+                "oauth_browser_context": {
+                    "version": 1,
+                    "created_at": 101,
+                    "expires_at": 4102444801,
+                    "device_id": "device-secret",
+                    "cookies": [
+                        {
+                            "name": "login_session",
+                            "value": "browser-cookie-secret",
+                            "domain": "auth.openai.com",
+                        }
+                    ],
+                },
             }
         )
 
@@ -55,6 +68,8 @@ class AccountApiSanitizationTests(unittest.TestCase):
         self.assertNotIn("openai-cookie-secret", serialized)
         self.assertNotIn("oauth-code-verifier-secret", serialized)
         self.assertNotIn("oauth-state-secret", serialized)
+        self.assertNotIn("browser-cookie-secret", serialized)
+        self.assertNotIn("device-secret", serialized)
         self.assertNotIn("MAILURLSECRET", serialized)
         self.assertNotIn("TOTPURLSECRET", serialized)
         self.assertEqual(
@@ -74,6 +89,15 @@ class AccountApiSanitizationTests(unittest.TestCase):
                 "expires_at": 4102444800.0,
                 "ready": True,
                 "flow_state": {"page_type": "add_phone"},
+            },
+        )
+        self.assertEqual(
+            extra["oauth_browser_context"],
+            {
+                "version": 1,
+                "created_at": 101.0,
+                "expires_at": 4102444801.0,
+                "ready": True,
             },
         )
 

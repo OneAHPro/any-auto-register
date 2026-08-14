@@ -827,6 +827,11 @@ class RefreshTokenRegistrationEngine:
         prepared_context = getattr(
             chatgpt_client, "phone_oauth_resume_context", None
         )
+        browser_context = getattr(
+            chatgpt_client, "phone_oauth_browser_context", {}
+        )
+        if not isinstance(browser_context, dict):
+            browser_context = {}
         prepared_ready = bool(
             prepared_context is not None
             and isinstance(getattr(prepared_context, "code_verifier", None), str)
@@ -858,11 +863,43 @@ class RefreshTokenRegistrationEngine:
             )
         else:
             oauth_resume_cache.take(result.email)
-            self._log(
-                "Access Token 已获取，但本次未生成可续接的手机授权事务；"
-                "接码前需要重新执行邮箱登录",
-                "warning",
-            )
+            if browser_context:
+                self._log(
+                    "Access Token 已获取；接码阶段将从已认证浏览器快照恢复新事务",
+                    "warning",
+                )
+            else:
+                self._log(
+                    "Access Token 已获取，但手机授权事务与认证浏览器快照均未生成",
+                    "warning",
+                )
+
+        raw_prepare_diagnostic = getattr(
+            chatgpt_client, "phone_oauth_prepare_diagnostic", {}
+        )
+        phone_oauth_prepare_diagnostic = {}
+        if isinstance(raw_prepare_diagnostic, dict):
+            raw_page_type = str(
+                raw_prepare_diagnostic.get("page_type") or "unknown"
+            ).strip().lower()
+            safe_page_type = "".join(
+                character
+                for character in raw_page_type
+                if character.isalnum() or character in {"_", "-"}
+            )[:64] or "unknown"
+            phone_oauth_prepare_diagnostic = {
+                "stage": "phone_oauth_prepare",
+                "attempt": max(0, int(raw_prepare_diagnostic.get("attempt") or 0)),
+                "page_type": safe_page_type,
+                "http_status": max(
+                    0, int(raw_prepare_diagnostic.get("http_status") or 0)
+                ),
+                "recovery_status": (
+                    "recovered"
+                    if raw_prepare_diagnostic.get("recovery_status") == "recovered"
+                    else "deferred"
+                ),
+            }
 
         mailbox_context = {}
         metadata_getter = getattr(self.email_service, "get_mailbox_metadata", None)
@@ -900,8 +937,10 @@ class RefreshTokenRegistrationEngine:
             "phone_oauth_prepare_error": str(
                 getattr(chatgpt_client, "phone_oauth_resume_error", "") or ""
             ).strip(),
+            "phone_oauth_prepare_diagnostic": phone_oauth_prepare_diagnostic,
             "mailbox_login_context": mailbox_context,
             "oauth_resume_context": oauth_resume_context,
+            "oauth_browser_context": browser_context,
         }
         self._log("已有账号邮箱登录完成，Access Token 已获取；Refresh Token 等待手机验证")
         return result

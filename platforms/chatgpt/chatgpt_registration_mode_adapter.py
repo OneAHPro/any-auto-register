@@ -131,12 +131,22 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 and oauth_resume_context
             ):
                 extra["oauth_resume_context"] = oauth_resume_context
+            oauth_browser_context = metadata.get("oauth_browser_context")
+            if isinstance(oauth_browser_context, dict) and oauth_browser_context:
+                extra["oauth_browser_context"] = oauth_browser_context
             if "phone_oauth_ready" in metadata:
                 extra["phone_oauth_ready"] = bool(metadata.get("phone_oauth_ready"))
             if "phone_oauth_prepare_error" in metadata:
                 extra["phone_oauth_prepare_error"] = str(
                     metadata.get("phone_oauth_prepare_error") or ""
                 ).strip()[:500]
+            phone_oauth_prepare_diagnostic = metadata.get(
+                "phone_oauth_prepare_diagnostic"
+            )
+            if isinstance(phone_oauth_prepare_diagnostic, dict):
+                extra["phone_oauth_prepare_diagnostic"] = dict(
+                    phone_oauth_prepare_diagnostic
+                )
             if metadata.get("phone_verification_required"):
                 extra["chatgpt_phone_verification_required"] = True
         return extra

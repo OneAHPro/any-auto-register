@@ -61,6 +61,20 @@ def _sanitize_account_extra_for_api(raw_extra: str) -> str:
             "flow_state": {"page_type": page_type},
         }
 
+    browser_context = extra.get("oauth_browser_context")
+    if isinstance(browser_context, dict):
+        version = int(browser_context.get("version") or 0)
+        extra["oauth_browser_context"] = {
+            "version": version,
+            "created_at": _safe_float(browser_context.get("created_at")),
+            "expires_at": _safe_float(browser_context.get("expires_at")),
+            "ready": bool(
+                version == 1
+                and isinstance(browser_context.get("cookies"), list)
+                and browser_context.get("cookies")
+            ),
+        }
+
     extra.pop("cookies", None)
     return json.dumps(extra, ensure_ascii=False)
 

@@ -465,6 +465,96 @@ class PhoneOAuthResumeTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "授权事务不存在或已过期"):
             self._run(None)
 
+    def test_phone_flow_recovers_fresh_pkce_from_browser_snapshot_without_mailbox(self):
+        browser_snapshot = {"version": 1, "cookies": [{"name": "login_session"}]}
+        browser_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="",
+            oauth_state="",
+            flow_state=None,
+        )
+        prepared_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        oauth_client = mock.Mock()
+        oauth_client.prepare_phone_verification_transaction.return_value = prepared_context
+        oauth_client.login_and_get_tokens.return_value = {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+        }
+        oauth_client.last_workspace_id = "workspace-1"
+        broker = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_phone_verification._load_account_context",
+            return_value=(
+                "existing@example.com",
+                "account-password",
+                {
+                    "proxy_used": "http://127.0.0.1:7890",
+                    "oauth_browser_context": browser_snapshot,
+                },
+            ),
+        ), mock.patch(
+            "services.chatgpt_phone_verification._load_account_and_email_service",
+            side_effect=AssertionError("浏览器快照恢复不应加载邮箱客户端"),
+        ), mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.oauth_resume_cache.take",
+            return_value=None,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.restore_oauth_resume_context",
+            side_effect=lambda snapshot: (
+                browser_context if snapshot is browser_snapshot else None
+            ),
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.OAuthClient",
+            return_value=oauth_client,
+        ), mock.patch(
+            "services.chatgpt_phone_verification._persist_prepared_phone_oauth_context",
+            create=True,
+        ) as persist, mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={},
+        ):
+            result = run_interactive_phone_oauth_flow(
+                7,
+                "+447456344799",
+                broker,
+            )
+
+        self.assertEqual(result["refresh_token"], "new-rt")
+        oauth_client.prepare_phone_verification_transaction.assert_called_once_with(
+            email="existing@example.com",
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+        )
+        persist.assert_called_once_with(7, prepared_context)
+        self.assertIs(
+            oauth_client.login_and_get_tokens.call_args.kwargs[
+                "prepared_oauth_context"
+            ],
+            prepared_context,
+        )
+        broker.mark_progress.assert_called_with(
+            "已从认证浏览器快照恢复新的手机授权事务；正在请求短信验证码"
+        )
+
     def test_leadbee_flow_passes_exchange_code_to_automatic_provider(self):
         oauth_client = mock.Mock()
         oauth_client.login_and_get_tokens.return_value = {

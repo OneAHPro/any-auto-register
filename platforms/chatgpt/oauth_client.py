@@ -129,6 +129,7 @@ class OAuthClient:
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_stage = ""
+        self.last_http_status = 0
         self.device_id = ""
         self.ua = ""
         self.sec_ch_ua = ""
@@ -932,6 +933,7 @@ class OAuthClient:
         impersonate=None,
     ):
         """启动 OAuth 会话，确保 auth 域上的 login_session 已建立。"""
+        self.last_http_status = 0
         if device_id:
             seed_oai_device_cookie(self.session, device_id)
 
@@ -960,6 +962,7 @@ class OAuthClient:
             self._browser_pause()
             r = self.session.get(authorize_url, **kwargs)
             authorize_status = int(r.status_code or 0)
+            self.last_http_status = authorize_status
             authorize_final_url = str(r.url)
             redirects = len(getattr(r, "history", []) or [])
             self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
@@ -999,6 +1002,7 @@ class OAuthClient:
             self._browser_pause()
             r2 = self.session.get(oauth2_url, **kwargs)
             oauth2_status = int(r2.status_code or 0)
+            self.last_http_status = oauth2_status
             authorize_final_url = str(r2.url)
             redirects2 = len(getattr(r2, "history", []) or [])
             self._log(
@@ -1041,6 +1045,10 @@ class OAuthClient:
             restore_oauth_resume_context,
             serialize_oauth_resume_context,
         )
+
+        self._enter_stage("phone_oauth_prepare")
+        self.last_http_status = 0
+        self.last_state = FlowState()
 
         browser_snapshot = serialize_oauth_resume_context(
             self.session,
@@ -1089,6 +1097,7 @@ class OAuthClient:
             return None
 
         state = self._state_from_url(authorize_final_url)
+        self.last_state = state
         if self._state_is_choose_an_account(state):
             self._log("预建手机验证 OAuth 命中账号选择页，选择当前登录账号...")
             state = self._submit_choose_account_session(
@@ -1103,6 +1112,7 @@ class OAuthClient:
                 if not self.last_error:
                     self._set_error("邮箱登录已通过，但选择当前登录账号失败")
                 return None
+            self.last_state = state
         if not self._state_can_resume_authenticated_flow(state):
             self._set_error(
                 "邮箱登录已通过，但手机验证 OAuth 未进入可续接状态: "

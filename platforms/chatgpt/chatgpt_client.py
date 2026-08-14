@@ -134,6 +134,8 @@ class ChatGPTClient:
         self.last_authorize_status = 0
         self.phone_oauth_resume_context = None
         self.phone_oauth_resume_error = ""
+        self.phone_oauth_browser_context = {}
+        self.phone_oauth_prepare_diagnostic = {}
 
     def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
         prefer_browser = flow in {"username_password_create", "oauth_create_account"}
@@ -672,6 +674,8 @@ class ChatGPTClient:
 
         self.phone_oauth_resume_context = None
         self.phone_oauth_resume_error = ""
+        self.phone_oauth_browser_context = {}
+        self.phone_oauth_prepare_diagnostic = {}
 
         try:
             otp_wait_timeout = max(30, int(otp_wait_timeout or 600))
@@ -697,7 +701,50 @@ class ChatGPTClient:
         phone_prepare_attempts = 0
         max_phone_prepare_attempts = 3
 
-        def prepare_phone_transaction(*, attempts: int = 2):
+        def capture_phone_browser_context() -> bool:
+            from .oauth_resume_cache import serialize_oauth_resume_context
+
+            snapshot = serialize_oauth_resume_context(
+                self.session,
+                device_id=self.device_id,
+                user_agent=self.ua,
+                sec_ch_ua=self.sec_ch_ua,
+                accept_language=self.accept_language,
+                impersonate=self.impersonate,
+                ttl_seconds=1800,
+            )
+            if isinstance(snapshot, dict) and int(snapshot.get("version") or 0) == 1:
+                existing_cookies = self.phone_oauth_browser_context.get("cookies")
+                new_cookies = snapshot.get("cookies")
+                existing_has_login = any(
+                    isinstance(cookie, dict)
+                    and str(cookie.get("name") or "") == "login_session"
+                    for cookie in (existing_cookies if isinstance(existing_cookies, list) else [])
+                )
+                new_has_login = any(
+                    isinstance(cookie, dict)
+                    and str(cookie.get("name") or "") == "login_session"
+                    for cookie in (new_cookies if isinstance(new_cookies, list) else [])
+                )
+                if new_has_login or not existing_has_login:
+                    self.phone_oauth_browser_context = snapshot
+                return bool(new_has_login or existing_has_login)
+            return False
+
+        def safe_prepare_page_type(value) -> str:
+            raw = str(value or "").strip().lower()
+            safe = "".join(
+                character
+                for character in raw
+                if character.isalnum() or character in {"_", "-"}
+            )[:64]
+            return safe or "unknown"
+
+        def prepare_phone_transaction(
+            *,
+            attempts: int = 1,
+            backoff_seconds: tuple[float, ...] = (),
+        ):
             nonlocal phone_prepare_attempts
             if self.phone_oauth_resume_context is not None:
                 return True
@@ -706,7 +753,15 @@ class ChatGPTClient:
                 max(1, int(attempts or 1)),
                 max_phone_prepare_attempts - phone_prepare_attempts,
             )
-            for _ in range(max(0, remaining)):
+            for local_attempt in range(max(0, remaining)):
+                if local_attempt < len(backoff_seconds):
+                    delay = max(0.0, float(backoff_seconds[local_attempt] or 0))
+                    if delay:
+                        self._log(
+                            "手机验证 OAuth 事务将在短暂退避后重试: "
+                            f"attempt={phone_prepare_attempts + 1}"
+                        )
+                        time.sleep(delay)
                 phone_prepare_attempts += 1
                 phone_helper = OAuthClient(
                     oauth_helper_config,
@@ -740,22 +795,45 @@ class ChatGPTClient:
                 if prepared_context is not None:
                     self.phone_oauth_resume_context = prepared_context
                     self.phone_oauth_resume_error = ""
+                    prepared_state = getattr(prepared_context, "flow_state", None)
+                    self.phone_oauth_prepare_diagnostic = {
+                        "stage": "phone_oauth_prepare",
+                        "attempt": phone_prepare_attempts,
+                        "page_type": safe_prepare_page_type(
+                            getattr(prepared_state, "page_type", "")
+                        ),
+                        "http_status": int(
+                            getattr(phone_helper, "last_http_status", 0) or 0
+                        ),
+                        "recovery_status": "recovered",
+                    }
                     self._log(
                         "首轮登录验证已通过，手机验证 OAuth 事务已同步预建"
                     )
                     return True
 
-                self.phone_oauth_resume_error = str(
-                    self.phone_oauth_resume_error
-                    or phone_helper.last_error
-                    or "复制首轮登录会话失败"
-                ).strip()[:500]
-                if phone_prepare_attempts < max_phone_prepare_attempts:
-                    self._log(
-                        "手机验证 OAuth 事务预建失败，"
-                        f"使用原认证会话重试 {phone_prepare_attempts + 1}/"
-                        f"{max_phone_prepare_attempts}"
-                    )
+                failed_state = getattr(phone_helper, "last_state", None)
+                failed_page_type = safe_prepare_page_type(
+                    getattr(failed_state, "page_type", "")
+                )
+                self.phone_oauth_prepare_diagnostic = {
+                    "stage": "phone_oauth_prepare",
+                    "attempt": phone_prepare_attempts,
+                    "page_type": failed_page_type,
+                    "http_status": int(
+                        getattr(phone_helper, "last_http_status", 0) or 0
+                    ),
+                    "recovery_status": "deferred",
+                }
+                self.phone_oauth_resume_error = (
+                    "手机验证 OAuth 仍停留在登录页"
+                    if failed_page_type in {"log_in", "login", "login_password"}
+                    else "手机验证 OAuth 未进入可续接状态"
+                )
+                self._log(
+                    "手机验证 OAuth 事务预建暂未就绪: "
+                    f"attempt={phone_prepare_attempts}, page_type={failed_page_type}"
+                )
 
             if self.phone_oauth_resume_context is not None:
                 self._log(
@@ -966,7 +1044,8 @@ class ChatGPTClient:
                 )
                 if not next_state:
                     return False, helper.last_error or "ChatGPT MFA 验证失败"
-                prepare_phone_transaction()
+                capture_phone_browser_context()
+                prepare_phone_transaction(attempts=1)
                 referer = state.current_url or state.continue_url or referer
                 state = next_state
                 self.last_registration_state = state
@@ -987,7 +1066,8 @@ class ChatGPTClient:
                 if not next_state:
                     return False, helper.last_error or "邮箱验证码校验失败"
                 if not helper._state_is_mfa_challenge(next_state):
-                    prepare_phone_transaction()
+                    capture_phone_browser_context()
+                    prepare_phone_transaction(attempts=1)
                 referer = state.current_url or referer
                 state = next_state
                 self.last_registration_state = state
@@ -1017,6 +1097,7 @@ class ChatGPTClient:
         else:
             return False, "邮箱登录状态机超出最大步数"
 
+        capture_phone_browser_context()
         session_ok, session_result = self.fetch_chatgpt_session()
         if not session_ok:
             try:
@@ -1032,14 +1113,20 @@ class ChatGPTClient:
         if not access_token:
             return False, "ChatGPT Session 未返回 Access Token"
 
+        capture_phone_browser_context()
+
         if (
             self.phone_oauth_resume_context is None
             and phone_prepare_attempts < max_phone_prepare_attempts
         ):
             self._log(
-                "Access Token 已获取，使用同一认证会话最后重试手机验证 OAuth 预建"
+                "Access Token 已获取，分阶段重试手机验证 OAuth 预建"
             )
-            prepare_phone_transaction(attempts=1)
+            retry_attempts = 2 if phone_prepare_attempts else 1
+            prepare_phone_transaction(
+                attempts=retry_attempts,
+                backoff_seconds=(0.5, 1.0),
+            )
 
         if self.phone_oauth_resume_context is not None:
             self._log(
@@ -1054,8 +1141,8 @@ class ChatGPTClient:
             )[:500]
             self._log(
                 "Access Token 已保留，但手机验证 OAuth 事务未就绪；"
-                "为避免重复发送邮箱验证码，不再启动第二轮登录: "
-                f"{self.phone_oauth_resume_error}"
+                "接码阶段将从已认证浏览器快照建立一次新事务；"
+                "不会再次发送邮箱验证码"
             )
 
         session_cookie = self.get_next_auth_session_token()

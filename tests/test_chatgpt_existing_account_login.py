@@ -598,6 +598,12 @@ class ExistingAccountLoginTests(unittest.TestCase):
         chatgpt_client.ua = "UA"
         chatgpt_client.sec_ch_ua = '"Chromium";v="136"'
         chatgpt_client.impersonate = "chrome136"
+        chatgpt_client.phone_oauth_browser_context = {
+            "version": 1,
+            "created_at": 100,
+            "expires_at": 200,
+            "cookies": [{"name": "login_session", "value": "browser-cookie"}],
+        }
         chatgpt_client.phone_oauth_resume_context = types.SimpleNamespace(
             session=prepared_session,
             device_id="device-1",
@@ -655,12 +661,33 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(snapshot["cookies"][0]["value"], "prepared-transaction-cookie")
         self.assertEqual(snapshot["code_verifier"], "prepared-verifier")
         self.assertEqual(snapshot["flow_state"]["page_type"], "add_phone")
+        self.assertEqual(result.metadata["oauth_browser_context"]["version"], 1)
 
-    def test_access_token_stage_clears_stale_cached_context_when_prepare_fails(self):
+    def test_access_token_stage_persists_browser_snapshot_when_prepare_fails(self):
         engine = self._make_engine(login_stage="access_token")
         chatgpt_client = mock.Mock()
         chatgpt_client.phone_oauth_resume_context = None
         chatgpt_client.phone_oauth_resume_error = "OAuth bootstrap failed"
+        chatgpt_client.phone_oauth_prepare_diagnostic = {
+            "stage": "phone_oauth_prepare",
+            "attempt": 3,
+            "page_type": "log_in",
+            "http_status": 200,
+            "recovery_status": "deferred",
+        }
+        chatgpt_client.phone_oauth_browser_context = {
+            "version": 1,
+            "created_at": 100,
+            "expires_at": 200,
+            "device_id": "device-1",
+            "cookies": [
+                {
+                    "name": "login_session",
+                    "value": "authenticated-browser-cookie",
+                    "domain": ".openai.com",
+                }
+            ],
+        }
         chatgpt_client.login_existing_account_and_get_session.return_value = (
             True,
             {
@@ -679,6 +706,11 @@ class ExistingAccountLoginTests(unittest.TestCase):
 
         self.assertTrue(result.success)
         self.assertFalse(result.metadata["phone_oauth_ready"])
+        self.assertEqual(result.metadata["oauth_browser_context"]["version"], 1)
+        self.assertEqual(
+            result.metadata["phone_oauth_prepare_diagnostic"]["recovery_status"],
+            "deferred",
+        )
         cache.take.assert_called_once_with("existing@example.com")
         cache.remember.assert_not_called()
 
@@ -1069,6 +1101,11 @@ class ExistingAccountLoginTests(unittest.TestCase):
             prepare_helpers.append(helper)
             if len(prepare_helpers) == 1:
                 helper.last_error = "OAuth bootstrap failed"
+                helper.last_state = FlowState(
+                    page_type="log_in",
+                    current_url="https://auth.openai.com/log-in?state=must-not-leak",
+                )
+                helper.last_http_status = 200
                 return None
             return prepared_context
 
@@ -1081,7 +1118,9 @@ class ExistingAccountLoginTests(unittest.TestCase):
             "prepare_phone_verification_transaction",
             autospec=True,
             side_effect=prepare_phone_transaction,
-        ) as prepare_phone:
+        ) as prepare_phone, mock.patch(
+            "platforms.chatgpt.chatgpt_client.time.sleep"
+        ) as sleep:
             ok, result = client.login_existing_account_and_get_session(
                 "existing@example.com",
                 mailbox,
@@ -1094,6 +1133,21 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(len(prepare_helpers), 2)
         self.assertIsNot(prepare_helpers[0], prepare_helpers[1])
         self.assertIs(client.phone_oauth_resume_context, prepared_context)
+        sleep.assert_called_once_with(0.5)
+        self.assertEqual(
+            client.phone_oauth_prepare_diagnostic,
+            {
+                "stage": "phone_oauth_prepare",
+                "attempt": 2,
+                "page_type": "add_phone",
+                "http_status": 0,
+                "recovery_status": "recovered",
+            },
+        )
+        self.assertNotIn(
+            "must-not-leak",
+            str(client.phone_oauth_prepare_diagnostic),
+        )
 
     def test_web_login_defers_phone_oauth_clone_until_email_mfa_passes(self):
         client = ChatGPTClient(verbose=False)

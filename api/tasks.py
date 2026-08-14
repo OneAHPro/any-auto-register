@@ -3868,44 +3868,33 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         else {}
                     )
                     resume = candidate_extra.get("oauth_resume_context")
-                    return bool(
-                        _is_truthy(candidate_extra.get("phone_oauth_ready"))
-                        or (isinstance(resume, dict) and bool(resume))
+                    browser = candidate_extra.get("oauth_browser_context")
+                    resume_ready = bool(
+                        isinstance(resume, dict)
+                        and int(resume.get("version") or 0) == 2
+                        and str(resume.get("code_verifier") or "").strip()
+                        and str(resume.get("oauth_state") or "").strip()
+                        and isinstance(resume.get("flow_state"), dict)
                     )
+                    browser_ready = bool(
+                        isinstance(browser, dict)
+                        and int(browser.get("version") or 0) == 1
+                        and isinstance(browser.get("cookies"), list)
+                        and browser.get("cookies")
+                    )
+                    return bool(resume_ready or browser_ready)
 
                 _mailbox, _platform = _new_platform_session()
                 _log(task_id, f"开始{action_name}第 {i + 1}/{req.count} 个账号")
                 if _proxy:
                     _log(task_id, f"使用代理: {_proxy}")
                 login_email = bound_email or req.email or None
-                oauth_recovery_attempted = False
-                while True:
-                    with bind_task_attempt_context(control, attempt_id):
-                        account = _platform.register(
-                            email=login_email,
-                            password=req.password,
-                        )
-                    current_email = account.email or current_email
-                    if (
-                        not _bind_phone_and_get_rt
-                        or _phone_oauth_is_ready(account)
-                        or oauth_recovery_attempted
-                    ):
-                        break
-
-                    oauth_recovery_attempted = True
-                    _log(
-                        task_id,
-                        "手机授权事务暂未就绪，重新建立一次 OAuth 登录会话",
+                with bind_task_attempt_context(control, attempt_id):
+                    account = _platform.register(
+                        email=login_email,
+                        password=req.password,
                     )
-                    if not _requeue_chatgpt_login_mailbox(_mailbox, account):
-                        _log(
-                            task_id,
-                            "[WARN] 当前邮箱登录凭据未能重新入池，停止本轮 OAuth 恢复",
-                        )
-                        break
-                    login_email = current_email or login_email
-                    _mailbox, _platform = _new_platform_session()
+                current_email = account.email or current_email
                 if str(merged_extra.get("mail_provider", "")).strip() == "cfworker":
                     from core.email_domain_policy import validate_email_domain_policy
 
@@ -3989,7 +3978,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     if not _phone_oauth_is_ready(account):
                         failure = (
                             "邮箱登录成功，Access Token 已保存，但手机授权事务未就绪；"
-                            "本次未启动 LeadBee，请重新执行该账号的登录接码"
+                            "已认证浏览器快照也不可用，本次未启动 LeadBee"
                         )
                         _log(task_id, f"[FAIL] {failure}: {account.email}")
                         _save_task_log(

@@ -1368,7 +1368,12 @@ def _load_account_context(account_id: int) -> tuple[str, str, dict[str, Any]]:
     return account_email, account_password, account_extra
 
 
-def _take_phone_oauth_resume_context(email: str, account_extra: dict[str, Any]):
+def _take_phone_oauth_resume_context(
+    email: str,
+    account_extra: dict[str, Any],
+    *,
+    oauth_client: Any = None,
+):
     from platforms.chatgpt.oauth_resume_cache import (
         oauth_resume_cache,
         restore_oauth_resume_context,
@@ -1390,15 +1395,89 @@ def _take_phone_oauth_resume_context(email: str, account_extra: dict[str, Any]):
     )
     if is_prepared(persisted_context):
         return persisted_context, "persisted"
-    if memory_context is not None or persisted_context is not None:
+
+    browser_context = restore_oauth_resume_context(
+        account_extra.get("oauth_browser_context")
+    )
+    if browser_context is None and persisted_context is not None:
+        browser_context = persisted_context
+    if browser_context is not None and oauth_client is not None:
+        oauth_client.adopt_browser_context(
+            browser_context.session,
+            device_id=browser_context.device_id,
+            user_agent=browser_context.user_agent,
+            sec_ch_ua=browser_context.sec_ch_ua,
+            accept_language=browser_context.accept_language,
+        )
+        prepared_context = oauth_client.prepare_phone_verification_transaction(
+            email=email,
+            device_id=browser_context.device_id,
+            user_agent=browser_context.user_agent,
+            sec_ch_ua=browser_context.sec_ch_ua,
+            accept_language=browser_context.accept_language,
+            impersonate=browser_context.impersonate,
+        )
+        if is_prepared(prepared_context):
+            return prepared_context, "browser_recovered"
+        raise RuntimeError(
+            "已认证浏览器快照未能建立新的手机授权事务；"
+            "本次未获取手机号、未发送短信"
+        )
+    if (
+        memory_context is not None
+        or persisted_context is not None
+        or browser_context is not None
+    ):
         raise RuntimeError(
             "当前 Access Token 来自旧版登录流程，缺少可续接的手机授权事务；"
-            "请重新执行一次邮箱登录。本次未获取手机号、未发送短信"
+            "本次未获取手机号、未发送短信"
         )
     raise RuntimeError(
-        "手机验证授权事务不存在或已过期，请重新执行一次邮箱登录；"
+        "手机验证授权事务不存在或已过期；"
         "本次未获取手机号、未发送短信"
     )
+
+
+def _persist_prepared_phone_oauth_context(account_id: int, context: Any) -> None:
+    from sqlmodel import Session
+
+    from core.db import AccountModel, engine
+    from platforms.chatgpt.oauth_resume_cache import serialize_oauth_resume_context
+
+    snapshot = serialize_oauth_resume_context(
+        context.session,
+        device_id=context.device_id,
+        user_agent=context.user_agent,
+        sec_ch_ua=context.sec_ch_ua,
+        accept_language=context.accept_language,
+        impersonate=context.impersonate,
+        code_verifier=context.code_verifier,
+        oauth_state=context.oauth_state,
+        authorize_url=context.authorize_url,
+        authorize_params=context.authorize_params,
+        flow_state=context.flow_state,
+        referer=context.referer,
+        ttl_seconds=1800,
+    )
+    if int(snapshot.get("version") or 0) != 2:
+        raise RuntimeError("恢复后的手机授权事务未能安全持久化")
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(account_id))
+        if not account or account.platform != "chatgpt":
+            raise RuntimeError("ChatGPT 账号不存在")
+        extra = account.get_extra()
+        extra["oauth_resume_context"] = snapshot
+        extra["phone_oauth_ready"] = True
+        extra["phone_oauth_prepare_diagnostic"] = {
+            "stage": "phone_oauth_prepare",
+            "page_type": str(
+                getattr(context.flow_state, "page_type", "") or "unknown"
+            )[:64],
+            "recovery_status": "recovered",
+        }
+        account.set_extra(extra)
+        session.add(account)
+        session.commit()
 
 
 def run_interactive_phone_oauth_flow(
@@ -1422,12 +1501,17 @@ def run_interactive_phone_oauth_flow(
         config, proxy=proxy, verbose=False, browser_mode="protocol"
     )
     resume_context, resume_source = _take_phone_oauth_resume_context(
-        email, account_extra
+        email, account_extra, oauth_client=oauth_client
     )
     if resume_source == "memory":
         broker.mark_progress("正在续接登录时预建的手机授权事务并请求短信验证码")
-    else:
+    elif resume_source == "persisted":
         broker.mark_progress("正在恢复登录时预建的手机授权事务并请求短信验证码")
+    else:
+        _persist_prepared_phone_oauth_context(account_id, resume_context)
+        broker.mark_progress(
+            "已从认证浏览器快照恢复新的手机授权事务；正在请求短信验证码"
+        )
     oauth_client.adopt_browser_context(
         resume_context.session,
         device_id=resume_context.device_id,
@@ -1525,11 +1609,18 @@ def run_leadbee_phone_oauth_flow(
             config["leadbee_base_url"] = leadbee_base_url
     proxy = str(account_extra.get("proxy_used") or "").strip() or None
     oauth_client = OAuthClient(config, proxy=proxy, verbose=False, browser_mode="protocol")
-    resume_context, resume_source = _take_phone_oauth_resume_context(email, account_extra)
+    resume_context, resume_source = _take_phone_oauth_resume_context(
+        email, account_extra, oauth_client=oauth_client
+    )
     if resume_source == "memory":
         broker.mark_progress("正在续接登录时预建的手机授权事务并启动 LeadBee 自动接码")
-    else:
+    elif resume_source == "persisted":
         broker.mark_progress("正在恢复登录时预建的手机授权事务并启动 LeadBee 自动接码")
+    else:
+        _persist_prepared_phone_oauth_context(account_id, resume_context)
+        broker.mark_progress(
+            "已从认证浏览器快照恢复新的手机授权事务；正在启动 LeadBee 自动接码"
+        )
     oauth_client.adopt_browser_context(
         resume_context.session,
         device_id=resume_context.device_id,
