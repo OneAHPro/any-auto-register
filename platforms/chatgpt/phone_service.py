@@ -28,6 +28,7 @@ from .leadbee_open_api import (
     LeadBeeResponseError,
     LeadBeeTransportError,
 )
+from .leadbee_runtime import leadbee_api_rate_limiter
 
 
 def _to_positive_int(value, default: int, *, minimum: int = 1) -> int:
@@ -888,6 +889,7 @@ class LeadBeeOpenAPIPhoneService:
         client=None,
         sleep_fn: Optional[Callable[[float], None]] = None,
         monotonic: Optional[Callable[[], float]] = None,
+        rate_limiter=None,
     ) -> None:
         self.config = dict(config or {})
         self.log_fn = log_fn or (lambda _msg: None)
@@ -925,6 +927,7 @@ class LeadBeeOpenAPIPhoneService:
         self._monotonic = monotonic or time.monotonic
         self._progress_broker = self.config.get("chatgpt_phone_progress_broker")
         self._provider_started = False
+        production_client = client is None
         self._client = client
         if self._client is None and self._configuration_complete:
             # Production always uses the client's fixed official default base.
@@ -932,6 +935,11 @@ class LeadBeeOpenAPIPhoneService:
                 api_key=self.api_key,
                 api_secret=self.api_secret,
             )
+        self._rate_limiter = (
+            rate_limiter
+            if rate_limiter is not None
+            else (leadbee_api_rate_limiter if production_client else None)
+        )
 
         self.order_id = ""
         self._order: dict[str, Any] = {}
@@ -1031,8 +1039,10 @@ class LeadBeeOpenAPIPhoneService:
         return delay
 
     def _poll_delay(self, order: dict[str, Any]) -> float:
-        return self._positive_delay(order.get("next_poll_after_seconds")) or float(
-            self.poll_interval_seconds
+        return max(
+            4.0,
+            float(self.poll_interval_seconds),
+            self._positive_delay(order.get("next_poll_after_seconds")) or 0.0,
         )
 
     def _ensure_enabled(self) -> None:
@@ -1119,10 +1129,21 @@ class LeadBeeOpenAPIPhoneService:
         deadline: float,
         phase: str,
         check_cancellation: bool = True,
+        create: bool = False,
     ) -> dict[str, Any]:
         while True:
             if check_cancellation:
                 self._raise_if_cancelled()
+            if self._rate_limiter is not None:
+                self._rate_limiter.wait(
+                    create=create,
+                    deadline=deadline,
+                    checkpoint=(
+                        self._raise_if_cancelled
+                        if check_cancellation
+                        else (lambda: None)
+                    ),
+                )
             request_timeout = self._remaining_request_timeout(deadline, phase)
             result: dict[str, Any] = {}
             retry_delay: float | None = None
@@ -1241,6 +1262,7 @@ class LeadBeeOpenAPIPhoneService:
                 create,
                 deadline=deadline,
                 phase="创建订单",
+                create=True,
             )
         except LeadBeeAPIError as exc:
             self._create_ambiguous = self._create_failure_is_ambiguous(exc)

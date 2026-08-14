@@ -967,7 +967,67 @@ def _open_api_service(client, *, clock=None, logs=None, **config):
     return service, resolved_clock, resolved_logs
 
 
+class _RecordingLeadBeeRateLimiter:
+    def __init__(self):
+        self.calls = []
+
+    def wait(self, *, create, deadline, checkpoint):
+        checkpoint()
+        self.calls.append((create, deadline))
+
+
 class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
+    def test_poll_delay_never_goes_below_provider_safe_minimum(self):
+        service, _clock, _logs = _open_api_service(
+            _OpenAPIClient(),
+            leadbee_poll_interval_seconds=1,
+        )
+
+        self.assertEqual(service._poll_delay({}), 4.0)
+        self.assertEqual(
+            service._poll_delay({"next_poll_after_seconds": 2}),
+            4.0,
+        )
+        self.assertEqual(
+            service._poll_delay({"next_poll_after_seconds": 7}),
+            7.0,
+        )
+
+    def test_rate_limiter_classifies_create_and_every_read_attempt(self):
+        limiter = _RecordingLeadBeeRateLimiter()
+        client = _OpenAPIClient(
+            create=[
+                {
+                    "order_id": "order_fixture_limited",
+                    "status": "PROCESSING",
+                    "next_poll_after_seconds": 4,
+                }
+            ],
+            get=[
+                LeadBeeTransportError("fixture retry"),
+                {
+                    "order_id": "order_fixture_limited",
+                    "status": "WAITING_CODE",
+                    "phone": "+12025550123",
+                },
+            ],
+        )
+        clock = _OpenAPIClock()
+        service = LeadBeeOpenAPIPhoneService(
+            _open_api_config(),
+            client=client,
+            sleep_fn=clock.sleep,
+            monotonic=clock.monotonic,
+            rate_limiter=limiter,
+        )
+
+        service.acquire_phone()
+
+        self.assertEqual(
+            [create for create, _deadline in limiter.calls],
+            [True, False, False],
+        )
+
     def test_normalizes_digit_only_international_phone_from_order_detail(self):
         self.assertEqual(
             LeadBeeOpenAPIPhoneService._phone("12025550123"),
@@ -1053,7 +1113,7 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
         self.assertIn("order_fixture_001", entry.detail_url)
         self.assertNotIn(phone, entry.detail_url)
         self.assertEqual(code, "654321")
-        self.assertEqual(clock.sleeps, [2.0, 3.0])
+        self.assertEqual(clock.sleeps, [4.0, 4.0])
         self.assertEqual(
             [call[0] for call in client.calls],
             ["create", "get", "get"],
@@ -1401,7 +1461,7 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
                 "cancel",
             ],
         )
-        self.assertEqual([call[-1] for call in client.calls], [10.0, 9.0, 9.0, 9.0])
+        self.assertEqual([call[-1] for call in client.calls], [10.0, 6.0, 6.0, 6.0])
 
     def test_provider_uses_subsecond_remaining_deadline_instead_of_client_default(self):
         client = _OpenAPIClient(
@@ -1482,7 +1542,7 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
 
         self.assertEqual(
             [call[-1] for call in client.calls],
-            [10.0, 9.0, 8.0],
+            [10.0, 6.0, 5.0],
         )
 
     def test_provider_request_timeout_is_capped_by_validated_configuration(self):
@@ -1819,7 +1879,7 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
         replace_calls = [call for call in client.calls if call[0] == "replace"]
         self.assertEqual(len(replace_calls), 2)
         self.assertEqual(replace_calls[0], replace_calls[1])
-        self.assertEqual(clock.sleeps, [1.0, 2.0, 3.0])
+        self.assertEqual(clock.sleeps, [1.0, 4.0, 4.0])
 
     def test_cancel_retries_then_polls_canceling_to_canceled(self):
         client = _OpenAPIClient(
@@ -1858,7 +1918,7 @@ class LeadBeeOpenAPIPhoneServiceTests(unittest.TestCase):
         cancel_calls = [call for call in client.calls if call[0] == "cancel"]
         self.assertEqual(len(cancel_calls), 2)
         self.assertEqual(cancel_calls[0], cancel_calls[1])
-        self.assertEqual(clock.sleeps, [1.0, 2.0])
+        self.assertEqual(clock.sleeps, [1.0, 4.0])
 
     def test_cancel_without_order_is_safe_and_completed_order_is_not_recanceled(self):
         empty_service, _clock, _logs = _open_api_service(_OpenAPIClient())
