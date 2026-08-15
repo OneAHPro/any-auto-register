@@ -23,6 +23,8 @@ leadbee_api_phone_flow_lock = threading.BoundedSemaphore(50)
 leadbee_card_phone_flow_lock = threading.BoundedSemaphore(5)
 leadbee_phone_flow_lock = leadbee_card_phone_flow_lock
 LEADBEE_PROVIDER_SETTLEMENT_MARGIN_SECONDS = 60.0
+LEADBEE_PRE_PROVIDER_OAUTH_RETRY_LIMIT = 1
+LEADBEE_PRE_PROVIDER_OAUTH_RETRY_BACKOFF_SECONDS = 0.5
 KNOWN_EXCHANGE_CODE_SETTLEMENTS = frozenset({"restored", "consumed", "unusable"})
 LEADBEE_API_CLIENT_ORDER_RE = re.compile(r"^aar_[0-9a-f]{32}$")
 _PROVIDER_DIAGNOSTIC_STAGES = frozenset(
@@ -114,6 +116,10 @@ class PhoneVerificationCancelled(RuntimeError):
     """Raised inside a phone flow after its owning task cancels the session."""
 
 
+class PhoneOAuthPreProviderError(RuntimeError):
+    """A retryable OAuth failure observed before a provider order can exist."""
+
+
 class InteractivePhoneVerificationBroker:
     def __init__(
         self,
@@ -163,6 +169,10 @@ class InteractivePhoneVerificationBroker:
         )
         self.phone_verified = False
         self.provider_started = False
+        # Internal worker state.  A non-zero value tells the next OAuth run to
+        # discard the stale prepared transaction and rebuild PKCE from the
+        # authenticated browser snapshot.
+        self.phone_oauth_retry_count = 0
         self.provider_error_code = ""
         self.provider_error_message = ""
         self.provider_diagnostic: dict[str, Any] = {}
@@ -401,6 +411,52 @@ class InteractivePhoneVerificationBroker:
                     self.provider_diagnostic[key] = value
             self._condition.notify_all()
 
+    def mark_phone_oauth_recovery(
+        self,
+        retry_count: int,
+        *,
+        recovery_status: str,
+    ) -> None:
+        """Publish fixed, secret-free state for the pre-provider retry path."""
+        normalized_retry_count = max(0, int(retry_count or 0))
+        normalized_status = str(recovery_status or "").strip().lower()
+        self.mark_provider_diagnostic(
+            failure_stage="oauth_prepare",
+            safe_error_code="OPENAI_OAUTH_CONTEXT_NOT_READY",
+            provider_retry_count=normalized_retry_count,
+            recovery_status=normalized_status,
+        )
+        with self._condition:
+            self.phone_oauth_retry_count = max(
+                self.phone_oauth_retry_count,
+                normalized_retry_count,
+            )
+            if self._terminal:
+                return
+            if normalized_status == "retrying":
+                self.status = "starting"
+                if self.leadbee_api:
+                    self.message = "LeadBee API 自动接码处理中"
+                    recovery_message = (
+                        "OpenAI 手机 OAuth 会话未就绪；"
+                        "LeadBee API 订单尚未创建，正在自动重建授权上下文"
+                        f"（{normalized_retry_count}/"
+                        f"{LEADBEE_PRE_PROVIDER_OAUTH_RETRY_LIMIT}）"
+                    )
+                else:
+                    self.message = "正在自动重建 OpenAI 手机 OAuth 会话"
+                    recovery_message = (
+                        self.message
+                        + f"（{normalized_retry_count}/"
+                        f"{LEADBEE_PRE_PROVIDER_OAUTH_RETRY_LIMIT}）"
+                    )
+                self._append_log_locked(recovery_message)
+            elif normalized_status == "reconciled":
+                self._append_log_locked(
+                    "OpenAI 手机 OAuth 会话已重建，继续自动接码"
+                )
+            self._condition.notify_all()
+
     def mark_exchange_code_restored(self) -> None:
         """Record the provider's explicit confirmation that the code is reusable."""
         restored_callback = None
@@ -542,11 +598,21 @@ class InteractivePhoneVerificationBroker:
             if self._cancel_event.is_set() and self._terminal:
                 return
             self.status = "failed"
-            self.message = (
-                "LeadBee API 自动接码失败"
-                if self.leadbee_api
-                else str(message or "手机验证失败")
+            oauth_failed_before_order = bool(
+                self.leadbee_api
+                and not self.provider_started
+                and self.provider_diagnostic.get("failure_stage")
+                == "oauth_prepare"
+                and self.provider_diagnostic.get("recovery_status") == "failed"
             )
+            if oauth_failed_before_order:
+                self.message = (
+                    "OpenAI 手机 OAuth 会话恢复失败，LeadBee API 订单未创建"
+                )
+            elif self.leadbee_api:
+                self.message = "LeadBee API 自动接码失败"
+            else:
+                self.message = str(message or "手机验证失败")
             self._append_log_locked(self.message)
             self._terminal = True
             self._finalizing = False
@@ -1021,11 +1087,49 @@ class ChatGPTPhoneVerificationManager:
                 # publishing cleanup while provider code is still executing
                 # would allow more than five live provider operations and late
                 # settlement callbacks after the task has already returned.
-                tokens = self.automatic_flow_runner(
-                    broker.account_id,
-                    exchange_code,
-                    broker,
-                )
+                pre_provider_retry_count = 0
+                while True:
+                    try:
+                        tokens = self.automatic_flow_runner(
+                            broker.account_id,
+                            exchange_code,
+                            broker,
+                        )
+                    except PhoneOAuthPreProviderError:
+                        provider_started = bool(
+                            broker.snapshot().get("provider_started", False)
+                        )
+                        retry_exhausted = bool(
+                            pre_provider_retry_count
+                            >= LEADBEE_PRE_PROVIDER_OAUTH_RETRY_LIMIT
+                        )
+                        if provider_started or retry_exhausted:
+                            if not provider_started:
+                                broker.mark_phone_oauth_recovery(
+                                    pre_provider_retry_count,
+                                    recovery_status="failed",
+                                )
+                            raise
+
+                        pre_provider_retry_count += 1
+                        broker.mark_phone_oauth_recovery(
+                            pre_provider_retry_count,
+                            recovery_status="retrying",
+                        )
+                        broker.raise_if_cancelled()
+                        time.sleep(
+                            LEADBEE_PRE_PROVIDER_OAUTH_RETRY_BACKOFF_SECONDS
+                        )
+                        broker.raise_if_cancelled()
+                        continue
+                    if pre_provider_retry_count and not bool(
+                        broker.snapshot().get("provider_started", False)
+                    ):
+                        broker.mark_phone_oauth_recovery(
+                            pre_provider_retry_count,
+                            recovery_status="reconciled",
+                        )
+                    break
             finally:
                 # The provider/card lifecycle ends with the runner. Token DB
                 # persistence and status refresh must not retain a scarce
@@ -1451,11 +1555,120 @@ def _load_account_context(account_id: int) -> tuple[str, str, dict[str, Any]]:
     return account_email, account_password, account_extra
 
 
+def _rebuild_phone_oauth_context_with_fresh_login(
+    account_id: int,
+    broker: InteractivePhoneVerificationBroker,
+) -> tuple[Any, str]:
+    """Repeat the saved account login without entering the phone provider."""
+    from core.config_store import config_store
+    from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+        ChatGPTRegistrationContext,
+        build_chatgpt_registration_mode_adapter,
+    )
+    from platforms.chatgpt.oauth_client import OAuthClient
+    from platforms.chatgpt.oauth_resume_cache import restore_oauth_resume_context
+    from services.chatgpt_relogin import _build_email_service, _load_saved_account
+
+    class BrokerTaskControl:
+        @staticmethod
+        def checkpoint(*_args, **_kwargs) -> None:
+            broker.raise_if_cancelled()
+
+    try:
+        broker.raise_if_cancelled()
+        saved = _load_saved_account(account_id)
+        login_config = dict(config_store.get_all() or {})
+        for key in (
+            "leadbee_api_key",
+            "leadbee_api_secret",
+            "leadbee_api_product_id",
+            "leadbee_api_client_order_id",
+            "leadbee_code",
+            "leadbee_base_url",
+        ):
+            login_config.pop(key, None)
+        email_service = _build_email_service(
+            saved,
+            login_config,
+            log_fn=None,
+            task_control=BrokerTaskControl(),
+            attempt_id=None,
+        )
+        extra_config = dict(login_config)
+        extra_config.update(
+            {
+                "chatgpt_registration_mode": "refresh_token",
+                "chatgpt_has_refresh_token_solution": True,
+                "chatgpt_existing_account_login_only": True,
+                "chatgpt_existing_account_login_stage": "access_token",
+                "chatgpt_existing_account_allow_phone_verification": False,
+            }
+        )
+        adapter = build_chatgpt_registration_mode_adapter(extra_config)
+        result = adapter.run(
+            ChatGPTRegistrationContext(
+                email_service=email_service,
+                proxy_url=str(saved["extra"].get("proxy_used") or "").strip()
+                or None,
+                callback_logger=lambda _message: None,
+                email=str(saved.get("email") or "").strip(),
+                password=str(saved.get("password") or ""),
+                browser_mode="protocol",
+                max_retries=1,
+                extra_config=extra_config,
+            )
+        )
+        broker.raise_if_cancelled()
+        if not bool(getattr(result, "success", False)):
+            raise PhoneOAuthPreProviderError(
+                "自动重登未能重建 OpenAI 手机 OAuth 会话"
+            )
+
+        metadata = getattr(result, "metadata", None)
+        metadata = dict(metadata) if isinstance(metadata, dict) else {}
+        prepared_context = restore_oauth_resume_context(
+            metadata.get("oauth_resume_context")
+        )
+        if bool(
+            prepared_context is not None
+            and str(getattr(prepared_context, "code_verifier", "") or "").strip()
+            and str(getattr(prepared_context, "oauth_state", "") or "").strip()
+            and getattr(prepared_context, "flow_state", None) is not None
+        ):
+            return prepared_context, "fresh_login"
+
+        proxy = str(saved["extra"].get("proxy_used") or "").strip() or None
+        oauth_client = OAuthClient(
+            login_config,
+            proxy=proxy,
+            verbose=False,
+            browser_mode="protocol",
+        )
+        prepared_context, _source = _take_phone_oauth_resume_context(
+            str(saved.get("email") or "").strip(),
+            {
+                "oauth_browser_context": metadata.get("oauth_browser_context"),
+            },
+            oauth_client=oauth_client,
+            prefer_browser_recovery=True,
+        )
+        return prepared_context, "fresh_login"
+    except PhoneVerificationCancelled:
+        raise
+    except PhoneOAuthPreProviderError:
+        raise
+    except Exception as exc:
+        raise PhoneOAuthPreProviderError(
+            "自动重登未能重建 OpenAI 手机 OAuth 会话"
+        ) from exc
+
+
 def _take_phone_oauth_resume_context(
     email: str,
     account_extra: dict[str, Any],
     *,
     oauth_client: Any = None,
+    prefer_browser_recovery: bool = False,
 ):
     from platforms.chatgpt.oauth_resume_cache import (
         oauth_resume_cache,
@@ -1471,12 +1684,12 @@ def _take_phone_oauth_resume_context(
         )
 
     memory_context = oauth_resume_cache.take(email)
-    if is_prepared(memory_context):
+    if not prefer_browser_recovery and is_prepared(memory_context):
         return memory_context, "memory"
     persisted_context = restore_oauth_resume_context(
         account_extra.get("oauth_resume_context")
     )
-    if is_prepared(persisted_context):
+    if not prefer_browser_recovery and is_prepared(persisted_context):
         return persisted_context, "persisted"
 
     browser_context = restore_oauth_resume_context(
@@ -1502,7 +1715,7 @@ def _take_phone_oauth_resume_context(
         )
         if is_prepared(prepared_context):
             return prepared_context, "browser_recovered"
-        raise RuntimeError(
+        raise PhoneOAuthPreProviderError(
             "已认证浏览器快照未能建立新的手机授权事务；"
             "本次未获取手机号、未发送短信"
         )
@@ -1511,11 +1724,11 @@ def _take_phone_oauth_resume_context(
         or persisted_context is not None
         or browser_context is not None
     ):
-        raise RuntimeError(
+        raise PhoneOAuthPreProviderError(
             "当前 Access Token 来自旧版登录流程，缺少可续接的手机授权事务；"
             "本次未获取手机号、未发送短信"
         )
-    raise RuntimeError(
+    raise PhoneOAuthPreProviderError(
         "手机验证授权事务不存在或已过期；"
         "本次未获取手机号、未发送短信"
     )
@@ -1691,10 +1904,44 @@ def run_leadbee_phone_oauth_flow(
         if leadbee_base_url:
             config["leadbee_base_url"] = leadbee_base_url
     proxy = str(account_extra.get("proxy_used") or "").strip() or None
-    oauth_client = OAuthClient(config, proxy=proxy, verbose=False, browser_mode="protocol")
-    resume_context, resume_source = _take_phone_oauth_resume_context(
-        email, account_extra, oauth_client=oauth_client
+    oauth_client = OAuthClient(
+        config,
+        proxy=proxy,
+        verbose=False,
+        browser_mode="protocol",
     )
+    raw_oauth_retry_count = getattr(broker, "phone_oauth_retry_count", 0)
+    oauth_retry_count = (
+        int(raw_oauth_retry_count)
+        if isinstance(raw_oauth_retry_count, int)
+        and not isinstance(raw_oauth_retry_count, bool)
+        else 0
+    )
+    if api_mode and oauth_retry_count > 0:
+        try:
+            resume_context, resume_source = (
+                _rebuild_phone_oauth_context_with_fresh_login(
+                    account_id,
+                    broker,
+                )
+            )
+        except PhoneOAuthPreProviderError:
+            # Old accounts may not have enough persisted mailbox credentials
+            # for a complete re-login.  A fresh PKCE transaction cloned from
+            # the authenticated snapshot is still safe before provider start.
+            resume_context, resume_source = _take_phone_oauth_resume_context(
+                email,
+                account_extra,
+                oauth_client=oauth_client,
+                prefer_browser_recovery=True,
+            )
+    else:
+        resume_context, resume_source = _take_phone_oauth_resume_context(
+            email,
+            account_extra,
+            oauth_client=oauth_client,
+            prefer_browser_recovery=oauth_retry_count > 0,
+        )
     if resume_source == "memory":
         broker.mark_progress("正在续接登录时预建的手机授权事务并启动 LeadBee 自动接码")
     elif resume_source == "persisted":
@@ -1711,27 +1958,42 @@ def run_leadbee_phone_oauth_flow(
         sec_ch_ua=resume_context.sec_ch_ua,
         accept_language=resume_context.accept_language,
     )
-    tokens = oauth_client.login_and_get_tokens(
-        email,
-        password,
-        device_id=resume_context.device_id,
-        user_agent=resume_context.user_agent,
-        sec_ch_ua=resume_context.sec_ch_ua,
-        impersonate=resume_context.impersonate,
-        skymail_client=None,
-        prefer_passwordless_login=False,
-        allow_phone_verification=True,
-        force_new_browser=False,
-        resume_authenticated_session=False,
-        force_chatgpt_entry=False,
-        screen_hint="login",
-        force_password_login=False,
-        complete_about_you_if_needed=False,
-        login_source="automatic_phone_verification",
-        prepared_oauth_context=resume_context,
-    )
+    try:
+        tokens = oauth_client.login_and_get_tokens(
+            email,
+            password,
+            device_id=resume_context.device_id,
+            user_agent=resume_context.user_agent,
+            sec_ch_ua=resume_context.sec_ch_ua,
+            impersonate=resume_context.impersonate,
+            skymail_client=None,
+            prefer_passwordless_login=False,
+            allow_phone_verification=True,
+            force_new_browser=False,
+            resume_authenticated_session=False,
+            force_chatgpt_entry=False,
+            screen_hint="login",
+            force_password_login=False,
+            complete_about_you_if_needed=False,
+            login_source="automatic_phone_verification",
+            prepared_oauth_context=resume_context,
+        )
+    except PhoneVerificationCancelled:
+        raise
+    except Exception as exc:
+        if not bool(broker.snapshot().get("provider_started", False)):
+            raise PhoneOAuthPreProviderError(
+                "OpenAI 手机 OAuth 会话未进入可续接状态"
+            ) from exc
+        raise
     if not tokens:
-        raise RuntimeError(oauth_client.last_error or "LeadBee 自动接码 OAuth 登录失败")
+        if not bool(broker.snapshot().get("provider_started", False)):
+            raise PhoneOAuthPreProviderError(
+                "OpenAI 手机 OAuth 会话未进入可续接状态"
+            )
+        raise RuntimeError(
+            oauth_client.last_error or "LeadBee 自动接码 OAuth 登录失败"
+        )
     result = dict(tokens)
     result.setdefault("workspace_id", str(oauth_client.last_workspace_id or "").strip())
     return result

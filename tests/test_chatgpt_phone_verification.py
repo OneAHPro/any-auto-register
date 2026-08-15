@@ -10,6 +10,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from core.db import AccountModel, OutlookAccountModel
+import services.chatgpt_phone_verification as phone_verification_module
 
 from services.chatgpt_phone_verification import (
     ChatGPTPhoneVerificationManager,
@@ -20,6 +21,7 @@ from services.chatgpt_phone_verification import (
     normalize_e164_phone,
     run_interactive_phone_oauth_flow,
     run_leadbee_phone_oauth_flow,
+    _take_phone_oauth_resume_context,
 )
 
 
@@ -593,6 +595,225 @@ class PhoneOAuthResumeTests(unittest.TestCase):
             "已从认证浏览器快照恢复新的手机授权事务；正在请求短信验证码"
         )
 
+    def test_retry_flag_forces_fresh_browser_oauth_transaction(self):
+        old_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-old",
+            user_agent="UA-old",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="old-verifier",
+            oauth_state="old-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        browser_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="",
+            oauth_state="",
+            flow_state=None,
+        )
+        fresh_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        oauth_client = mock.Mock()
+        oauth_client.prepare_phone_verification_transaction.return_value = fresh_context
+        broker = mock.Mock(phone_oauth_retry_count=1)
+        persisted_snapshot = {"version": 2, "flow_state": {"page_type": "add_phone"}}
+        browser_snapshot = {"version": 1, "cookies": [{"name": "login_session"}]}
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.oauth_resume_cache.take",
+            return_value=old_context,
+        ), mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.restore_oauth_resume_context",
+            side_effect=lambda snapshot: (
+                browser_context if snapshot is browser_snapshot else old_context
+            ),
+        ) as restore, mock.patch(
+            "platforms.chatgpt.oauth_client.OAuthClient",
+            return_value=oauth_client,
+        ):
+            context, source = _take_phone_oauth_resume_context(
+                "existing@example.com",
+                {
+                    "oauth_resume_context": persisted_snapshot,
+                    "oauth_browser_context": browser_snapshot,
+                },
+                oauth_client=oauth_client,
+                prefer_browser_recovery=True,
+            )
+
+        self.assertIs(context, fresh_context)
+        self.assertEqual(source, "browser_recovered")
+        self.assertEqual(restore.call_count, 2)
+        oauth_client.adopt_browser_context.assert_called_once_with(
+            browser_context.session,
+            device_id="device-browser",
+            user_agent="UA-browser",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+        )
+
+    def test_leadbee_api_retry_prefers_fresh_account_login_context(self):
+        fresh_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-fresh-login",
+            user_agent="UA-fresh",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        oauth_client = mock.Mock()
+        oauth_client.login_and_get_tokens.return_value = {
+            "access_token": "new-at",
+            "refresh_token": "new-rt",
+        }
+        oauth_client.last_workspace_id = "workspace-1"
+        broker = InteractivePhoneVerificationBroker(
+            account_id=7,
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_0123456789abcdef0123456789abcdef",
+        )
+        broker.phone_oauth_retry_count = 1
+        loaded = (
+            "existing@example.com",
+            "account-password",
+            {
+                "proxy_used": "http://127.0.0.1:7890",
+                "oauth_browser_context": {
+                    "version": 1,
+                    "cookies": [{"name": "login_session"}],
+                },
+            },
+        )
+
+        with mock.patch(
+            "services.chatgpt_phone_verification._load_account_context",
+            return_value=loaded,
+        ), mock.patch(
+            "services.chatgpt_phone_verification._rebuild_phone_oauth_context_with_fresh_login",
+            return_value=(fresh_context, "fresh_login"),
+            create=True,
+        ) as rebuild, mock.patch(
+            "services.chatgpt_phone_verification._take_phone_oauth_resume_context",
+            side_effect=AssertionError("fresh login context should be preferred"),
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.OAuthClient",
+            return_value=oauth_client,
+        ), mock.patch(
+            "services.chatgpt_phone_verification._persist_prepared_phone_oauth_context"
+        ) as persist, mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={
+                "leadbee_api_enabled": "1",
+                "leadbee_api_key": "fixture-api-key",
+                "leadbee_api_secret": "fixture-api-secret",
+                "leadbee_api_product_id": "fixture-product",
+            },
+        ):
+            result = run_leadbee_phone_oauth_flow(7, broker.client_order_id, broker)
+
+        self.assertEqual(result["refresh_token"], "new-rt")
+        rebuild.assert_called_once_with(7, broker)
+        persist.assert_called_once_with(7, fresh_context)
+        self.assertIs(
+            oauth_client.login_and_get_tokens.call_args.kwargs[
+                "prepared_oauth_context"
+            ],
+            fresh_context,
+        )
+
+    def test_fresh_account_login_rebuilds_and_returns_prepared_context(self):
+        helper = getattr(
+            phone_verification_module,
+            "_rebuild_phone_oauth_context_with_fresh_login",
+            None,
+        )
+        self.assertIsNotNone(helper)
+        prepared_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-fresh-login",
+            user_agent="UA-fresh",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            flow_state=types.SimpleNamespace(page_type="add_phone"),
+        )
+        resume_snapshot = {"version": 2, "flow_state": {"page_type": "add_phone"}}
+        saved = {
+            "email": "existing@example.com",
+            "password": "account-password",
+            "extra": {"proxy_used": "http://127.0.0.1:7890"},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "existing@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_totp",
+                    "password": "account-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            },
+        }
+        email_service = mock.Mock()
+        adapter = mock.Mock()
+        adapter.run.return_value = types.SimpleNamespace(
+            success=True,
+            error_message="",
+            metadata={"oauth_resume_context": resume_snapshot},
+        )
+        broker = mock.Mock()
+
+        with mock.patch(
+            "services.chatgpt_relogin._load_saved_account",
+            return_value=saved,
+        ), mock.patch(
+            "services.chatgpt_relogin._build_email_service",
+            return_value=email_service,
+        ) as build_email_service, mock.patch(
+            "platforms.chatgpt.chatgpt_registration_mode_adapter.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ) as build_adapter, mock.patch(
+            "platforms.chatgpt.oauth_resume_cache.restore_oauth_resume_context",
+            return_value=prepared_context,
+        ), mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={"default_executor": "protocol"},
+        ):
+            context, source = helper(7, broker)
+
+        self.assertIs(context, prepared_context)
+        self.assertEqual(source, "fresh_login")
+        build_email_service.assert_called_once()
+        build_adapter.assert_called_once()
+        login_context = adapter.run.call_args.args[0]
+        self.assertEqual(login_context.email, "existing@example.com")
+        self.assertEqual(login_context.password, "account-password")
+        self.assertEqual(
+            login_context.extra_config["chatgpt_existing_account_login_stage"],
+            "access_token",
+        )
+
+
     def test_leadbee_flow_passes_exchange_code_to_automatic_provider(self):
         oauth_client = mock.Mock()
         oauth_client.login_and_get_tokens.return_value = {
@@ -758,6 +979,183 @@ class PhoneOAuthResumeTests(unittest.TestCase):
 
 
 class PhoneVerificationManagerTests(unittest.TestCase):
+    def test_api_retries_pre_provider_oauth_failure_once(self):
+        attempts = []
+        pre_provider_error = getattr(
+            phone_verification_module,
+            "PhoneOAuthPreProviderError",
+            RuntimeError,
+        )
+
+        def runner(_account_id, _client_order_id, broker):
+            attempts.append(int(getattr(broker, "phone_oauth_retry_count", 0)))
+            if len(attempts) == 1:
+                raise pre_provider_error("OAuth context returned log_in")
+            return {"refresh_token": "fixture-rt"}
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.time.sleep"
+        ) as sleep:
+            result = manager.start(301, leadbee_api=True)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(attempts, [0, 1])
+        self.assertFalse(result["provider_started"])
+        self.assertEqual(result["provider_diagnostic"]["recovery_status"], "reconciled")
+        sleep.assert_called_once_with(0.5)
+        self.assertTrue(any("OAuth" in line for line in result["logs"]))
+
+    def test_api_pre_provider_oauth_retry_is_bounded_and_marks_order_uncreated(self):
+        attempts = 0
+        pre_provider_error = getattr(
+            phone_verification_module,
+            "PhoneOAuthPreProviderError",
+            RuntimeError,
+        )
+
+        def runner(*_args):
+            nonlocal attempts
+            attempts += 1
+            raise pre_provider_error("OAuth context returned log_in")
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.time.sleep"
+        ) as sleep:
+            result = manager.start(302, leadbee_api=True)
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result["status"], "failed")
+        self.assertFalse(result["provider_started"])
+        self.assertEqual(
+            result["message"],
+            "OpenAI 手机 OAuth 会话恢复失败，LeadBee API 订单未创建",
+        )
+        self.assertEqual(
+            result["provider_diagnostic"],
+            {
+                "failure_stage": "oauth_prepare",
+                "safe_error_code": "OPENAI_OAUTH_CONTEXT_NOT_READY",
+                "provider_retry_count": 1,
+                "recovery_status": "failed",
+            },
+        )
+        self.assertEqual(sleep.call_count, 1)
+
+    def test_oauth_retry_does_not_overwrite_captured_order_diagnostic(self):
+        attempts = 0
+
+        def runner(_account_id, _client_order_id, broker):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise phone_verification_module.PhoneOAuthPreProviderError(
+                    "OAuth context returned log_in"
+                )
+            broker.mark_provider_started()
+            broker.mark_provider_diagnostic(
+                failure_stage="openai_validate",
+                order_status="COMPLETED",
+                billing_status="CAPTURED",
+                recovery_status="captured",
+            )
+            return {"refresh_token": "fixture-rt"}
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ), mock.patch("services.chatgpt_phone_verification.time.sleep"):
+            result = manager.start(303, leadbee_api=True)
+
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(attempts, 2)
+        self.assertTrue(result["provider_started"])
+        self.assertEqual(result["provider_diagnostic"]["order_status"], "COMPLETED")
+        self.assertEqual(result["provider_diagnostic"]["billing_status"], "CAPTURED")
+        self.assertEqual(result["provider_diagnostic"]["recovery_status"], "captured")
+
+    def test_pre_provider_error_is_not_retried_after_provider_start(self):
+        attempts = 0
+
+        def runner(_account_id, _client_order_id, broker):
+            nonlocal attempts
+            attempts += 1
+            broker.mark_provider_started()
+            raise phone_verification_module.PhoneOAuthPreProviderError(
+                "late OAuth classification"
+            )
+
+        manager = ChatGPTPhoneVerificationManager(
+            automatic_flow_runner=runner,
+            token_persister=lambda *_args: None,
+            status_refresher=lambda *_args: None,
+            start_timeout_seconds=1,
+        )
+        config = {
+            "leadbee_api_enabled": "1",
+            "leadbee_api_key": "fixture-api-key",
+            "leadbee_api_secret": "fixture-api-secret",
+            "leadbee_api_product_id": "fixture-product",
+        }
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value=config,
+        ), mock.patch(
+            "services.chatgpt_phone_verification.time.sleep"
+        ) as sleep:
+            result = manager.start(304, leadbee_api=True)
+
+        self.assertEqual(attempts, 1)
+        self.assertEqual(result["status"], "failed")
+        self.assertTrue(result["provider_started"])
+        self.assertEqual(result["message"], "LeadBee API 自动接码失败")
+        sleep.assert_not_called()
+
     def test_api_capacity_lease_is_attached_only_to_internal_broker(self):
         lease = object()
         observed = []
