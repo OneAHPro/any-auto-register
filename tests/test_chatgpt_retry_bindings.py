@@ -1,3 +1,4 @@
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -14,6 +15,7 @@ from api.tasks import (
     RegisterTaskRequest,
     _build_chatgpt_retry_request,
     get_retryable_task_bindings,
+    _load_chatgpt_retry_mailbox_context,
     retry_failed_task_bindings,
     _retryable_chatgpt_bindings,
     _upsert_chatgpt_attempt_binding,
@@ -22,6 +24,51 @@ from core.db import ChatGPTAttemptBindingModel, _recover_chatgpt_attempt_binding
 
 
 class ChatGPTRetryBindingTests(unittest.TestCase):
+    def test_retry_mailbox_context_is_loaded_by_matching_binding_and_email_only(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        context = {
+            "provider": "microsoft",
+            "email": "bound@example.com",
+            "account_id": "mailbox-7",
+            "extra": {
+                "provider": "microsoft",
+                "account_type": "mailapi_url",
+                "password": "fixture-secret",
+                "mailapi_url": "https://mail.example.test/TOKEN",
+            },
+        }
+        with Session(test_engine) as session:
+            row = ChatGPTAttemptBindingModel(
+                task_id="task-original",
+                attempt_index=0,
+                email="bound@example.com",
+                leadbee_code="aar_" + "a" * 32,
+                status="failed",
+                mailbox_context_json=json.dumps(context),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            binding_id = int(row.id)
+
+        with mock.patch("api.tasks.engine", test_engine):
+            restored = _load_chatgpt_retry_mailbox_context(
+                binding_id,
+                "BOUND@example.com",
+            )
+            mismatched = _load_chatgpt_retry_mailbox_context(
+                binding_id,
+                "other@example.com",
+            )
+
+        self.assertEqual(restored, context)
+        self.assertEqual(mismatched, {})
+
     def test_api_phone_auto_retry_requires_released_terminal_order(self):
         result = {
             "status": "failed",

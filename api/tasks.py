@@ -3568,6 +3568,125 @@ def _reload_saved_account(account_id: int, fallback):
         return fallback
 
 
+def _load_chatgpt_retry_mailbox_context(
+    binding_id: int,
+    expected_email: str,
+) -> dict:
+    """Load retry credentials by local binding ID without copying them into task metadata."""
+    try:
+        normalized_id = int(binding_id or 0)
+    except (TypeError, ValueError):
+        return {}
+    normalized_email = str(expected_email or "").strip().lower()
+    if normalized_id <= 0 or not normalized_email:
+        return {}
+
+    with _chatgpt_binding_db_lock:
+        _ensure_chatgpt_attempt_binding_table()
+        with Session(engine) as session:
+            row = session.get(ChatGPTAttemptBindingModel, normalized_id)
+            if row is None or str(row.email or "").strip().lower() != normalized_email:
+                return {}
+            context = _json_loads(row.mailbox_context_json, {})
+
+    if not isinstance(context, dict):
+        return {}
+    context_email = str(context.get("email") or expected_email or "").strip()
+    if not context_email or context_email.lower() != normalized_email:
+        return {}
+    context_extra = context.get("extra")
+    if not isinstance(context_extra, dict):
+        return {}
+    restored = deepcopy(context)
+    restored["email"] = context_email
+    restored["extra"] = deepcopy(context_extra)
+    return restored
+
+
+def _chatgpt_retry_mailbox_provider(
+    mailbox_context: dict,
+    fallback_provider: str,
+) -> str:
+    context_extra = (
+        mailbox_context.get("extra")
+        if isinstance(mailbox_context.get("extra"), dict)
+        else {}
+    )
+    provider = str(mailbox_context.get("provider") or "").strip().lower()
+    if provider == "custom_provider":
+        provider = str(context_extra.get("provider") or "").strip().lower()
+    if provider in {"outlook", "microsoft"}:
+        return "microsoft"
+    if provider in {"icloud", "chatgpt_credentials"}:
+        return "applemail"
+    return provider or str(fallback_provider or "").strip()
+
+
+class _PersistedChatGPTRetryMailbox:
+    """Use one persisted mailbox identity while delegating receive operations."""
+
+    _LOCAL_ATTRIBUTES = frozenset({"_delegate", "_account"})
+
+    def __init__(self, delegate, account) -> None:
+        object.__setattr__(self, "_delegate", delegate)
+        object.__setattr__(self, "_account", account)
+
+    def __getattr__(self, name):
+        return getattr(self._delegate, name)
+
+    def __setattr__(self, name, value) -> None:
+        if name in self._LOCAL_ATTRIBUTES:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._delegate, name, value)
+
+    def get_email(self):
+        return self._account
+
+    def get_email_by_address(self, email: str):
+        requested = str(email or "").strip().lower()
+        bound = str(getattr(self._account, "email", "") or "").strip().lower()
+        if not requested or requested != bound:
+            raise RuntimeError("重试绑定邮箱与持久化邮箱凭据不一致")
+        return self._account
+
+    def requeue_account(self, account) -> bool:
+        del account
+        return True
+
+    def mark_account_used(self, account) -> bool:
+        del account
+        return True
+
+
+def _bind_chatgpt_retry_mailbox(
+    mailbox,
+    mailbox_context: dict,
+    expected_email: str,
+):
+    from core.base_mailbox import MailboxAccount
+
+    context_email = str(
+        mailbox_context.get("email") or expected_email or ""
+    ).strip()
+    normalized_expected = str(expected_email or "").strip().lower()
+    if (
+        not context_email
+        or not normalized_expected
+        or context_email.lower() != normalized_expected
+    ):
+        raise RuntimeError("重试绑定邮箱与持久化邮箱凭据不一致")
+    context_extra = mailbox_context.get("extra")
+    if not isinstance(context_extra, dict):
+        raise RuntimeError("重试绑定缺少持久化邮箱凭据")
+    mailbox_account = MailboxAccount(
+        email=context_email,
+        account_id=str(mailbox_context.get("account_id") or ""),
+        extra=deepcopy(context_extra),
+    )
+    return _PersistedChatGPTRetryMailbox(mailbox, mailbox_account)
+
+
 def _requeue_chatgpt_login_mailbox(mailbox, account) -> bool:
     """Return a consumed mailbox after a phone-stage failure for later retry."""
     from core.base_mailbox import MailboxAccount
@@ -3824,15 +3943,41 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         def _build_mailbox(
             proxy: Optional[str],
             provider_override: str = "",
+            mailbox_context: dict | None = None,
+            expected_email: str = "",
         ):
+            persisted_context = (
+                mailbox_context if isinstance(mailbox_context, dict) else {}
+            )
+            mailbox_extra = _base_extra
+            provider = (
+                str(provider_override or "").strip()
+                or _base_extra.get("mail_provider", "luckmail")
+            )
+            if persisted_context:
+                context_extra = persisted_context.get("extra")
+                if not isinstance(context_extra, dict):
+                    raise RuntimeError("重试绑定缺少持久化邮箱凭据")
+                mailbox_extra = _base_extra.copy()
+                mailbox_extra.update(context_extra)
+                provider = _chatgpt_retry_mailbox_provider(
+                    persisted_context,
+                    provider,
+                )
+                pool_file = str(context_extra.get("pool_file") or "").strip()
+                if provider == "applemail" and pool_file:
+                    mailbox_extra["applemail_pool_file"] = pool_file
             mailbox = create_mailbox(
-                provider=(
-                    str(provider_override or "").strip()
-                    or _base_extra.get("mail_provider", "luckmail")
-                ),
-                extra=_base_extra,
+                provider=provider,
+                extra=mailbox_extra,
                 proxy=proxy,
             )
+            if persisted_context:
+                mailbox = _bind_chatgpt_retry_mailbox(
+                    mailbox,
+                    persisted_context,
+                    expected_email,
+                )
             bind_claim_scope = getattr(mailbox, "bind_claim_scope", None)
             if _mailbox_claim_scope is not None and callable(bind_claim_scope):
                 bind_claim_scope(_mailbox_claim_scope)
@@ -3882,6 +4027,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             bound_email = str(retry_binding.get("email") or "").strip()
             bound_account_id = int(retry_binding.get("account_id") or 0)
             bound_mail_provider = str(retry_binding.get("mail_provider") or "").strip()
+            retry_mailbox_context: dict = {}
             client_order_id = _leadbee_client_order_ids[i] if _leadbee_api else ""
             leadbee_code = (
                 client_order_id
@@ -3929,6 +4075,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 control.checkpoint()
                 attempt_id = control.start_attempt()
                 control.checkpoint(attempt_id=attempt_id)
+                if parent_binding_id and bound_email:
+                    retry_mailbox_context = _load_chatgpt_retry_mailbox_context(
+                        parent_binding_id,
+                        bound_email,
+                    )
                 if _bind_phone_and_get_rt:
                     _persist_binding(
                         task_id=task_id,
@@ -3938,7 +4089,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         account_id=current_account_id,
                         stage=current_stage,
                         status="running",
-                        mailbox_context=_sms_pool_binding_context(),
+                        mailbox_context=_sms_pool_binding_context(
+                            retry_mailbox_context
+                        ),
                         parent_binding_id=parent_binding_id,
                     )
                 _proxy = normalize_proxy_url(_get_proxy())
@@ -3965,7 +4118,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     _mail_provider_plan[i] if i < len(_mail_provider_plan) else ""
                 )
                 attempt_mail_provider = (
-                    bound_mail_provider
+                    _chatgpt_retry_mailbox_provider(
+                        retry_mailbox_context,
+                        bound_mail_provider,
+                    )
+                    if retry_mailbox_context
+                    else bound_mail_provider
                     or planned_mail_provider
                     or str(merged_extra.get("mail_provider") or "").strip()
                 )
@@ -4018,7 +4176,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 )
 
                 def _new_platform_session():
-                    mailbox = _build_mailbox(_proxy, attempt_mail_provider)
+                    mailbox = _build_mailbox(
+                        _proxy,
+                        attempt_mail_provider,
+                        retry_mailbox_context,
+                        bound_email,
+                    )
                     platform = PlatformCls(config=_config, mailbox=mailbox)
                     platform._task_attempt_token = attempt_id
                     platform._log_fn = lambda msg: _log(task_id, msg)

@@ -62,6 +62,8 @@ class _ExistingAccountPlatform(BasePlatform):
     phone_oauth_prepare_error = ""
     phone_oauth_browser_context_available = True
     register_emails = []
+    claim_mailbox_on_register = False
+    claimed_mailbox_extras = []
 
     @classmethod
     def reset(cls):
@@ -73,6 +75,8 @@ class _ExistingAccountPlatform(BasePlatform):
             cls.phone_oauth_prepare_error = ""
             cls.phone_oauth_browser_context_available = True
             cls.register_emails = []
+            cls.claim_mailbox_on_register = False
+            cls.claimed_mailbox_extras = []
 
     def __init__(self, config=None, mailbox=None):
         super().__init__(config)
@@ -90,6 +94,12 @@ class _ExistingAccountPlatform(BasePlatform):
                 else bool(type(self).phone_oauth_ready)
             )
         account_email = str(email or f"existing-{index}@example.com")
+        if type(self).claim_mailbox_on_register:
+            mailbox_account = self.mailbox.get_email_by_address(account_email)
+            with type(self)._lock:
+                type(self).claimed_mailbox_extras.append(
+                    dict(getattr(mailbox_account, "extra", None) or {})
+                )
         return Account(
             platform="chatgpt",
             email=account_email,
@@ -873,6 +883,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         count=2,
         api_mode=False,
         retry_bindings=None,
+        retry_mailbox_context=None,
         saved_account_ids=None,
         sms_mode="",
         capacity_error=False,
@@ -967,6 +978,10 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
                 "core.base_mailbox.create_mailbox",
                 side_effect=lambda **_: _LoginMailbox(),
             ),
+            patch(
+                "api.tasks._load_chatgpt_retry_mailbox_context",
+                return_value=dict(retry_mailbox_context or {}),
+            ),
             patch("core.db.save_account", side_effect=save_account),
             patch(
                 "core.db.save_account_with_creation_state",
@@ -1021,6 +1036,49 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             save_task_log,
             cleanup_incomplete,
         )
+
+    def test_retry_uses_persisted_mailbox_credentials_without_readding_pool_row(self):
+        _ExistingAccountPlatform.claim_mailbox_on_register = True
+        retry = [{
+            "id": 1452,
+            "email": "bound-retry@example.com",
+            "leadbee_api": True,
+            "leadbee_code": "aar_" + "f" * 32,
+        }]
+        mailbox_context = {
+            "provider": "microsoft",
+            "email": "bound-retry@example.com",
+            "account_id": "historical-mailbox-id",
+            "extra": {
+                "provider": "microsoft",
+                "account_type": "mailapi_url",
+                "password": "persisted-secret-password",
+                "mailapi_url": "https://mail.example.test/messages/TOKEN",
+            },
+        }
+
+        snapshot, _saved, provider, _logs, _cleanup = self._run(
+            "task-chatgpt-retry-persisted-mailbox",
+            api_mode=True,
+            count=1,
+            retry_bindings=retry,
+            retry_mailbox_context=mailbox_context,
+            completion=lambda **kwargs: {
+                "status": "completed",
+                "message": "手机验证完成",
+                "phone_verified": True,
+                "account_id": kwargs["account_id"],
+            },
+        )
+
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(provider.call_count, 1)
+        self.assertEqual(
+            _ExistingAccountPlatform.claimed_mailbox_extras,
+            [mailbox_context["extra"]],
+        )
+        self.assertNotIn("persisted-secret-password", str(snapshot))
+        self.assertNotIn("TOKEN", str(snapshot))
 
     def test_api_capacity_exhaustion_reserves_one_card_and_reuses_phone_stage(self):
         row = SimpleNamespace(
