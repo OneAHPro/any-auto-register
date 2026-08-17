@@ -479,7 +479,7 @@ def _recover_password_totp_credentials(
     saved: dict[str, Any],
     mailbox_context: dict[str, Any],
     config: dict[str, Any],
-) -> dict[str, str]:
+) -> dict[str, Any]:
     email = _text(mailbox_context.get("email")) or saved["email"]
     context_extra = dict(mailbox_context.get("extra") or {})
     password = str(context_extra.get("password") or saved.get("password") or "")
@@ -488,58 +488,79 @@ def _recover_password_totp_credentials(
         or context_extra.get("mfa_secret")
         or context_extra.get("totp")
     )
+    pool_file = _text(context_extra.get("pool_file"))
+    mail_api_url = _text(
+        context_extra.get("mail_api_url")
+        or context_extra.get("mailapi_url")
+    )
+    record: dict[str, Any] | None = None
 
-    if not totp_secret:
-        pool_file = _text(context_extra.get("pool_file"))
+    if not totp_secret or (pool_file and not mail_api_url):
         if not pool_file:
-            raise RuntimeError(
-                f"账号 {email} 缺少邮箱登录凭据：未保存 MFA 秘钥来源"
-            )
-        try:
-            _path, records = load_applemail_pool_records(
-                pool_file=pool_file,
-                pool_dir=_text(config.get("applemail_pool_dir")) or "mail",
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                f"账号 {email} 的邮箱登录凭据读取失败: {exc}"
-            ) from exc
-        email_records = [
-            item
-            for item in records
-            if _text(item.get("email")).lower() == email.lower()
-        ]
-        if not email_records:
-            raise RuntimeError(
-                f"账号 {email} 在邮箱凭据池 {pool_file} 中不存在"
-            )
-        record = next(
-            (
+            if not totp_secret:
+                raise RuntimeError(
+                    f"账号 {email} 缺少邮箱登录凭据：未保存 MFA 秘钥来源"
+                )
+        else:
+            try:
+                _path, records = load_applemail_pool_records(
+                    pool_file=pool_file,
+                    pool_dir=_text(config.get("applemail_pool_dir")) or "mail",
+                )
+            except Exception as exc:
+                if not totp_secret:
+                    raise RuntimeError(
+                        f"账号 {email} 的邮箱登录凭据读取失败: {exc}"
+                    ) from exc
+                records = []
+            email_records = [
                 item
-                for item in email_records
-                if _text(item.get("account_type")).lower()
-                == "chatgpt_password_totp"
-            ),
-            None,
-        )
-        if record is None:
-            raise RuntimeError(
-                f"账号 {email} 的凭据类型不是 ChatGPT 密码 + MFA"
+                for item in records
+                if _text(item.get("email")).lower() == email.lower()
+            ]
+            if not email_records and not totp_secret:
+                raise RuntimeError(
+                    f"账号 {email} 在邮箱凭据池 {pool_file} 中不存在"
+                )
+            record = next(
+                (
+                    item
+                    for item in email_records
+                    if _text(item.get("account_type")).lower()
+                    == "chatgpt_password_totp"
+                ),
+                None,
             )
+            if record is None and not totp_secret:
+                raise RuntimeError(
+                    f"账号 {email} 的凭据类型不是 ChatGPT 密码 + MFA"
+                )
+
+    if record is not None:
         password = str(record.get("password") or password)
         totp_secret = _text(
             record.get("totp_secret")
             or record.get("mfa_secret")
             or record.get("totp")
+        ) or totp_secret
+        mail_api_url = _text(
+            mail_api_url
+            or record.get("mail_api_url")
+            or record.get("mailapi_url")
         )
 
     if not password or not totp_secret:
         raise RuntimeError(f"账号 {email} 缺少邮箱登录凭据：密码或 MFA 秘钥为空")
-    return {
+    credentials: dict[str, Any] = {
         "email": email,
         "password": password,
         "totp_secret": totp_secret,
     }
+    if mail_api_url:
+        credentials["mail_api_url"] = mail_api_url
+    if pool_file:
+        credentials["pool_file"] = pool_file
+    return credentials
 
 
 def _recover_url_login_credentials(
@@ -704,7 +725,19 @@ class _PersistedEmailService:
         }
         account_extra = dict(self._account.extra or {})
         account_type = _text(account_extra.get("account_type"))
-        if account_type in {
+        if account_type == "chatgpt_password_totp":
+            result.update({
+                "account_type": account_type,
+                "password": str(account_extra.get("password") or ""),
+                "totp_secret": str(account_extra.get("totp_secret") or ""),
+            })
+            mail_api_url = _text(
+                account_extra.get("mail_api_url")
+                or account_extra.get("mailapi_url")
+            )
+            if mail_api_url:
+                result["mail_api_url"] = mail_api_url
+        elif account_type in {
             "chatgpt_password_url_otp",
             "chatgpt_password_reset_url_mail",
         }:
@@ -1024,6 +1057,53 @@ def _build_email_service(
             mailbox_context,
             config,
         )
+        if credentials.get("mail_api_url"):
+            mailbox_config = dict(config)
+            if credentials.get("pool_file"):
+                mailbox_config["applemail_pool_file"] = credentials["pool_file"]
+            mailbox_config["applemail_pool_dir"] = (
+                _text(config.get("applemail_pool_dir")) or "mail"
+            )
+            proxy = _text(saved["extra"].get("proxy_used")) or None
+            mailbox = create_mailbox(
+                "applemail",
+                extra=mailbox_config,
+                proxy=proxy,
+            )
+            setattr(mailbox, "_log_fn", log_fn)
+            _bind_mailbox_task_control(mailbox, task_control, attempt_id)
+            if credentials.get("pool_file"):
+                mailbox_account = mailbox.get_email_by_address(
+                    credentials["email"]
+                )
+            else:
+                mailbox_account = MailboxAccount(
+                    email=credentials["email"],
+                    account_id=credentials["email"],
+                    extra={},
+                )
+            account_extra = dict(mailbox_account.extra or {})
+            account_extra.update(
+                {
+                    "provider": "chatgpt_credentials",
+                    "account_type": "chatgpt_password_totp",
+                    "password": credentials["password"],
+                    "totp_secret": credentials["totp_secret"],
+                    "mail_api_url": credentials["mail_api_url"],
+                    "mailapi_url": credentials["mail_api_url"],
+                }
+            )
+            if credentials.get("pool_file"):
+                account_extra["pool_file"] = credentials["pool_file"]
+            mailbox_account.extra = account_extra
+            return _PersistedEmailService(
+                mailbox=mailbox,
+                mailbox_account=mailbox_account,
+                mailbox_context=mailbox_context,
+                provider="chatgpt_credentials",
+                log_fn=log_fn,
+                otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+            )
         return _PasswordTotpEmailService(credentials, mailbox_context)
 
     if provider in {"outlook", "microsoft"}:

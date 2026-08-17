@@ -832,6 +832,64 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(mailbox._task_attempt_token, 42)
         self.assertEqual(service._otp_remaining_seconds, 75.0)
 
+    def test_password_totp_with_mail_url_reads_email_otp_during_relogin(self):
+        mail_api_url = "https://mail.example.test/messages/token"
+        saved = {
+            "email": "mfa-mail@example.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "mfa-mail@example.com",
+                "extra": {
+                    "account_type": "chatgpt_password_totp",
+                    "password": "saved-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mail_api_url": mail_api_url,
+                    "pool_file": "mfa-mail.json",
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        mailbox.get_email_by_address.return_value = MailboxAccount(
+            email="mfa-mail@example.com",
+            account_id="mfa-mail@example.com",
+            extra={},
+        )
+        mailbox.get_current_ids.return_value = set()
+        mailbox.wait_for_code.return_value = "123456"
+        mailbox.pause_active_slot_for_mailbox_wait.return_value = nullcontext(
+            True
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ):
+            service = _build_email_service(
+                saved,
+                {
+                    "applemail_pool_dir": "mail",
+                    "mailbox_otp_timeout_seconds": 75,
+                },
+                log_fn=None,
+            )
+
+        email_info = service.create_email()
+        self.assertEqual(email_info["account_type"], "chatgpt_password_totp")
+        self.assertEqual(email_info["password"], "saved-password")
+        self.assertEqual(email_info["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(email_info["mail_api_url"], mail_api_url)
+        self.assertTrue(service._baseline_ready.wait(timeout=1))
+        self.assertEqual(
+            service.get_verification_code(
+                email="mfa-mail@example.com",
+                timeout=30,
+            ),
+            "123456",
+        )
+        mailbox.wait_for_code.assert_called_once()
+
     def test_saved_login_uses_mailbox_timeout_as_all_outer_otp_budgets(self):
         saved = {
             "email": "demo@example.com",
