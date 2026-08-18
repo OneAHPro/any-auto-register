@@ -1591,6 +1591,59 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         )
         self.assertIn("旧订单已释放", str(snapshot["logs"]))
 
+    def test_api_failure_log_explains_both_released_orders_after_auto_retry(self):
+        attempts = 0
+
+        def completion(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            diagnostic = {
+                "provider_retry_count": 0,
+                "replacement_count": 0,
+                "order_status": "CANCELED",
+                "billing_status": "RELEASED",
+                "recovery_status": "released",
+            }
+            if attempts == 1:
+                diagnostic.update(
+                    {
+                        "failure_stage": "openai_send",
+                        "safe_error_code": "OPENAI_SEND_RETRY_EXHAUSTED",
+                        "http_status": 504,
+                        "provider_retry_count": 2,
+                    }
+                )
+            return {
+                "status": "failed",
+                "message": "LeadBee API 自动接码失败",
+                "phone_verified": False,
+                "provider_cleanup_settled": True,
+                "provider_diagnostic": diagnostic,
+            }
+
+        snapshot, _saved, provider, save_logs, _cleanup = self._run(
+            "task-chatgpt-api-auto-retry-failure-reason",
+            api_mode=True,
+            count=1,
+            completion=completion,
+        )
+
+        self.assertEqual(provider.call_count, 2)
+        self.assertEqual(snapshot["success"], 0)
+        public_text = " ".join(
+            [*snapshot["logs"], *snapshot["errors"]]
+        )
+        self.assertIn("OPENAI_SEND_RETRY_EXHAUSTED", public_text)
+        self.assertIn("HTTP 504", public_text)
+        self.assertIn("订单已取消", public_text)
+        self.assertIn("费用已释放", public_text)
+        self.assertIn("自动新建订单重试 1 次", public_text)
+        failure_detail = save_logs.call_args.kwargs["detail"]
+        self.assertEqual(
+            failure_detail["previous_provider_diagnostic"]["safe_error_code"],
+            "OPENAI_SEND_RETRY_EXHAUSTED",
+        )
+
     def test_concurrent_attempts_receive_distinct_codes_without_exposing_them(self):
         def completion(**kwargs):
             return {

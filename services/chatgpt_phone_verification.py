@@ -53,6 +53,148 @@ _PROVIDER_RECOVERY_STATUSES = frozenset(
 _SAFE_PROVIDER_CODE_RE = re.compile(r"^[A-Z0-9_]{1,64}$")
 _SAFE_PROVIDER_STATUS_RE = re.compile(r"^[A-Z0-9_]{1,32}$")
 
+_LEADBEE_API_FAILURE_STAGES = {
+    "oauth_prepare": "OpenAI 手机 OAuth 会话准备",
+    "leadbee_create": "LeadBee 创建订单",
+    "leadbee_reconcile": "LeadBee 订单对账",
+    "leadbee_read": "LeadBee 获取手机号或短信验证码",
+    "leadbee_replace": "LeadBee 更换手机号",
+    "leadbee_cancel": "LeadBee 取消订单",
+    "openai_send": "OpenAI 发送短信",
+    "openai_validate": "OpenAI 校验短信验证码",
+}
+_LEADBEE_API_FAILURE_REASONS = {
+    "OPENAI_OAUTH_CONTEXT_NOT_READY": "OpenAI 手机 OAuth 会话未就绪",
+    "OPENAI_SEND_TRANSPORT": "OpenAI 发送短信时网络连接失败",
+    "OPENAI_SEND_HTTP_RETRY": "OpenAI 发送短信接口暂时不可用",
+    "OPENAI_SEND_RETRY_EXHAUSTED": "OpenAI 发送短信临时失败，接口重试已耗尽",
+    "OPENAI_SEND_HTTP_ERROR": "OpenAI 发送短信请求被拒绝",
+    "OPENAI_PHONE_ALREADY_USED": "OpenAI 拒绝该手机号：号码已被其他账号使用",
+    "OPENAI_PHONE_SIMILAR_REJECTED": "OpenAI 拒绝该手机号：与已绑定号码过于相似",
+    "OPENAI_PHONE_UNSUPPORTED": "OpenAI 不支持该手机号或运营商",
+    "OPENAI_PHONE_INVALID": "OpenAI 判定手机号格式无效",
+    "OPENAI_SEND_INVALID_JSON": "OpenAI 发送短信接口返回了无效 JSON",
+    "OPENAI_SEND_INVALID_PAYLOAD": "OpenAI 发送短信接口返回了无效数据",
+    "OPENAI_VALIDATE_TRANSPORT": "OpenAI 校验短信验证码时网络连接失败",
+    "OPENAI_OTP_INVALID": "OpenAI 判定短信验证码错误或已过期",
+    "OPENAI_VALIDATE_HTTP_ERROR": "OpenAI 校验短信验证码请求被拒绝",
+    "OPENAI_VALIDATE_INVALID_JSON": "OpenAI 校验短信验证码接口返回了无效 JSON",
+    "OPENAI_VALIDATE_INVALID_PAYLOAD": "OpenAI 校验短信验证码接口返回了无效数据",
+    "LEADBEE_API_CAPACITY_EXHAUSTED": "LeadBee API 可用余额或号码容量不足",
+    "LEADBEE_API_CAPACITY_CHECK_FAILED": "LeadBee API 容量检查失败",
+    "LEADBEE_TRANSPORT": "LeadBee API 网络连接失败",
+    "LEADBEE_AUTH_ERROR": "LeadBee API 鉴权失败",
+    "LEADBEE_PERMISSION_ERROR": "LeadBee API 权限或 IP 白名单校验失败",
+    "LEADBEE_PRODUCT_ERROR": "LeadBee API 产品配置无效或产品不可用",
+    "LEADBEE_IDEMPOTENCY_CONFLICT": "LeadBee API 订单幂等标识冲突",
+    "LEADBEE_RATE_LIMITED": "LeadBee API 请求频率受限",
+    "LEADBEE_RESPONSE_ERROR": "LeadBee API 返回数据格式异常",
+    "LEADBEE_REQUEST_RETRY_EXHAUSTED": "LeadBee API 临时错误，接口重试已耗尽",
+    "LEADBEE_CLIENT_ERROR": "LeadBee API 客户端调用异常",
+    "LEADBEE_REQUEST_FAILED": "LeadBee API 请求失败",
+}
+
+
+def format_leadbee_api_failure_message(
+    diagnostic: Any = None,
+    *,
+    provider_error_code: str = "",
+    automatic_retry_count: int = 0,
+) -> str:
+    """Turn the public diagnostic allowlist into one actionable Chinese error."""
+    source = diagnostic if isinstance(diagnostic, dict) else {}
+    stage = str(source.get("failure_stage") or "").strip().lower()
+    if stage not in _PROVIDER_DIAGNOSTIC_STAGES:
+        stage = ""
+    error_code = str(
+        source.get("safe_error_code") or provider_error_code or ""
+    ).strip().upper()
+    if not _SAFE_PROVIDER_CODE_RE.fullmatch(error_code):
+        error_code = ""
+
+    def bounded_int(key: str, maximum: int) -> int:
+        value = source.get(key)
+        if isinstance(value, bool):
+            return 0
+        try:
+            normalized = int(value)
+        except (TypeError, ValueError):
+            return 0
+        return normalized if 0 <= normalized <= maximum else 0
+
+    http_status = bounded_int("http_status", 599)
+    provider_retry_count = bounded_int("provider_retry_count", 100)
+    replacement_count = bounded_int("replacement_count", 100)
+    try:
+        task_retry_count = int(automatic_retry_count)
+    except (TypeError, ValueError):
+        task_retry_count = 0
+    if not 0 <= task_retry_count <= 100:
+        task_retry_count = 0
+
+    order_status = str(source.get("order_status") or "").strip().upper()
+    if not _SAFE_PROVIDER_STATUS_RE.fullmatch(order_status):
+        order_status = ""
+    billing_status = str(source.get("billing_status") or "").strip().upper()
+    if not _SAFE_PROVIDER_STATUS_RE.fullmatch(billing_status):
+        billing_status = ""
+    recovery_status = str(source.get("recovery_status") or "").strip().lower()
+    if recovery_status not in _PROVIDER_RECOVERY_STATUSES:
+        recovery_status = ""
+
+    reason = _LEADBEE_API_FAILURE_REASONS.get(error_code, "")
+    has_specific_reason = bool(reason)
+    if not reason and order_status in {"CANCELED", "EXPIRED"}:
+        reason = "LeadBee 未完成取号或收码"
+        has_specific_reason = True
+    if not reason and stage:
+        reason = f"{_LEADBEE_API_FAILURE_STAGES[stage]}失败"
+        has_specific_reason = True
+    if not reason:
+        reason = "LeadBee API 自动接码失败"
+
+    if not has_specific_reason:
+        message = "LeadBee API 自动接码失败"
+        if task_retry_count:
+            message += (
+                f"；已自动新建订单重试 {task_retry_count} 次，仍未完成接码"
+            )
+        return message
+
+    diagnostics: list[str] = []
+    if error_code:
+        diagnostics.append(f"错误码 {error_code}")
+    if http_status:
+        diagnostics.append(f"HTTP {http_status}")
+    if provider_retry_count:
+        diagnostics.append(f"接口已重试 {provider_retry_count} 次")
+    if replacement_count:
+        diagnostics.append(f"已更换手机号 {replacement_count} 次")
+    if order_status:
+        diagnostics.append(f"订单状态 {order_status}")
+    if billing_status:
+        diagnostics.append(f"计费状态 {billing_status}")
+
+    message = f"LeadBee API 自动接码失败：{reason}"
+    if diagnostics:
+        message += f"（{'，'.join(diagnostics)}）"
+    outcomes: list[str] = []
+    if order_status == "CANCELED":
+        outcomes.append("订单已取消")
+    elif order_status == "EXPIRED":
+        outcomes.append("订单已过期")
+    if billing_status == "RELEASED" or recovery_status == "released":
+        outcomes.append("费用已释放")
+    elif recovery_status == "quarantined":
+        outcomes.append("订单终态待人工核对")
+    if outcomes:
+        message += f"；{'，'.join(outcomes)}"
+    if task_retry_count:
+        message += (
+            f"；已自动新建订单重试 {task_retry_count} 次，仍未完成接码"
+        )
+    return message
+
 
 def _truthy_config(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -610,7 +752,10 @@ class InteractivePhoneVerificationBroker:
                     "OpenAI 手机 OAuth 会话恢复失败，LeadBee API 订单未创建"
                 )
             elif self.leadbee_api:
-                self.message = "LeadBee API 自动接码失败"
+                self.message = format_leadbee_api_failure_message(
+                    self.provider_diagnostic,
+                    provider_error_code=self.provider_error_code,
+                )
             else:
                 self.message = str(message or "手机验证失败")
             self._append_log_locked(self.message)

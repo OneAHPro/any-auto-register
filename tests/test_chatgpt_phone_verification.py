@@ -113,6 +113,35 @@ class PhoneValidationTests(unittest.TestCase):
         )
         self.assertNotIn("secret", str(broker.snapshot()))
 
+    def test_leadbee_api_failure_explains_structured_openai_send_error(self):
+        broker = InteractivePhoneVerificationBroker(
+            account_id=1,
+            phone="",
+            provider="leadbee",
+            leadbee_api=True,
+            client_order_id="aar_" + "a" * 32,
+        )
+
+        broker.mark_provider_diagnostic(
+            failure_stage="openai_send",
+            safe_error_code="OPENAI_SEND_RETRY_EXHAUSTED",
+            http_status=504,
+            provider_retry_count=2,
+            order_status="CANCELED",
+            billing_status="RELEASED",
+            recovery_status="released",
+        )
+        broker.mark_failed("unsafe raw provider response")
+
+        snapshot = broker.snapshot()
+        self.assertIn("OpenAI 发送短信", snapshot["message"])
+        self.assertIn("OPENAI_SEND_RETRY_EXHAUSTED", snapshot["message"])
+        self.assertIn("HTTP 504", snapshot["message"])
+        self.assertIn("已重试 2 次", snapshot["message"])
+        self.assertIn("订单已取消", snapshot["message"])
+        self.assertIn("费用已释放", snapshot["message"])
+        self.assertNotIn("unsafe raw provider response", str(snapshot))
+
     def test_unusable_exchange_code_is_structured_and_notified_once(self):
         settled = mock.Mock()
         broker = InteractivePhoneVerificationBroker(

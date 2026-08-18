@@ -4701,6 +4701,21 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             .strip()
                             .upper()
                         )
+                        if (
+                            phone_status != "completed"
+                            and active_leadbee_api
+                            and not capacity_preflight_failure
+                            and bool(phone_diagnostic or provider_error_code)
+                        ):
+                            from services.chatgpt_phone_verification import (
+                                format_leadbee_api_failure_message,
+                            )
+
+                            phone_message = format_leadbee_api_failure_message(
+                                phone_diagnostic,
+                                provider_error_code=provider_error_code,
+                                automatic_retry_count=api_order_auto_retry_count,
+                            )
                         if phone_status != "completed":
                             # The stop/skip request may arrive while the provider
                             # is still polling.  Observe it before any retry,
@@ -4741,6 +4756,15 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             )
                         )
                         if can_retry_released_api_order:
+                            reported_logs = phone_result.get("logs")
+                            if not (
+                                isinstance(reported_logs, list)
+                                and any(
+                                    str(line or "").strip().endswith(phone_message)
+                                    for line in reported_logs
+                                )
+                            ):
+                                _log(task_id, f"  [接码原因] {phone_message}")
                             previous_phone_diagnostic = dict(phone_diagnostic)
                             api_order_auto_retry_count += 1
                             replacement_client_order_id = f"aar_{uuid.uuid4().hex}"
@@ -4996,6 +5020,15 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "phone_status": phone_status or "failed",
                                 "exchange_code_consumed": exchange_code_consumed,
                                 "provider_diagnostic": dict(phone_diagnostic),
+                                **(
+                                    {
+                                        "previous_provider_diagnostic": dict(
+                                            previous_phone_diagnostic
+                                        )
+                                    }
+                                    if previous_phone_diagnostic
+                                    else {}
+                                ),
                                 "phone_auto_retry_count": (
                                     api_order_auto_retry_count
                                 ),
