@@ -179,6 +179,35 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
             },
         )
 
+    def test_mfa_secrets_are_not_duplicated_into_retry_binding(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+
+        with mock.patch("api.tasks.engine", test_engine):
+            row = _upsert_chatgpt_attempt_binding(
+                task_id="task-mfa-secret",
+                attempt_index=0,
+                email="bound@example.com",
+                leadbee_code="aar_" + "a" * 32,
+                mailbox_context={
+                    "provider": "microsoft",
+                    "email": "bound@example.com",
+                    "extra": {
+                        "totp_secret": "MUST-NOT-BE-DUPLICATED",
+                        "mfa_recovery_code": "RECOVERY-MUST-NOT-BE-DUPLICATED",
+                        "chatgpt_mfa_managed": True,
+                    },
+                },
+            )
+
+        self.assertNotIn("MUST-NOT-BE-DUPLICATED", row.mailbox_context_json)
+        self.assertNotIn("RECOVERY-MUST-NOT-BE-DUPLICATED", row.mailbox_context_json)
+        self.assertIn("chatgpt_mfa_managed", row.mailbox_context_json)
+
     def test_build_retry_request_preserves_email_card_order(self):
         bindings = [
             {
@@ -187,12 +216,14 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
                 "leadbee_code": "bei-sms-FIRST",
                 "mail_provider": "microsoft",
                 "status": "failed",
+                "mfa_rotation_requested": True,
             },
             {
                 "id": 42,
                 "email": "second@example.com",
                 "leadbee_code": "bei-sms-SECOND",
                 "status": "failed",
+                "mfa_rotation_requested": True,
             },
         ]
 
@@ -220,9 +251,44 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
                     "email": "first@example.com",
                     "leadbee_code": "bei-sms-FIRST",
                     "mail_provider": "microsoft",
+                    "mfa_rotation_requested": True,
                 },
-                {"id": 42, "email": "second@example.com", "leadbee_code": "bei-sms-SECOND"},
+                {
+                    "id": 42,
+                    "email": "second@example.com",
+                    "leadbee_code": "bei-sms-SECOND",
+                    "mfa_rotation_requested": True,
+                },
             ],
+        )
+        self.assertTrue(
+            request.extra["chatgpt_existing_account_rotate_mfa"]
+        )
+        self.assertTrue(
+            request.extra[
+                "chatgpt_existing_account_skip_managed_mfa_rotation"
+            ]
+        )
+
+    def test_build_retry_request_preserves_disabled_mfa_rotation(self):
+        bindings = [
+            {
+                "id": 41,
+                "email": "first@example.com",
+                "leadbee_code": "bei-sms-FIRST",
+                "mfa_rotation_requested": False,
+            }
+        ]
+
+        with mock.patch(
+            "core.config_store.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ):
+            request = _build_chatgpt_retry_request(bindings)
+
+        self.assertFalse(request.extra["chatgpt_existing_account_rotate_mfa"])
+        self.assertFalse(
+            request.extra["chatgpt_existing_account_skip_managed_mfa_rotation"]
         )
 
     def test_build_retry_request_uses_requested_concurrency_bounded_by_count(self):
@@ -407,7 +473,11 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
                 "email": "bound@example.com",
                 "leadbee_code": "bei-sms-SECRET-CODE",
                 "mail_provider": "microsoft",
+                "mfa_rotation_requested": False,
             },
+        )
+        self.assertFalse(
+            queued_request.extra["chatgpt_existing_account_rotate_mfa"]
         )
         with Session(test_engine) as session:
             row = session.exec(select(ChatGPTAttemptBindingModel)).one()

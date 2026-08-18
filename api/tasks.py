@@ -36,6 +36,10 @@ logger = logging.getLogger(__name__)
 MAX_FINISHED_TASKS = 200
 CLEANUP_THRESHOLD = 250
 CHATGPT_BIND_PHONE_FLAG = "chatgpt_existing_account_bind_phone_and_get_rt"
+CHATGPT_ROTATE_MFA_FLAG = "chatgpt_existing_account_rotate_mfa"
+CHATGPT_SKIP_MANAGED_MFA_ROTATION_FLAG = (
+    "chatgpt_existing_account_skip_managed_mfa_rotation"
+)
 CHATGPT_LEADBEE_CODES_KEY = "chatgpt_existing_account_leadbee_codes"
 CHATGPT_LEADBEE_API_KEY = "chatgpt_existing_account_leadbee_api"
 CHATGPT_LEADBEE_CLIENT_ORDER_IDS_KEY = (
@@ -457,6 +461,11 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
                     if isinstance(mailbox_context, dict)
                     else ""
                 ),
+                "mfa_rotation_requested": (
+                    _is_truthy(mailbox_context.get("mfa_rotation_requested"))
+                    if isinstance(mailbox_context, dict)
+                    else False
+                ),
             }
         elif isinstance(raw, dict):
             source = raw
@@ -503,6 +512,9 @@ def _normalize_chatgpt_retry_bindings(value) -> list[dict]:
         )
         if mail_provider not in {"", "custom_provider", "chatgpt_credentials"}:
             item["mail_provider"] = mail_provider
+        item["mfa_rotation_requested"] = _is_truthy(
+            source.get("mfa_rotation_requested")
+        )
         normalized.append(item)
     return normalized
 
@@ -551,6 +563,12 @@ def _build_chatgpt_retry_request(
     if len(explicit_modes) > 1:
         raise HTTPException(409, "不同接码方式的失败账号不能混合重试")
     explicit_mode = next(iter(explicit_modes), "")
+    mfa_rotation_modes = [
+        bool(item.get("mfa_rotation_requested")) for item in normalized
+    ]
+    if any(mfa_rotation_modes) and not all(mfa_rotation_modes):
+        raise HTTPException(409, "不同 MFA 轮换设置的失败账号不能混合重试")
+    rotate_mfa = bool(mfa_rotation_modes and all(mfa_rotation_modes))
     extra = {
         "chatgpt_registration_mode": "refresh_token",
         "chatgpt_has_refresh_token_solution": True,
@@ -558,6 +576,8 @@ def _build_chatgpt_retry_request(
         "chatgpt_existing_account_login_stage": "access_token",
         "chatgpt_existing_account_allow_phone_verification": False,
         CHATGPT_BIND_PHONE_FLAG: True,
+        CHATGPT_ROTATE_MFA_FLAG: rotate_mfa,
+        CHATGPT_SKIP_MANAGED_MFA_ROTATION_FLAG: rotate_mfa,
         CHATGPT_RETRY_BINDINGS_KEY: normalized,
     }
     if str(config.get("mail_provider") or "").strip():
@@ -2812,6 +2832,19 @@ def _safe_chatgpt_phone_diagnostic(value) -> dict:
 
 def _safe_chatgpt_binding_context(value) -> dict:
     context = deepcopy(value) if isinstance(value, dict) else {}
+    if "mfa_rotation_requested" in context:
+        context["mfa_rotation_requested"] = _is_truthy(
+            context.get("mfa_rotation_requested")
+        )
+    context_extra = context.get("extra")
+    if isinstance(context_extra, dict):
+        for sensitive_key in (
+            "totp_secret",
+            "mfa_secret",
+            "totp",
+            "mfa_recovery_code",
+        ):
+            context_extra.pop(sensitive_key, None)
     for key in ("phone_diagnostic", "previous_phone_diagnostic"):
         safe = _safe_chatgpt_phone_diagnostic(context.get(key))
         if safe:
@@ -3587,7 +3620,25 @@ def _load_chatgpt_retry_mailbox_context(
             row = session.get(ChatGPTAttemptBindingModel, normalized_id)
             if row is None or str(row.email or "").strip().lower() != normalized_email:
                 return {}
-            context = _json_loads(row.mailbox_context_json, {})
+            account_context = {}
+            account = None
+            if int(row.account_id or 0) > 0:
+                account = session.get(AccountModel, int(row.account_id))
+            if account is None:
+                account = session.exec(
+                    select(AccountModel)
+                    .where(AccountModel.platform == "chatgpt")
+                    .where(AccountModel.email == expected_email)
+                ).first()
+            if account is not None:
+                account_extra = account.get_extra()
+                candidate = account_extra.get("mailbox_login_context")
+                if isinstance(candidate, dict):
+                    account_context = deepcopy(candidate)
+            context = account_context or _json_loads(
+                row.mailbox_context_json,
+                {},
+            )
 
     if not isinstance(context, dict):
         return {}
@@ -4052,6 +4103,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
 
             def _sms_pool_binding_context(value=None):
                 context = dict(value) if isinstance(value, dict) else {}
+                context["mfa_rotation_requested"] = _is_truthy(
+                    req.extra.get(CHATGPT_ROTATE_MFA_FLAG)
+                )
                 if active_leadbee_api:
                     context["leadbee_api"] = True
                 else:
@@ -4279,6 +4333,16 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             saved_account_extra_snapshot = raw_saved_extra
                 else:
                     saved_account = save_account(account)
+                try:
+                    from core.db import finalize_chatgpt_mfa_rotation
+
+                    finalize_chatgpt_mfa_rotation(account.email)
+                except Exception as exc:
+                    _log(
+                        task_id,
+                        "[WARN] 账号已保存，但 MFA 写前记录清理失败；"
+                        f"下次登录将自动核对（{type(exc).__name__}）",
+                    )
                 if _proxy:
                     _proxy_pool.report_success(_proxy)
 

@@ -6,6 +6,7 @@ from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
 )
 from platforms.chatgpt.chatgpt_client import ChatGPTClient
+from platforms.chatgpt.mfa_manager import MfaRotationResult
 from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.utils import FlowState
 
@@ -159,6 +160,7 @@ class ExistingAccountLoginTests(unittest.TestCase):
         allow_phone_verification=False,
         login_stage="refresh_token",
         email_service=None,
+        rotate_mfa=False,
     ):
         return RefreshTokenRegistrationEngine(
             email_service=email_service or DummyEmailService(),
@@ -171,6 +173,7 @@ class ExistingAccountLoginTests(unittest.TestCase):
                     allow_phone_verification
                 ),
                 "chatgpt_existing_account_login_stage": login_stage,
+                "chatgpt_existing_account_rotate_mfa": rotate_mfa,
             },
         )
 
@@ -209,6 +212,44 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(login_kwargs["login_source"], "existing_account_login_only")
         self.assertTrue(any("加载邮箱凭据" in line for line in result.logs))
         self.assertFalse(any("成功创建邮箱" in line for line in result.logs))
+
+    def test_refresh_token_stage_rotates_mfa_with_fresh_web_session_before_oauth(self):
+        engine = self._make_engine(rotate_mfa=True)
+        web_client = mock.Mock()
+        web_client.session = object()
+        web_client.ua = "web-agent"
+        web_client.impersonate = "chrome"
+        web_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "web-access-token",
+                "account_id": "account-1",
+            },
+        )
+        oauth_client = self._successful_oauth_client()
+        engine._build_chatgpt_client = mock.Mock(return_value=web_client)
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        rotation = MfaRotationResult(
+            totp_secret="NEWSECRET",
+            recovery_code="RECOVERY",
+            replaced_existing=True,
+            mfa_enabled=True,
+            rotated_at="2026-08-19T12:00:00+00:00",
+        )
+        engine._rotate_mfa_after_login = mock.Mock(return_value=rotation)
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        web_call = web_client.login_existing_account_and_get_session.call_args
+        self.assertFalse(web_call.kwargs["prepare_phone_oauth"])
+        rotate_call = engine._rotate_mfa_after_login.call_args.kwargs
+        self.assertIs(rotate_call["session"], web_client.session)
+        self.assertEqual(rotate_call["access_token"], "web-access-token")
+        oauth_client.login_and_get_tokens.assert_called_once()
 
     def test_password_totp_credentials_force_chatgpt_password_login(self):
         engine = self._make_engine(email_service=PasswordTotpEmailService())

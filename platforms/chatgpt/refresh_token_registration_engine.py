@@ -15,9 +15,16 @@ from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
 from core.task_runtime import TaskInterruption
+from core.db import (
+    load_chatgpt_mfa_rotation,
+    mark_chatgpt_mfa_rotation_activated,
+    stage_chatgpt_mfa_rotation,
+    update_chatgpt_mfa_rotation_recovery_code,
+)
 
 from .chatgpt_client import ChatGPTClient
 from .log_sanitizer import sanitize_chatgpt_log_message
+from .mfa_manager import ChatGPTMfaManager, MfaRotationError, MfaRotationResult
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
 from .oauth_resume_cache import oauth_resume_cache, serialize_oauth_resume_context
@@ -172,6 +179,35 @@ class EmailServiceAdapter:
             raise RuntimeError("当前邮箱服务不支持保存重置后的密码")
         return commit(str(new_password or "")) is not False
 
+    def commit_mfa_rotation(
+        self,
+        *,
+        totp_secret: str,
+        recovery_code: str,
+        rotated_at: str,
+    ) -> bool:
+        commit = getattr(self.email_service, "commit_mfa_rotation", None)
+        if not callable(commit):
+            raise RuntimeError("当前邮箱服务不支持保存轮换后的 MFA 凭据")
+        return commit(
+            totp_secret=str(totp_secret or ""),
+            recovery_code=str(recovery_code or ""),
+            rotated_at=str(rotated_at or ""),
+        ) is not False
+
+    def supports_email_verification(self) -> bool:
+        supports = getattr(
+            self.email_service,
+            "supports_email_verification",
+            None,
+        )
+        if callable(supports):
+            try:
+                return bool(supports())
+            except Exception:
+                return False
+        return callable(getattr(self.email_service, "get_verification_code", None))
+
 
 class RefreshTokenRegistrationEngine:
     """Refresh token 注册引擎。"""
@@ -235,6 +271,38 @@ class RefreshTokenRegistrationEngine:
             return value
         return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
+    def _existing_account_rotate_mfa_enabled(self) -> bool:
+        value = self.extra_config.get(
+            "chatgpt_existing_account_rotate_mfa",
+            False,
+        )
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _existing_account_should_rotate_mfa(self) -> bool:
+        if not self._existing_account_rotate_mfa_enabled():
+            return False
+        skip_managed = self.extra_config.get(
+            "chatgpt_existing_account_skip_managed_mfa_rotation",
+            False,
+        )
+        skip_managed = (
+            skip_managed
+            if isinstance(skip_managed, bool)
+            else str(skip_managed or "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        already_managed = bool(
+            isinstance(self.email_info, dict)
+            and self.email_info.get("chatgpt_mfa_managed") is True
+            and str(self.email_info.get("totp_secret") or "").strip()
+        )
+        if skip_managed and already_managed:
+            self._log("检测到本任务已完成 MFA 轮换，重试阶段跳过再次轮换")
+            return False
+        return True
+
     def _existing_account_login_stage(self) -> str:
         value = str(
             self.extra_config.get(
@@ -280,6 +348,24 @@ class RefreshTokenRegistrationEngine:
             self.email_info["email"] = email_value
             self.email = email_value
             if existing_account_login_only:
+                journal = load_chatgpt_mfa_rotation(email_value)
+                journal_secret = str(journal.get("totp_secret") or "").strip()
+                if journal_secret:
+                    self.email_info["totp_secret"] = journal_secret
+                    self.email_info["mfa_recovery_code"] = str(
+                        journal.get("recovery_code") or ""
+                    ).strip()
+                    self.email_info["chatgpt_mfa_managed"] = (
+                        str(journal.get("status") or "") == "activated"
+                    )
+                    self.email_info["mfa_rotated_at"] = str(
+                        journal.get("rotated_at") or ""
+                    ).strip()
+                    self.email_info.pop("totp_url", None)
+                    self._log(
+                        "检测到未完成落库的 MFA 写前记录，已恢复本地密钥继续登录",
+                        "warning",
+                    )
                 account_type = str(
                     self.email_info.get("account_type") or ""
                 ).strip()
@@ -307,7 +393,9 @@ class RefreshTokenRegistrationEngine:
                     if not password:
                         raise ValueError("ChatGPT URL 验证记录缺少登录密码")
                     self.password = password
-                    self.totp_secret = ""
+                    self.totp_secret = str(
+                        self.email_info.get("totp_secret") or ""
+                    ).strip()
                     self.password_reset_required = False
                     self._log("已识别 ChatGPT 密码 + URL 邮箱/2FA 凭据")
                 elif account_type == "chatgpt_password_reset_url_mail":
@@ -321,7 +409,9 @@ class RefreshTokenRegistrationEngine:
                             "ChatGPT 忘记密码记录缺少可用的新密码"
                         )
                     self.password = password
-                    self.totp_secret = ""
+                    self.totp_secret = str(
+                        self.email_info.get("totp_secret") or ""
+                    ).strip()
                     self.password_reset_required = reset_required
                     if reset_required:
                         self._log(
@@ -329,6 +419,11 @@ class RefreshTokenRegistrationEngine:
                         )
                     else:
                         self._log("已加载此前重置并保存的 ChatGPT 登录密码")
+                managed_totp_secret = str(
+                    self.email_info.get("totp_secret") or ""
+                ).strip()
+                if managed_totp_secret:
+                    self.totp_secret = managed_totp_secret
             if existing_account_login_only:
                 self._log(f"邮箱凭据加载成功: {self.email}")
             else:
@@ -355,6 +450,92 @@ class RefreshTokenRegistrationEngine:
             self.email_info["password_reset_required"] = False
             self.email_info.pop("new_password", None)
         return True
+
+    def _commit_mfa_rotation(
+        self,
+        email_adapter: EmailServiceAdapter,
+        rotation: MfaRotationResult,
+    ) -> bool:
+        committed = email_adapter.commit_mfa_rotation(
+            totp_secret=rotation.totp_secret,
+            recovery_code=rotation.recovery_code,
+            rotated_at=rotation.rotated_at,
+        )
+        if committed is False:
+            return False
+        self.totp_secret = str(rotation.totp_secret or "").strip()
+        if isinstance(self.email_info, dict):
+            self.email_info["totp_secret"] = self.totp_secret
+            self.email_info["mfa_recovery_code"] = str(
+                rotation.recovery_code or ""
+            ).strip()
+            self.email_info["chatgpt_mfa_managed"] = True
+            self.email_info["mfa_rotated_at"] = rotation.rotated_at
+            self.email_info.pop("totp_url", None)
+            self.email_info.pop("mfa_secret", None)
+            self.email_info.pop("totp", None)
+        return True
+
+    def _rotate_mfa_after_login(
+        self,
+        *,
+        result: RegistrationResult,
+        email_adapter: EmailServiceAdapter,
+        session,
+        access_token: str,
+        account_id: str = "",
+        user_agent: str = "",
+        impersonate: str = "",
+    ) -> MfaRotationResult | None:
+        self._log("3. 登录会话已刷新，开始新增/轮换 ChatGPT MFA...")
+        try:
+            rotation = ChatGPTMfaManager(
+                session=session,
+                access_token=access_token,
+                account_id=account_id,
+                user_agent=user_agent,
+                impersonate=impersonate,
+                log_fn=self._log,
+                can_recover_by_email=email_adapter.supports_email_verification(),
+                on_secret_enrolled=lambda secret: stage_chatgpt_mfa_rotation(
+                    self.email or result.email,
+                    secret,
+                ),
+                on_secret_activated=lambda rotated_at: (
+                    mark_chatgpt_mfa_rotation_activated(
+                        self.email or result.email,
+                        rotated_at=rotated_at,
+                    )
+                ),
+                on_recovery_code=lambda recovery_code: (
+                    update_chatgpt_mfa_rotation_recovery_code(
+                        self.email or result.email,
+                        recovery_code,
+                    )
+                ),
+            ).rotate()
+            if not self._commit_mfa_rotation(email_adapter, rotation):
+                raise MfaRotationError(
+                    "[stage=mfa_rotate] 新 MFA 已激活，但本地凭据保存失败"
+                )
+        except MfaRotationError as exc:
+            result.error_message = str(exc)
+            result.error_code = "mfa_rotation_failed"
+            self._log(result.error_message, "error")
+            return None
+        except Exception as exc:
+            result.error_message = (
+                "[stage=mfa_rotate] MFA 轮换异常: "
+                f"{type(exc).__name__}"
+            )
+            result.error_code = "mfa_rotation_failed"
+            self._log(result.error_message, "error")
+            return None
+        self._log(
+            "MFA 已由项目托管；若使用共享接码地址，邮箱控制权仍未接管",
+            "warning",
+        )
+        return rotation
 
     def _read_int_config(
         self,
@@ -723,6 +904,61 @@ class RefreshTokenRegistrationEngine:
         otp_resend_wait_seconds: int,
     ) -> RegistrationResult:
         self._log("2. 登录已有 ChatGPT 账号并提取 Access Token + Refresh Token...")
+        rotation = None
+        if self._existing_account_should_rotate_mfa():
+            self._log("先建立 ChatGPT Web 会话，确保 MFA 轮换使用新鲜认证状态")
+            web_client = self._build_chatgpt_client()
+            web_ok, web_session_result = (
+                web_client.login_existing_account_and_get_session(
+                    result.email,
+                    email_adapter,
+                    password=self.password or "",
+                    totp_secret=self.totp_secret or "",
+                    password_reset_required=self.password_reset_required,
+                    on_password_reset=lambda new_password: self._commit_password_reset(
+                        email_adapter,
+                        new_password,
+                    ),
+                    otp_wait_timeout=otp_wait_seconds,
+                    otp_resend_wait_timeout=otp_resend_wait_seconds,
+                    prepare_phone_oauth=False,
+                )
+            )
+            if not web_ok:
+                result.error_message = str(
+                    web_session_result
+                    or "已有 ChatGPT 账号 Web 登录失败，未执行 MFA 轮换"
+                )
+                return result
+            web_session = (
+                web_session_result
+                if isinstance(web_session_result, dict)
+                else {}
+            )
+            web_access_token = str(
+                web_session.get("access_token") or ""
+            ).strip()
+            if not web_access_token:
+                result.error_message = "ChatGPT Web 会话未返回 Access Token"
+                return result
+            rotation = self._rotate_mfa_after_login(
+                result=result,
+                email_adapter=email_adapter,
+                session=web_client.session,
+                access_token=web_access_token,
+                account_id=str(
+                    web_session.get("account_id")
+                    or web_session.get("workspace_id")
+                    or ""
+                ).strip(),
+                user_agent=str(getattr(web_client, "ua", "") or ""),
+                impersonate=str(
+                    getattr(web_client, "impersonate", "") or ""
+                ),
+            )
+            if rotation is None:
+                return result
+
         oauth_client = self._build_oauth_client()
         oauth_client.config.setdefault(
             "chatgpt_oauth_otp_wait_seconds",
@@ -786,6 +1022,27 @@ class RefreshTokenRegistrationEngine:
             source="login",
             register_client=None,
         )
+        if isinstance(result.metadata, dict):
+            metadata_getter = getattr(
+                self.email_service,
+                "get_mailbox_metadata",
+                None,
+            )
+            if callable(metadata_getter):
+                try:
+                    result.metadata["mailbox_login_context"] = (
+                        metadata_getter() or {}
+                    )
+                except Exception as exc:
+                    self._log(f"读取 MFA 托管凭据上下文失败: {exc}", "warning")
+            if rotation is not None:
+                result.metadata["mfa_rotation"] = {
+                    "managed": True,
+                    "replaced_existing": rotation.replaced_existing,
+                    "recovery_code_saved": bool(rotation.recovery_code),
+                    "rotated_at": rotation.rotated_at,
+                    "mailbox_control_risk": "shared_receiver",
+                }
         self._log("已有账号登录完成，Access Token 与 Refresh Token 均已获取")
         return result
 
@@ -823,6 +1080,52 @@ class RefreshTokenRegistrationEngine:
         if not access_token:
             result.error_message = "已有账号邮箱登录未获取 Access Token"
             return result
+
+        rotation = None
+        if self._existing_account_should_rotate_mfa():
+            rotation = self._rotate_mfa_after_login(
+                result=result,
+                email_adapter=email_adapter,
+                session=chatgpt_client.session,
+                access_token=access_token,
+                account_id=str(
+                    session_data.get("account_id")
+                    or session_data.get("workspace_id")
+                    or ""
+                ).strip(),
+                user_agent=str(getattr(chatgpt_client, "ua", "") or ""),
+                impersonate=str(
+                    getattr(chatgpt_client, "impersonate", "") or ""
+                ),
+            )
+            if rotation is None:
+                return result
+            refreshed_browser_context = serialize_oauth_resume_context(
+                chatgpt_client.session,
+                device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+                user_agent=str(getattr(chatgpt_client, "ua", "") or ""),
+                sec_ch_ua=str(
+                    getattr(chatgpt_client, "sec_ch_ua", "") or ""
+                ),
+                accept_language=str(
+                    getattr(chatgpt_client, "accept_language", "") or ""
+                ),
+                impersonate=str(
+                    getattr(chatgpt_client, "impersonate", "") or ""
+                ),
+                ttl_seconds=1800,
+            )
+            if isinstance(refreshed_browser_context, dict):
+                chatgpt_client.phone_oauth_browser_context = (
+                    refreshed_browser_context
+                )
+            chatgpt_client.phone_oauth_resume_context = None
+            chatgpt_client.phone_oauth_resume_error = (
+                "MFA 轮换后将从最新认证浏览器快照建立手机验证事务"
+            )
+            self._log(
+                "MFA 轮换后已作废旧手机 OAuth 预建事务，将使用最新会话继续"
+            )
 
         prepared_context = getattr(
             chatgpt_client, "phone_oauth_resume_context", None
@@ -942,6 +1245,14 @@ class RefreshTokenRegistrationEngine:
             "oauth_resume_context": oauth_resume_context,
             "oauth_browser_context": browser_context,
         }
+        if rotation is not None:
+            result.metadata["mfa_rotation"] = {
+                "managed": True,
+                "replaced_existing": rotation.replaced_existing,
+                "recovery_code_saved": bool(rotation.recovery_code),
+                "rotated_at": rotation.rotated_at,
+                "mailbox_control_risk": "shared_receiver",
+            }
         self._log("已有账号邮箱登录完成，Access Token 已获取；Refresh Token 等待手机验证")
         return result
 

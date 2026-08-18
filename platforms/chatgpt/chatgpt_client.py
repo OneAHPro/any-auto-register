@@ -661,6 +661,7 @@ class ChatGPTClient:
         on_password_reset=None,
         otp_wait_timeout=600,
         otp_resend_wait_timeout=300,
+        prepare_phone_oauth=True,
         _password_reset_depth=0,
     ):
         """通过 ChatGPT Web 登录获取 AT，不发起 offline_access token exchange。"""
@@ -1005,6 +1006,7 @@ class ChatGPTClient:
                         on_password_reset=on_password_reset,
                         otp_wait_timeout=otp_wait_timeout,
                         otp_resend_wait_timeout=otp_resend_wait_timeout,
+                        prepare_phone_oauth=prepare_phone_oauth,
                         _password_reset_depth=int(_password_reset_depth or 0) + 1,
                     )
                 if password_login:
@@ -1044,8 +1046,9 @@ class ChatGPTClient:
                 )
                 if not next_state:
                     return False, helper.last_error or "ChatGPT MFA 验证失败"
-                capture_phone_browser_context()
-                prepare_phone_transaction(attempts=1)
+                if prepare_phone_oauth:
+                    capture_phone_browser_context()
+                    prepare_phone_transaction(attempts=1)
                 referer = state.current_url or state.continue_url or referer
                 state = next_state
                 self.last_registration_state = state
@@ -1066,8 +1069,9 @@ class ChatGPTClient:
                 if not next_state:
                     return False, helper.last_error or "邮箱验证码校验失败"
                 if not helper._state_is_mfa_challenge(next_state):
-                    capture_phone_browser_context()
-                    prepare_phone_transaction(attempts=1)
+                    if prepare_phone_oauth:
+                        capture_phone_browser_context()
+                        prepare_phone_transaction(attempts=1)
                 referer = state.current_url or referer
                 state = next_state
                 self.last_registration_state = state
@@ -1097,7 +1101,8 @@ class ChatGPTClient:
         else:
             return False, "邮箱登录状态机超出最大步数"
 
-        capture_phone_browser_context()
+        if prepare_phone_oauth:
+            capture_phone_browser_context()
         session_ok, session_result = self.fetch_chatgpt_session()
         if not session_ok:
             try:
@@ -1113,9 +1118,10 @@ class ChatGPTClient:
         if not access_token:
             return False, "ChatGPT Session 未返回 Access Token"
 
-        capture_phone_browser_context()
+        if prepare_phone_oauth:
+            capture_phone_browser_context()
 
-        if (
+        if prepare_phone_oauth and (
             self.phone_oauth_resume_context is None
             and phone_prepare_attempts < max_phone_prepare_attempts
         ):
@@ -1128,7 +1134,10 @@ class ChatGPTClient:
                 backoff_seconds=(0.5, 1.0),
             )
 
-        if self.phone_oauth_resume_context is not None:
+        if not prepare_phone_oauth:
+            self.phone_oauth_resume_error = ""
+            self.phone_oauth_prepare_diagnostic = {}
+        elif self.phone_oauth_resume_context is not None:
             self._log(
                 "Access Token 已获取，手机验证 OAuth 事务可直接续接；"
                 "无需再次登录邮箱"

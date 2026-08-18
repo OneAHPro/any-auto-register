@@ -211,6 +211,49 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         submit_email.assert_called_once()
         submit_totp.assert_not_called()
 
+    def test_mfa_router_falls_back_to_email_when_supplier_totp_is_rejected(self):
+        state = FlowState(
+            page_type="mfa_challenge",
+            payload={
+                "factors": [
+                    {"id": "factor-totp", "factor_type": "totp"},
+                    {"id": "factor-email", "factor_type": "email"},
+                ]
+            },
+        )
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = True
+        expected = FlowState(page_type="add_phone")
+
+        def reject_totp(*args, **kwargs):
+            del args, kwargs
+            self.client.last_error = (
+                "[stage=mfa] ChatGPT MFA 验证失败: "
+                "403 - {\"error\":{\"code\":\"incorrect_code\"}}"
+            )
+            return None
+
+        with mock.patch.object(
+            self.client,
+            "_submit_totp_mfa_challenge",
+            side_effect=reject_totp,
+        ) as submit_totp, mock.patch.object(
+            self.client,
+            "_submit_email_mfa_challenge",
+            return_value=expected,
+        ) as submit_email:
+            result = self.client._submit_mfa_challenge(
+                state,
+                email="demo@example.com",
+                skymail_client=mailbox,
+                totp_secret="OLD-SUPPLIER-SECRET",
+                device_id="device-id",
+            )
+
+        self.assertIs(result, expected)
+        submit_totp.assert_called_once()
+        submit_email.assert_called_once()
+
     def test_complete_password_reset_runs_email_otp_then_commits_password(self):
         login_state = FlowState(page_type="login_password")
         otp_state = FlowState(page_type="email_otp_verification")

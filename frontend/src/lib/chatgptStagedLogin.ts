@@ -9,6 +9,7 @@ type ExistingAccountLoginTaskInput = {
   executorType: string
   captchaSolver: string
   bindPhoneAndGetRefreshToken: boolean
+  rotateMfa?: boolean
   smsMode?: ChatGPTSmsMode
   leadbeeApi?: boolean
   useSmsPool?: boolean
@@ -99,6 +100,7 @@ export function buildExistingAccountLoginTaskPayload(input: ExistingAccountLogin
       ? 'access_token'
       : 'refresh_token',
     chatgpt_existing_account_allow_phone_verification: false,
+    chatgpt_existing_account_rotate_mfa: input.rotateMfa !== false,
   }
   if (explicitSmsMode) {
     extra.chatgpt_existing_account_sms_mode = explicitSmsMode

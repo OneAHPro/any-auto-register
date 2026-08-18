@@ -10,6 +10,7 @@ import {
   Row,
   Skeleton,
   Space,
+  Switch,
   Tag,
   Typography,
   message,
@@ -37,6 +38,7 @@ type LoginFormValues = {
   concurrency: number
   register_delay_seconds: number
   sms_mode: ChatGPTSmsMode
+  rotate_mfa: boolean
 }
 
 type ImportedMailProvider = 'microsoft' | 'applemail'
@@ -124,6 +126,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
   const [submitting, setSubmitting] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
   const smsMode = Form.useWatch('sms_mode', form) || 'none'
+  const rotateMfa = Form.useWatch('rotate_mfa', form) !== false
   const watchedCount = Math.max(1, Number(Form.useWatch('count', form) || 1))
 
   useEffect(() => {
@@ -195,6 +198,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
           concurrency: 1,
           register_delay_seconds: 0,
           sms_mode: defaultSmsMode,
+          rotate_mfa: true,
         })
       } catch (error) {
         if (!cancelled) {
@@ -204,6 +208,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
             concurrency: 1,
             register_delay_seconds: 0,
             sms_mode: 'none',
+            rotate_mfa: true,
           })
         }
       } finally {
@@ -246,6 +251,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
         ),
         captchaSolver: String(config.default_captcha_solver || 'yescaptcha'),
         bindPhoneAndGetRefreshToken: values.sms_mode !== 'none',
+        rotateMfa: values.rotate_mfa,
         smsMode: values.sms_mode,
         leadbeeCodes: [],
         mailProviderPlan: mailProviderPlan.slice(0, values.count),
@@ -316,6 +322,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               concurrency: 1,
               register_delay_seconds: 0,
               sms_mode: 'none',
+              rotate_mfa: true,
             }}
             onFinish={handleStart}
           >
@@ -348,6 +355,37 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 </Form.Item>
               </Col>
             </Row>
+
+            <div
+              style={{
+                border: `1px solid ${token.colorBorderSecondary}`,
+                borderRadius: token.borderRadiusLG,
+                background: token.colorFillAlter,
+                padding: 16,
+                marginBottom: 16,
+              }}
+            >
+              <Form.Item
+                name="rotate_mfa"
+                valuePropName="checked"
+                style={{ marginBottom: 10 }}
+              >
+                <Switch aria-label="登录后新增或轮换 MFA" />
+              </Form.Item>
+              <Typography.Text strong>登录后新增/轮换 MFA</Typography.Text>
+              <Typography.Paragraph
+                type="secondary"
+                style={{ margin: '4px 0 12px', fontSize: 13 }}
+              >
+                无 MFA 自动新增；已有 MFA 自动废弃旧密钥并保存项目生成的新密钥。
+              </Typography.Paragraph>
+              <Alert
+                type="warning"
+                showIcon
+                message="MFA 轮换不等于邮箱接管"
+                description="共享接码地址仍可能被供货商访问；系统会保存风险标记，不会把此类账号显示为已完全接管。"
+              />
+            </div>
 
             <div
               style={{
@@ -431,6 +469,12 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
               >
                 <Tag color="blue" bordered={false}>邮箱登录</Tag>
                 <Typography.Text type="secondary">→</Typography.Text>
+                {rotateMfa ? (
+                  <>
+                    <Tag color="gold" bordered={false}>MFA 新增/轮换</Tag>
+                    <Typography.Text type="secondary">→</Typography.Text>
+                  </>
+                ) : null}
                 {usesPhoneVerification ? (
                   <>
                     <Tag color="purple" bordered={false}>手机验证</Tag>

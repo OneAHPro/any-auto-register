@@ -183,6 +183,9 @@ class ChatGPTPlatform(BasePlatform):
                                 "password": str(account_extra.get("password") or ""),
                                 "mail_api_url": str(account_extra.get("mail_api_url") or ""),
                                 "totp_url": str(account_extra.get("totp_url") or ""),
+                                "totp_secret": str(
+                                    account_extra.get("totp_secret") or ""
+                                ),
                                 "password_reset_required": bool(
                                     account_extra.get("password_reset_required", False)
                                 ),
@@ -202,8 +205,16 @@ class ChatGPTPlatform(BasePlatform):
                                     "password": str(account_extra.get("password") or ""),
                                     "mail_api_url": mail_api_url,
                                     "mailapi_url": mail_api_url,
+                                    "totp_secret": str(
+                                        account_extra.get("totp_secret") or ""
+                                    ),
                                 }
                             )
+                    managed_totp = str(
+                        account_extra.get("totp_secret") or ""
+                    ).strip()
+                    if managed_totp:
+                        result["totp_secret"] = managed_totp
                     return result
 
                 def _load_baseline(self, get_current_ids):
@@ -424,6 +435,26 @@ class ChatGPTPlatform(BasePlatform):
                     )
                     return bool(str(account_extra.get("totp_url") or "").strip())
 
+                def supports_email_verification(self):
+                    if not self._acct:
+                        return False
+                    account_extra = dict(
+                        getattr(self._acct, "extra", None) or {}
+                    )
+                    account_type = str(
+                        account_extra.get("account_type") or ""
+                    ).strip()
+                    has_mail_api = bool(
+                        str(
+                            account_extra.get("mail_api_url")
+                            or account_extra.get("mailapi_url")
+                            or ""
+                        ).strip()
+                    )
+                    if account_type == "chatgpt_password_totp" and not has_mail_api:
+                        return False
+                    return callable(getattr(_mailbox, "wait_for_code", None))
+
                 def commit_password_reset(self, new_password=""):
                     if not self._acct:
                         raise RuntimeError("邮箱账户尚未创建，无法保存新密码")
@@ -431,6 +462,49 @@ class ChatGPTPlatform(BasePlatform):
                     if not callable(commit):
                         raise RuntimeError("当前邮箱后端不支持保存重置密码")
                     return commit(self._acct, new_password)
+
+                def commit_mfa_rotation(
+                    self,
+                    *,
+                    totp_secret="",
+                    recovery_code="",
+                    rotated_at="",
+                ):
+                    if not self._acct:
+                        raise RuntimeError("邮箱账户尚未创建，无法保存 MFA 凭据")
+                    secret = str(totp_secret or "").strip()
+                    if not secret:
+                        raise ValueError("轮换后的 MFA 密钥为空")
+                    account_extra = dict(
+                        getattr(self._acct, "extra", None) or {}
+                    )
+                    shared_receiver = bool(
+                        str(
+                            account_extra.get("mail_api_url")
+                            or account_extra.get("mailapi_url")
+                            or ""
+                        ).strip()
+                    )
+                    account_extra.update(
+                        {
+                            "totp_secret": secret,
+                            "mfa_recovery_code": str(
+                                recovery_code or ""
+                            ).strip(),
+                            "chatgpt_mfa_managed": True,
+                            "mfa_rotated_at": str(rotated_at or "").strip(),
+                            "mailbox_control_risk": (
+                                "shared_receiver"
+                                if shared_receiver
+                                else "email_control_unverified"
+                            ),
+                        }
+                    )
+                    account_extra.pop("totp_url", None)
+                    account_extra.pop("mfa_secret", None)
+                    account_extra.pop("totp", None)
+                    self._acct.extra = account_extra
+                    return True
 
                 def get_mailbox_metadata(self):
                     account = self._acct
@@ -485,6 +559,9 @@ class ChatGPTPlatform(BasePlatform):
                                     "totp_url": str(
                                         account_extra.get("totp_url") or ""
                                     ),
+                                    "totp_secret": str(
+                                        account_extra.get("totp_secret") or ""
+                                    ),
                                     "password_reset_required": bool(
                                         account_extra.get(
                                             "password_reset_required",
@@ -493,6 +570,16 @@ class ChatGPTPlatform(BasePlatform):
                                     ),
                                 }
                             )
+                        for managed_key in (
+                            "mfa_recovery_code",
+                            "chatgpt_mfa_managed",
+                            "mfa_rotated_at",
+                            "mailbox_control_risk",
+                        ):
+                            if managed_key in account_extra:
+                                credential_snapshot[managed_key] = account_extra[
+                                    managed_key
+                                ]
                         account_extra = credential_snapshot
                     return {
                         "provider": provider,
@@ -551,6 +638,9 @@ class ChatGPTPlatform(BasePlatform):
 
                 def update_status(self, success, error=None):
                     pass
+
+                def supports_email_verification(self):
+                    return True
 
                 @property
                 def status(self):

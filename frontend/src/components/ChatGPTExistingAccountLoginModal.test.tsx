@@ -88,12 +88,15 @@ describe('ChatGPTExistingAccountLoginModal', () => {
     expect((screen.getByRole('radio', { name: '仅卡密池' }) as HTMLInputElement).checked).toBe(true)
     expect(screen.getByText('卡密池可用 5 张')).toBeTruthy()
     expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
+    expect(screen.getByRole('switch', { name: '登录后新增或轮换 MFA' }).getAttribute('aria-checked')).toBe('true')
+    expect(screen.getByText(/共享接码地址仍可能被供货商访问/)).toBeTruthy()
 
     await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
     expect(await screen.findByText('任务 login-task-1')).toBeTruthy()
 
     const payload = taskPayload()
     expect(payload.extra.chatgpt_existing_account_sms_mode).toBe('pool')
+    expect(payload.extra.chatgpt_existing_account_rotate_mfa).toBe(true)
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_use_sms_pool')
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
   })

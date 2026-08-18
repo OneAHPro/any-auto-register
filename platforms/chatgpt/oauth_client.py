@@ -1929,10 +1929,30 @@ class OAuthClient:
                 )
                 return None
 
+            verify_payload = verify_response.json()
+            verify_error = (
+                verify_payload.get("error")
+                if isinstance(verify_payload, dict)
+                else None
+            )
+            verify_error_code = ""
+            if isinstance(verify_error, dict):
+                verify_error_code = str(
+                    verify_error.get("code") or verify_error.get("type") or ""
+                ).strip()
+            if verify_error_code:
+                self._set_error(
+                    "ChatGPT MFA 验证失败: "
+                    f"HTTP 200 - {verify_error_code}"
+                )
+                return None
             next_state = self._state_from_payload(
-                verify_response.json(),
+                verify_payload,
                 current_url=str(verify_response.url) or verify_url,
             )
+            if self._state_is_mfa_challenge(next_state):
+                self._set_error("ChatGPT MFA 验证失败: 验证后仍停留在 MFA 页面")
+                return None
             self._log(f"MFA 通过 {describe_flow_state(next_state)}")
             return next_state
         except Exception as exc:
@@ -2118,7 +2138,7 @@ class OAuthClient:
             or callable(totp_code_provider)
         )
         if totp_factor is not None and has_totp_source:
-            return self._submit_totp_mfa_challenge(
+            totp_result = self._submit_totp_mfa_challenge(
                 state,
                 totp_secret=totp_secret,
                 totp_code_provider=(
@@ -2131,6 +2151,35 @@ class OAuthClient:
                 sec_ch_ua=sec_ch_ua,
                 impersonate=impersonate,
             )
+            if totp_result is not None:
+                return totp_result
+            normalized_error = str(self.last_error or "").lower()
+            rejected_totp = any(
+                marker in normalized_error
+                for marker in (
+                    "incorrect_code",
+                    "wrong_mfa_code",
+                    "invalid_totp",
+                    "代码错误",
+                    "验证码错误",
+                )
+            )
+            if email_factor is not None and skymail_client is not None and rejected_totp:
+                self._log(
+                    "已有 MFA 验证码被拒绝，自动改用邮箱验证码继续登录"
+                )
+                self.last_error = ""
+                return self._submit_email_mfa_challenge(
+                    state,
+                    factor=email_factor,
+                    email=email,
+                    skymail_client=skymail_client,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+            return None
         if email_factor is not None and skymail_client is not None:
             return self._submit_email_mfa_challenge(
                 state,

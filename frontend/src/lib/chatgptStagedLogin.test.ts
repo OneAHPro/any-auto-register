@@ -57,6 +57,7 @@ describe('chatgpt staged login helpers', () => {
       executorType: 'protocol',
       captchaSolver: 'yescaptcha',
       bindPhoneAndGetRefreshToken: false,
+      rotateMfa: true,
       leadbeeCodes: [],
       config: {
         mail_provider: 'microsoft',
@@ -79,6 +80,7 @@ describe('chatgpt staged login helpers', () => {
       chatgpt_existing_account_login_stage: 'refresh_token',
       chatgpt_existing_account_allow_phone_verification: false,
       chatgpt_existing_account_bind_phone_and_get_rt: false,
+      chatgpt_existing_account_rotate_mfa: true,
     })
     expect(payload.extra).not.toHaveProperty('chatgpt_existing_account_leadbee_codes')
   })

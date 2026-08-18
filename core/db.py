@@ -119,6 +119,21 @@ class ChatGPTAttemptBindingModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+class ChatGPTMfaRotationJournalModel(SQLModel, table=True):
+    """Durable write-ahead record for a newly enrolled ChatGPT MFA secret."""
+
+    __tablename__ = "chatgpt_mfa_rotation_journal"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    email: str = Field(index=True, sa_column_kwargs={"unique": True})
+    totp_secret: str
+    recovery_code: str = ""
+    status: str = Field(default="staged", index=True)
+    rotated_at: str = ""
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
 class SmsPoolItemModel(SQLModel, table=True):
     """A LeadBee card and its receive endpoint managed by the local SMS pool."""
 
@@ -220,6 +235,142 @@ def save_account(account) -> 'AccountModel':
     """从 base_platform.Account 存入数据库（同平台同邮箱则更新）"""
     saved, _created = save_account_with_creation_state(account)
     return saved
+
+
+def _ensure_chatgpt_mfa_rotation_journal(database_engine=None) -> None:
+    target_engine = database_engine or engine
+    ChatGPTMfaRotationJournalModel.__table__.create(
+        bind=target_engine,
+        checkfirst=True,
+    )
+
+
+def stage_chatgpt_mfa_rotation(
+    email: str,
+    totp_secret: str,
+    *,
+    database_engine=None,
+) -> None:
+    normalized_email = str(email or "").strip().lower()
+    normalized_secret = str(totp_secret or "").strip()
+    if not normalized_email or not normalized_secret:
+        raise ValueError("MFA 写前记录缺少邮箱或密钥")
+    target_engine = database_engine or engine
+    _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    with Session(target_engine) as session:
+        row = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == normalized_email
+            )
+        ).first()
+        if row is None:
+            row = ChatGPTMfaRotationJournalModel(
+                email=normalized_email,
+                totp_secret=normalized_secret,
+            )
+        else:
+            row.totp_secret = normalized_secret
+            row.recovery_code = ""
+            row.status = "staged"
+            row.rotated_at = ""
+            row.updated_at = _utcnow()
+        session.add(row)
+        session.commit()
+
+
+def mark_chatgpt_mfa_rotation_activated(
+    email: str,
+    *,
+    rotated_at: str = "",
+    database_engine=None,
+) -> None:
+    normalized_email = str(email or "").strip().lower()
+    target_engine = database_engine or engine
+    _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    with Session(target_engine) as session:
+        row = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == normalized_email
+            )
+        ).first()
+        if row is None:
+            raise RuntimeError("MFA 写前记录不存在")
+        row.status = "activated"
+        row.rotated_at = str(rotated_at or "").strip()
+        row.updated_at = _utcnow()
+        session.add(row)
+        session.commit()
+
+
+def update_chatgpt_mfa_rotation_recovery_code(
+    email: str,
+    recovery_code: str,
+    *,
+    database_engine=None,
+) -> None:
+    normalized_email = str(email or "").strip().lower()
+    target_engine = database_engine or engine
+    _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    with Session(target_engine) as session:
+        row = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == normalized_email
+            )
+        ).first()
+        if row is None:
+            raise RuntimeError("MFA 写前记录不存在")
+        row.recovery_code = str(recovery_code or "").strip()
+        row.updated_at = _utcnow()
+        session.add(row)
+        session.commit()
+
+
+def load_chatgpt_mfa_rotation(
+    email: str,
+    *,
+    database_engine=None,
+) -> dict:
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return {}
+    target_engine = database_engine or engine
+    _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    with Session(target_engine) as session:
+        row = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == normalized_email
+            )
+        ).first()
+        if row is None:
+            return {}
+        return {
+            "email": row.email,
+            "totp_secret": row.totp_secret,
+            "recovery_code": row.recovery_code,
+            "status": row.status,
+            "rotated_at": row.rotated_at,
+        }
+
+
+def finalize_chatgpt_mfa_rotation(
+    email: str,
+    *,
+    database_engine=None,
+) -> None:
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return
+    target_engine = database_engine or engine
+    _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    with Session(target_engine) as session:
+        row = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == normalized_email
+            )
+        ).first()
+        if row is not None:
+            session.delete(row)
+            session.commit()
 
 
 def delete_incomplete_chatgpt_account(

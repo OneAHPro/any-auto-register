@@ -609,6 +609,14 @@ def _recover_url_login_credentials(
     totp_url = _text(
         context_extra.get("totp_url") or record.get("totp_url")
     )
+    totp_secret = _text(
+        context_extra.get("totp_secret")
+        or context_extra.get("mfa_secret")
+        or context_extra.get("totp")
+        or record.get("totp_secret")
+        or record.get("mfa_secret")
+        or record.get("totp")
+    )
     reset_required = bool(
         context_extra.get(
             "password_reset_required",
@@ -635,6 +643,7 @@ def _recover_url_login_credentials(
         "password": password,
         "mail_api_url": mail_api_url,
         "totp_url": totp_url,
+        "totp_secret": totp_secret,
         "account_type": account_type,
         "password_reset_required": reset_required,
         "pool_file": pool_file,
@@ -669,6 +678,34 @@ class _PasswordTotpEmailService:
 
     def get_mailbox_metadata(self):
         return dict(self._mailbox_context)
+
+    def supports_email_verification(self) -> bool:
+        return False
+
+    def commit_mfa_rotation(
+        self,
+        *,
+        totp_secret="",
+        recovery_code="",
+        rotated_at="",
+    ):
+        secret = _text(totp_secret)
+        if not secret:
+            raise ValueError("轮换后的 MFA 密钥为空")
+        self._credentials["totp_secret"] = secret
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        context_extra.update({
+            "totp_secret": secret,
+            "mfa_recovery_code": _text(recovery_code),
+            "chatgpt_mfa_managed": True,
+            "mfa_rotated_at": _text(rotated_at),
+            "mailbox_control_risk": "no_email_recovery",
+        })
+        context_extra.pop("totp_url", None)
+        context_extra.pop("mfa_secret", None)
+        context_extra.pop("totp", None)
+        self._mailbox_context["extra"] = context_extra
+        return True
 
 
 class _PersistedEmailService:
@@ -746,6 +783,7 @@ class _PersistedEmailService:
                 "password": str(account_extra.get("password") or ""),
                 "mail_api_url": _text(account_extra.get("mail_api_url")),
                 "totp_url": _text(account_extra.get("totp_url")),
+                "totp_secret": _text(account_extra.get("totp_secret")),
                 "password_reset_required": bool(
                     account_extra.get("password_reset_required", False)
                 ),
@@ -762,7 +800,11 @@ class _PersistedEmailService:
                     "password": str(account_extra.get("password") or ""),
                     "mail_api_url": mail_api_url,
                     "mailapi_url": mail_api_url,
+                    "totp_secret": _text(account_extra.get("totp_secret")),
                 })
+        managed_totp = _text(account_extra.get("totp_secret"))
+        if managed_totp:
+            result["totp_secret"] = managed_totp
         return result
 
     def commit_password_reset(self, new_password=""):
@@ -788,6 +830,46 @@ class _PersistedEmailService:
             }
         )
         context_extra.pop("new_password", None)
+        self._mailbox_context["extra"] = context_extra
+        return True
+
+    def commit_mfa_rotation(
+        self,
+        *,
+        totp_secret="",
+        recovery_code="",
+        rotated_at="",
+    ):
+        secret = _text(totp_secret)
+        if not secret:
+            raise ValueError("轮换后的 MFA 密钥为空")
+        account_extra = dict(self._account.extra or {})
+        shared_receiver = bool(
+            _text(
+                account_extra.get("mail_api_url")
+                or account_extra.get("mailapi_url")
+            )
+        )
+        account_extra.update({
+            "totp_secret": secret,
+            "mfa_recovery_code": _text(recovery_code),
+            "chatgpt_mfa_managed": True,
+            "mfa_rotated_at": _text(rotated_at),
+            "mailbox_control_risk": (
+                "shared_receiver"
+                if shared_receiver
+                else "email_control_unverified"
+            ),
+        })
+        account_extra.pop("totp_url", None)
+        account_extra.pop("mfa_secret", None)
+        account_extra.pop("totp", None)
+        self._account.extra = account_extra
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        context_extra.update(account_extra)
+        context_extra.pop("totp_url", None)
+        context_extra.pop("mfa_secret", None)
+        context_extra.pop("totp", None)
         self._mailbox_context["extra"] = context_extra
         return True
 
@@ -956,6 +1038,9 @@ class _PersistedEmailService:
         account_extra = dict(self._account.extra or {})
         return bool(_text(account_extra.get("totp_url")))
 
+    def supports_email_verification(self) -> bool:
+        return callable(getattr(self._mailbox, "wait_for_code", None))
+
 
 def _build_email_service(
     saved: dict[str, Any],
@@ -1024,6 +1109,7 @@ def _build_email_service(
                 "password_reset_required": credentials[
                     "password_reset_required"
                 ],
+                "totp_secret": credentials["totp_secret"],
             }
         )
         if credentials["pool_file"]:
