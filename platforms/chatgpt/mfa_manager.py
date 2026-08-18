@@ -55,6 +55,8 @@ class ChatGPTMfaManager:
         impersonate: str = "",
         log_fn: Callable[[str], None] | None = None,
         can_recover_by_email: bool = False,
+        can_recover_by_existing_totp: bool = False,
+        allow_unrecoverable_replacement: bool = False,
         on_secret_enrolled: Callable[[str], None] | None = None,
         on_secret_activated: Callable[[str], None] | None = None,
         on_recovery_code: Callable[[str], None] | None = None,
@@ -66,6 +68,12 @@ class ChatGPTMfaManager:
         self.impersonate = str(impersonate or "").strip()
         self.log_fn = log_fn or (lambda _message: None)
         self.can_recover_by_email = bool(can_recover_by_email)
+        self.can_recover_by_existing_totp = bool(
+            can_recover_by_existing_totp
+        )
+        self.allow_unrecoverable_replacement = bool(
+            allow_unrecoverable_replacement
+        )
         self.on_secret_enrolled = on_secret_enrolled
         self.on_secret_activated = on_secret_activated
         self.on_recovery_code = on_recovery_code
@@ -337,9 +345,13 @@ class ChatGPTMfaManager:
         factor_id = self._factor_id(current)
         had_mfa = bool(factor_id)
         if had_mfa:
-            if not self.can_recover_by_email:
+            if not (
+                self.can_recover_by_email
+                or self.can_recover_by_existing_totp
+                or self.allow_unrecoverable_replacement
+            ):
                 raise MfaRotationError(
-                    "[stage=mfa_rotate] 已有 MFA 需要轮换，但缺少可用的邮箱验证码恢复渠道；"
+                    "[stage=mfa_rotate] 已有 MFA 需要轮换，但缺少可用的邮箱验证码恢复渠道或旧 TOTP 凭据；"
                     "为避免账号锁死，本次未删除旧 MFA"
                 )
             self._log("[MFA] 正在移除旧 MFA 因子")

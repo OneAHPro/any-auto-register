@@ -1255,6 +1255,7 @@ def _login_with_saved_credentials(
     log_fn: LogFn | None = None,
     task_control=None,
     attempt_id: int | None = None,
+    rotate_mfa: bool = False,
 ) -> dict[str, Any]:
     mailbox_context = saved.get("mailbox_context")
     if not isinstance(mailbox_context, dict) or not mailbox_context:
@@ -1286,6 +1287,8 @@ def _login_with_saved_credentials(
             "chatgpt_existing_account_login_only": True,
             "chatgpt_existing_account_login_stage": "refresh_token",
             "chatgpt_existing_account_allow_phone_verification": False,
+            "chatgpt_existing_account_rotate_mfa": bool(rotate_mfa),
+            "chatgpt_existing_account_skip_managed_mfa_rotation": False,
         }
     )
     try:
@@ -1640,6 +1643,7 @@ def _relogin_chatgpt_account_locked(
     attempt_id: int | None = None,
     codex2api_delete_on_account_remove_enabled: bool | None = None,
     remove_on_mailbox_otp_timeout: bool = False,
+    rotate_mfa: bool = False,
 ) -> dict[str, Any]:
     """Perform a real credential login, persist fresh tokens, then replace Codex2API."""
     email = ""
@@ -1657,7 +1661,24 @@ def _relogin_chatgpt_account_locked(
             log_fn=_login_log,
             task_control=task_control,
             attempt_id=attempt_id,
+            rotate_mfa=rotate_mfa,
         )
+        if rotate_mfa:
+            metadata = tokens.get("metadata")
+            rotation_metadata = (
+                metadata.get("mfa_rotation")
+                if isinstance(metadata, dict)
+                else None
+            )
+            if not (
+                isinstance(rotation_metadata, dict)
+                and rotation_metadata.get("managed") is True
+                and _text(rotation_metadata.get("rotated_at"))
+            ):
+                raise RuntimeError(
+                    "[stage=mfa_rotate] 登录流程未确认新 MFA 已激活，"
+                    "已停止覆盖本地凭据"
+                )
         _checkpoint_task(task_control, attempt_id)
         account = _persist_fresh_tokens(
             saved["id"],
@@ -1665,6 +1686,17 @@ def _relogin_chatgpt_account_locked(
             expected_email=saved["email"],
             expected_created_at=saved["created_at"],
         )
+        if rotate_mfa:
+            try:
+                from core.db import finalize_chatgpt_mfa_rotation
+
+                finalize_chatgpt_mfa_rotation(saved["email"])
+            except Exception as exc:
+                _emit_observer(
+                    log_fn,
+                    "MFA 已保存到账号，但写前记录清理失败，将在后续自动恢复"
+                    f"（{type(exc).__name__}）",
+                )
         _emit_observer(log_fn, "已获取并保存全新的 Access Token / Refresh Token")
     except ChatGPTAccountDeactivatedError:
         if saved is None:
@@ -1746,6 +1778,7 @@ def _relogin_chatgpt_account_locked(
             "email": _text(account.email) or email,
             "message": f"重登成功，但 Codex2API 覆盖更新失败: {detail}",
             "sync": sync_result,
+            "mfa_rotated": bool(rotate_mfa),
         }
 
     return {
@@ -1756,6 +1789,7 @@ def _relogin_chatgpt_account_locked(
         "email": _text(account.email) or email,
         "message": "重登并同步 Codex2API 成功",
         "sync": sync_result,
+        "mfa_rotated": bool(rotate_mfa),
     }
 
 
@@ -2045,6 +2079,7 @@ def relogin_chatgpt_account(
     attempt_id: int | None = None,
     codex2api_delete_on_account_remove_enabled: bool | None = None,
     remove_on_mailbox_otp_timeout: bool = False,
+    rotate_mfa: bool = False,
 ) -> dict[str, Any]:
     """Run one account at a time so local and remote credentials cannot cross."""
     with chatgpt_account_operation_lock(account_id, blocking=False) as acquired:
@@ -2066,4 +2101,5 @@ def relogin_chatgpt_account(
                 codex2api_delete_on_account_remove_enabled
             ),
             remove_on_mailbox_otp_timeout=remove_on_mailbox_otp_timeout,
+            rotate_mfa=rotate_mfa,
         )

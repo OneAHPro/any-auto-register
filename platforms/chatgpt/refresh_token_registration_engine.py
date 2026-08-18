@@ -497,6 +497,12 @@ class RefreshTokenRegistrationEngine:
                 impersonate=impersonate,
                 log_fn=self._log,
                 can_recover_by_email=email_adapter.supports_email_verification(),
+                can_recover_by_existing_totp=bool(
+                    str(self.totp_secret or "").strip()
+                ),
+                allow_unrecoverable_replacement=bool(
+                    self._existing_account_rotate_mfa_enabled()
+                ),
                 on_secret_enrolled=lambda secret: stage_chatgpt_mfa_rotation(
                     self.email or result.email,
                     secret,

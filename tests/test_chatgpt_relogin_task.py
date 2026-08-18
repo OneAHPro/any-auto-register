@@ -125,6 +125,17 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValidationError):
                 ChatGPTReloginTaskRequest(account_ids=[17], concurrency=invalid)
 
+    def test_request_supports_all_eligible_mfa_rotation_mode(self):
+        request = ChatGPTReloginTaskRequest(
+            all_eligible=True,
+            rotate_mfa=True,
+            concurrency=3,
+        )
+
+        self.assertEqual(request.account_ids, [])
+        self.assertTrue(request.all_eligible)
+        self.assertTrue(request.rotate_mfa)
+
     def test_request_rejects_coercible_non_integer_ids_and_concurrency(self):
         invalid_payloads = (
             {"account_ids": [True], "concurrency": 1},
@@ -284,6 +295,57 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             10,
             background_tasks=background_tasks,
         )
+
+    def test_all_eligible_mfa_route_resolves_ids_and_marks_rotation(self):
+        request = ChatGPTReloginTaskRequest(
+            all_eligible=True,
+            rotate_mfa=True,
+            concurrency=4,
+        )
+        background_tasks = BackgroundTasks()
+        task_id = f"task-mfa-{uuid.uuid4().hex}"
+
+        with mock.patch(
+            "services.chatgpt_relogin.list_relogin_eligible_account_ids",
+            return_value=[17, 18, 19],
+        ), mock.patch(
+            "api.tasks.enqueue_chatgpt_relogin_task",
+            return_value=task_id,
+        ) as enqueue, mock.patch.object(
+            _task_store,
+            "snapshot",
+            return_value={"total": 3, "meta": {"concurrency": 3}},
+        ):
+            response = tasks_module.create_chatgpt_relogin_task(
+                request,
+                background_tasks,
+            )
+
+        self.assertEqual(
+            response,
+            {"task_id": task_id, "count": 3, "concurrency": 3},
+        )
+        enqueue.assert_called_once_with(
+            [17, 18, 19],
+            4,
+            rotate_mfa=True,
+            background_tasks=background_tasks,
+        )
+
+    def test_all_eligible_mfa_route_rejects_empty_eligible_set(self):
+        request = ChatGPTReloginTaskRequest(all_eligible=True, rotate_mfa=True)
+        with mock.patch(
+            "services.chatgpt_relogin.list_relogin_eligible_account_ids",
+            return_value=[],
+        ), mock.patch("api.tasks.enqueue_chatgpt_relogin_task") as enqueue:
+            with self.assertRaises(HTTPException) as error:
+                tasks_module.create_chatgpt_relogin_task(
+                    request,
+                    BackgroundTasks(),
+                )
+
+        self.assertEqual(error.exception.status_code, 400)
+        enqueue.assert_not_called()
 
     def test_enqueue_rejects_values_that_are_not_positive_integer_ids(self):
         invalid_values = ([], [0], [-1], [1.5], [True], ["2"])
@@ -473,6 +535,35 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(snapshot["registered"], 2)
         self.assertEqual(snapshot["meta"]["concurrency"], 2)
+
+    def test_mfa_rotation_task_counts_rotation_when_codex2api_sync_fails(self):
+        task_id = f"task-mfa-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [17],
+            concurrency=1,
+            rotate_mfa=True,
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+            return_value={
+                "ok": False,
+                "relogin_ok": True,
+                "mfa_rotated": True,
+                "stage": "codex2api_sync",
+                "account_id": 17,
+                "email": "rotated@example.com",
+                "message": "重登成功，但 Codex2API 覆盖更新失败: 模型不支持",
+            },
+        ):
+            _run_chatgpt_relogin_task(task_id, [17], concurrency=1)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 1)
+        self.assertEqual(len(snapshot.get("errors") or []), 0)
+        self.assertTrue(any("MFA 重设成功" in line for line in snapshot["logs"]))
+        self.assertTrue(any("Codex2API" in line for line in snapshot["logs"]))
 
     def test_automatic_task_skips_remote_healthy_account_without_refreshing_rt(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"

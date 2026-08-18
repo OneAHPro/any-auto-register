@@ -461,6 +461,38 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(await screen.findByText('relogin:relogin-task-concurrent')).toBeTruthy()
   })
 
+  it('starts forced MFA rotation for all eligible ChatGPT accounts', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string, options?: RequestInit) => {
+      if (path.startsWith('/accounts?')) {
+        return { items: [eligibleAccount, completedAccount], total: 2 }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/tasks/chatgpt-relogin' && options?.method === 'POST') {
+        return { task_id: 'mfa-reset-all-task', count: 2, concurrency: 5 }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    await user.click(screen.getByRole('button', { name: /重设全部 MFA/ }))
+    await user.click(await screen.findByRole('button', { name: '确认重设' }))
+
+    await waitFor(() => {
+      expect(apiFetch).toHaveBeenCalledWith('/tasks/chatgpt-relogin', {
+        method: 'POST',
+        body: JSON.stringify({
+          all_eligible: true,
+          rotate_mfa: true,
+          concurrency: 5,
+        }),
+      })
+    })
+    expect(await screen.findByText('relogin:mfa-reset-all-task')).toBeTruthy()
+    expect(screen.getByText('重设全部 ChatGPT MFA')).toBeTruthy()
+  })
+
   it('keeps the relogin action visible before an account is selected', async () => {
     render(<Accounts />)
 

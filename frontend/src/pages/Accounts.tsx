@@ -53,6 +53,7 @@ import {
 
 const { Text } = Typography
 const CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
+const CHATGPT_MFA_RESET_CONCURRENCY = 5
 
 const STATUS_COLORS: Record<string, string> = {
   registered: 'default',
@@ -670,7 +671,9 @@ export default function Accounts() {
   const [taskId, setTaskId] = useState<string | null>(null)
   const [registerLoading, setRegisterLoading] = useState(false)
   const [reloginTaskId, setReloginTaskId] = useState<string | null>(null)
+  const [reloginTaskMode, setReloginTaskMode] = useState<'relogin' | 'mfa'>('relogin')
   const [reloginLoading, setReloginLoading] = useState(false)
+  const [mfaResetLoading, setMfaResetLoading] = useState(false)
   const [reloginStartError, setReloginStartError] = useState('')
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
   const reloginRequestEpochRef = useRef(0)
@@ -691,7 +694,9 @@ export default function Accounts() {
     setSelectedRowKeys([])
     setReloginStartError('')
     setReloginTaskId(null)
+    setReloginTaskMode('relogin')
     setReloginLoading(false)
+    setMfaResetLoading(false)
     setReloginConcurrency(1)
     setAutoReloginStatus(null)
     setAutoReloginRunNowLoading(false)
@@ -981,6 +986,7 @@ export default function Accounts() {
 
       setSelectedRowKeys([])
       setReloginConcurrency(1)
+      setReloginTaskMode('relogin')
       setReloginTaskId(nextTaskId)
       message.success(
         `已启动 ${accountIds.length} 个账号重登（并发 ${effectiveConcurrency}）`,
@@ -994,6 +1000,46 @@ export default function Accounts() {
     } finally {
       if (requestEpoch === reloginRequestEpochRef.current) {
         setReloginLoading(false)
+      }
+    }
+  }
+
+  const handleResetAllChatgptMfa = async () => {
+    if (currentPlatform !== 'chatgpt' || total === 0 || mfaResetLoading) return
+
+    const requestEpoch = ++reloginRequestEpochRef.current
+    setMfaResetLoading(true)
+    setReloginStartError('')
+    try {
+      const result = await apiFetch('/tasks/chatgpt-relogin', {
+        method: 'POST',
+        body: JSON.stringify({
+          all_eligible: true,
+          rotate_mfa: true,
+          concurrency: CHATGPT_MFA_RESET_CONCURRENCY,
+        }),
+      })
+      if (requestEpoch !== reloginRequestEpochRef.current) return
+      const nextTaskId = String(result.task_id || '').trim()
+      if (!nextTaskId) throw new Error('服务端未返回任务 ID')
+
+      const taskCount = Math.max(Number(result.count) || 0, 0)
+      setReloginTaskMode('mfa')
+      setReloginTaskId(nextTaskId)
+      message.success(
+        taskCount > 0
+          ? `已启动 ${taskCount} 个账号的 MFA 重设`
+          : '已启动全部账号的 MFA 重设',
+      )
+    } catch (error: unknown) {
+      if (requestEpoch !== reloginRequestEpochRef.current) return
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      const errorMessage = `启动 MFA 重设失败: ${detail}`
+      setReloginStartError(errorMessage)
+      message.error(errorMessage)
+    } finally {
+      if (requestEpoch === reloginRequestEpochRef.current) {
+        setMfaResetLoading(false)
       }
     }
   }
@@ -1798,6 +1844,25 @@ export default function Accounts() {
           )}
           {currentPlatform === 'chatgpt' && (
             <Popconfirm
+              title="确认强制重设全部 ChatGPT 账号的 MFA？"
+              description="所有具备登录凭据的账号都会新增或替换 MFA；没有邮箱接码地址也会继续执行。"
+              onConfirm={handleResetAllChatgptMfa}
+              disabled={total === 0}
+              okText="确认重设"
+              cancelText="取消"
+              okButtonProps={{ danger: true, autoInsertSpace: false }}
+            >
+              <Button
+                icon={<SyncOutlined />}
+                loading={mfaResetLoading}
+                disabled={total === 0 || reloginLoading}
+              >
+                重设全部 MFA
+              </Button>
+            </Popconfirm>
+          )}
+          {currentPlatform === 'chatgpt' && (
+            <Popconfirm
               title={
                 getBackfillScope() === 'selected'
                   ? `确认补传所选 ${selectedRowKeys.length} 个账号中远端未发现的 auth-file？`
@@ -1908,7 +1973,7 @@ export default function Accounts() {
               <Button
                 icon={<RedoOutlined />}
                 loading={reloginLoading}
-                disabled={selectedRowKeys.length === 0}
+                disabled={selectedRowKeys.length === 0 || mfaResetLoading}
               >
                 重登所选 ({selectedRowKeys.length})
               </Button>
@@ -1983,7 +2048,7 @@ export default function Accounts() {
 
       {reloginTaskId && currentPlatform === 'chatgpt' ? (
         <Modal
-          title="重登并同步 Codex2API"
+          title={reloginTaskMode === 'mfa' ? '重设全部 ChatGPT MFA' : '重登并同步 Codex2API'}
           open
           onCancel={() => setReloginTaskId(null)}
           footer={null}

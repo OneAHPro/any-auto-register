@@ -179,6 +179,72 @@ class ChatGPTMfaManagerTests(unittest.TestCase):
             {"factor_id": "totp-factor"},
         )
 
+    def test_existing_totp_can_be_replaced_with_local_totp_recovery(self):
+        session = mock.Mock()
+        session.get.side_effect = [
+            _response({
+                "mfa_enabled": True,
+                "factors": {"totp": [{"id": "old-totp"}]},
+            }),
+            _response({"mfa_enabled": True, "factors": {"totp": [{}]}}),
+        ]
+        session.post.side_effect = [
+            _response({"ok": True}),
+            _response({"state_token": "state-token"}),
+            _response({"secret": "NEWSECRET"}),
+            _response({"status": "success"}),
+            _response({}, status_code=404),
+        ]
+
+        with mock.patch(
+            "platforms.chatgpt.mfa_manager.generate_totp",
+            return_value="123456",
+        ):
+            result = self._manager(
+                session,
+                [],
+                can_recover_by_existing_totp=True,
+            ).rotate()
+
+        self.assertTrue(result.replaced_existing)
+        self.assertEqual(
+            session.post.call_args_list[0].kwargs["json"],
+            {"factor_id": "old-totp"},
+        )
+
+    def test_explicit_force_replaces_existing_totp_without_email_receiver(self):
+        session = mock.Mock()
+        session.get.side_effect = [
+            _response({
+                "mfa_enabled": True,
+                "factors": {"totp": [{"id": "old-totp"}]},
+            }),
+            _response({"mfa_enabled": True, "factors": {"totp": [{}]}}),
+        ]
+        session.post.side_effect = [
+            _response({"ok": True}),
+            _response({"state_token": "state-token"}),
+            _response({"secret": "NEWSECRET"}),
+            _response({"status": "success"}),
+            _response({}, status_code=404),
+        ]
+
+        with mock.patch(
+            "platforms.chatgpt.mfa_manager.generate_totp",
+            return_value="123456",
+        ):
+            result = self._manager(
+                session,
+                [],
+                allow_unrecoverable_replacement=True,
+            ).rotate()
+
+        self.assertTrue(result.replaced_existing)
+        self.assertEqual(
+            session.post.call_args_list[0].kwargs["json"],
+            {"factor_id": "old-totp"},
+        )
+
     def test_keeps_activated_secret_when_final_status_is_eventually_consistent(self):
         session = mock.Mock()
         session.get.side_effect = [

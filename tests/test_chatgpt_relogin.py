@@ -1353,6 +1353,66 @@ class ChatGPTReloginTests(unittest.TestCase):
             self.assertEqual(extra["sync_statuses"]["cpa"], {"uploaded": True})
             self.assertNotIn("chatgpt_local", extra)
 
+    def test_full_relogin_passes_mfa_rotation_intent_to_login_engine(self):
+        tokens = self._fresh_tokens()
+        tokens["metadata"] = {
+            "mfa_rotation": {
+                "managed": True,
+                "rotated_at": "2026-08-19T00:00:00+00:00",
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ) as login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ), mock.patch("services.chatgpt_relogin.engine", self.engine):
+            result = relogin_chatgpt_account(self.account_id, rotate_mfa=True)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["mfa_rotated"])
+        self.assertTrue(login.call_args.kwargs["rotate_mfa"])
+
+    def test_full_relogin_rejects_unconfirmed_mfa_rotation(self):
+        sync = mock.Mock()
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=self._fresh_tokens(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            sync,
+        ):
+            result = relogin_chatgpt_account(self.account_id, rotate_mfa=True)
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["relogin_ok"])
+        self.assertEqual(result["stage"], "relogin")
+        self.assertIn("未确认新 MFA 已激活", result["message"])
+        sync.assert_not_called()
+
+    def test_mfa_rotation_remains_confirmed_when_codex2api_sync_fails(self):
+        tokens = self._fresh_tokens()
+        tokens["metadata"] = {
+            "mfa_rotation": {
+                "managed": True,
+                "rotated_at": "2026-08-19T00:00:00+00:00",
+            }
+        }
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": False, "msg": "模型不支持"},
+        ):
+            result = relogin_chatgpt_account(self.account_id, rotate_mfa=True)
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["relogin_ok"])
+        self.assertTrue(result["mfa_rotated"])
+        self.assertEqual(result["stage"], "codex2api_sync")
+
     def test_full_relogin_persists_password_changed_by_reset_flow(self):
         tokens = self._fresh_tokens()
         tokens["password"] = "Replacement-ChatGPT-Password"

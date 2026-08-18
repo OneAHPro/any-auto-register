@@ -1,6 +1,6 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, StrictInt
+from pydantic import BaseModel, Field, StrictBool, StrictInt
 from sqlalchemy import case, func, update
 from sqlmodel import Session, select
 from typing import Optional
@@ -259,6 +259,8 @@ class RegisterTaskRequest(BaseModel):
 
 class ChatGPTReloginTaskRequest(BaseModel):
     account_ids: list[StrictInt] = Field(default_factory=list)
+    all_eligible: StrictBool = False
+    rotate_mfa: StrictBool = False
     concurrency: StrictInt = Field(
         default=1,
         ge=1,
@@ -1536,18 +1538,26 @@ def _create_chatgpt_relogin_task_record(
     *,
     source: str = "manual_relogin",
     automation: bool = False,
+    rotate_mfa: bool = False,
 ) -> None:
     normalized_ids = _normalize_chatgpt_relogin_account_ids(
         account_ids,
-        max_accounts=None if automation else 100,
+        max_accounts=None if automation or rotate_mfa else 100,
     )
     effective_concurrency = _normalize_chatgpt_relogin_concurrency(
         concurrency,
         account_count=len(normalized_ids),
     )
     task_meta = {
-        "mode": "remote_auth_monitor" if automation else "relogin",
+        "mode": (
+            "remote_auth_monitor"
+            if automation
+            else "mfa_rotation"
+            if rotate_mfa
+            else "relogin"
+        ),
         "automation": automation,
+        "rotate_mfa": bool(rotate_mfa),
         "account_ids": normalized_ids,
         "concurrency": effective_concurrency,
     }
@@ -1644,6 +1654,7 @@ def _enqueue_chatgpt_relogin_task_locked(
     concurrency,
     source: str = "manual_relogin",
     automation: bool = False,
+    rotate_mfa: bool = False,
     background_tasks: BackgroundTasks | None = None,
 ) -> str:
     task_id = f"task_relogin_{uuid.uuid4().hex}"
@@ -1654,6 +1665,7 @@ def _enqueue_chatgpt_relogin_task_locked(
             concurrency=concurrency,
             source=source,
             automation=automation,
+            rotate_mfa=rotate_mfa,
         )
         task_meta = _task_store.snapshot(task_id)["meta"]
         normalized_ids = list(task_meta["account_ids"])
@@ -1678,6 +1690,7 @@ def enqueue_chatgpt_relogin_task(
     concurrency,
     source: str = "manual_relogin",
     automation: bool = False,
+    rotate_mfa: bool = False,
     background_tasks: BackgroundTasks | None = None,
 ) -> str:
     with _chatgpt_task_enqueue_lock:
@@ -1686,6 +1699,7 @@ def enqueue_chatgpt_relogin_task(
             concurrency,
             source=source,
             automation=automation,
+            rotate_mfa=rotate_mfa,
             background_tasks=background_tasks,
         )
 
@@ -1820,6 +1834,7 @@ def _run_chatgpt_relogin_task_inner(
     task_snapshot = _task_store.snapshot(task_id)
     task_meta = task_snapshot.get("meta") or {}
     automation = _is_truthy(task_meta.get("automation"))
+    rotate_mfa = _is_truthy(task_meta.get("rotate_mfa"))
     delete_linked_credential = (
         _is_truthy(
             task_meta.get("codex2api_delete_on_account_remove_enabled")
@@ -1873,7 +1888,13 @@ def _run_chatgpt_relogin_task_inner(
             *probe_only_account_ids,
             *login_candidate_account_ids,
         ]
-    task_label = "Codex2API 鉴权巡检" if automation else "重登"
+    task_label = (
+        "Codex2API 鉴权巡检"
+        if automation
+        else "MFA 重设"
+        if rotate_mfa
+        else "重登"
+    )
     total = len(account_ids)
     max_workers = min(
         max(int(concurrency or 1), 1),
@@ -2053,6 +2074,7 @@ def _run_chatgpt_relogin_task_inner(
                     log_fn=_service_log,
                     task_control=control,
                     attempt_id=attempt_id,
+                    rotate_mfa=rotate_mfa,
                     codex2api_delete_on_account_remove_enabled=None,
                     remove_on_mailbox_otp_timeout=False,
                 )
@@ -2067,19 +2089,33 @@ def _run_chatgpt_relogin_task_inner(
                 "remote_probe" if automation else "relogin"
             )
             relogin_ok = bool(result.get("relogin_ok"))
+            mfa_rotated = bool(result.get("mfa_rotated"))
             account_removed = bool(result.get("account_removed")) or stage == "account_removed"
             _record_automatic_result(account_id, result)
 
-            if bool(result.get("ok")):
+            operation_ok = (
+                mfa_rotated
+                if rotate_mfa
+                else bool(result.get("ok"))
+            )
+            if operation_ok:
                 detail_message = message or "重登并同步成功"
                 success_label = (
-                    "远端认证正常"
+                    "MFA 重设成功"
+                    if rotate_mfa
+                    else "远端认证正常"
                     if result_mode == "remote_probe"
                     else "完整登录并同步成功"
                     if automation and result_mode == "full_login"
                     else "重登并同步成功"
                 )
                 _log(task_id, f"[OK] {success_label}: {account_label}（{detail_message}）")
+                if rotate_mfa and not bool(result.get("ok")):
+                    _log(
+                        task_id,
+                        "[WARN] MFA 已重设并保存，但 Codex2API 覆盖更新未完成；"
+                        "不影响新 MFA 登录",
+                    )
                 if not (
                     automation
                     and result_mode == "remote_probe"
@@ -2093,6 +2129,8 @@ def _run_chatgpt_relogin_task_inner(
                             "mode": result_mode,
                             "account_id": account_id,
                             "stage": stage or "completed",
+                            "mfa_rotated": mfa_rotated,
+                            "codex2api_synced": bool(result.get("ok")),
                         },
                     )
                 return AttemptResult.success()
@@ -5480,10 +5518,22 @@ def create_chatgpt_relogin_task(
     req: ChatGPTReloginTaskRequest,
     background_tasks: BackgroundTasks,
 ):
+    if req.all_eligible and req.account_ids:
+        raise HTTPException(400, "全部账号模式不能同时指定账号 ID")
+    account_ids = list(req.account_ids)
+    if req.all_eligible:
+        from services.chatgpt_relogin import list_relogin_eligible_account_ids
+
+        account_ids = list_relogin_eligible_account_ids()
+        if not account_ids:
+            raise HTTPException(400, "当前没有具备登录凭据的 ChatGPT 账号")
+    enqueue_options = {"background_tasks": background_tasks}
+    if req.rotate_mfa:
+        enqueue_options["rotate_mfa"] = True
     task_id = enqueue_chatgpt_relogin_task(
-        req.account_ids,
+        account_ids,
         req.concurrency,
-        background_tasks=background_tasks,
+        **enqueue_options,
     )
     snapshot = _task_store.snapshot(task_id)
     return {
