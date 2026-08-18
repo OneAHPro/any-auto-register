@@ -1632,6 +1632,68 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(code, "417024")
 
     @mock.patch("requests.get")
+    def test_mailapi_latest_view_uses_current_card_before_stale_detail(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@outlook.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/latest",
+            },
+        )
+        mock_get.side_effect = [
+            _FakeResponse(
+                200,
+                text="""
+                <html><body>
+                  <main class="mailbox" data-view="latest">
+                    <nav><a href="/history">查看全部</a></nav>
+                    <div class="card">
+                      <div class="code" aria-label="验证码">654321</div>
+                      <div class="su">Your temporary ChatGPT login code</div>
+                      <time class="dt">2026-08-18T09:16:18+00:00</time>
+                      <div class="bd content">
+                        Enter this temporary verification code to continue:
+                        654321
+                      </div>
+                    </div>
+                  </main>
+                </body></html>
+                """,
+            ),
+            _FakeResponse(
+                200,
+                text=(
+                    '<section class="panel">'
+                    '<div class="subject">Your authentication code</div>'
+                    '<div class="content">Your authentication code is 111111</div>'
+                    '</section>'
+                ),
+            ),
+        ]
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-18T09:16:17+00:00"
+        ).timestamp()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=otp_sent_at,
+            )
+
+        self.assertEqual(code, "654321")
+        self.assertEqual(mock_get.call_count, 1)
+
+    @mock.patch("requests.get")
     def test_mailapi_html_rejects_old_latest_card(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(

@@ -4065,6 +4065,46 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         import re
 
         raw = str(raw_text or "")
+        latest_view = re.search(
+            r"<main\b(?=[^>]*\bdata-view\s*=\s*(['\"])latest\1)[^>]*>"
+            r"(.*?)</main\s*>",
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if latest_view:
+            latest_body = latest_view.group(2)
+
+            def latest_class_text(class_name: str) -> str:
+                element = re.search(
+                    rf"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*"
+                    rf"(?P<quote>['\"])[^'\"]*\b{class_name}\b[^'\"]*"
+                    rf"(?P=quote)[^>]*>(?P<body>.*?)</(?P=tag)\s*>",
+                    latest_body,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                return (
+                    cls._mailapi_visible_text(element.group("body"))
+                    if element
+                    else ""
+                )
+
+            code = latest_class_text("code")
+            subject = latest_class_text("su") or latest_class_text("subject")
+            received_text = latest_class_text("dt") or latest_class_text("date")
+            if re.fullmatch(r"\d{6}", code) and cls._is_openai_history_subject(
+                subject
+            ):
+                identity = "|".join((subject, received_text, code))
+                return {
+                    "content": f"{subject} verification code {code}",
+                    "received_at": cls._parse_timestamp(received_text),
+                    "message_id": "mailapi_message:" + hashlib.sha256(
+                        identity.encode("utf-8", errors="ignore")
+                    ).hexdigest(),
+                    "bounded_content": True,
+                    "status": None,
+                }
+
         for article_match in re.finditer(
             r"<article\b([^>]*)>(.*?)</article\s*>",
             raw,
