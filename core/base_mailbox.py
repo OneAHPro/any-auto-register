@@ -4061,6 +4061,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         try:
             return datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
         except ValueError:
+            pass
+        try:
+            from email.utils import parsedate_to_datetime
+
+            parsed = parsedate_to_datetime(text)
+            if parsed is None:
+                return None
+            return parsed.timestamp()
+        except (TypeError, ValueError, OverflowError):
             return None
 
     @staticmethod
@@ -4124,6 +4133,66 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             code = latest_class_text("code")
             subject = latest_class_text("su") or latest_class_text("subject")
             received_text = latest_class_text("dt") or latest_class_text("date")
+            if re.fullmatch(r"\d{6}", code) and cls._is_openai_history_subject(
+                subject
+            ):
+                identity = "|".join((subject, received_text, code))
+                return {
+                    "content": f"{subject} verification code {code}",
+                    "received_at": cls._parse_timestamp(received_text),
+                    "message_id": "mailapi_message:" + hashlib.sha256(
+                        identity.encode("utf-8", errors="ignore")
+                    ).hexdigest(),
+                    "bounded_content": True,
+                    "status": None,
+                }
+
+        # Newer MailAPI pages use a `latest-view` section with a dedicated
+        # `latest-code` output instead of the older `main[data-view=latest]`
+        # or `article.mail-card` markup.  Keep extraction bounded to that
+        # section so unrelated six-digit values elsewhere on the page are not
+        # treated as OTPs.
+        latest_section = re.search(
+            r"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*"
+            r"(?P<quote>['\"])[^'\"]*\blatest-view\b[^'\"]*"
+            r"(?P=quote)[^>]*>(?P<body>.*?)</(?P=tag)\s*>",
+            raw,
+            re.IGNORECASE | re.DOTALL,
+        )
+        if latest_section:
+            latest_body = latest_section.group("body")
+
+            def latest_section_text(pattern: str) -> str:
+                element = re.search(
+                    pattern,
+                    latest_body,
+                    re.IGNORECASE | re.DOTALL,
+                )
+                return (
+                    cls._mailapi_visible_text(element.group("body"))
+                    if element
+                    else ""
+                )
+
+            code = latest_section_text(
+                r"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bid\s*=\s*"
+                r"(?P<quote>['\"])latest-code(?P=quote)[^>]*>"
+                r"(?P<body>.*?)</(?P=tag)\s*>"
+            )
+            subject = latest_section_text(
+                r"<h2\b[^>]*>(?P<body>.*?)</h2\s*>"
+            ) or latest_section_text(
+                r"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*"
+                r"(?P<quote>['\"])[^'\"]*\bsubject\b[^'\"]*"
+                r"(?P=quote)[^>]*>(?P<body>.*?)</(?P=tag)\s*>"
+            )
+            received_text = latest_section_text(
+                r"<dd\b[^>]*>(?P<body>.*?)</dd\s*>"
+            ) or latest_section_text(
+                r"<(?P<tag>[A-Za-z][\w:-]*)\b[^>]*\bclass\s*=\s*"
+                r"(?P<quote>['\"])[^'\"]*\b(?:date|time)\b[^'\"]*"
+                r"(?P=quote)[^>]*>(?P<body>.*?)</(?P=tag)\s*>"
+            )
             if re.fullmatch(r"\d{6}", code) and cls._is_openai_history_subject(
                 subject
             ):

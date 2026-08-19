@@ -794,6 +794,45 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
 
         self.assertEqual(backend._extract_message_code(message, page, None), "326097")
 
+    def test_mailapi_parses_latest_code_mailbox_page(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        page = """
+        <main class="page-shell">
+          <section class="latest-view" id="latest-view">
+            <div class="code-band">
+              <span class="section-label">最新验证码</span>
+              <output class="latest-code" id="latest-code">030979</output>
+            </div>
+            <article class="latest-mail">
+              <div class="mail-heading">
+                <h2>Your temporary ChatGPT login code</h2>
+                <span class="inline-code">030979</span>
+              </div>
+              <dl class="mail-meta">
+                <dt>时间</dt>
+                <dd>Wed, 19 Aug 2026 18:34:10 +0000</dd>
+              </dl>
+              <div class="mail-content">
+                Enter this temporary verification code to continue: 030979
+              </div>
+            </article>
+          </section>
+        </main>
+        """
+
+        message = backend._parse_mailapi_message(page)
+
+        self.assertEqual(
+            backend._extract_message_code(message, page, None),
+            "030979",
+        )
+        self.assertTrue(message["message_id"].startswith("mailapi_message:"))
+        self.assertEqual(
+            message["received_at"],
+            datetime.fromisoformat("2026-08-19T18:34:10+00:00").timestamp(),
+        )
+
     def test_mailapi_panel_does_not_scan_page_chrome_for_otp(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]
