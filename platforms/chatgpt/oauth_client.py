@@ -871,10 +871,7 @@ class OAuthClient:
                         )
             else:
                 self.last_mfa_enrollment["recovery_code"] = secret
-                if (
-                    self.last_mfa_enrollment.get("totp_secret")
-                    and callable(on_recovery_code)
-                ):
+                if callable(on_recovery_code):
                     try:
                         on_recovery_code(secret)
                     except Exception as exc:

@@ -306,6 +306,45 @@ class ExistingAccountLoginTests(unittest.TestCase):
             "MANDATORY-RECOVERY",
         )
 
+    def test_recovery_only_enrollment_continues_with_regular_rotation(self):
+        engine = self._make_engine(
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+        )
+        web_client = mock.Mock()
+        web_client.session = object()
+        web_client.ua = "web-agent"
+        web_client.impersonate = "chrome"
+        web_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "web-access-token",
+                "account_id": "account-1",
+                "mfa_enrollment": {
+                    "recovery_code": "REFRESHED-RECOVERY",
+                },
+            },
+        )
+        oauth_client = self._successful_oauth_client()
+        engine._build_chatgpt_client = mock.Mock(return_value=web_client)
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        rotation = MfaRotationResult(
+            totp_secret="ROTATED-SECRET",
+            recovery_code="ROTATED-RECOVERY",
+            replaced_existing=True,
+            mfa_enabled=True,
+            rotated_at="2026-08-19T12:30:00+00:00",
+        )
+        engine._rotate_mfa_after_login = mock.Mock(return_value=rotation)
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        engine._rotate_mfa_after_login.assert_called_once()
+
     def test_password_totp_credentials_force_chatgpt_password_login(self):
         engine = self._make_engine(email_service=PasswordTotpEmailService())
         oauth_client = self._successful_oauth_client()

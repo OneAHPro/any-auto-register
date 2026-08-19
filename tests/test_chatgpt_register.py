@@ -627,7 +627,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertIs(state, expected_state)
-        recovery_saved.assert_not_called()
+        recovery_saved.assert_called_once_with("RECOVERY-CODE")
         self.assertEqual(
             client.session.post.call_args.kwargs["json"],
             {

@@ -494,6 +494,16 @@ class RefreshTokenRegistrationEngine:
 
         totp_secret = str(enrollment.get("totp_secret") or "").strip()
         rotated_at = str(enrollment.get("rotated_at") or "").strip()
+        recovery_code = str(
+            enrollment.get("recovery_code") or ""
+        ).strip()
+        if not totp_secret and recovery_code:
+            if isinstance(self.email_info, dict):
+                self.email_info["mfa_recovery_code"] = recovery_code
+            self._log(
+                "恢复登录已刷新 MFA 恢复码，继续使用新鲜会话执行 TOTP 轮换"
+            )
+            return False, None
         if not totp_secret or not rotated_at:
             result.error_message = (
                 "[stage=mfa_enroll] 新 MFA 已进入绑定流程，"
@@ -505,9 +515,7 @@ class RefreshTokenRegistrationEngine:
 
         rotation = MfaRotationResult(
             totp_secret=totp_secret,
-            recovery_code=str(
-                enrollment.get("recovery_code") or ""
-            ).strip(),
+            recovery_code=recovery_code,
             replaced_existing=True,
             mfa_enabled=True,
             rotated_at=rotated_at,
@@ -521,6 +529,27 @@ class RefreshTokenRegistrationEngine:
             return True, None
         self._log("恢复登录后要求的新 MFA 已完成绑定并由项目托管")
         return True, rotation
+
+    def _stage_mfa_recovery_code(
+        self,
+        email: str,
+        recovery_code: str,
+    ) -> None:
+        """Durably save a recovery code even when OpenAI returns it first."""
+        normalized_email = str(email or "").strip()
+        normalized_code = str(recovery_code or "").strip()
+        if not normalized_email or not normalized_code:
+            return
+        journal = load_chatgpt_mfa_rotation(normalized_email)
+        if not str(journal.get("totp_secret") or "").strip():
+            current_secret = str(self.totp_secret or "").strip()
+            if not current_secret:
+                raise RuntimeError("MFA 恢复码写前记录缺少现有 TOTP")
+            stage_chatgpt_mfa_rotation(normalized_email, current_secret)
+        update_chatgpt_mfa_rotation_recovery_code(
+            normalized_email,
+            normalized_code,
+        )
 
     def _rotate_mfa_after_login(
         self,
@@ -983,7 +1012,7 @@ class RefreshTokenRegistrationEngine:
                         )
                     ),
                     on_mfa_recovery_code=lambda recovery_code: (
-                        update_chatgpt_mfa_rotation_recovery_code(
+                        self._stage_mfa_recovery_code(
                             self.email or result.email,
                             recovery_code,
                         )
@@ -1084,7 +1113,7 @@ class RefreshTokenRegistrationEngine:
                 )
             ),
             on_mfa_recovery_code=lambda recovery_code: (
-                update_chatgpt_mfa_rotation_recovery_code(
+                self._stage_mfa_recovery_code(
                     self.email or result.email,
                     recovery_code,
                 )
@@ -1198,7 +1227,7 @@ class RefreshTokenRegistrationEngine:
                 )
             ),
             on_mfa_recovery_code=lambda recovery_code: (
-                update_chatgpt_mfa_rotation_recovery_code(
+                self._stage_mfa_recovery_code(
                     self.email or result.email,
                     recovery_code,
                 )
