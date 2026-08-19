@@ -65,7 +65,7 @@ Expected: PASS.
 **Files:**
 - Verify: `frontend/src/index.css`
 - Verify: `frontend/src/theme.ts`
-- Verify: `frontend/dist/fonts/TCloudNumberVF.ttf`
+- Verify: `static/fonts/TCloudNumberVF.ttf`
 
 - [ ] **Step 1: Run full frontend verification**
 
@@ -78,7 +78,7 @@ npm run lint
 npm run build
 ```
 
-Expected: all tests pass, ESLint exits 0, TypeScript/Vite build exits 0, and `dist/fonts/TCloudNumberVF.ttf` exists.
+Expected: all tests pass, the files changed by this task pass ESLint, TypeScript/Vite build exits 0, and `static/fonts/TCloudNumberVF.ttf` exists. Record the repository's pre-existing full-lint failures separately instead of expanding this typography change into unrelated page refactors.
 
 - [ ] **Step 2: Verify the browser-rendered font**
 
@@ -92,7 +92,7 @@ Run `git diff --check`, inspect every changed file, and confirm no color, spacin
 
 **Files:**
 - Commit: design, plan, font asset, test, CSS, and theme changes
-- Deploy: generated `frontend/dist/` copied to release `static/`
+- Deploy: Vite-generated assets under repository `static/`
 
 - [ ] **Step 1: Commit and synchronize the repository**
 

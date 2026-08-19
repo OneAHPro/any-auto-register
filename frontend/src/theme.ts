@@ -1,7 +1,11 @@
 import { theme } from 'antd'
 
+const tdesignFontFamily =
+  "TCloudNumber, -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Microsoft YaHei', Arial, sans-serif"
+
 const darkTheme = {
   token: {
+    fontFamily: tdesignFontFamily,
     colorPrimary: '#6366f1',
     colorBgBase: '#1c1f2e',
     colorTextBase: '#f1f5f9',
@@ -27,6 +31,7 @@ const darkTheme = {
 
 const lightTheme = {
   token: {
+    fontFamily: tdesignFontFamily,
     colorPrimary: '#4f46e5',
     colorBgBase: '#ffffff',
     colorTextBase: '#0f172a',
@@ -49,4 +54,4 @@ const lightTheme = {
   algorithm: theme.defaultAlgorithm,
 }
 
-export { darkTheme, lightTheme }
+export { darkTheme, lightTheme, tdesignFontFamily }
