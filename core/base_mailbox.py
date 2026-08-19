@@ -610,10 +610,10 @@ class AppleMailMailbox(BaseMailbox):
     @staticmethod
     def _is_chatgpt_password_totp_account(account: MailboxAccount) -> bool:
         extra = account.extra or {}
-        return (
-            str(extra.get("account_type") or "").strip()
-            == "chatgpt_password_totp"
-        )
+        return str(extra.get("account_type") or "").strip() in {
+            "chatgpt_password_totp",
+            "chatgpt_password_remote_totp",
+        }
 
     @staticmethod
     def _has_mailapi_url(account: MailboxAccount) -> bool:
@@ -747,7 +747,10 @@ class AppleMailMailbox(BaseMailbox):
         self._email = record["email"]
         account_type = str(record.get("account_type") or "").strip()
         direct_icloud = account_type == "icloud_web"
-        chatgpt_credentials = account_type == "chatgpt_password_totp"
+        chatgpt_credentials = account_type in {
+            "chatgpt_password_totp",
+            "chatgpt_password_remote_totp",
+        }
         url_credentials = account_type in {
             "chatgpt_password_url_otp",
             "chatgpt_password_reset_url_mail",
@@ -761,7 +764,18 @@ class AppleMailMailbox(BaseMailbox):
         )
         self._log(f"[{provider_label}] 使用邮箱池: {pool_path.name}")
         self._log(f"[{provider_label}] 分配邮箱: {record['email']}")
-        if url_credentials:
+        if account_type == "chatgpt_password_remote_totp":
+            totp_url = str(record.get("totp_url") or "").strip()
+            if not totp_url:
+                raise RuntimeError("ChatGPT 远程 MFA 记录缺少 2FA 地址")
+            extra = {
+                "provider": "chatgpt_credentials",
+                "account_type": account_type,
+                "password": str(record.get("password") or ""),
+                "totp_url": totp_url,
+                "pool_file": pool_path.name,
+            }
+        elif url_credentials:
             extra = {
                 "provider": "chatgpt_credentials",
                 "account_type": account_type,
@@ -784,11 +798,14 @@ class AppleMailMailbox(BaseMailbox):
         elif chatgpt_credentials:
             extra = {
                 "provider": "chatgpt_credentials",
-                "account_type": "chatgpt_password_totp",
+                "account_type": account_type,
                 "password": record["password"],
-                "totp_secret": record["totp_secret"],
                 "pool_file": pool_path.name,
             }
+            if account_type == "chatgpt_password_totp":
+                extra["totp_secret"] = record["totp_secret"]
+            else:
+                extra["totp_url"] = str(record["totp_url"] or "")
             mail_api_url = str(record.get("mail_api_url") or "").strip()
             if mail_api_url:
                 extra["mail_api_url"] = mail_api_url
@@ -1073,10 +1090,26 @@ class AppleMailMailbox(BaseMailbox):
                 if response_email and response_email != str(account.email or "").strip().lower():
                     raise RuntimeError("响应邮箱不匹配")
                 code = str(payload.get("code") or "").strip()
+                result_payload = None
+                if not code:
+                    expected_email = str(account.email or "").strip().lower()
+                    results = payload.get("results")
+                    if isinstance(results, list):
+                        result_payload = next((
+                            item
+                            for item in results
+                            if isinstance(item, dict)
+                            and str(item.get("email") or "").strip().lower()
+                            == expected_email
+                        ), None)
+                    if isinstance(result_payload, dict):
+                        code = str(result_payload.get("code") or "").strip()
                 if not re.fullmatch(r"\d{6}", code):
                     raise RuntimeError("验证码格式无效")
                 try:
-                    remaining = float(payload.get("remaining"))
+                    remaining = float(
+                        (result_payload or payload).get("remaining")
+                    )
                 except (TypeError, ValueError):
                     remaining = None
                 return code, remaining

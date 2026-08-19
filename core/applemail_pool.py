@@ -197,6 +197,18 @@ def _looks_like_direct_totp_url(value: Any) -> bool:
     )
 
 
+def _looks_like_remote_totp_url(value: Any) -> bool:
+    """Recognize supplier-hosted MFA lookup endpoints without treating mail URLs as MFA."""
+    if not _looks_like_http_url(value):
+        return False
+    parsed = urlsplit(str(value).strip())
+    host = str(parsed.hostname or "").lower().rstrip(".")
+    path = str(parsed.path or "").lower()
+    return host in {"2fa.nloop.cc", "mfa.nloop.cc"} and (
+        "/api/mfa/" in path or path.endswith("/2fa") or path.endswith("/view")
+    )
+
+
 def _resolve_url_credential_roles(third: str, fourth: str) -> tuple[str, str]:
     if _looks_like_direct_totp_url(third) and _looks_like_mail_message_url(fourth):
         return fourth, third
@@ -247,6 +259,24 @@ def _normalize_url_credential(
         "mail_api_url": _normalize_http_url(mail_api_url, "收件地址"),
         "totp_url": _normalize_http_url(totp_url, "2FA 地址"),
         "account_type": "chatgpt_password_url_otp",
+        "mailbox": _normalize_mailbox(mailbox),
+    }
+
+
+def _normalize_remote_totp_credential(
+    *,
+    email: str,
+    password: str,
+    totp_url: str,
+    mailbox: str = "INBOX",
+) -> dict[str, Any]:
+    if not str(password or "").strip():
+        raise ValueError(f"{email} 缺少 ChatGPT 密码")
+    return {
+        "email": email,
+        "password": str(password).strip(),
+        "totp_url": _normalize_http_url(totp_url, "2FA 地址"),
+        "account_type": "chatgpt_password_remote_totp",
         "mailbox": _normalize_mailbox(mailbox),
     }
 
@@ -313,10 +343,16 @@ def _normalize_record(entry: Any) -> dict[str, str]:
             mailbox=mailbox,
             password_reset_required=reset_required,
         ), entry)
-    if account_type in {
-        "chatgpt_password_url_otp",
-        "chatgpt_password_remote_totp",
-    } or (mail_api_url and totp_url):
+    if account_type == "chatgpt_password_remote_totp" or (
+        not mail_api_url and _looks_like_remote_totp_url(totp_url)
+    ):
+        return _copy_pool_metadata(_normalize_remote_totp_credential(
+            email=email,
+            password=password,
+            totp_url=totp_url,
+            mailbox=mailbox,
+        ), entry)
+    if account_type == "chatgpt_password_url_otp" or (mail_api_url and totp_url):
         return _copy_pool_metadata(_normalize_url_credential(
             email=email,
             password=password,
@@ -375,6 +411,12 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
     if len(values) == 3:
         email, second, third = values
         if _looks_like_http_url(third):
+            if _looks_like_remote_totp_url(third):
+                return _normalize_remote_totp_credential(
+                    email=email,
+                    password=second,
+                    totp_url=third,
+                )
             if not _is_password_reset_marker(second):
                 raise ValueError(f"{email} URL 收件记录缺少 2FA 地址")
             return _normalize_url_credential(
@@ -406,6 +448,12 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
         }
     if len(values) >= 4:
         email, password, third, fourth = values[:4]
+        if _looks_like_remote_totp_url(third) and _looks_like_remote_totp_url(fourth):
+            return _normalize_remote_totp_credential(
+                email=email,
+                password=password,
+                totp_url=third,
+            )
         mail_api_url, totp_url = _resolve_url_credential_roles(third, fourth)
         if _is_password_reset_marker(password) and _looks_like_http_url(mail_api_url):
             return _normalize_url_credential(
@@ -414,6 +462,18 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
                 mail_api_url=mail_api_url,
                 totp_url=totp_url,
                 account_type="chatgpt_password_reset_url_mail",
+            )
+        if _looks_like_remote_totp_url(mail_api_url) and not _looks_like_http_url(totp_url):
+            return _normalize_remote_totp_credential(
+                email=email,
+                password=password,
+                totp_url=mail_api_url,
+            )
+        if _looks_like_remote_totp_url(totp_url) and not _looks_like_http_url(mail_api_url):
+            return _normalize_remote_totp_credential(
+                email=email,
+                password=password,
+                totp_url=totp_url,
             )
         if _looks_like_http_url(mail_api_url) or _looks_like_http_url(totp_url):
             return _normalize_url_credential(

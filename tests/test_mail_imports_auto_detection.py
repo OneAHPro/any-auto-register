@@ -43,6 +43,26 @@ class MailImportAutoDetectionTests(unittest.TestCase):
         self.assertEqual(result.rows[0].account_type, "chatgpt_password_totp")
         self.assertNotIn(secret, json.dumps(result.to_public_dict()))
 
+    def test_detects_chatgpt_password_remote_mfa_url_as_applemail(self):
+        lookup_url = (
+            "https://2fa.nloop.cc/api/mfa/lookup"
+            "?email=user%2Balias%40gmail.com"
+        )
+
+        result = detect_mail_import_content(
+            f"user+alias@gmail.com----password-value----{lookup_url}"
+        )
+
+        self.assertEqual(
+            result.counts,
+            {"microsoft": 0, "applemail": 1, "unresolved": 0},
+        )
+        self.assertEqual(
+            result.rows[0].account_type,
+            "chatgpt_password_remote_totp",
+        )
+        self.assertNotIn(lookup_url, json.dumps(result.to_public_dict()))
+
     def test_accepts_mixed_three_and_four_dash_rows_without_splitting_short_runs(self):
         microsoft_line = "one@outlook.com----https://mail.test/messages/one"
         applemail_line = (

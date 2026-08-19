@@ -784,6 +784,55 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             ],
         )
 
+    def test_parses_supplier_email_password_remote_mfa_url(self):
+        lookup_url = (
+            "https://2fa.nloop.cc/api/mfa/lookup"
+            "?email=user%2Balias%40gmail.com"
+        )
+
+        records = parse_applemail_pool_content(
+            f"user+alias@gmail.com----chatgpt-password----{lookup_url}"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                {
+                    "email": "user+alias@gmail.com",
+                    "password": "chatgpt-password",
+                    "totp_url": lookup_url,
+                    "account_type": "chatgpt_password_remote_totp",
+                    "mailbox": "INBOX",
+                }
+            ],
+        )
+
+    def test_remote_mfa_url_pool_account_does_not_require_mail_receiver(self):
+        lookup_url = (
+            "https://2fa.nloop.cc/api/mfa/lookup"
+            "?email=user%2Balias%40gmail.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                f"user+alias@gmail.com----chatgpt-password----{lookup_url}",
+                pool_dir=tmp_dir,
+                filename="remote-mfa.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="remote-mfa.json",
+            )
+
+            account = mailbox.get_email()
+
+        self.assertEqual(
+            account.extra["account_type"],
+            "chatgpt_password_remote_totp",
+        )
+        self.assertEqual(account.extra["password"], "chatgpt-password")
+        self.assertEqual(account.extra["totp_url"], lookup_url)
+        self.assertNotIn("mail_api_url", account.extra)
+
     def test_rejects_invalid_totp_in_three_field_chatgpt_record(self):
         with self.assertRaisesRegex(ValueError, "MFA 秘钥格式无效"):
             parse_applemail_pool_content(
@@ -1108,6 +1157,45 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             rendered_logs = "\n".join(logs)
             self.assertNotIn("JBSWY3DPEHPK3PXP", rendered_logs)
             self.assertNotIn("654321", rendered_logs)
+
+    def test_remote_totp_accepts_nloop_single_lookup_response(self):
+        lookup_url = (
+            "https://2fa.nloop.cc/api/mfa/lookup"
+            "?email=user%2Balias%40gmail.com"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "user+alias@gmail.com----password----"
+                f"{lookup_url}----{lookup_url}",
+                pool_dir=tmp_dir,
+                filename="nloop-totp.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="nloop-totp.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(status_code=200, text="")
+            response.json.return_value = {
+                "ok": True,
+                "email": "user+alias@gmail.com",
+                "found": True,
+                "results": [
+                    {
+                        "service": "ChatGPT",
+                        "email": "user+alias@gmail.com",
+                        "code": "654321",
+                        "remaining": 20,
+                        "period": 30,
+                    }
+                ],
+            }
+
+            with mock.patch("requests.get", return_value=response) as request_get:
+                code = mailbox.get_totp_code(account)
+
+            self.assertEqual(code, "654321")
+            self.assertEqual(request_get.call_args.args[0], lookup_url)
 
     def test_remote_totp_rejects_html_containing_six_digits(self):
         mail_url = (

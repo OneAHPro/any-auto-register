@@ -832,6 +832,46 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(mailbox._task_attempt_token, 42)
         self.assertEqual(service._otp_remaining_seconds, 75.0)
 
+    def test_remote_mfa_service_logs_in_without_mail_receiver(self):
+        lookup_url = (
+            "https://2fa.nloop.cc/api/mfa/lookup"
+            "?email=user%2Balias%40gmail.com"
+        )
+        saved = {
+            "email": "user+alias@gmail.com",
+            "password": "saved-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "user+alias@gmail.com",
+                "extra": {
+                    "account_type": "chatgpt_password_remote_totp",
+                    "password": "saved-password",
+                    "totp_url": lookup_url,
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        mailbox.get_totp_code.return_value = "654321"
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ):
+            service = _build_email_service(saved, {}, log_fn=None)
+
+        email_info = service.create_email()
+
+        self.assertEqual(
+            email_info["account_type"],
+            "chatgpt_password_remote_totp",
+        )
+        self.assertEqual(email_info["password"], "saved-password")
+        self.assertEqual(email_info["totp_url"], lookup_url)
+        self.assertEqual(service.get_totp_code(), "654321")
+        self.assertFalse(service.supports_email_verification())
+        mailbox.get_current_ids.assert_not_called()
+
     def test_password_totp_with_mail_url_reads_email_otp_during_relogin(self):
         mail_api_url = "https://mail.example.test/messages/token"
         saved = {

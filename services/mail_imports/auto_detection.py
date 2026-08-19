@@ -106,6 +106,17 @@ def _looks_like_http_url(value: str) -> bool:
     return parsed.scheme.lower() in {"http", "https"} and bool(parsed.netloc)
 
 
+def _looks_like_remote_totp_url(value: str) -> bool:
+    if not _looks_like_http_url(value):
+        return False
+    parsed = urlsplit(str(value).strip())
+    host = str(parsed.hostname or "").lower().rstrip(".")
+    path = str(parsed.path or "").lower()
+    return host in {"2fa.nloop.cc", "mfa.nloop.cc"} and (
+        "/api/mfa/" in path or path.endswith("/2fa") or path.endswith("/view")
+    )
+
+
 def _looks_like_mfa_secret(value: str) -> bool:
     normalized = re.sub(r"[\s-]+", "", str(value or ""))
     return bool(_MFA_SECRET_RE.fullmatch(normalized))
@@ -269,6 +280,13 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
                 raw_content=line,
                 fallback_account_type="chatgpt_password_reset_url_mail",
             )
+        if _looks_like_remote_totp_url(third):
+            return _resolved_apple_row(
+                line_number=line_number,
+                email=email,
+                raw_content=line,
+                fallback_account_type="chatgpt_password_remote_totp",
+            )
         if _looks_like_mfa_secret(third):
             return _resolved_apple_row(
                 line_number=line_number,
@@ -287,11 +305,18 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
     if len(parts) >= 4:
         password, third, fourth = parts[1:4]
         if _looks_like_http_url(third) or _looks_like_http_url(fourth):
-            fallback_account_type: MailImportAccountType = (
-                "chatgpt_password_reset_url_mail"
-                if _is_reset_marker(password)
-                else "chatgpt_password_url_otp"
-            )
+            if _looks_like_remote_totp_url(third) and _looks_like_remote_totp_url(fourth):
+                fallback_account_type = "chatgpt_password_remote_totp"
+            elif _looks_like_remote_totp_url(third) and not _looks_like_http_url(fourth):
+                fallback_account_type = "chatgpt_password_remote_totp"
+            elif _looks_like_remote_totp_url(fourth) and not _looks_like_http_url(third):
+                fallback_account_type = "chatgpt_password_remote_totp"
+            else:
+                fallback_account_type = (
+                    "chatgpt_password_reset_url_mail"
+                    if _is_reset_marker(password)
+                    else "chatgpt_password_url_otp"
+                )
             return _resolved_apple_row(
                 line_number=line_number,
                 email=email,

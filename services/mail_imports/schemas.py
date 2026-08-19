@@ -13,6 +13,7 @@ MailImportAccountType = Literal[
     "applemail_oauth",
     "icloud_web",
     "chatgpt_password_totp",
+    "chatgpt_password_remote_totp",
     "chatgpt_password_url_otp",
     "chatgpt_password_reset_url_mail",
 ]

@@ -388,7 +388,10 @@ class RefreshTokenRegistrationEngine:
                         self._log(
                             "已识别 ChatGPT 密码 + MFA 登录凭据；不会访问 Apple 邮箱"
                         )
-                elif account_type == "chatgpt_password_url_otp":
+                elif account_type in {
+                    "chatgpt_password_url_otp",
+                    "chatgpt_password_remote_totp",
+                }:
                     password = str(self.email_info.get("password") or "")
                     if not password:
                         raise ValueError("ChatGPT URL 验证记录缺少登录密码")
@@ -673,6 +676,7 @@ class RefreshTokenRegistrationEngine:
             and str(email_info.get("account_type") or "").strip() in {
                 "chatgpt_password_totp",
                 "chatgpt_password_url_otp",
+                "chatgpt_password_remote_totp",
             }
             and str(
                 email_info.get("mail_api_url")

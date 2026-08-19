@@ -175,6 +175,7 @@ class ChatGPTPlatform(BasePlatform):
                     elif str(account_extra.get("account_type") or "").strip() in {
                         "chatgpt_password_url_otp",
                         "chatgpt_password_reset_url_mail",
+                        "chatgpt_password_remote_totp",
                     }:
                         account_type = str(account_extra.get("account_type") or "").strip()
                         result.update(
@@ -249,7 +250,10 @@ class ChatGPTPlatform(BasePlatform):
                     )
                     is_chatgpt_credentials = (
                         str(account_extra.get("account_type") or "").strip()
-                        == "chatgpt_password_totp"
+                        in {
+                            "chatgpt_password_totp",
+                            "chatgpt_password_remote_totp",
+                        }
                     )
                     has_mail_api_url = bool(
                         str(
@@ -451,7 +455,10 @@ class ChatGPTPlatform(BasePlatform):
                             or ""
                         ).strip()
                     )
-                    if account_type == "chatgpt_password_totp" and not has_mail_api:
+                    if account_type in {
+                        "chatgpt_password_totp",
+                        "chatgpt_password_remote_totp",
+                    } and not has_mail_api:
                         return False
                     return callable(getattr(_mailbox, "wait_for_code", None))
 
@@ -519,6 +526,7 @@ class ChatGPTPlatform(BasePlatform):
                         "chatgpt_password_totp",
                         "chatgpt_password_url_otp",
                         "chatgpt_password_reset_url_mail",
+                        "chatgpt_password_remote_totp",
                     }:
                         credential_snapshot = {
                             "provider": "chatgpt_credentials",
@@ -545,6 +553,20 @@ class ChatGPTPlatform(BasePlatform):
                             ).strip()
                             if mail_api_url:
                                 credential_snapshot["mail_api_url"] = mail_api_url
+                        elif account_type == "chatgpt_password_remote_totp":
+                            credential_snapshot.update(
+                                {
+                                    "password": str(
+                                        account_extra.get("password") or ""
+                                    ),
+                                    "totp_url": str(
+                                        account_extra.get("totp_url") or ""
+                                    ),
+                                    "totp_secret": str(
+                                        account_extra.get("totp_secret") or ""
+                                    ),
+                                }
+                            )
                         else:
                             credential_snapshot.update(
                                 {

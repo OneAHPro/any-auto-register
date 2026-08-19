@@ -224,6 +224,11 @@ def _mailbox_context_has_usable_credentials(
         mailbox_context,
         context_extra,
     )
+    if account_type == "chatgpt_password_remote_totp":
+        return bool(
+            _text(context_extra.get("password") or saved.get("password"))
+            and _text(context_extra.get("totp_url"))
+        )
     if account_type in {
         "chatgpt_password_url_otp",
         "chatgpt_password_reset_url_mail",
@@ -752,7 +757,12 @@ class _PersistedEmailService:
 
     def create_email(self, config=None):
         del config
-        if not self._baseline_started:
+        account_type = _text((self._account.extra or {}).get("account_type"))
+        if account_type == "chatgpt_password_remote_totp":
+            self._baseline_started = True
+            self._before_ids = set()
+            self._baseline_ready.set()
+        elif not self._baseline_started:
             self._baseline_started = True
             threading.Thread(
                 target=self._load_baseline,
@@ -766,12 +776,18 @@ class _PersistedEmailService:
         }
         account_extra = dict(self._account.extra or {})
         account_type = _text(account_extra.get("account_type"))
-        if account_type == "chatgpt_password_totp":
+        if account_type in {
+            "chatgpt_password_totp",
+            "chatgpt_password_remote_totp",
+        }:
             result.update({
                 "account_type": account_type,
                 "password": str(account_extra.get("password") or ""),
-                "totp_secret": str(account_extra.get("totp_secret") or ""),
             })
+            if account_type == "chatgpt_password_totp":
+                result["totp_secret"] = str(account_extra.get("totp_secret") or "")
+            else:
+                result["totp_url"] = _text(account_extra.get("totp_url"))
             mail_api_url = _text(
                 account_extra.get("mail_api_url")
                 or account_extra.get("mailapi_url")
@@ -1050,7 +1066,16 @@ class _PersistedEmailService:
         return bool(_text(account_extra.get("totp_url")))
 
     def supports_email_verification(self) -> bool:
-        return callable(getattr(self._mailbox, "wait_for_code", None))
+        account_extra = dict(self._account.extra or {})
+        has_mail_api = bool(
+            _text(
+                account_extra.get("mail_api_url")
+                or account_extra.get("mailapi_url")
+            )
+        )
+        return has_mail_api and callable(
+            getattr(self._mailbox, "wait_for_code", None)
+        )
 
 
 def _build_email_service(
@@ -1072,6 +1097,56 @@ def _build_email_service(
         mailbox_context,
         context_extra,
     )
+    if account_type == "chatgpt_password_remote_totp":
+        password = _text(
+            context_extra.get("password") or saved.get("password")
+        )
+        totp_url = _text(context_extra.get("totp_url"))
+        if not password or not totp_url:
+            raise RuntimeError(
+                f"账号 {saved['email']} 的远程 MFA 凭据缺少密码或 2FA 地址"
+            )
+        mailbox_config = dict(config)
+        pool_file = _text(context_extra.get("pool_file"))
+        if pool_file:
+            mailbox_config["applemail_pool_file"] = pool_file
+        mailbox_config["applemail_pool_dir"] = (
+            _text(config.get("applemail_pool_dir")) or "mail"
+        )
+        proxy = _text(saved.get("extra", {}).get("proxy_used")) or None
+        mailbox = create_mailbox(
+            "applemail",
+            extra=mailbox_config,
+            proxy=proxy,
+        )
+        setattr(mailbox, "_log_fn", log_fn)
+        _bind_mailbox_task_control(mailbox, task_control, attempt_id)
+        if pool_file:
+            mailbox_account = mailbox.get_email_by_address(saved["email"])
+        else:
+            mailbox_account = MailboxAccount(
+                email=saved["email"],
+                account_id=saved["email"],
+                extra={},
+            )
+        account_extra = dict(mailbox_account.extra or {})
+        account_extra.update({
+            "provider": "chatgpt_credentials",
+            "account_type": account_type,
+            "password": password,
+            "totp_url": totp_url,
+        })
+        if pool_file:
+            account_extra["pool_file"] = pool_file
+        mailbox_account.extra = account_extra
+        return _PersistedEmailService(
+            mailbox=mailbox,
+            mailbox_account=mailbox_account,
+            mailbox_context=mailbox_context,
+            provider="chatgpt_credentials",
+            log_fn=log_fn,
+            otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+        )
     if account_type in {
         "chatgpt_password_url_otp",
         "chatgpt_password_reset_url_mail",

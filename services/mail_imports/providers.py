@@ -93,6 +93,7 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
             helper_text=(
                 "支持数组/对象 JSON，也支持每行一条；TXT 字段可使用完整的 `---` 或 `----` 分隔符："
                 "ChatGPT 使用 `email----ChatGPT密码----MFA秘钥`；"
+                "远程 MFA 使用 `email----ChatGPT密码----MFA查询URL`；"
                 "URL 凭据使用 `email----密码----收件URL----2FA URL`；"
                 "忘记密码记录使用 `email----登陆请点击忘记密码----收件URL`；"
                 "AppleMail OAuth 使用 `email----password----client_id----refresh_token`。"
