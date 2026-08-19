@@ -259,6 +259,53 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(rotate_call["access_token"], "web-access-token")
         oauth_client.login_and_get_tokens.assert_called_once()
 
+    def test_recovery_mfa_enrollment_is_saved_and_skips_second_rotation(self):
+        email_service = PasswordTotpEmailService()
+        email_service.commit_mfa_rotation = mock.Mock(return_value=True)
+        engine = self._make_engine(
+            email_service=email_service,
+            rotate_mfa=True,
+        )
+        web_client = mock.Mock()
+        web_client.session = object()
+        web_client.ua = "web-agent"
+        web_client.impersonate = "chrome"
+        web_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "web-access-token",
+                "account_id": "account-1",
+                "mfa_enrollment": {
+                    "totp_secret": "MANDATORY-NEW-SECRET",
+                    "recovery_code": "MANDATORY-RECOVERY",
+                    "rotated_at": "2026-08-19T12:00:00+00:00",
+                },
+            },
+        )
+        oauth_client = self._successful_oauth_client()
+        engine._build_chatgpt_client = mock.Mock(return_value=web_client)
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._rotate_mfa_after_login = mock.Mock()
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        engine._rotate_mfa_after_login.assert_not_called()
+        email_service.commit_mfa_rotation.assert_called_once_with(
+            totp_secret="MANDATORY-NEW-SECRET",
+            recovery_code="MANDATORY-RECOVERY",
+            rotated_at="2026-08-19T12:00:00+00:00",
+        )
+        oauth_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
+        self.assertEqual(oauth_kwargs["totp_secret"], "MANDATORY-NEW-SECRET")
+        self.assertEqual(
+            oauth_kwargs["mfa_recovery_code"],
+            "MANDATORY-RECOVERY",
+        )
+
     def test_password_totp_credentials_force_chatgpt_password_login(self):
         engine = self._make_engine(email_service=PasswordTotpEmailService())
         oauth_client = self._successful_oauth_client()

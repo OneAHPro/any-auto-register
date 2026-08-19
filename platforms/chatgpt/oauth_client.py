@@ -9,6 +9,7 @@ import secrets
 import uuid
 import json
 import random
+from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
 from core.base_mailbox import MailboxAuthenticationError
 from core.icloud_mail import generate_totp
@@ -137,6 +138,7 @@ class OAuthClient:
         self.last_prepared_oauth_context = None
         self.last_phone_send_diagnostic = {}
         self.last_phone_validate_diagnostic = {}
+        self.last_mfa_enrollment = {}
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -609,6 +611,15 @@ class OAuthClient:
             or "mfa-challenge" in target
         )
 
+    def _state_is_mfa_enroll(self, state: FlowState):
+        target = f"{state.continue_url} {state.current_url}".lower()
+        page_type = str(state.page_type or "").strip().lower()
+        return (
+            page_type == "mfa_enroll"
+            or page_type.startswith("mfa_enroll_")
+            or "mfa-enroll" in target
+        )
+
     @staticmethod
     def _extract_mfa_factors(state: FlowState) -> list[dict[str, str]]:
         factors: list[dict[str, str]] = []
@@ -651,6 +662,215 @@ class OAuthClient:
             seen.add(signature)
             deduplicated.append(factor)
         return deduplicated
+
+    @staticmethod
+    def _extract_mfa_enrollment_factors(state: FlowState) -> list[dict[str, str]]:
+        """Extract mandatory-enrollment factors without exposing their secrets."""
+        factors: list[dict[str, str]] = []
+
+        def visit(value):
+            if isinstance(value, dict):
+                factor_type = str(
+                    value.get("factor_type") or value.get("type") or ""
+                ).strip().lower()
+                factor_id = str(
+                    value.get("id") or value.get("factor_id") or ""
+                ).strip()
+                metadata = value.get("metadata")
+                secret = ""
+                if isinstance(metadata, dict):
+                    secret = str(metadata.get("secret") or "").strip()
+                if not secret:
+                    secret = str(value.get("secret") or "").strip()
+                if factor_id and factor_type in {"totp", "recovery_code"} and secret:
+                    factors.append(
+                        {
+                            "id": factor_id,
+                            "type": factor_type,
+                            "secret": secret,
+                        }
+                    )
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    visit(nested)
+
+        visit(state.payload or {})
+        visit(state.raw or {})
+        deduplicated: list[dict[str, str]] = []
+        seen: set[tuple[str, str]] = set()
+        for factor in factors:
+            signature = (factor["id"], factor["type"])
+            if signature in seen:
+                continue
+            seen.add(signature)
+            deduplicated.append(factor)
+        return deduplicated
+
+    @staticmethod
+    def _extract_mfa_enrollment_factor_id(state: FlowState) -> str:
+        found = ""
+
+        def visit(value):
+            nonlocal found
+            if found:
+                return
+            if isinstance(value, dict):
+                candidate = str(value.get("factor_id") or "").strip()
+                if candidate:
+                    found = candidate
+                    return
+                for nested in value.values():
+                    visit(nested)
+            elif isinstance(value, (list, tuple)):
+                for nested in value:
+                    visit(nested)
+
+        visit(state.payload or {})
+        visit(state.raw or {})
+        if found:
+            return found
+
+        target = str(state.continue_url or state.current_url or "").strip()
+        parts = [part for part in urlparse(target).path.split("/") if part]
+        for index, part in enumerate(parts):
+            if part.lower() == "mfa-enroll" and index + 1 < len(parts):
+                return str(parts[index + 1] or "").strip()
+        return ""
+
+    def _submit_mfa_enrollment(
+        self,
+        state: FlowState,
+        *,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+        on_totp_staged=None,
+        on_totp_activated=None,
+        on_recovery_code=None,
+    ):
+        """Complete OpenAI's mandatory MFA enrollment after account recovery."""
+        self._enter_stage("mfa_enroll", "activate")
+        factors = self._extract_mfa_enrollment_factors(state)
+        active_id = self._extract_mfa_enrollment_factor_id(state)
+        factor = next(
+            (item for item in factors if item["id"] == active_id),
+            factors[0] if len(factors) == 1 else None,
+        )
+        if factor is None:
+            self._set_error("MFA 绑定页面未返回当前验证因子")
+            return None
+
+        factor_id = factor["id"]
+        factor_type = factor["type"]
+        secret = factor["secret"]
+        if factor_type == "totp":
+            if callable(on_totp_staged):
+                try:
+                    on_totp_staged(secret)
+                except Exception as exc:
+                    self._set_error(
+                        "新 MFA 秘钥暂存失败，已停止激活: "
+                        f"{type(exc).__name__}"
+                    )
+                    return None
+            code = generate_totp(secret)
+        elif factor_type == "recovery_code":
+            code = secret
+        else:
+            self._set_error(f"未支持的 MFA 绑定因子: {factor_type}")
+            return None
+
+        activate_url = f"{self.oauth_issuer}/api/accounts/mfa/activate"
+        referer = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/mfa-enroll/{factor_id}"
+        )
+        headers = self._headers(
+            activate_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="application/json",
+            referer=referer,
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers={"oai-device-id": device_id},
+        )
+        headers.update(generate_datadog_trace())
+        kwargs = {
+            "json": {
+                "id": factor_id,
+                "type": factor_type,
+                "code": code,
+            },
+            "headers": headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            kwargs["impersonate"] = impersonate
+
+        try:
+            self._browser_pause()
+            response = self.session.post(activate_url, **kwargs)
+            self.last_http_status = int(response.status_code or 0)
+            self._log(
+                f"/mfa/activate({factor_type}) -> {response.status_code}"
+            )
+            if response.status_code != 200:
+                self._set_error(
+                    f"MFA {factor_type} 激活失败: {response.status_code}"
+                )
+                return None
+            payload = response.json()
+            if not isinstance(payload, dict):
+                self._set_error("MFA 激活响应格式无效")
+                return None
+            error = payload.get("error")
+            if error or payload.get("success") is False:
+                error_code = ""
+                if isinstance(error, dict):
+                    error_code = str(
+                        error.get("code") or error.get("type") or ""
+                    ).strip()
+                elif error:
+                    error_code = str(error).strip()
+                self._set_error(
+                    "MFA 激活被服务端拒绝"
+                    + (f": {error_code}" if error_code else "")
+                )
+                return None
+
+            if factor_type == "totp":
+                rotated_at = datetime.now(timezone.utc).isoformat()
+                self.last_mfa_enrollment["totp_secret"] = secret
+                self.last_mfa_enrollment["rotated_at"] = rotated_at
+                if callable(on_totp_activated):
+                    on_totp_activated(rotated_at)
+            else:
+                self.last_mfa_enrollment["recovery_code"] = secret
+                if callable(on_recovery_code):
+                    on_recovery_code(secret)
+
+            next_state = self._state_from_payload(
+                payload,
+                current_url=str(response.url) or activate_url,
+            )
+            self._log(
+                f"MFA {factor_type} 已激活: {describe_flow_state(next_state)}"
+            )
+            return next_state
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(
+                f"MFA {factor_type} 激活异常: {type(exc).__name__}"
+            )
+            return None
 
     @staticmethod
     def _extract_totp_factor_id(state: FlowState) -> str:
@@ -3132,6 +3352,9 @@ class OAuthClient:
         force_password_login=False,
         totp_secret="",
         mfa_recovery_code="",
+        on_mfa_totp_staged=None,
+        on_mfa_totp_activated=None,
+        on_mfa_recovery_code=None,
         password_reset_required=False,
         on_password_reset=None,
         force_chatgpt_entry=False,
@@ -3163,6 +3386,9 @@ class OAuthClient:
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
             totp_secret: ChatGPT TOTP MFA 秘钥；仅在服务端要求 MFA 时使用
             mfa_recovery_code: 项目保存的 MFA 恢复码；仅在 TOTP 被拒绝时使用
+            on_mfa_totp_staged: 强制重新绑定时，新 TOTP 激活前的安全暂存回调
+            on_mfa_totp_activated: 新 TOTP 激活后的回调
+            on_mfa_recovery_code: 新恢复码生成后的保存回调
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
@@ -3178,6 +3404,7 @@ class OAuthClient:
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_prepared_oauth_context = None
+        self.last_mfa_enrollment = {}
         self._log(
             "开始 OAuth 登录流程..."
             + (f" (source={login_source})" if login_source else "")
@@ -3368,6 +3595,8 @@ class OAuthClient:
                 return False
             if self._state_is_mfa_challenge(state_to_check):
                 return False
+            if self._state_is_mfa_enroll(state_to_check):
+                return False
             if self._state_is_create_account_password(state_to_check):
                 return False
             prepared_context = self._capture_prepared_oauth_context(
@@ -3436,6 +3665,10 @@ class OAuthClient:
                     resume_authenticated_session=False,
                     force_password_login=True,
                     totp_secret=totp_secret,
+                    mfa_recovery_code=mfa_recovery_code,
+                    on_mfa_totp_staged=on_mfa_totp_staged,
+                    on_mfa_totp_activated=on_mfa_totp_activated,
+                    on_mfa_recovery_code=on_mfa_recovery_code,
                     password_reset_required=False,
                     on_password_reset=on_password_reset,
                     force_chatgpt_entry=force_chatgpt_entry,
@@ -3539,6 +3772,25 @@ class OAuthClient:
                     )
                     self.last_state = next_state
                     self._set_error("登录链路已完成，按要求停止")
+                    return None
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                continue
+
+            if self._state_is_mfa_enroll(state):
+                next_state = self._submit_mfa_enrollment(
+                    state,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                    on_totp_staged=on_mfa_totp_staged,
+                    on_totp_activated=on_mfa_totp_activated,
+                    on_recovery_code=on_mfa_recovery_code,
+                )
+                if not next_state:
+                    if not self.last_error:
+                        self._set_error("ChatGPT MFA 绑定后未进入下一步 OAuth 状态")
                     return None
                 referer = state.current_url or state.continue_url or referer
                 state = next_state

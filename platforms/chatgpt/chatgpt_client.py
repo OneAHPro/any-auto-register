@@ -658,6 +658,9 @@ class ChatGPTClient:
         password="",
         totp_secret="",
         mfa_recovery_code="",
+        on_mfa_totp_staged=None,
+        on_mfa_totp_activated=None,
+        on_mfa_recovery_code=None,
         password_reset_required=False,
         on_password_reset=None,
         otp_wait_timeout=600,
@@ -1004,6 +1007,9 @@ class ChatGPTClient:
                         password=str(password or ""),
                         totp_secret=str(totp_secret or ""),
                         mfa_recovery_code=str(mfa_recovery_code or ""),
+                        on_mfa_totp_staged=on_mfa_totp_staged,
+                        on_mfa_totp_activated=on_mfa_totp_activated,
+                        on_mfa_recovery_code=on_mfa_recovery_code,
                         password_reset_required=False,
                         on_password_reset=on_password_reset,
                         otp_wait_timeout=otp_wait_timeout,
@@ -1052,6 +1058,24 @@ class ChatGPTClient:
                 if prepare_phone_oauth:
                     capture_phone_browser_context()
                     prepare_phone_transaction(attempts=1)
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
+            if helper._state_is_mfa_enroll(state):
+                next_state = helper._submit_mfa_enrollment(
+                    state,
+                    device_id=self.device_id,
+                    user_agent=self.ua,
+                    sec_ch_ua=self.sec_ch_ua,
+                    impersonate=self.impersonate,
+                    on_totp_staged=on_mfa_totp_staged,
+                    on_totp_activated=on_mfa_totp_activated,
+                    on_recovery_code=on_mfa_recovery_code,
+                )
+                if not next_state:
+                    return False, helper.last_error or "ChatGPT MFA 绑定失败"
                 referer = state.current_url or state.continue_url or referer
                 state = next_state
                 self.last_registration_state = state
@@ -1184,6 +1208,7 @@ class ChatGPTClient:
             "user": user,
             "account": account,
             "expires": session_data.get("expires"),
+            "mfa_enrollment": dict(helper.last_mfa_enrollment or {}),
         }
 
     def authorize(self, url, max_retries=3):

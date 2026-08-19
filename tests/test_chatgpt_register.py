@@ -509,6 +509,138 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "\n".join(logs),
         )
 
+    def test_submit_mfa_enrollment_activates_totp_and_stages_secret(self):
+        client = self._make_client()
+        logs = []
+        client._log = logs.append
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/activate",
+            text='{"page":{"type":"mfa_enroll"}}',
+        )
+        response.json.return_value = {"page": {"type": "mfa_enroll"}}
+        client.session.post = mock.Mock(return_value=response)
+        next_state = FlowState(
+            page_type="mfa_enroll",
+            continue_url=(
+                "https://auth.openai.com/mfa-enroll/recovery-factor"
+            ),
+        )
+        staged = mock.Mock()
+        activated = mock.Mock()
+        recovery_saved = mock.Mock()
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.generate_totp",
+            return_value="123456",
+        ) as generate, mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=next_state,
+        ):
+            state = client._submit_mfa_enrollment(
+                FlowState(
+                    page_type="mfa_enroll",
+                    continue_url=(
+                        "https://auth.openai.com/mfa-enroll/totp-factor"
+                    ),
+                    payload={
+                        "factor_id": "totp-factor",
+                        "mfa_enrollment_factors": [
+                            {
+                                "id": "totp-factor",
+                                "factor_type": "totp",
+                                "metadata": {
+                                    "secret": "JBSWY3DPEHPK3PXP",
+                                },
+                            },
+                            {
+                                "id": "recovery-factor",
+                                "factor_type": "recovery_code",
+                                "metadata": {
+                                    "secret": "RECOVERY-CODE",
+                                },
+                            },
+                        ],
+                    },
+                ),
+                device_id="device-fixed",
+                on_totp_staged=staged,
+                on_totp_activated=activated,
+                on_recovery_code=recovery_saved,
+            )
+
+        self.assertIs(state, next_state)
+        generate.assert_called_once_with("JBSWY3DPEHPK3PXP")
+        staged.assert_called_once_with("JBSWY3DPEHPK3PXP")
+        activated.assert_called_once()
+        recovery_saved.assert_not_called()
+        call = client.session.post.call_args
+        self.assertEqual(
+            call.kwargs["json"],
+            {"id": "totp-factor", "type": "totp", "code": "123456"},
+        )
+        self.assertEqual(
+            client.last_mfa_enrollment["totp_secret"],
+            "JBSWY3DPEHPK3PXP",
+        )
+        self.assertNotIn("JBSWY3DPEHPK3PXP", "\n".join(logs))
+
+    def test_submit_mfa_enrollment_activates_and_saves_recovery_code(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/activate",
+            text='{"page":{"type":"consent"}}',
+        )
+        response.json.return_value = {"page": {"type": "consent"}}
+        client.session.post = mock.Mock(return_value=response)
+        expected_state = FlowState(page_type="consent")
+        recovery_saved = mock.Mock()
+
+        with mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=expected_state,
+        ):
+            state = client._submit_mfa_enrollment(
+                FlowState(
+                    page_type="mfa_enroll",
+                    continue_url=(
+                        "https://auth.openai.com/mfa-enroll/recovery-factor"
+                    ),
+                    payload={
+                        "factor_id": "recovery-factor",
+                        "mfa_enrollment_factors": [
+                            {
+                                "id": "recovery-factor",
+                                "factor_type": "recovery_code",
+                                "metadata": {
+                                    "secret": "RECOVERY-CODE",
+                                },
+                            }
+                        ],
+                    },
+                ),
+                device_id="device-fixed",
+                on_recovery_code=recovery_saved,
+            )
+
+        self.assertIs(state, expected_state)
+        recovery_saved.assert_called_once_with("RECOVERY-CODE")
+        self.assertEqual(
+            client.session.post.call_args.kwargs["json"],
+            {
+                "id": "recovery-factor",
+                "type": "recovery_code",
+                "code": "RECOVERY-CODE",
+            },
+        )
+        self.assertEqual(
+            client.last_mfa_enrollment["recovery_code"],
+            "RECOVERY-CODE",
+        )
+
     def test_submit_mfa_prefers_supplied_totp_over_email_factor(self):
         client = self._make_client()
         expected_state = FlowState(page_type="consent")

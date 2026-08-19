@@ -476,6 +476,52 @@ class RefreshTokenRegistrationEngine:
             self.email_info.pop("totp", None)
         return True
 
+    def _consume_mfa_enrollment(
+        self,
+        *,
+        result: RegistrationResult,
+        email_adapter: EmailServiceAdapter,
+        session_data: dict,
+    ) -> tuple[bool, MfaRotationResult | None]:
+        """Persist a mandatory MFA enrollment completed during login."""
+        enrollment = (
+            session_data.get("mfa_enrollment")
+            if isinstance(session_data, dict)
+            else None
+        )
+        if not isinstance(enrollment, dict) or not enrollment:
+            return False, None
+
+        totp_secret = str(enrollment.get("totp_secret") or "").strip()
+        rotated_at = str(enrollment.get("rotated_at") or "").strip()
+        if not totp_secret or not rotated_at:
+            result.error_message = (
+                "[stage=mfa_enroll] 新 MFA 已进入绑定流程，"
+                "但服务端没有返回完整托管凭据"
+            )
+            result.error_code = "mfa_rotation_failed"
+            self._log(result.error_message, "error")
+            return True, None
+
+        rotation = MfaRotationResult(
+            totp_secret=totp_secret,
+            recovery_code=str(
+                enrollment.get("recovery_code") or ""
+            ).strip(),
+            replaced_existing=True,
+            mfa_enabled=True,
+            rotated_at=rotated_at,
+        )
+        if not self._commit_mfa_rotation(email_adapter, rotation):
+            result.error_message = (
+                "[stage=mfa_enroll] 新 MFA 已激活，但本地凭据保存失败"
+            )
+            result.error_code = "mfa_rotation_failed"
+            self._log(result.error_message, "error")
+            return True, None
+        self._log("恢复登录后要求的新 MFA 已完成绑定并由项目托管")
+        return True, rotation
+
     def _rotate_mfa_after_login(
         self,
         *,
@@ -924,6 +970,24 @@ class RefreshTokenRegistrationEngine:
                         (self.email_info or {}).get("mfa_recovery_code")
                         or ""
                     ),
+                    on_mfa_totp_staged=lambda secret: (
+                        stage_chatgpt_mfa_rotation(
+                            self.email or result.email,
+                            secret,
+                        )
+                    ),
+                    on_mfa_totp_activated=lambda rotated_at: (
+                        mark_chatgpt_mfa_rotation_activated(
+                            self.email or result.email,
+                            rotated_at=rotated_at,
+                        )
+                    ),
+                    on_mfa_recovery_code=lambda recovery_code: (
+                        update_chatgpt_mfa_rotation_recovery_code(
+                            self.email or result.email,
+                            recovery_code,
+                        )
+                    ),
                     password_reset_required=self.password_reset_required,
                     on_password_reset=lambda new_password: self._commit_password_reset(
                         email_adapter,
@@ -951,23 +1015,32 @@ class RefreshTokenRegistrationEngine:
             if not web_access_token:
                 result.error_message = "ChatGPT Web 会话未返回 Access Token"
                 return result
-            rotation = self._rotate_mfa_after_login(
+            enrollment_present, rotation = self._consume_mfa_enrollment(
                 result=result,
                 email_adapter=email_adapter,
-                session=web_client.session,
-                access_token=web_access_token,
-                account_id=str(
-                    web_session.get("account_id")
-                    or web_session.get("workspace_id")
-                    or ""
-                ).strip(),
-                user_agent=str(getattr(web_client, "ua", "") or ""),
-                impersonate=str(
-                    getattr(web_client, "impersonate", "") or ""
-                ),
+                session_data=web_session,
             )
-            if rotation is None:
-                return result
+            if enrollment_present:
+                if rotation is None:
+                    return result
+            else:
+                rotation = self._rotate_mfa_after_login(
+                    result=result,
+                    email_adapter=email_adapter,
+                    session=web_client.session,
+                    access_token=web_access_token,
+                    account_id=str(
+                        web_session.get("account_id")
+                        or web_session.get("workspace_id")
+                        or ""
+                    ).strip(),
+                    user_agent=str(getattr(web_client, "ua", "") or ""),
+                    impersonate=str(
+                        getattr(web_client, "impersonate", "") or ""
+                    ),
+                )
+                if rotation is None:
+                    return result
 
         oauth_client = self._build_oauth_client()
         oauth_client.config.setdefault(
@@ -1000,6 +1073,22 @@ class RefreshTokenRegistrationEngine:
             mfa_recovery_code=str(
                 (self.email_info or {}).get("mfa_recovery_code") or ""
             ),
+            on_mfa_totp_staged=lambda secret: stage_chatgpt_mfa_rotation(
+                self.email or result.email,
+                secret,
+            ),
+            on_mfa_totp_activated=lambda rotated_at: (
+                mark_chatgpt_mfa_rotation_activated(
+                    self.email or result.email,
+                    rotated_at=rotated_at,
+                )
+            ),
+            on_mfa_recovery_code=lambda recovery_code: (
+                update_chatgpt_mfa_rotation_recovery_code(
+                    self.email or result.email,
+                    recovery_code,
+                )
+            ),
             password_reset_required=self.password_reset_required,
             on_password_reset=lambda new_password: self._commit_password_reset(
                 email_adapter,
@@ -1026,6 +1115,27 @@ class RefreshTokenRegistrationEngine:
                 "已有账号登录未同时获取 " + " 和 ".join(missing_tokens)
             )
             return result
+
+        raw_oauth_enrollment = getattr(
+            oauth_client,
+            "last_mfa_enrollment",
+            {},
+        )
+        oauth_enrollment = (
+            dict(raw_oauth_enrollment)
+            if isinstance(raw_oauth_enrollment, dict)
+            else {}
+        )
+        if oauth_enrollment:
+            enrollment_present, oauth_rotation = self._consume_mfa_enrollment(
+                result=result,
+                email_adapter=email_adapter,
+                session_data={"mfa_enrollment": oauth_enrollment},
+            )
+            if enrollment_present and oauth_rotation is None:
+                return result
+            if oauth_rotation is not None:
+                rotation = oauth_rotation
 
         self._populate_result_from_tokens(
             result=result,
@@ -1077,6 +1187,22 @@ class RefreshTokenRegistrationEngine:
             mfa_recovery_code=str(
                 (self.email_info or {}).get("mfa_recovery_code") or ""
             ),
+            on_mfa_totp_staged=lambda secret: stage_chatgpt_mfa_rotation(
+                self.email or result.email,
+                secret,
+            ),
+            on_mfa_totp_activated=lambda rotated_at: (
+                mark_chatgpt_mfa_rotation_activated(
+                    self.email or result.email,
+                    rotated_at=rotated_at,
+                )
+            ),
+            on_mfa_recovery_code=lambda recovery_code: (
+                update_chatgpt_mfa_rotation_recovery_code(
+                    self.email or result.email,
+                    recovery_code,
+                )
+            ),
             password_reset_required=self.password_reset_required,
             on_password_reset=lambda new_password: self._commit_password_reset(
                 email_adapter,
@@ -1098,7 +1224,14 @@ class RefreshTokenRegistrationEngine:
             return result
 
         rotation = None
-        if self._existing_account_should_rotate_mfa():
+        enrollment_present, rotation = self._consume_mfa_enrollment(
+            result=result,
+            email_adapter=email_adapter,
+            session_data=session_data,
+        )
+        if enrollment_present and rotation is None:
+            return result
+        if self._existing_account_should_rotate_mfa() and not enrollment_present:
             rotation = self._rotate_mfa_after_login(
                 result=result,
                 email_adapter=email_adapter,
