@@ -663,6 +663,7 @@ class _PasswordTotpEmailService:
 
     def create_email(self, config=None):
         del config
+        context_extra = dict(self._mailbox_context.get("extra") or {})
         return {
             "email": self._credentials["email"],
             "service_id": self._credentials["email"],
@@ -670,6 +671,9 @@ class _PasswordTotpEmailService:
             "account_type": "chatgpt_password_totp",
             "password": self._credentials["password"],
             "totp_secret": self._credentials["totp_secret"],
+            "mfa_recovery_code": _text(
+                context_extra.get("mfa_recovery_code")
+            ),
         }
 
     def get_verification_code(self, **kwargs):
@@ -805,6 +809,13 @@ class _PersistedEmailService:
         managed_totp = _text(account_extra.get("totp_secret"))
         if managed_totp:
             result["totp_secret"] = managed_totp
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        recovery_code = _text(
+            account_extra.get("mfa_recovery_code")
+            or context_extra.get("mfa_recovery_code")
+        )
+        if recovery_code:
+            result["mfa_recovery_code"] = recovery_code
         return result
 
     def commit_password_reset(self, new_password=""):

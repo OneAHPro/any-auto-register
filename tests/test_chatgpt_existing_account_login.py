@@ -44,6 +44,7 @@ class PasswordTotpEmailService:
             "account_type": "chatgpt_password_totp",
             "password": "chatgpt-password",
             "totp_secret": "JBSWY3DPEHPK3PXP",
+            "mfa_recovery_code": "RECOVERY-CODE",
         }
 
     def get_verification_code(self, **kwargs):
@@ -214,7 +215,10 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertFalse(any("成功创建邮箱" in line for line in result.logs))
 
     def test_refresh_token_stage_rotates_mfa_with_fresh_web_session_before_oauth(self):
-        engine = self._make_engine(rotate_mfa=True)
+        engine = self._make_engine(
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+        )
         web_client = mock.Mock()
         web_client.session = object()
         web_client.ua = "web-agent"
@@ -246,6 +250,10 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertTrue(result.success)
         web_call = web_client.login_existing_account_and_get_session.call_args
         self.assertFalse(web_call.kwargs["prepare_phone_oauth"])
+        self.assertEqual(
+            web_call.kwargs["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
         rotate_call = engine._rotate_mfa_after_login.call_args.kwargs
         self.assertIs(rotate_call["session"], web_client.session)
         self.assertEqual(rotate_call["access_token"], "web-access-token")
@@ -268,6 +276,10 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(
             call.kwargs["totp_secret"],
             "JBSWY3DPEHPK3PXP",
+        )
+        self.assertEqual(
+            call.kwargs["mfa_recovery_code"],
+            "RECOVERY-CODE",
         )
         self.assertFalse(call.kwargs["prefer_passwordless_login"])
         self.assertTrue(call.kwargs["force_password_login"])
@@ -1341,7 +1353,7 @@ class ExistingAccountLoginTests(unittest.TestCase):
             return_value=mfa_state,
         ) as submit_password, mock.patch.object(
             OAuthClient,
-            "_submit_totp_mfa_challenge",
+            "_submit_mfa_challenge",
             return_value=add_phone_state,
         ) as submit_mfa, mock.patch.object(
             OAuthClient,
@@ -1356,6 +1368,7 @@ class ExistingAccountLoginTests(unittest.TestCase):
                 mailbox,
                 password="chatgpt-password",
                 totp_secret="JBSWY3DPEHPK3PXP",
+                mfa_recovery_code="RECOVERY-CODE",
             )
 
         self.assertTrue(ok)
@@ -1366,6 +1379,10 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(
             submit_mfa.call_args.kwargs["totp_secret"],
             "JBSWY3DPEHPK3PXP",
+        )
+        self.assertEqual(
+            submit_mfa.call_args.kwargs["mfa_recovery_code"],
+            "RECOVERY-CODE",
         )
         passwordless.assert_not_called()
         prepare_phone.assert_called_once()

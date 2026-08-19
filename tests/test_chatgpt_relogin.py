@@ -845,6 +845,7 @@ class ChatGPTReloginTests(unittest.TestCase):
                     "account_type": "chatgpt_password_totp",
                     "password": "saved-password",
                     "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_recovery_code": "RECOVERY-CODE",
                     "mail_api_url": mail_api_url,
                     "pool_file": "mfa-mail.json",
                 },
@@ -879,6 +880,10 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(email_info["account_type"], "chatgpt_password_totp")
         self.assertEqual(email_info["password"], "saved-password")
         self.assertEqual(email_info["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(
+            email_info["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
         self.assertEqual(email_info["mail_api_url"], mail_api_url)
         self.assertTrue(service._baseline_ready.wait(timeout=1))
         self.assertEqual(

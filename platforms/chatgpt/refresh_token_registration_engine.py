@@ -920,6 +920,10 @@ class RefreshTokenRegistrationEngine:
                     email_adapter,
                     password=self.password or "",
                     totp_secret=self.totp_secret or "",
+                    mfa_recovery_code=str(
+                        (self.email_info or {}).get("mfa_recovery_code")
+                        or ""
+                    ),
                     password_reset_required=self.password_reset_required,
                     on_password_reset=lambda new_password: self._commit_password_reset(
                         email_adapter,
@@ -993,6 +997,9 @@ class RefreshTokenRegistrationEngine:
             screen_hint="login",
             force_password_login=password_login,
             totp_secret=self.totp_secret or "",
+            mfa_recovery_code=str(
+                (self.email_info or {}).get("mfa_recovery_code") or ""
+            ),
             password_reset_required=self.password_reset_required,
             on_password_reset=lambda new_password: self._commit_password_reset(
                 email_adapter,
@@ -1067,6 +1074,9 @@ class RefreshTokenRegistrationEngine:
             email_adapter,
             password=self.password or "",
             totp_secret=self.totp_secret or "",
+            mfa_recovery_code=str(
+                (self.email_info or {}).get("mfa_recovery_code") or ""
+            ),
             password_reset_required=self.password_reset_required,
             on_password_reset=lambda new_password: self._commit_password_reset(
                 email_adapter,

@@ -363,6 +363,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
                 prefer_passwordless_login=False,
                 force_password_login=True,
                 totp_secret="JBSWY3DPEHPK3PXP",
+                mfa_recovery_code="RECOVERY-CODE",
                 allow_phone_verification=False,
             )
 
@@ -376,7 +377,137 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             submit_mfa.call_args.kwargs["totp_secret"],
             "JBSWY3DPEHPK3PXP",
         )
+        self.assertEqual(
+            submit_mfa.call_args.kwargs["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
         follow_state.assert_not_called()
+
+    def test_submit_mfa_falls_back_to_recovery_code_when_totp_is_rejected(self):
+        client = self._make_client()
+        expected_state = FlowState(page_type="consent")
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = False
+
+        def reject_totp(*args, **kwargs):
+            del args, kwargs
+            client.last_error = (
+                "[stage=mfa] ChatGPT MFA 验证失败: "
+                '403 - {"error":{"code":"incorrect_code"}}'
+            )
+            return None
+
+        with mock.patch.object(
+            client,
+            "_submit_totp_mfa_challenge",
+            side_effect=reject_totp,
+        ) as submit_totp, mock.patch.object(
+            client,
+            "_submit_recovery_code_mfa_challenge",
+            return_value=expected_state,
+        ) as submit_recovery, mock.patch.object(
+            client,
+            "_submit_email_mfa_challenge",
+        ) as submit_email:
+            state = client._submit_mfa_challenge(
+                FlowState(
+                    page_type="mfa_challenge",
+                    payload={
+                        "factors": [
+                            {"id": "totp-1", "factor_type": "totp"},
+                            {
+                                "id": "recovery-1",
+                                "factor_type": "recovery_code",
+                            },
+                        ]
+                    },
+                ),
+                email="user@example.com",
+                skymail_client=mailbox,
+                totp_secret="OUTDATED-TOTP-SECRET",
+                mfa_recovery_code="RECOVERY-CODE",
+                device_id="device-fixed",
+            )
+
+        self.assertIs(state, expected_state)
+        submit_totp.assert_called_once()
+        submit_recovery.assert_called_once()
+        self.assertEqual(
+            submit_recovery.call_args.kwargs["recovery_code"],
+            "RECOVERY-CODE",
+        )
+        submit_email.assert_not_called()
+
+    def test_submit_recovery_code_mfa_challenge_never_logs_code(self):
+        client = self._make_client()
+        logs = []
+        client._log = logs.append
+        issue_response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/issue_challenge",
+            text="{}",
+        )
+        verify_response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/verify",
+            text='{"page":{"type":"consent"}}',
+        )
+        verify_response.json.return_value = {"page": {"type": "consent"}}
+        client.session.post = mock.Mock(
+            side_effect=[issue_response, verify_response]
+        )
+        expected_state = FlowState(page_type="consent")
+
+        with mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=expected_state,
+        ):
+            state = client._submit_recovery_code_mfa_challenge(
+                FlowState(
+                    page_type="mfa_challenge",
+                    continue_url=(
+                        "https://auth.openai.com/mfa-challenge/recovery-1"
+                    ),
+                    payload={
+                        "factors": [
+                            {
+                                "id": "recovery-1",
+                                "factor_type": "recovery_code",
+                            }
+                        ]
+                    },
+                ),
+                factor={"id": "recovery-1", "type": "recovery_code"},
+                recovery_code="RECOVERY-CODE-MUST-STAY-SECRET",
+                device_id="device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+            )
+
+        self.assertIs(state, expected_state)
+        issue_call, verify_call = client.session.post.call_args_list
+        self.assertEqual(
+            issue_call.kwargs["json"],
+            {
+                "id": "recovery-1",
+                "type": "recovery_code",
+                "force_fresh_challenge": False,
+            },
+        )
+        self.assertEqual(
+            verify_call.kwargs["json"],
+            {
+                "id": "recovery-1",
+                "type": "recovery_code",
+                "code": "RECOVERY-CODE-MUST-STAY-SECRET",
+            },
+        )
+        self.assertNotIn(
+            "RECOVERY-CODE-MUST-STAY-SECRET",
+            "\n".join(logs),
+        )
 
     def test_submit_mfa_prefers_supplied_totp_over_email_factor(self):
         client = self._make_client()

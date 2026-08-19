@@ -2095,6 +2095,168 @@ class OAuthClient:
             self._set_error(f"ChatGPT 邮箱 MFA 验证异常: {exc}")
             return None
 
+    def _submit_recovery_code_mfa_challenge(
+        self,
+        state: FlowState,
+        *,
+        factor: dict[str, str],
+        recovery_code: str,
+        device_id: str,
+        user_agent=None,
+        sec_ch_ua=None,
+        impersonate=None,
+    ):
+        """Use a stored recovery code without exposing it to logs."""
+        self._enter_stage("mfa", "recovery_code")
+        factor_id = str(factor.get("id") or "").strip()
+        factor_type = str(
+            factor.get("type") or "recovery_code"
+        ).strip().lower()
+        normalized_code = str(recovery_code or "").strip()
+        if not factor_id:
+            self._set_error("ChatGPT MFA 页面未返回恢复码因子")
+            return None
+        if not normalized_code:
+            self._set_error("ChatGPT 账号需要恢复码，但本地记录为空")
+            return None
+
+        referer = (
+            state.continue_url
+            or state.current_url
+            or f"{self.oauth_issuer}/mfa-challenge/{factor_id}"
+        )
+        common_headers = {"oai-device-id": device_id}
+        issue_url = f"{self.oauth_issuer}/api/accounts/mfa/issue_challenge"
+        issue_headers = self._headers(
+            issue_url,
+            user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            accept="*/*",
+            referer=referer,
+            origin=self.oauth_issuer,
+            content_type="application/json",
+            fetch_site="same-origin",
+            extra_headers=common_headers,
+        )
+        issue_headers.update(generate_datadog_trace())
+        issue_kwargs = {
+            "json": {
+                "id": factor_id,
+                "type": factor_type,
+                "force_fresh_challenge": False,
+            },
+            "headers": issue_headers,
+            "timeout": 30,
+            "allow_redirects": False,
+        }
+        if impersonate:
+            issue_kwargs["impersonate"] = impersonate
+
+        try:
+            self._browser_pause()
+            issue_response = self.session.post(issue_url, **issue_kwargs)
+            self._log(
+                "/mfa/issue_challenge(recovery_code) -> "
+                f"{issue_response.status_code}"
+            )
+            if issue_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT MFA 恢复码 challenge 初始化失败: "
+                    f"{issue_response.status_code} - "
+                    f"{issue_response.text[:180]}"
+                )
+                return None
+
+            verify_url = f"{self.oauth_issuer}/api/accounts/mfa/verify"
+            verify_headers = self._headers(
+                verify_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept="application/json",
+                referer=referer,
+                origin=self.oauth_issuer,
+                content_type="application/json",
+                fetch_site="same-origin",
+                extra_headers=common_headers,
+            )
+            verify_headers.update(generate_datadog_trace())
+            verify_kwargs = {
+                "json": {
+                    "id": factor_id,
+                    "type": factor_type,
+                    "code": normalized_code,
+                },
+                "headers": verify_headers,
+                "timeout": 30,
+                "allow_redirects": False,
+            }
+            if impersonate:
+                verify_kwargs["impersonate"] = impersonate
+
+            self._browser_pause()
+            verify_response = self.session.post(verify_url, **verify_kwargs)
+            self._log(
+                "/mfa/verify(recovery_code) -> "
+                f"{verify_response.status_code}"
+            )
+            if verify_response.status_code != 200:
+                self._set_error(
+                    "ChatGPT MFA 恢复码验证失败: "
+                    f"{verify_response.status_code} - "
+                    f"{verify_response.text[:180]}"
+                )
+                return None
+
+            verify_payload = verify_response.json()
+            verify_error = (
+                verify_payload.get("error")
+                if isinstance(verify_payload, dict)
+                else None
+            )
+            verify_error_code = ""
+            if isinstance(verify_error, dict):
+                verify_error_code = str(
+                    verify_error.get("code")
+                    or verify_error.get("type")
+                    or ""
+                ).strip()
+            if verify_error_code:
+                self._set_error(
+                    "ChatGPT MFA 恢复码验证失败: "
+                    f"HTTP 200 - {verify_error_code}"
+                )
+                return None
+            next_state = self._state_from_payload(
+                verify_payload,
+                current_url=str(verify_response.url) or verify_url,
+            )
+            if self._state_is_mfa_challenge(next_state):
+                self._set_error(
+                    "ChatGPT MFA 恢复码验证失败: 验证后仍停留在 MFA 页面"
+                )
+                return None
+            self._log(f"MFA 恢复码通过 {describe_flow_state(next_state)}")
+            return next_state
+        except Exception as exc:
+            self._set_error(f"ChatGPT MFA 恢复码验证异常: {exc}")
+            return None
+
+    @staticmethod
+    def _mfa_code_was_rejected(error_message: str) -> bool:
+        normalized_error = str(error_message or "").lower()
+        return any(
+            marker in normalized_error
+            for marker in (
+                "incorrect_code",
+                "wrong_mfa_code",
+                "invalid_totp",
+                "invalid_recovery_code",
+                "代码错误",
+                "验证码错误",
+                "恢复码错误",
+            )
+        )
+
     def _submit_mfa_challenge(
         self,
         state: FlowState,
@@ -2103,6 +2265,7 @@ class OAuthClient:
         skymail_client,
         totp_secret: str,
         device_id: str,
+        mfa_recovery_code: str = "",
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
@@ -2121,6 +2284,15 @@ class OAuthClient:
             (factor for factor in factors if factor["type"] == "totp"),
             None,
         )
+        recovery_factor = next(
+            (
+                factor
+                for factor in factors
+                if factor["type"] == "recovery_code"
+            ),
+            None,
+        )
+        recovery_code = str(mfa_recovery_code or "").strip()
         totp_code_provider = getattr(skymail_client, "get_totp_code", None)
         supports_totp_code = getattr(
             skymail_client,
@@ -2153,17 +2325,30 @@ class OAuthClient:
             )
             if totp_result is not None:
                 return totp_result
-            normalized_error = str(self.last_error or "").lower()
-            rejected_totp = any(
-                marker in normalized_error
-                for marker in (
-                    "incorrect_code",
-                    "wrong_mfa_code",
-                    "invalid_totp",
-                    "代码错误",
-                    "验证码错误",
+            rejected_totp = self._mfa_code_was_rejected(self.last_error)
+            if (
+                recovery_factor is not None
+                and recovery_code
+                and rejected_totp
+            ):
+                self._log(
+                    "已有 TOTP 被拒绝，自动使用项目保存的 MFA 恢复码"
                 )
-            )
+                self.last_error = ""
+                recovery_result = self._submit_recovery_code_mfa_challenge(
+                    state,
+                    factor=recovery_factor,
+                    recovery_code=recovery_code,
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    impersonate=impersonate,
+                )
+                if recovery_result is not None:
+                    return recovery_result
+                rejected_totp = self._mfa_code_was_rejected(
+                    self.last_error
+                )
             if email_factor is not None and skymail_client is not None and rejected_totp:
                 self._log(
                     "已有 MFA 验证码被拒绝，自动改用邮箱验证码继续登录"
@@ -2180,6 +2365,16 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
             return None
+        if recovery_factor is not None and recovery_code:
+            return self._submit_recovery_code_mfa_challenge(
+                state,
+                factor=recovery_factor,
+                recovery_code=recovery_code,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
         if email_factor is not None and skymail_client is not None:
             return self._submit_email_mfa_challenge(
                 state,
@@ -2936,6 +3131,7 @@ class OAuthClient:
         resume_authenticated_session=False,
         force_password_login=False,
         totp_secret="",
+        mfa_recovery_code="",
         password_reset_required=False,
         on_password_reset=None,
         force_chatgpt_entry=False,
@@ -2966,6 +3162,7 @@ class OAuthClient:
             resume_authenticated_session: 已进入认证后状态时跳过再次提交邮箱
             force_password_login: 即使 prefer_passwordless_login=true，也强制走密码登录
             totp_secret: ChatGPT TOTP MFA 秘钥；仅在服务端要求 MFA 时使用
+            mfa_recovery_code: 项目保存的 MFA 恢复码；仅在 TOTP 被拒绝时使用
             force_chatgpt_entry: 在 OAuth 前先走 ChatGPT 首页 -> CSRF -> signin/openai
             complete_about_you_if_needed: 命中 about_you 后是否自动提交资料完成注册
             screen_hint: authorize/continue 的 screen_hint（login/signup）
@@ -2993,6 +3190,7 @@ class OAuthClient:
             f"force_new_browser={'on' if force_new_browser else 'off'}, "
             f"force_password_login={'on' if force_password_login else 'off'}, "
             f"totp_mfa={'on' if str(totp_secret or '').strip() else 'off'}, "
+            f"mfa_recovery={'on' if str(mfa_recovery_code or '').strip() else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
             f"stop_after_login={'on' if stop_after_login else 'off'}"
@@ -3325,6 +3523,7 @@ class OAuthClient:
                     email=email,
                     skymail_client=skymail_client,
                     totp_secret=str(totp_secret or ""),
+                    mfa_recovery_code=str(mfa_recovery_code or ""),
                     device_id=device_id,
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
