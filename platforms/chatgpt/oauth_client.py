@@ -776,6 +776,17 @@ class OAuthClient:
                         f"{type(exc).__name__}"
                     )
                     return None
+            pending_recovery_code = str(
+                self.last_mfa_enrollment.get("recovery_code") or ""
+            ).strip()
+            if pending_recovery_code and callable(on_recovery_code):
+                try:
+                    on_recovery_code(pending_recovery_code)
+                except Exception as exc:
+                    self._log(
+                        "新 MFA 恢复码写前记录暂存失败，将在登录完成后落库: "
+                        f"{type(exc).__name__}"
+                    )
             code = generate_totp(secret)
         elif factor_type == "recovery_code":
             code = secret
@@ -850,11 +861,28 @@ class OAuthClient:
                 self.last_mfa_enrollment["totp_secret"] = secret
                 self.last_mfa_enrollment["rotated_at"] = rotated_at
                 if callable(on_totp_activated):
-                    on_totp_activated(rotated_at)
+                    try:
+                        on_totp_activated(rotated_at)
+                    except Exception as exc:
+                        self._log(
+                            "新 MFA 激活状态写前记录更新失败，"
+                            "将由最终凭据落库兜底: "
+                            f"{type(exc).__name__}"
+                        )
             else:
                 self.last_mfa_enrollment["recovery_code"] = secret
-                if callable(on_recovery_code):
-                    on_recovery_code(secret)
+                if (
+                    self.last_mfa_enrollment.get("totp_secret")
+                    and callable(on_recovery_code)
+                ):
+                    try:
+                        on_recovery_code(secret)
+                    except Exception as exc:
+                        self._log(
+                            "新 MFA 恢复码写前记录更新失败，"
+                            "将由最终凭据落库兜底: "
+                            f"{type(exc).__name__}"
+                        )
 
             next_state = self._state_from_payload(
                 payload,

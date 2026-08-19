@@ -627,7 +627,7 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
 
         self.assertIs(state, expected_state)
-        recovery_saved.assert_called_once_with("RECOVERY-CODE")
+        recovery_saved.assert_not_called()
         self.assertEqual(
             client.session.post.call_args.kwargs["json"],
             {
@@ -639,6 +639,95 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertEqual(
             client.last_mfa_enrollment["recovery_code"],
             "RECOVERY-CODE",
+        )
+
+    def test_submit_totp_enrollment_flushes_recovery_enrolled_first(self):
+        client = self._make_client()
+        client.last_mfa_enrollment = {"recovery_code": "RECOVERY-FIRST"}
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/activate",
+        )
+        response.json.return_value = {"page": {"type": "consent"}}
+        client.session.post = mock.Mock(return_value=response)
+        staged = mock.Mock()
+        recovery_saved = mock.Mock()
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.generate_totp",
+            return_value="123456",
+        ), mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=FlowState(page_type="consent"),
+        ):
+            state = client._submit_mfa_enrollment(
+                FlowState(
+                    page_type="mfa_enroll",
+                    continue_url="https://auth.openai.com/mfa-enroll/totp-factor",
+                    payload={
+                        "factor_id": "totp-factor",
+                        "mfa_enrollment_factors": [
+                            {
+                                "id": "totp-factor",
+                                "factor_type": "totp",
+                                "metadata": {"secret": "JBSWY3DPEHPK3PXP"},
+                            }
+                        ],
+                    },
+                ),
+                device_id="device-fixed",
+                on_totp_staged=staged,
+                on_recovery_code=recovery_saved,
+            )
+
+        self.assertEqual(state.page_type, "consent")
+        staged.assert_called_once_with("JBSWY3DPEHPK3PXP")
+        recovery_saved.assert_called_once_with("RECOVERY-FIRST")
+
+    def test_post_activation_journal_callback_error_does_not_fail_flow(self):
+        client = self._make_client()
+        response = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/activate",
+        )
+        response.json.return_value = {"page": {"type": "consent"}}
+        client.session.post = mock.Mock(return_value=response)
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.generate_totp",
+            return_value="123456",
+        ), mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=FlowState(page_type="consent"),
+        ):
+            state = client._submit_mfa_enrollment(
+                FlowState(
+                    page_type="mfa_enroll",
+                    continue_url="https://auth.openai.com/mfa-enroll/totp-factor",
+                    payload={
+                        "factor_id": "totp-factor",
+                        "mfa_enrollment_factors": [
+                            {
+                                "id": "totp-factor",
+                                "factor_type": "totp",
+                                "metadata": {"secret": "JBSWY3DPEHPK3PXP"},
+                            }
+                        ],
+                    },
+                ),
+                device_id="device-fixed",
+                on_totp_staged=mock.Mock(),
+                on_totp_activated=mock.Mock(
+                    side_effect=RuntimeError("journal unavailable")
+                ),
+            )
+
+        self.assertEqual(state.page_type, "consent")
+        self.assertEqual(
+            client.last_mfa_enrollment["totp_secret"],
+            "JBSWY3DPEHPK3PXP",
         )
 
     def test_submit_mfa_prefers_supplied_totp_over_email_factor(self):
