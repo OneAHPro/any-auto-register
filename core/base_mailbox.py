@@ -4417,6 +4417,53 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         )
 
     @classmethod
+    def _mailapi_history_item_code(cls, item: dict[str, Any]) -> str:
+        import re
+
+        explicit = str(
+            item.get("verificationCode")
+            or item.get("verification_code")
+            or item.get("code")
+            or ""
+        ).strip()
+        if explicit:
+            return explicit
+
+        subject = " ".join(str(item.get("subject") or "").strip().split())
+        if not re.search(
+            r"(?is)\b(?:verification|authentication|login|security)\s+code\b|"
+            r"\btemporary\b.{0,32}\bcode\b|"
+            r"验证码|校验码|动态码|登录代码|登錄代碼|登入代碼|"
+            r"認証コード|認證碼|驗證碼",
+            subject,
+        ):
+            return ""
+
+        content = " ".join(
+            str(item.get(key) or "")
+            for key in (
+                "subject",
+                "preview",
+                "snippet",
+                "text_body",
+                "text",
+                "body",
+                "content",
+            )
+        )
+        match = re.search(
+            r"(?is)(?:verification|authentication|login|security)\s+code\b"
+            r"[^0-9]{0,160}(\d{6})\b|"
+            r"(?:验证码|校验码|动态码|登录代码|登錄代碼|"
+            r"登入代碼|認証コード|認證碼|驗證碼)"
+            r"[^0-9]{0,80}(\d{6})\b",
+            content,
+        )
+        if not match:
+            return ""
+        return str(match.group(1) or match.group(2) or "").strip()
+
+    @classmethod
     def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
         import json
 
@@ -4443,12 +4490,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             for index, item in enumerate(messages):
                 if not isinstance(item, dict):
                     continue
-                verification_code = str(
-                    item.get("verificationCode")
-                    or item.get("verification_code")
-                    or item.get("code")
-                    or ""
-                ).strip()
+                verification_code = cls._mailapi_history_item_code(item)
                 subject = str(item.get("subject") or "").strip()
                 if (
                     not verification_code
@@ -4992,6 +5034,28 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 cookie_jar.update(cookies)
         return cookie_jar
 
+    @staticmethod
+    def _naturalflower_mailbox_api_url(value: Any) -> Optional[str]:
+        from urllib.parse import parse_qs, quote, unquote, urlsplit, urlunsplit
+
+        source = urlsplit(str(value or "").strip())
+        if source.hostname != "pickup.naturalflower.cn":
+            return None
+        token = str(parse_qs(source.query).get("token", [""])[0] or "").strip()
+        if not token and source.path.startswith("/p/"):
+            token = unquote(source.path[3:]).strip()
+        if not token:
+            return None
+        return urlunsplit(
+            (
+                source.scheme,
+                source.netloc,
+                f"/api/public/mailbox/{quote(token, safe='')}",
+                "",
+                "",
+            )
+        )
+
     def _fetch_mailapi_text(self, account: MailboxAccount) -> str:
         extra = account.extra or {}
         url = str(extra.get("mailapi_url") or "").strip()
@@ -5008,6 +5072,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         ):
             return text
         source_url = str(getattr(response, "url", "") or url)
+        naturalflower_api_url = self._naturalflower_mailbox_api_url(source_url)
+        if naturalflower_api_url:
+            cookies = self._collect_mailapi_cookies(response)
+            api_response = self._request_mailapi(
+                naturalflower_api_url,
+                cookies=cookies,
+                timeout=5,
+            )
+            return str(api_response.text or "")
         detail_urls = self._find_mailapi_detail_urls(text, source_url)
         if not detail_urls:
             return text

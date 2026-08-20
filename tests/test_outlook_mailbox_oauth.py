@@ -721,6 +721,71 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             15,
         )
 
+    @mock.patch("requests.get")
+    def test_mailapi_naturalflower_shell_follows_public_mailbox_api(self, mock_get):
+        mailbox = OutlookMailbox()
+        token = "pickup-token.with-punctuation"
+        account = MailboxAccount(
+            email="demo@post.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": (
+                    "https://pickup.naturalflower.cn/?token=" + token
+                ),
+            },
+        )
+        shell = """
+        <!doctype html>
+        <html><body>
+          <strong id="pickup-email">正在验证取件链接...</strong>
+          <aside id="pickup-list">正在获取邮件...</aside>
+          <script src="/static/pickup.js"></script>
+        </body></html>
+        """
+        mailbox_payload = {
+            "email": "demo@post.com",
+            "messages": [
+                {
+                    "id": 36759760,
+                    "subject": "Your temporary ChatGPT login code",
+                    "sender_address": "noreply@tm.openai.com",
+                    "received_at": "2026-08-20T23:45:34+08:00",
+                    "preview": (
+                        "Enter this temporary verification code to continue: "
+                        "292882"
+                    ),
+                }
+            ],
+        }
+        mock_get.side_effect = [
+            _FakeResponse(200, text=shell),
+            _FakeResponse(200, text=json.dumps(mailbox_payload)),
+        ]
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=datetime.fromisoformat(
+                    "2026-08-20T23:45:33+08:00"
+                ).timestamp(),
+            )
+
+        self.assertEqual(code, "292882")
+        self.assertEqual(mock_get.call_count, 2)
+        self.assertEqual(
+            mock_get.call_args_list[1].args[0],
+            (
+                "https://pickup.naturalflower.cn/api/public/mailbox/"
+                "pickup-token.with-punctuation"
+            ),
+        )
+
     def test_mailapi_parses_single_message_panel_with_timestamp_and_code(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]
