@@ -387,6 +387,28 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         )
         follow_state.assert_not_called()
 
+    def test_google_federated_browser_error_redacts_password(self):
+        client = self._make_client()
+        state = FlowState(
+            page_type="external_url",
+            current_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+        )
+        password = "supplier-password-must-not-leak"
+
+        with mock.patch(
+            "platforms.chatgpt.oauth_client.complete_google_federated_login_via_browser",
+            side_effect=RuntimeError(f"Locator.fill({password!r}) timed out"),
+        ):
+            result = client._complete_google_federated_login(
+                state,
+                email="worker@example.com",
+                password=password,
+                user_agent="UA",
+            )
+
+        self.assertIsNone(result)
+        self.assertNotIn(password, client.last_error)
+
     def test_login_and_get_tokens_dispatches_mfa_with_mailbox_and_totp_context(self):
         client = self._make_client()
         mailbox = mock.Mock()

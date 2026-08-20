@@ -35,7 +35,12 @@ interface MailImportSnapshotItem {
   mailbox: string
   enabled?: boolean | null
   has_oauth?: boolean | null
-  account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_password_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
+  account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_google_password' | 'chatgpt_password_totp' | 'chatgpt_password_remote_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
+}
+
+interface UnifiedMailImportSnapshotItem extends MailImportSnapshotItem {
+  providerType: MailImportProviderType
+  key: string
 }
 
 interface MailImportSnapshot {
@@ -187,33 +192,6 @@ function buildDisplayProviders(providers: MailImportProviderDescriptor[]) {
   return items
 }
 
-function matchesSelectionType(
-  selectionType: MailImportSelectionType,
-  email: string,
-  accountType?: string | null,
-) {
-  const domain = String(email.split('@')[1] || '').trim().toLowerCase()
-  const normalizedType = String(accountType || 'microsoft_oauth').trim().toLowerCase()
-  if (selectionType === 'mailapi') return normalizedType === 'mailapi_url'
-  if (selectionType === 'hotmail') return normalizedType !== 'mailapi_url' && domain.includes('hotmail')
-  if (selectionType === 'outlook') return normalizedType !== 'mailapi_url' && domain.includes('outlook')
-  return true
-}
-
-function filterSnapshotBySelection(
-  snapshot: MailImportSnapshot | null,
-  selectionType: MailImportSelectionType,
-) {
-  if (!snapshot || selectionType === 'applemail' || snapshot.type !== 'microsoft') {
-    return snapshot
-  }
-
-  return {
-    ...snapshot,
-    items: snapshot.items.filter((item) => matchesSelectionType(selectionType, item.email, item.account_type)),
-  }
-}
-
 function buildImportSuccessMessage(result: MailImportResult) {
   if (result.type === 'applemail') {
     const fileLabel = result.snapshot.filename ? `，已绑定 ${result.snapshot.filename}` : ''
@@ -246,9 +224,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   const [deletingEmail, setDeletingEmail] = useState('')
   const [batchDeleting, setBatchDeleting] = useState(false)
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
-  const [loadingProviders, setLoadingProviders] = useState(false)
   const [loadingSnapshot, setLoadingSnapshot] = useState(false)
-  const [rawSnapshot, setRawSnapshot] = useState<MailImportSnapshot | null>(null)
+  const [snapshots, setSnapshots] = useState<Partial<Record<MailImportProviderType, MailImportSnapshot>>>({})
   const [result, setResult] = useState<MailImportResult | null>(null)
   const [aliasSplitEnabled, setAliasSplitEnabled] = useState(false)
   const [aliasSplitCount, setAliasSplitCount] = useState(5)
@@ -286,20 +263,26 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     ),
     [currentMailImportSource, currentMailProvider, watchedLuckmailDomain, watchedLuckmailEmailType, watchedPoolFile],
   )
-  const snapshot = useMemo(
-    () => filterSnapshotBySelection(rawSnapshot, selectedType),
-    [rawSnapshot, selectedType],
+  const tableData = useMemo<UnifiedMailImportSnapshotItem[]>(() => {
+    let displayIndex = 0
+    return (['microsoft', 'applemail'] as MailImportProviderType[]).flatMap((providerType) => (
+      (snapshots[providerType]?.items || []).map((item) => ({
+        ...item,
+        index: ++displayIndex,
+        providerType,
+        key: `${providerType}::${item.email}::${item.mailbox || ''}`,
+      }))
+    ))
+  }, [snapshots])
+  const importedCount = SUPPORTED_IMPORT_TYPES.reduce(
+    (total, providerType) => total + Math.max(0, Number(snapshots[providerType]?.count || 0)),
+    0,
   )
-  const tableData = useMemo(
-    () => (snapshot?.items || []).map((item) => ({
-      ...item,
-      key: `${item.email}::${item.mailbox || ''}`,
-    })),
-    [snapshot],
+  const hasTruncatedSnapshot = SUPPORTED_IMPORT_TYPES.some(
+    providerType => Boolean(snapshots[providerType]?.truncated),
   )
 
   const loadProviders = async () => {
-    setLoadingProviders(true)
     try {
       const data = await apiFetch('/mail-imports/providers') as { items?: MailImportProviderDescriptor[] }
       const items = Array.isArray(data.items) ? data.items.filter((item) => isSupportedImportType(item.type)) : []
@@ -314,28 +297,39 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     } catch (error) {
       const detail = error instanceof Error ? error.message : '加载邮箱导入配置失败'
       message.error(detail)
-    } finally {
-      setLoadingProviders(false)
     }
   }
 
-  const loadSnapshot = async (providerType: MailImportSelectionType) => {
+  const loadSnapshots = async () => {
     setLoadingSnapshot(true)
     try {
-      const apiType = toImportApiType(providerType)
-      const params = new URLSearchParams({ type: apiType })
-      if (apiType === 'applemail') {
-        if (watchedPoolDir.trim()) {
-          params.set('pool_dir', watchedPoolDir.trim())
+      const entries = await Promise.all(SUPPORTED_IMPORT_TYPES.map(async (providerType) => {
+        const params = new URLSearchParams({
+          type: providerType,
+          preview_limit: '500',
+        })
+        if (providerType === 'applemail') {
+          if (watchedPoolDir.trim()) {
+            params.set('pool_dir', watchedPoolDir.trim())
+          }
+          if (watchedPoolFile.trim()) {
+            params.set('pool_file', watchedPoolFile.trim())
+          }
         }
-        if (watchedPoolFile.trim()) {
-          params.set('pool_file', watchedPoolFile.trim())
+        try {
+          const nextSnapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`) as MailImportSnapshot
+          return [providerType, nextSnapshot] as const
+        } catch {
+          return [providerType, null] as const
         }
+      }))
+      const nextSnapshots: Partial<Record<MailImportProviderType, MailImportSnapshot>> = {}
+      for (const [providerType, providerSnapshot] of entries) {
+        if (providerSnapshot) nextSnapshots[providerType] = providerSnapshot
       }
-      const nextSnapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`) as MailImportSnapshot
-      setRawSnapshot(nextSnapshot)
+      setSnapshots(nextSnapshots)
     } catch {
-      setRawSnapshot(null)
+      setSnapshots({})
     } finally {
       setLoadingSnapshot(false)
     }
@@ -352,13 +346,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   }, [preferredImportType, providerMap])
 
   useEffect(() => {
-    if (!selectedProvider) return
-    void loadSnapshot(selectedType)
-  }, [selectedProvider, selectedType, watchedPoolDir, watchedPoolFile])
+    if (!providers.length) return
+    void loadSnapshots()
+  }, [providers.length, watchedPoolDir, watchedPoolFile])
 
   useEffect(() => {
     setSelectedRowKeys([])
-  }, [selectedType, rawSnapshot])
+  }, [snapshots])
 
   useEffect(() => {
     const payload = content.trim()
@@ -424,7 +418,12 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       }) as MailImportResult
 
       setResult(response)
-      setRawSnapshot(response.snapshot)
+      if (response.snapshot?.type) {
+        setSnapshots((current) => ({
+          ...current,
+          [response.snapshot.type]: response.snapshot,
+        }))
+      }
       setContent('')
       setFilename('')
       setDetection(null)
@@ -459,6 +458,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       }
 
       message.success(buildImportSuccessMessage(response))
+      window.setTimeout(() => void loadSnapshots(), 0)
     } catch (error) {
       const detail = error instanceof Error ? error.message : '邮箱导入失败'
       message.error(detail)
@@ -475,8 +475,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     })
   }
 
-  const handleDelete = async (item: MailImportSnapshotItem) => {
-    const apiType = toImportApiType(selectedType)
+  const handleDelete = async (item: UnifiedMailImportSnapshotItem) => {
+    const apiType = item.providerType
     const email = String(item.email || '').trim()
     if (!email) return
 
@@ -499,7 +499,10 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       }) as MailImportResult
 
       setResult(response)
-      setRawSnapshot(response.snapshot)
+      setSnapshots((current) => ({
+        ...current,
+        [apiType]: response.snapshot,
+      }))
       setSelectedRowKeys([])
       message.success(`已删除 ${email}`)
     } catch (error) {
@@ -522,31 +525,47 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       return
     }
 
-    const apiType = toImportApiType(selectedType)
     setBatchDeleting(true)
     try {
-      const body: Record<string, unknown> = {
-        type: apiType,
-        items: selectedItems.map((item) => ({
-          email: item.email,
-          mailbox: item.mailbox || '',
-        })),
+      let success = 0
+      let failed = 0
+      let lastResponse: MailImportResult | null = null
+      for (const apiType of SUPPORTED_IMPORT_TYPES) {
+        const providerItems = selectedItems.filter(item => item.providerType === apiType)
+        if (!providerItems.length) continue
+        const body: Record<string, unknown> = {
+          type: apiType,
+          items: providerItems.map((item) => ({
+            email: item.email,
+            mailbox: item.mailbox || '',
+          })),
+        }
+        if (apiType === 'applemail') {
+          body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
+          body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
+        }
+        const response = await apiFetch('/mail-imports/batch-delete', {
+          method: 'POST',
+          body: JSON.stringify(body),
+        }) as MailImportResult
+        lastResponse = response
+        success += response.summary.success
+        failed += response.summary.failed
+        setSnapshots((current) => ({
+          ...current,
+          [apiType]: response.snapshot,
+        }))
       }
 
-      if (apiType === 'applemail') {
-        body.pool_dir = String(form.getFieldValue('applemail_pool_dir') || 'mail').trim() || 'mail'
-        body.pool_file = String(form.getFieldValue('applemail_pool_file') || '').trim()
+      if (lastResponse) {
+        setResult({
+          ...lastResponse,
+          type: 'auto',
+          summary: { total: success + failed, success, failed },
+        })
       }
-
-      const response = await apiFetch('/mail-imports/batch-delete', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      }) as MailImportResult
-
-      setResult(response)
-      setRawSnapshot(response.snapshot)
       setSelectedRowKeys([])
-      message.success(`批量删除完成：成功 ${response.summary.success} / 失败 ${response.summary.failed}`)
+      message.success(`批量删除完成：成功 ${success} / 失败 ${failed}`)
     } catch (error) {
       const detail = error instanceof Error ? error.message : '批量删除失败'
       const shouldFallbackToSingleDelete = /405|404|Method Not Allowed|Not Found/i.test(detail)
@@ -562,6 +581,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
 
       for (const item of selectedItems) {
         try {
+          const apiType = item.providerType
           const body: Record<string, unknown> = {
             type: apiType,
             email: item.email,
@@ -579,7 +599,10 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           }) as MailImportResult
 
           setResult(response)
-          setRawSnapshot(response.snapshot)
+          setSnapshots((current) => ({
+            ...current,
+            [apiType]: response.snapshot,
+          }))
           success += 1
         } catch (singleError) {
           failed += 1
@@ -600,10 +623,22 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       }
     } finally {
       setBatchDeleting(false)
+      void loadSnapshots()
     }
   }
 
   const columns = useMemo(() => {
+    const accountTypeLabels: Record<string, { label: string, color?: string }> = {
+      microsoft_oauth: { label: 'Microsoft OAuth', color: 'blue' },
+      mailapi_url: { label: 'MailAPI URL', color: 'purple' },
+      applemail_oauth: { label: 'AppleMail OAuth', color: 'blue' },
+      icloud_web: { label: 'iCloud Web', color: 'cyan' },
+      chatgpt_google_password: { label: 'Google 联邦', color: 'geekblue' },
+      chatgpt_password_totp: { label: '密码 + TOTP', color: 'green' },
+      chatgpt_password_remote_totp: { label: '远程 TOTP', color: 'green' },
+      chatgpt_password_url_otp: { label: '密码 + 接码地址', color: 'orange' },
+      chatgpt_password_reset_url_mail: { label: '需重置密码', color: 'volcano' },
+    }
     const baseColumns = [
       {
         title: '#',
@@ -616,72 +651,44 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         dataIndex: 'email',
         key: 'email',
       },
+      {
+        title: '来源',
+        dataIndex: 'providerType',
+        key: 'providerType',
+        width: 170,
+        render: (value: MailImportProviderType) => (
+          <Tag color={value === 'microsoft' ? 'blue' : 'purple'}>
+            {value === 'microsoft' ? '微软邮箱池' : 'Google / MFA / AppleMail'}
+          </Tag>
+        ),
+      } as never,
+      {
+        title: '凭据类型',
+        dataIndex: 'account_type',
+        key: 'account_type',
+        width: 180,
+        render: (value: string | null | undefined, item: UnifiedMailImportSnapshotItem) => {
+          const fallbackType = item.providerType === 'microsoft' ? 'microsoft_oauth' : 'applemail_oauth'
+          const config = accountTypeLabels[String(value || fallbackType)] || { label: String(value || fallbackType) }
+          return <Tag color={config.color}>{config.label}</Tag>
+        },
+      } as never,
+      {
+        title: '状态',
+        key: 'status',
+        width: 100,
+        render: (_: unknown, item: UnifiedMailImportSnapshotItem) => {
+          const enabled = item.providerType === 'applemail' || item.enabled !== false
+          return <Tag color={enabled ? 'green' : 'default'}>{enabled ? '可用' : '停用'}</Tag>
+        },
+      } as never,
     ]
-
-    if (selectedType === 'applemail') {
-      baseColumns.push(
-        {
-          title: '类型',
-          dataIndex: 'account_type',
-          key: 'account_type',
-          width: 180,
-          render: (value: string) => {
-            const labels: Record<string, string> = {
-              chatgpt_password_url_otp: '密码 + URL 2FA',
-              chatgpt_password_reset_url_mail: '需重置密码',
-              chatgpt_password_totp: '密码 + TOTP',
-              icloud_web: 'iCloud Web',
-              applemail_oauth: 'AppleMail OAuth',
-            }
-            return <Tag>{labels[value] || value || 'AppleMail OAuth'}</Tag>
-          },
-        } as never,
-        {
-          title: '邮箱文件夹',
-          dataIndex: 'mailbox',
-          key: 'mailbox',
-          width: 140,
-          render: (value: string) => <Tag>{value || 'INBOX'}</Tag>,
-        } as never,
-      )
-    } else {
-      baseColumns.push(
-        {
-          title: '类型',
-          dataIndex: 'account_type',
-          key: 'account_type',
-          width: 120,
-          render: (value: string | null | undefined) => {
-            const isMailApi = String(value || '').trim().toLowerCase() === 'mailapi_url'
-            return <Tag color={isMailApi ? 'purple' : 'blue'}>{isMailApi ? 'MailAPI URL' : 'OAuth'}</Tag>
-          },
-        } as never,
-        {
-          title: '状态',
-          dataIndex: 'enabled',
-          key: 'enabled',
-          width: 100,
-          render: (value: boolean | null | undefined) => (
-            <Tag color={value ? 'green' : 'default'}>{value ? '启用' : '停用'}</Tag>
-          ),
-        } as never,
-        {
-          title: '认证',
-          dataIndex: 'has_oauth',
-          key: 'has_oauth',
-          width: 100,
-          render: (value: boolean | null | undefined) => (
-            <Tag color={value ? 'blue' : 'default'}>{value ? 'OAuth' : '密码'}</Tag>
-          ),
-        } as never,
-      )
-    }
 
     baseColumns.push({
       title: '操作',
       key: 'action',
       width: 90,
-      render: (_: unknown, item: MailImportSnapshotItem) => (
+      render: (_: unknown, item: UnifiedMailImportSnapshotItem) => (
         <Popconfirm
           title="确认删除这个邮箱吗？"
           description={item.email}
@@ -704,36 +711,20 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     } as never)
 
     return baseColumns
-  }, [deletingEmail, selectedType, tableData])
+  }, [deletingEmail])
 
   return (
     <Card
-      title="邮箱导入"
-      extra={(
-        <Select
-          aria-label="邮箱池视图"
-          value={selectedType}
-          onChange={handleTypeChange}
-          loading={loadingProviders}
-          style={{ width: 240 }}
-          options={providers.map((provider) => ({
-            label: provider.label,
-            value: provider.type,
-          }))}
-        />
-      )}
+      title={<Space><span>邮箱导入</span><Tag color="geekblue">统一兼容导入</Tag></Space>}
       style={{ marginBottom: 16 }}
     >
       <Space direction="vertical" style={{ width: '100%' }} size={12}>
         <Typography.Text strong>
-          粘贴后自动识别邮箱类型，字段支持完整的 --- 或 ---- 分隔符；右上角仅用于切换已导入邮箱池的预览和手动兜底类型。
+          粘贴后自动识别所有支持格式，字段支持完整的 --- 或 ---- 分隔符。
         </Typography.Text>
         <Typography.Text type="secondary">
-          {selectedProvider?.description || '通过统一导入接口，将内容导入到对应邮箱账号池。'}
+          Microsoft OAuth、MailAPI URL、Google 联邦、密码 + TOTP、密码 + 接码地址和 AppleMail 统一从这里导入；下方同时显示两个邮箱池的全部账号。
         </Typography.Text>
-        {selectedProvider?.helper_text ? (
-          <Typography.Text type="secondary">{selectedProvider.helper_text}</Typography.Text>
-        ) : null}
 
         {supportsFilename ? (
           <Form.Item label={selectedProvider?.filename_label || '文件名'} style={{ marginBottom: 0 }}>
@@ -785,7 +776,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           value={content}
           onChange={(event) => setContent(event.target.value)}
           rows={10}
-          placeholder={selectedProvider?.content_placeholder || ''}
+          placeholder={'邮箱----接码地址\n邮箱----密码\n邮箱----密码----MFA密钥\n邮箱----密码----client_id----refresh_token'}
           style={{ fontFamily: 'monospace' }}
         />
 
@@ -837,6 +828,22 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
           />
         ) : null}
 
+        {manualFallback ? (
+          <Space align="center" wrap>
+            <Typography.Text strong>手动兜底类型</Typography.Text>
+            <Select
+              aria-label="手动导入类型"
+              value={selectedType === 'applemail' ? 'applemail' : 'outlook'}
+              onChange={handleTypeChange}
+              style={{ width: 240 }}
+              options={[
+                { label: '微软邮箱', value: 'outlook' },
+                { label: 'Google / MFA / AppleMail', value: 'applemail' },
+              ]}
+            />
+          </Space>
+        ) : null}
+
         <Space style={{ width: '100%', justifyContent: 'space-between' }}>
           <Button
             danger
@@ -851,7 +858,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             清空
           </Button>
           <Space>
-            <Button onClick={() => void loadSnapshot(selectedType)} loading={loadingSnapshot}>
+            <Button onClick={() => void loadSnapshots()} loading={loadingSnapshot}>
               刷新预览
             </Button>
             <Button
@@ -877,15 +884,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         ) : null}
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-          <Tag color="blue">
-            {selectedType === 'applemail'
-              ? `已导入: ${snapshot?.count || 0} 个邮箱`
-              : `当前预览匹配: ${snapshot?.items.length || 0}${rawSnapshot?.truncated ? ` / 总池 ${rawSnapshot?.count || 0}` : ''}`}
-          </Tag>
-          {selectedType === 'applemail' && snapshot?.filename ? (
-            <Typography.Text type="secondary">当前文件: {snapshot.filename}</Typography.Text>
+          <Tag color="blue">已导入: {importedCount} 个邮箱</Tag>
+          <Tag>微软邮箱 {snapshots.microsoft?.count || 0}</Tag>
+          <Tag color="purple">Google / MFA / AppleMail {snapshots.applemail?.count || 0}</Tag>
+          {snapshots.applemail?.filename ? (
+            <Typography.Text type="secondary">AppleMail 文件: {snapshots.applemail.filename}</Typography.Text>
           ) : null}
-          {snapshot?.items?.length ? (
+          {tableData.length ? (
             <Popconfirm
               title={`确认删除已勾选的 ${selectedRowKeys.length} 个邮箱吗？`}
               okText="批量删除"
@@ -900,8 +905,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             </Popconfirm>
           ) : null}
         </div>
-        {snapshot?.items?.length ? (
+        {tableData.length ? (
           <Table
+            rowKey="key"
             rowSelection={{
               selectedRowKeys,
               onChange: setSelectedRowKeys,
@@ -925,13 +931,13 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             }}
           >
             <Typography.Text type="secondary">
-              {selectedProvider?.preview_empty_text || '当前还没有可预览的导入内容。'}
+              当前两个邮箱池都没有可预览的已导入账号。
             </Typography.Text>
           </div>
         )}
 
-        {snapshot?.truncated ? (
-          <Typography.Text type="secondary">预览只展示前 100 条记录，完整内容以实际存储为准。</Typography.Text>
+        {hasTruncatedSnapshot ? (
+          <Typography.Text type="secondary">单个邮箱池最多预览前 500 条记录，顶部总数仍为实际导入数量。</Typography.Text>
         ) : null}
       </Space>
     </Card>

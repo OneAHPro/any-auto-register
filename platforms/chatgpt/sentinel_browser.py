@@ -37,6 +37,10 @@ SENTINEL_FRAME_URL = (
     f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}"
 )
 
+# Google 会对同一出口短时间内并发打开多个登录页触发额外验证。
+# 进程内串行执行联邦登录，避免批量任务彼此污染登录状态。
+_GOOGLE_FEDERATED_LOGIN_LOCK = threading.Lock()
+
 
 def _playwright_driver_process(playwright: Any) -> Any:
     """Best-effort access to the driver owned by this Playwright instance."""
@@ -588,7 +592,16 @@ def complete_google_federated_login_via_browser(
     playwright = None
     browser = None
     unregister_interrupt = lambda: None
+    google_login_lock_acquired = False
     try:
+        queued = False
+        while not _GOOGLE_FEDERATED_LOGIN_LOCK.acquire(timeout=0.25):
+            queued = True
+            checkpoint_current_task_attempt()
+        google_login_lock_acquired = True
+        if queued:
+            logger("Google 联邦登录并发保护：已排队进入登录流程")
+
         playwright = sync_playwright().start()
         unregister_interrupt = _register_current_attempt_driver_interrupt(playwright)
         browser = playwright.chromium.launch(**launch_args)
@@ -642,6 +655,83 @@ def complete_google_federated_login_via_browser(
 
         deadline = time.monotonic() + (bounded_timeout / 1000)
 
+        def click_first_visible(selectors: tuple[str, ...]) -> bool:
+            for candidate in selectors:
+                locator = page.locator(candidate)
+                if not locator.count():
+                    continue
+                try:
+                    locator.first.click(timeout=3_000)
+                    return True
+                except Exception:
+                    continue
+            return False
+
+        def select_password_method() -> bool:
+            password_choices = (
+                "[data-challengetype='1']:visible",
+                "li[data-challengetype='1']:visible",
+                "button:has-text('Enter your password'):visible",
+                "[role='button']:has-text('Enter your password'):visible",
+                "button:has-text('Use your password'):visible",
+                "[role='button']:has-text('Use your password'):visible",
+                "button:has-text('输入密码'):visible",
+                "[role='button']:has-text('输入密码'):visible",
+                "button:has-text('使用密码'):visible",
+                "[role='button']:has-text('使用密码'):visible",
+            )
+            if click_first_visible(password_choices):
+                logger("Google 联邦登录已选择密码验证方式")
+                return True
+
+            alternate_choices = (
+                "button:has-text('Try another way'):visible",
+                "[role='button']:has-text('Try another way'):visible",
+                "button:has-text('尝试其他方式'):visible",
+                "[role='button']:has-text('尝试其他方式'):visible",
+            )
+            if not click_first_visible(alternate_choices):
+                return False
+            logger("Google 联邦登录已打开其他验证方式")
+            page.wait_for_timeout(500)
+            if click_first_visible(password_choices):
+                logger("Google 联邦登录已从其他验证方式切换到密码")
+            return True
+
+        identifier_restart_attempts = 0
+
+        def restart_identifier_flow() -> bool:
+            nonlocal identifier_restart_attempts
+            if identifier_restart_attempts >= 2:
+                return False
+            restart_choices = (
+                "button:has-text('Restart'):visible",
+                "[role='button']:has-text('Restart'):visible",
+                "button:has-text('重新开始'):visible",
+                "[role='button']:has-text('重新开始'):visible",
+            )
+            if not click_first_visible(restart_choices):
+                return False
+            identifier_restart_attempts += 1
+            logger(
+                "Google 登录页返回临时错误，已点击 Restart 并重新提交邮箱"
+            )
+            page.wait_for_timeout(750)
+            email_selector = (
+                "input#identifierId:visible, input[type='email']:visible, "
+                "input[name='identifier']:visible"
+            )
+            retry_deadline = min(deadline, time.monotonic() + 10)
+            while time.monotonic() < retry_deadline:
+                checkpoint_current_task_attempt()
+                email_locator = page.locator(email_selector)
+                if email_locator.count():
+                    email_locator.first.fill(normalized_email)
+                    email_locator.first.press("Enter")
+                    return True
+                page.wait_for_timeout(250)
+            return True
+
         def wait_for_field(
             selector: str,
             label: str,
@@ -653,6 +743,12 @@ def complete_google_federated_login_via_browser(
                 locator = page.locator(selector)
                 if locator.count():
                     return locator.first
+                if label == "密码" and restart_identifier_flow():
+                    page.wait_for_timeout(250)
+                    continue
+                if label == "密码" and select_password_method():
+                    page.wait_for_timeout(250)
+                    continue
                 if alternate_selector and page.locator(alternate_selector).count():
                     return None
                 current_host = str(urlparse(str(page.url or "")).hostname or "").lower()
@@ -662,9 +758,12 @@ def complete_google_federated_login_via_browser(
             raise RuntimeError(f"Google 联邦登录未出现{label}输入框")
 
         email_field = wait_for_field(
-            "input#identifierId, input[type='email'], input[name='identifier']",
+            "input#identifierId:visible, input[type='email']:visible, "
+            "input[name='identifier']:visible",
             "邮箱",
-            alternate_selector="input[name='Passwd'], input[type='password']",
+            alternate_selector=(
+                "input[name='Passwd']:visible, input[type='password']:visible"
+            ),
         )
         if email_field is not None:
             email_field.fill(normalized_email)
@@ -672,7 +771,7 @@ def complete_google_federated_login_via_browser(
             logger("Google 联邦登录已提交邮箱")
 
         password_field = wait_for_field(
-            "input[name='Passwd'], input[type='password']",
+            "input[name='Passwd']:visible, input[type='password']:visible",
             "密码",
         )
         if password_field is not None:
@@ -738,4 +837,6 @@ def complete_google_federated_login_via_browser(
             except Exception:
                 pass
         unregister_interrupt()
+        if google_login_lock_acquired:
+            _GOOGLE_FEDERATED_LOGIN_LOCK.release()
         checkpoint_current_task_attempt()

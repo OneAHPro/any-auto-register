@@ -617,9 +617,16 @@ class OAuthClient:
         except TaskInterruption:
             raise
         except Exception as exc:
+            detail = str(exc).strip() or type(exc).__name__
+            normalized_password = str(password or "")
+            if normalized_password:
+                detail = detail.replace(
+                    normalized_password,
+                    "[密码已隐藏]",
+                )
             self._set_error(
                 "Google 联邦登录失败: "
-                f"{str(exc).strip() or type(exc).__name__}"
+                f"{detail}"
             )
             return None
         if not final_url:

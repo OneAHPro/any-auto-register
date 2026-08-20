@@ -315,6 +315,50 @@ class RefreshTokenRegistrationEngine:
             return "access_token"
         return "refresh_token"
 
+    def _should_upgrade_passwordless_login_for_mfa(self) -> bool:
+        """Use the one-time mailbox session to establish a primary password.
+
+        TOTP is a second factor and cannot replace the primary password/email
+        challenge.  During MFA rotation, or when a previously managed MFA is
+        found, passwordless mailbox imports should therefore set and persist a
+        ChatGPT password while the receiver is still available.
+        """
+        if self.password or self.password_reset_required:
+            return False
+        email_info = self.email_info if isinstance(self.email_info, dict) else {}
+        managed_mfa = bool(
+            email_info.get("chatgpt_mfa_managed") is True
+            and str(email_info.get("totp_secret") or "").strip()
+        )
+        if not self._existing_account_rotate_mfa_enabled() and not managed_mfa:
+            return False
+        account_type = str(email_info.get("account_type") or "").strip().lower()
+        if account_type not in {"mailapi_url", "microsoft_oauth"}:
+            return False
+        if not callable(getattr(self.email_service, "commit_password_reset", None)):
+            return False
+        supports = getattr(self.email_service, "supports_email_verification", None)
+        if callable(supports):
+            try:
+                return bool(supports())
+            except Exception:
+                return False
+        return callable(getattr(self.email_service, "get_verification_code", None))
+
+    def _prepare_passwordless_login_for_mfa(self) -> None:
+        replacement = generate_random_password(20)
+        self.password = replacement
+        self.password_reset_required = True
+        if isinstance(self.email_info, dict):
+            self.email_info["new_password"] = replacement
+            self.email_info["password_reset_required"] = True
+        self._log(
+            "账号当前仅依赖邮箱验证码作为主登录凭据；"
+            "本轮先设置项目托管的 ChatGPT 密码，再使用密码 + MFA，"
+            "后续常规重登将优先使用密码和项目 MFA",
+            "warning",
+        )
+
     def _create_email(self, *, existing_account_login_only: bool = False) -> bool:
         action = "加载" if existing_account_login_only else "创建"
         self._email_error_message = ""
@@ -438,6 +482,8 @@ class RefreshTokenRegistrationEngine:
                 ).strip()
                 if managed_totp_secret:
                     self.totp_secret = managed_totp_secret
+                if self._should_upgrade_passwordless_login_for_mfa():
+                    self._prepare_passwordless_login_for_mfa()
             if existing_account_login_only:
                 self._log(f"邮箱凭据加载成功: {self.email}")
             else:
@@ -1001,6 +1047,7 @@ class RefreshTokenRegistrationEngine:
     ) -> RegistrationResult:
         self._log("2. 登录已有 ChatGPT 账号并提取 Access Token + Refresh Token...")
         rotation = None
+        authenticated_web_client = None
         if self._existing_account_should_rotate_mfa():
             self._log("先建立 ChatGPT Web 会话，确保 MFA 轮换使用新鲜认证状态")
             web_client = self._build_chatgpt_client()
@@ -1085,6 +1132,7 @@ class RefreshTokenRegistrationEngine:
                 )
                 if rotation is None:
                     return result
+            authenticated_web_client = web_client
 
         oauth_client = self._build_oauth_client()
         oauth_client.config.setdefault(
@@ -1099,48 +1147,97 @@ class RefreshTokenRegistrationEngine:
             self._existing_account_phone_verification_enabled()
         )
         password_login = bool(self.password)
-        tokens = oauth_client.login_and_get_tokens(
-            result.email,
-            self.password or "",
-            device_id="",
-            user_agent=None,
-            sec_ch_ua=None,
-            impersonate=None,
-            skymail_client=email_adapter,
-            prefer_passwordless_login=not password_login,
-            allow_phone_verification=allow_phone_verification,
-            force_new_browser=True,
-            force_chatgpt_entry=False,
-            screen_hint="login",
-            force_password_login=password_login,
-            totp_secret=self.totp_secret or "",
-            mfa_recovery_code=str(
+        reuse_authenticated_session = authenticated_web_client is not None
+        oauth_device_id = ""
+        oauth_user_agent = None
+        oauth_sec_ch_ua = None
+        oauth_impersonate = None
+        if authenticated_web_client is not None:
+            self._reuse_register_browser_context(
+                authenticated_web_client,
+                oauth_client,
+            )
+            oauth_device_id = str(
+                getattr(authenticated_web_client, "device_id", "") or ""
+            )
+            oauth_user_agent = getattr(authenticated_web_client, "ua", None)
+            oauth_sec_ch_ua = getattr(
+                authenticated_web_client,
+                "sec_ch_ua",
+                None,
+            )
+            oauth_impersonate = getattr(
+                authenticated_web_client,
+                "impersonate",
+                None,
+            )
+            self._log(
+                "复用刚完成登录和 MFA 轮换的认证会话获取 Refresh Token，"
+                "不再重复登录 Google"
+            )
+        oauth_login_kwargs = {
+            "device_id": oauth_device_id,
+            "user_agent": oauth_user_agent,
+            "sec_ch_ua": oauth_sec_ch_ua,
+            "impersonate": oauth_impersonate,
+            "skymail_client": email_adapter,
+            "prefer_passwordless_login": not password_login,
+            "allow_phone_verification": allow_phone_verification,
+            "force_new_browser": not reuse_authenticated_session,
+            "resume_authenticated_session": reuse_authenticated_session,
+            "force_chatgpt_entry": False,
+            "screen_hint": "login",
+            "force_password_login": password_login,
+            "totp_secret": self.totp_secret or "",
+            "mfa_recovery_code": str(
                 (self.email_info or {}).get("mfa_recovery_code") or ""
             ),
-            on_mfa_totp_staged=lambda secret: stage_chatgpt_mfa_rotation(
+            "on_mfa_totp_staged": lambda secret: stage_chatgpt_mfa_rotation(
                 self.email or result.email,
                 secret,
             ),
-            on_mfa_totp_activated=lambda rotated_at: (
+            "on_mfa_totp_activated": lambda rotated_at: (
                 mark_chatgpt_mfa_rotation_activated(
                     self.email or result.email,
                     rotated_at=rotated_at,
                 )
             ),
-            on_mfa_recovery_code=lambda recovery_code: (
+            "on_mfa_recovery_code": lambda recovery_code: (
                 self._stage_mfa_recovery_code(
                     self.email or result.email,
                     recovery_code,
                 )
             ),
-            password_reset_required=self.password_reset_required,
-            on_password_reset=lambda new_password: self._commit_password_reset(
+            "password_reset_required": self.password_reset_required,
+            "on_password_reset": lambda new_password: self._commit_password_reset(
                 email_adapter,
                 new_password,
             ),
-            complete_about_you_if_needed=False,
-            login_source="existing_account_login_only",
+            "complete_about_you_if_needed": False,
+            "login_source": "existing_account_login_only",
+        }
+        tokens = oauth_client.login_and_get_tokens(
+            result.email,
+            self.password or "",
+            **oauth_login_kwargs,
         )
+        if (
+            not tokens
+            and reuse_authenticated_session
+            and "OpenAI 登录会话已失效" in str(oauth_client.last_error or "")
+        ):
+            self._log(
+                "网页认证会话不能直接续接 Codex OAuth，"
+                "自动切换完整授权并使用项目保存的新 MFA",
+                "warning",
+            )
+            oauth_login_kwargs["resume_authenticated_session"] = False
+            oauth_login_kwargs["force_new_browser"] = False
+            tokens = oauth_client.login_and_get_tokens(
+                result.email,
+                self.password or "",
+                **oauth_login_kwargs,
+            )
         if not tokens:
             result.error_message = (
                 oauth_client.last_error or "已有 ChatGPT 账号 OAuth 登录失败"

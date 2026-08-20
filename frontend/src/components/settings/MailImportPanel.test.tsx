@@ -35,12 +35,21 @@ const providers = [
   },
 ]
 
-function snapshot(type: 'microsoft' | 'applemail') {
+function snapshot(
+  type: 'microsoft' | 'applemail',
+  items: Array<{ email: string; account_type?: string }> = [],
+) {
   return {
     type,
     label: type,
-    count: 0,
-    items: [],
+    count: items.length,
+    items: items.map((item, index) => ({
+      index: index + 1,
+      mailbox: 'INBOX',
+      enabled: true,
+      has_oauth: true,
+      ...item,
+    })),
     truncated: false,
     filename: '',
     path: '',
@@ -122,7 +131,7 @@ describe('MailImportPanel automatic detection', () => {
     expect(await screen.findByText(/完整的 --- 或 ---- 分隔符/)).toBeTruthy()
   })
 
-  it('detects mixed content without changing the snapshot selector', async () => {
+  it('detects mixed content without showing separate pool windows', async () => {
     const user = userEvent.setup()
     renderPanel()
 
@@ -135,7 +144,8 @@ describe('MailImportPanel automatic detection', () => {
     expect(await screen.findByText('微软邮箱 1')).toBeTruthy()
     expect(screen.getByText('AppleMail 1')).toBeTruthy()
     expect(screen.getByText('待确认 0')).toBeTruthy()
-    expect(screen.getByRole('combobox', { name: '邮箱池视图' })).toBeTruthy()
+    expect(screen.queryByRole('combobox', { name: '邮箱池视图' })).toBeNull()
+    expect(screen.getByText('统一兼容导入')).toBeTruthy()
   })
 
   it('submits auto type by default', async () => {
@@ -227,5 +237,25 @@ describe('MailImportPanel automatic detection', () => {
       const call = vi.mocked(apiFetch).mock.calls.find(([path]) => path === '/mail-imports')
       expect(JSON.parse(String(call?.[1]?.body || '{}')).type).toBe('microsoft')
     })
+  })
+
+  it('shows all imported provider pools in one compatibility preview', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/mail-imports/providers') return { items: providers }
+      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) {
+        return snapshot('microsoft', [{ email: 'one@outlook.com' }])
+      }
+      if (path.startsWith('/mail-imports/snapshot?type=applemail')) {
+        return snapshot('applemail', [{ email: 'two@gmail.com', account_type: 'chatgpt_google_password' }])
+      }
+      throw new Error(`unexpected request: ${path}`)
+    })
+
+    renderPanel()
+
+    expect(await screen.findByText('统一兼容导入')).toBeTruthy()
+    expect(await screen.findByText('one@outlook.com')).toBeTruthy()
+    expect(await screen.findByText('two@gmail.com')).toBeTruthy()
+    expect(screen.getByText('已导入: 2 个邮箱')).toBeTruthy()
   })
 })

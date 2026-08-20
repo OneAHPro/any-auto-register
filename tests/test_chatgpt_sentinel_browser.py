@@ -421,6 +421,117 @@ class _FakeGooglePage:
         return "Sign in"
 
 
+class _FakeHiddenGooglePasswordLocator(_FakeGoogleLocator):
+    def count(self):
+        return 58
+
+    def fill(self, value):
+        raise RuntimeError(f"Locator.fill({value!r}): element is not visible")
+
+
+class _FakeGooglePageWithHiddenPassword(_FakeGooglePage):
+    def locator(self, selector):
+        normalized = str(selector).lower()
+        if "password" in normalized and ":visible" not in normalized:
+            return _FakeHiddenGooglePasswordLocator(self, "password")
+        return super().locator(selector)
+
+
+class _FakeGoogleActionLocator:
+    def __init__(self, page, action):
+        self.page = page
+        self.action = action
+
+    def count(self):
+        if self.action == "alternate":
+            return int(self.page.stage == "passkey")
+        return int(self.page.stage == "method_picker")
+
+    @property
+    def first(self):
+        return self
+
+    def click(self, **_kwargs):
+        if self.action == "alternate":
+            self.page.stage = "method_picker"
+        else:
+            self.page.stage = "password"
+
+
+class _FakeGooglePasskeyPage(_FakeGooglePage):
+    def locator(self, selector):
+        normalized = str(selector).lower()
+        if "try another way" in normalized or "尝试其他方式" in normalized:
+            return _FakeGoogleActionLocator(self, "alternate")
+        if "challengetype" in normalized or "enter your password" in normalized:
+            return _FakeGoogleActionLocator(self, "password_method")
+        locator = super().locator(selector)
+        original_press = locator.press
+
+        def press(key):
+            if locator.field == "email":
+                assert key == "Enter"
+                self.stage = "passkey"
+                return
+            original_press(key)
+
+        locator.press = press
+        return locator
+
+
+class _FakeGoogleRestartActionLocator:
+    def __init__(self, page):
+        self.page = page
+
+    def count(self):
+        return int(self.page.stage == "identifier_error")
+
+    @property
+    def first(self):
+        return self
+
+    def click(self, **_kwargs):
+        self.page.stage = "retry_email"
+
+
+class _FakeGoogleRestartFieldLocator(_FakeGoogleLocator):
+    def count(self):
+        if self.field == "email":
+            return int(self.page.stage in {"email", "retry_email"})
+        return int(self.page.stage == "password")
+
+    def press(self, key):
+        assert key == "Enter"
+        if self.field == "email" and self.page.stage == "email":
+            self.page.stage = "identifier_error"
+        elif self.field == "email":
+            self.page.stage = "password"
+        else:
+            super().press(key)
+
+
+class _FakeGoogleRestartPage(_FakeGooglePage):
+    def locator(self, selector):
+        normalized = str(selector).lower()
+        if "restart" in normalized or "重新开始" in normalized:
+            return _FakeGoogleRestartActionLocator(self)
+        field = "password" if "password" in normalized else "email"
+        return _FakeGoogleRestartFieldLocator(self, field)
+
+
+class _TrackingGoogleLoginLock:
+    def __init__(self):
+        self.acquire_calls = 0
+        self.release_calls = 0
+
+    def acquire(self, **_kwargs):
+        self.acquire_calls += 1
+        return True
+
+    def release(self):
+        self.release_calls += 1
+
+
 class _FakeGoogleContext:
     def __init__(self, page):
         self.page = page
@@ -532,3 +643,105 @@ def test_google_federated_browser_accepts_password_first_redirect():
 
     assert final_url.startswith("https://auth.openai.com/")
     assert page.filled == {"password": "supplier-password"}
+
+
+def test_google_federated_browser_ignores_hidden_password_inputs():
+    import requests
+
+    page = _FakeGooglePageWithHiddenPassword()
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch:
+        final_url = complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert final_url.startswith("https://auth.openai.com/")
+    assert page.filled["password"] == "supplier-password"
+
+
+def test_google_federated_browser_selects_password_after_passkey_prompt():
+    import requests
+
+    page = _FakeGooglePasskeyPage()
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch:
+        final_url = complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert final_url.startswith("https://auth.openai.com/")
+    assert page.filled["password"] == "supplier-password"
+
+
+def test_google_federated_browser_restarts_transient_identifier_error():
+    import requests
+
+    page = _FakeGoogleRestartPage()
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch:
+        final_url = complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert final_url.startswith("https://auth.openai.com/")
+    assert page.filled["password"] == "supplier-password"
+
+
+def test_google_federated_browser_uses_process_wide_login_lock():
+    import requests
+    import platforms.chatgpt.sentinel_browser as sentinel_browser
+
+    page = _FakeGooglePage()
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    tracking_lock = _TrackingGoogleLoginLock()
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch, patch.object(
+        sentinel_browser,
+        "_GOOGLE_FEDERATED_LOGIN_LOCK",
+        tracking_lock,
+    ):
+        complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert tracking_lock.acquire_calls == 1
+    assert tracking_lock.release_calls == 1

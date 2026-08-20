@@ -181,6 +181,16 @@ class MailApiOnlyEmailService:
         return True
 
 
+class ManagedMfaMailApiOnlyEmailService(MailApiOnlyEmailService):
+    def create_email(self):
+        result = super().create_email()
+        result.update({
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+            "chatgpt_mfa_managed": True,
+        })
+        return result
+
+
 class ExistingAccountLoginTests(unittest.TestCase):
     def _make_engine(
         self,
@@ -286,6 +296,16 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertIs(rotate_call["session"], web_client.session)
         self.assertEqual(rotate_call["access_token"], "web-access-token")
         oauth_client.login_and_get_tokens.assert_called_once()
+        oauth_client.adopt_browser_context.assert_called_once_with(
+            web_client.session,
+            device_id=web_client.device_id,
+            user_agent=web_client.ua,
+            sec_ch_ua=web_client.sec_ch_ua,
+            accept_language="",
+        )
+        oauth_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
+        self.assertFalse(oauth_kwargs["force_new_browser"])
+        self.assertTrue(oauth_kwargs["resume_authenticated_session"])
 
     def test_recovery_mfa_enrollment_is_saved_and_skips_second_rotation(self):
         email_service = PasswordTotpEmailService()
@@ -333,6 +353,55 @@ class ExistingAccountLoginTests(unittest.TestCase):
             oauth_kwargs["mfa_recovery_code"],
             "MANDATORY-RECOVERY",
         )
+
+    def test_rotated_web_session_falls_back_to_full_oauth_when_resume_is_rejected(self):
+        engine = self._make_engine(
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+        )
+        web_client = mock.Mock()
+        web_client.session = object()
+        web_client.ua = "web-agent"
+        web_client.sec_ch_ua = '"Chromium";v="136"'
+        web_client.impersonate = "chrome"
+        web_client.device_id = "web-device"
+        web_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "web-access-token",
+                "account_id": "account-1",
+            },
+        )
+        oauth_client = self._successful_oauth_client()
+        successful_tokens = oauth_client.login_and_get_tokens.return_value
+        oauth_client.login_and_get_tokens.side_effect = [None, successful_tokens]
+        oauth_client.last_error = (
+            "OpenAI 登录会话已失效，请先重新执行邮箱登录"
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=web_client)
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._rotate_mfa_after_login = mock.Mock(
+            return_value=MfaRotationResult(
+                totp_secret="NEWSECRET",
+                recovery_code="RECOVERY",
+                replaced_existing=True,
+                mfa_enabled=True,
+                rotated_at="2026-08-19T12:00:00+00:00",
+            )
+        )
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(oauth_client.login_and_get_tokens.call_count, 2)
+        first_kwargs = oauth_client.login_and_get_tokens.call_args_list[0].kwargs
+        retry_kwargs = oauth_client.login_and_get_tokens.call_args_list[1].kwargs
+        self.assertTrue(first_kwargs["resume_authenticated_session"])
+        self.assertFalse(retry_kwargs["resume_authenticated_session"])
+        self.assertFalse(retry_kwargs["force_new_browser"])
 
     def test_recovery_only_enrollment_continues_with_regular_rotation(self):
         engine = self._make_engine(
@@ -575,6 +644,56 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertTrue(
             any("补充 ChatGPT 密码" in line for line in result.logs)
         )
+
+    def test_mfa_rotation_upgrades_mailapi_only_account_to_password_login(self):
+        email_service = MailApiOnlyEmailService()
+        engine = self._make_engine(
+            email_service=email_service,
+            rotate_mfa=True,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
+            return_value="Managed-Password-2026!",
+        ):
+            created = engine._create_email(existing_account_login_only=True)
+
+        self.assertTrue(created)
+        self.assertEqual(engine.password, "Managed-Password-2026!")
+        self.assertTrue(engine.password_reset_required)
+        self.assertEqual(
+            engine.email_info["new_password"],
+            "Managed-Password-2026!",
+        )
+        self.assertTrue(engine.email_info["password_reset_required"])
+        self.assertTrue(
+            any("仅依赖邮箱验证码" in line for line in engine.logs)
+        )
+
+    def test_mailapi_only_account_stays_passwordless_without_mfa_rotation(self):
+        engine = self._make_engine(email_service=MailApiOnlyEmailService())
+
+        created = engine._create_email(existing_account_login_only=True)
+
+        self.assertTrue(created)
+        self.assertFalse(engine.password)
+        self.assertFalse(engine.password_reset_required)
+
+    def test_automatic_relogin_upgrades_managed_mfa_account_to_password(self):
+        engine = self._make_engine(
+            email_service=ManagedMfaMailApiOnlyEmailService(),
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
+            return_value="Managed-Password-2026!",
+        ):
+            created = engine._create_email(existing_account_login_only=True)
+
+        self.assertTrue(created)
+        self.assertEqual(engine.password, "Managed-Password-2026!")
+        self.assertEqual(engine.totp_secret, "JBSWY3DPEHPK3PXP")
+        self.assertTrue(engine.password_reset_required)
 
     def test_totp_with_mail_access_login_resets_rejected_password_and_keeps_totp(self):
         email_service = PasswordTotpWithMailEmailService()
