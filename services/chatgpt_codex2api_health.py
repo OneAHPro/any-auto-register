@@ -340,6 +340,18 @@ def confirm_codex2api_auth_failure(
     snapshot = dict(health)
     if _text(snapshot.get("state")).lower() != "auth_failed":
         return snapshot
+    if _text(snapshot.get("auth_failure_source")).lower() == "error_message":
+        return _confirmation_result(
+            snapshot,
+            state="auth_failed",
+            resolution="remote_error_confirmed_failure",
+            remote_status=_text(snapshot.get("remote_status")),
+            remote_updated_at=_text(snapshot.get("remote_updated_at")),
+            message=(
+                "Codex2API 已明确返回 Refresh Token 失效，"
+                "需要本地验证码重登"
+            ),
+        )
     try:
         remote_id = int(snapshot.get("remote_id") or 0)
     except (TypeError, ValueError):
@@ -601,14 +613,20 @@ def inspect_codex2api_account_health(
 
         row = matches[0]
         remote_status = _text(row.get("status")).lower()
+        explicit_error_auth_failure = (
+            remote_status == "error"
+            and _explicit_refresh_credential_failure(
+                _text(row.get("error_message"))
+            )
+        )
         remote_id = _remote_id(row)
         remote_updated_at = _text(row.get("updated_at"))
         quota_fields = {
             "usage_percent_7d": row.get("usage_percent_7d"),
             "billed_7d": row.get("billed_7d"),
         }
-        if remote_status in AUTH_FAILED_STATUSES:
-            result[account_id] = _record(
+        if remote_status in AUTH_FAILED_STATUSES or explicit_error_auth_failure:
+            record = _record(
                 account_id=account_id,
                 email=email,
                 state="auth_failed",
@@ -617,8 +635,15 @@ def inspect_codex2api_account_health(
                 remote_updated_at=remote_updated_at,
                 probe_mode="wham_only",
                 **quota_fields,
-                message="Codex2API 本轮 wham 探针明确标记账号鉴权失效",
+                message=(
+                    "Codex2API 明确返回 Refresh Token 已失效"
+                    if explicit_error_auth_failure
+                    else "Codex2API 本轮 wham 探针明确标记账号鉴权失效"
+                ),
             )
+            if explicit_error_auth_failure:
+                record["auth_failure_source"] = "error_message"
+            result[account_id] = record
         elif remote_status not in HEALTHY_STATUSES:
             result[account_id] = _record(
                 account_id=account_id,

@@ -978,6 +978,107 @@ class ChatGPTReloginTests(unittest.TestCase):
         )
         mailbox.wait_for_code.assert_called_once()
 
+    def test_legacy_mailapi_context_promotes_saved_password_and_managed_totp(self):
+        mail_api_url = "https://mail.example.test/messages/token"
+        saved = {
+            "email": "legacy@example.com",
+            "password": "Saved-ChatGPT-Password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "applemail",
+                "email": "legacy@example.com",
+                "account_id": "legacy@example.com",
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": mail_api_url,
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_recovery_code": "RECOVERY-CODE",
+                    "chatgpt_mfa_managed": True,
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ):
+            service = _build_email_service(saved, {}, log_fn=None)
+
+        email_info = service.create_email()
+        self.assertEqual(
+            email_info["account_type"],
+            "chatgpt_password_url_otp",
+        )
+        self.assertEqual(
+            email_info["password"],
+            "Saved-ChatGPT-Password",
+        )
+        self.assertEqual(email_info["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(email_info["mail_api_url"], mail_api_url)
+
+    def test_passwordless_legacy_mailapi_bootstraps_and_returns_saved_password(self):
+        saved = {
+            "email": "bootstrap@example.com",
+            "password": "",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "applemail",
+                "email": "bootstrap@example.com",
+                "account_id": "bootstrap@example.com",
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": "https://mail.example.test/messages/token",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "chatgpt_mfa_managed": True,
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox.commit_password_reset.return_value = True
+
+        class Adapter:
+            def run(self, context):
+                email_info = context.email_service.create_email()
+                generated = email_info["new_password"]
+                assert email_info["password_reset_required"] is True
+                assert context.email_service.commit_password_reset(generated)
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                    source="existing_account_web_login",
+                    metadata={},
+                )
+
+        with mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=Adapter(),
+        ):
+            tokens = _login_with_saved_credentials(saved, rotate_mfa=True)
+
+        self.assertGreaterEqual(len(tokens["password"]), 12)
+        metadata_extra = tokens["metadata"]["mailbox_login_context"]["extra"]
+        self.assertEqual(metadata_extra["password"], tokens["password"])
+        self.assertFalse(metadata_extra["password_reset_required"])
+        self.assertEqual(
+            metadata_extra["account_type"],
+            "chatgpt_password_reset_url_mail",
+        )
+
     def test_saved_login_uses_mailbox_timeout_as_all_outer_otp_budgets(self):
         saved = {
             "email": "demo@example.com",
@@ -1485,6 +1586,45 @@ class ChatGPTReloginTests(unittest.TestCase):
             "mfa_rotation": {
                 "managed": True,
                 "rotated_at": "2026-08-21T03:00:00+00:00",
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ) as login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ), mock.patch("services.chatgpt_relogin.engine", self.engine):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["mfa_rotated"])
+        self.assertTrue(login.call_args.kwargs["rotate_mfa"])
+
+    def test_full_relogin_auto_enrolls_mfa_for_passwordless_mailapi_account(self):
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            account.password = ""
+            extra = account.get_extra()
+            extra["mailbox_login_context"] = {
+                "provider": "microsoft",
+                "email": account.email,
+                "account_id": account.email,
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": "https://mail.example.test/messages/token",
+                },
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        tokens = self._fresh_tokens()
+        tokens["password"] = "Generated-ChatGPT-Password"
+        tokens["metadata"] = {
+            "mfa_rotation": {
+                "managed": True,
+                "rotated_at": "2026-08-21T03:45:00+00:00",
             }
         }
         with mock.patch(

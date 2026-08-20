@@ -128,6 +128,7 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
         5: "missing@example.com",
         6: "duplicate@example.com",
         7: "unknown-status@example.com",
+        8: "invalidated-error@example.com",
     }
     responses = [
         FakeResponse({"usage_probe_responses_fallback_enabled": False}),
@@ -184,6 +185,15 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
                         "usage_percent_7d": 25,
                         "billed_7d": 10.0,
                     },
+                    {
+                        "id": 109,
+                        "email": "invalidated-error@example.com",
+                        "status": "error",
+                        "error_message": (
+                            "刷新失败 (status 401): "
+                            '{"error":{"code":"refresh_token_invalidated"}}'
+                        ),
+                    },
                 ]
             }
         ),
@@ -231,7 +241,10 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     )
     assert snapshot[6]["state"] == "ambiguous"
     assert snapshot[7]["state"] == "deferred"
-    assert {row["remote_id"] for row in quota_accounts} == set(range(101, 109))
+    assert snapshot[8]["state"] == "auth_failed"
+    assert snapshot[8]["remote_status"] == "error"
+    assert snapshot[8]["probe_mode"] == "wham_only"
+    assert {row["remote_id"] for row in quota_accounts} == set(range(101, 110))
     assert all("reset_7d_at" not in row for row in quota_accounts)
     assert next(
         row for row in quota_accounts if row["remote_id"] == 108
@@ -422,6 +435,33 @@ def test_auth_failure_confirmation_skips_local_login_when_remote_refresh_recover
     assert read_accounts.call_args.args[0].endswith(
         "/api/admin/accounts?channel=codex"
     )
+
+
+def test_auth_failure_confirmation_trusts_explicit_refresh_token_invalidation():
+    from services import chatgpt_codex2api_health as health
+
+    initial = {
+        "account_id": 8,
+        "email": "invalidated@example.com",
+        "state": "auth_failed",
+        "remote_id": 108,
+        "remote_status": "error",
+        "remote_updated_at": "2026-08-21T03:32:40+08:00",
+        "probe_mode": "wham_only",
+        "auth_failure_source": "error_message",
+        "message": "Codex2API 明确返回 Refresh Token 已失效",
+    }
+
+    with mock.patch.object(health.cffi_requests, "post") as refresh:
+        result = health.confirm_codex2api_auth_failure(
+            initial,
+            config=BASE_CONFIG,
+        )
+
+    assert result["state"] == "auth_failed"
+    assert result["resolution"] == "remote_error_confirmed_failure"
+    assert "本地验证码重登" in result["message"]
+    refresh.assert_not_called()
 
 
 def test_auth_failure_confirmation_requires_a_fresh_remote_result():

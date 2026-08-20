@@ -1165,6 +1165,30 @@ def _build_email_service(
             f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
         )
     context_extra = dict(mailbox_context.get("extra") or {})
+    if _text(context_extra.get("account_type")).lower() == "mailapi_url":
+        saved_password = str(
+            context_extra.get("password") or saved.get("password") or ""
+        )
+        if force_password_reset:
+            context_extra.update(
+                {
+                    "account_type": "chatgpt_password_reset_url_mail",
+                    "password": "",
+                    "password_reset_required": True,
+                }
+            )
+        elif saved_password:
+            context_extra.update(
+                {
+                    "account_type": "chatgpt_password_url_otp",
+                    "password": saved_password,
+                    "password_reset_required": False,
+                }
+            )
+        mailbox_context = {
+            **mailbox_context,
+            "extra": context_extra,
+        }
     provider, account_type = _resolve_saved_mailbox_provider(
         mailbox_context,
         context_extra,
@@ -1406,6 +1430,25 @@ def _saved_account_supports_password_reset(saved: Mapping[str, Any]) -> bool:
     )
 
 
+def _saved_account_requires_password_bootstrap(
+    saved: Mapping[str, Any],
+) -> bool:
+    mailbox_context = saved.get("mailbox_context")
+    if not isinstance(mailbox_context, Mapping):
+        return False
+    context_extra = mailbox_context.get("extra")
+    if not isinstance(context_extra, Mapping):
+        return False
+    return bool(
+        _text(context_extra.get("account_type")).lower() == "mailapi_url"
+        and _text(
+            context_extra.get("mail_api_url")
+            or context_extra.get("mailapi_url")
+        )
+        and not _text(context_extra.get("password") or saved.get("password"))
+    )
+
+
 def _saved_account_requires_managed_mfa_repair(
     saved: Mapping[str, Any],
 ) -> bool:
@@ -1426,6 +1469,35 @@ def _saved_account_requires_managed_mfa_repair(
     )
     has_recovery = bool(_text(context_extra.get("mfa_recovery_code")))
     return managed and has_recovery and not has_totp
+
+
+def _saved_account_requires_managed_mfa_enrollment(
+    saved: Mapping[str, Any],
+) -> bool:
+    mailbox_context = saved.get("mailbox_context")
+    if not isinstance(mailbox_context, Mapping):
+        return False
+    context_extra = mailbox_context.get("extra")
+    if not isinstance(context_extra, Mapping):
+        return False
+    has_mail_api = bool(
+        _text(
+            context_extra.get("mail_api_url")
+            or context_extra.get("mailapi_url")
+        )
+    )
+    has_totp = bool(
+        _text(
+            context_extra.get("totp_secret")
+            or context_extra.get("mfa_secret")
+            or context_extra.get("totp")
+        )
+    )
+    return bool(
+        _text(context_extra.get("account_type")).lower() == "mailapi_url"
+        and has_mail_api
+        and not has_totp
+    )
 
 
 def _is_explicit_saved_password_rejection(detail: str) -> bool:
@@ -1465,12 +1537,20 @@ def _login_with_saved_credentials(
         "chatgpt_register_otp_resend_wait_seconds",
     ):
         config[timeout_key] = mailbox_timeout
+    bootstrap_password = _saved_account_requires_password_bootstrap(saved)
+    if bootstrap_password:
+        _emit(
+            log_fn,
+            "检测到仅有邮箱接码地址且尚未保存 ChatGPT 密码；"
+            "本次先创建并保存密码，再继续 MFA 登录",
+        )
     email_service = _build_email_service(
         saved,
         config,
         log_fn=log_fn,
         task_control=task_control,
         attempt_id=attempt_id,
+        force_password_reset=bootstrap_password,
     )
     extra_config = dict(config)
     extra_config.update(
@@ -1506,7 +1586,7 @@ def _login_with_saved_credentials(
     login_started_at = time.monotonic()
     result = run_login(
         email_service,
-        password=str(saved.get("password") or ""),
+        password="" if bootstrap_password else str(saved.get("password") or ""),
     )
     if not bool(getattr(result, "success", False)):
         detail = _text(getattr(result, "error_message", "")) or "认证服务未返回成功状态"
@@ -1846,13 +1926,22 @@ def _relogin_chatgpt_account_locked(
         saved = _load_saved_account(account_id)
         email = saved["email"]
         _emit_observer(log_fn, f"开始使用已保存的邮箱凭据重新登录 {email}")
-        if not rotate_mfa and _saved_account_requires_managed_mfa_repair(saved):
+        repair_managed_mfa = _saved_account_requires_managed_mfa_repair(saved)
+        enroll_managed_mfa = _saved_account_requires_managed_mfa_enrollment(saved)
+        if not rotate_mfa and (repair_managed_mfa or enroll_managed_mfa):
             rotate_mfa = True
-            _emit_observer(
-                log_fn,
-                "检测到旧记录只保存了 MFA 恢复码，"
-                "本次登录成功后将自动补建并保存新的 TOTP",
-            )
+            if repair_managed_mfa:
+                _emit_observer(
+                    log_fn,
+                    "检测到旧记录只保存了 MFA 恢复码，"
+                    "本次登录成功后将自动补建并保存新的 TOTP",
+                )
+            else:
+                _emit_observer(
+                    log_fn,
+                    "检测到邮箱接码账号尚未托管 MFA；"
+                    "本次建立密码后将自动创建并保存 TOTP",
+                )
 
         def _login_log(message: str) -> None:
             _emit_observer(log_fn, message)
