@@ -326,10 +326,10 @@ class RefreshTokenRegistrationEngine:
         if self.password or self.password_reset_required:
             return False
         email_info = self.email_info if isinstance(self.email_info, dict) else {}
-        managed_mfa = bool(
-            email_info.get("chatgpt_mfa_managed") is True
-            and str(email_info.get("totp_secret") or "").strip()
-        )
+        # Legacy mailbox snapshots may not contain the explicit managed flag,
+        # but mailapi/microsoft records only gain a TOTP after project-side MFA
+        # enrollment.  Treat the persisted secret itself as the durable marker.
+        managed_mfa = bool(str(email_info.get("totp_secret") or "").strip())
         if not self._existing_account_rotate_mfa_enabled() and not managed_mfa:
             return False
         account_type = str(email_info.get("account_type") or "").strip().lower()

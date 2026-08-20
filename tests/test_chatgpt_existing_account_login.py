@@ -184,10 +184,9 @@ class MailApiOnlyEmailService:
 class ManagedMfaMailApiOnlyEmailService(MailApiOnlyEmailService):
     def create_email(self):
         result = super().create_email()
-        result.update({
-            "totp_secret": "JBSWY3DPEHPK3PXP",
-            "chatgpt_mfa_managed": True,
-        })
+        # Legacy persisted mailbox adapters expose the saved TOTP, but older
+        # rows may omit the explicit chatgpt_mfa_managed marker.
+        result["totp_secret"] = "JBSWY3DPEHPK3PXP"
         return result
 
 
