@@ -50,6 +50,19 @@ class MailImportServiceTests(unittest.TestCase):
         self.assertEqual(record.account_type, "mailapi_url")
         self.assertEqual(record.mailapi_url, "https://mailapi.icu/key?type=html&orderNo=abc123")
 
+    def test_parse_microsoft_import_line_unwraps_markdown_mailapi_url(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        secret_url = "https://mail.example.test/messages?token=super-secret"
+
+        record = parse_microsoft_import_line(
+            1,
+            f"demo@example.com----[{secret_url}]({secret_url})",
+        )
+
+        self.assertEqual(record.account_type, "mailapi_url")
+        self.assertEqual(record.mailapi_url, secret_url)
+
     def test_parse_microsoft_import_line_supports_chatgpt_password_and_mailapi_url(self):
         rules_module = load_microsoft_import_rules_module()
         parse_microsoft_import_line = rules_module.parse_microsoft_import_line
