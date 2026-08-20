@@ -694,54 +694,6 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(engine.totp_secret, "JBSWY3DPEHPK3PXP")
         self.assertTrue(engine.password_reset_required)
 
-    def test_unconfirmed_password_reset_does_not_expose_generated_password(self):
-        email_service = ManagedMfaMailApiOnlyEmailService()
-        engine = self._make_engine(email_service=email_service)
-        oauth_client = self._successful_oauth_client()
-        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
-        engine._extract_account_info = mock.Mock(
-            return_value={"email": "mailapi-only@icloud.com", "account_id": "account-1"}
-        )
-
-        with mock.patch(
-            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
-            return_value="Unconfirmed-Password-2026!",
-        ):
-            result = engine.run()
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.password, "")
-        self.assertEqual(email_service.committed_password, "")
-        self.assertTrue(engine.password_reset_required)
-
-    def test_unconfirmed_password_reset_does_not_expose_password_in_access_token_stage(self):
-        email_service = ManagedMfaMailApiOnlyEmailService()
-        engine = self._make_engine(
-            email_service=email_service,
-            login_stage="access_token",
-        )
-        chatgpt_client = mock.Mock()
-        chatgpt_client.login_existing_account_and_get_session.return_value = (
-            True,
-            {
-                "access_token": "access-token",
-                "session_token": "session-token",
-                "account_id": "account-1",
-            },
-        )
-        engine._build_chatgpt_client = mock.Mock(return_value=chatgpt_client)
-
-        with mock.patch(
-            "platforms.chatgpt.refresh_token_registration_engine.generate_random_password",
-            return_value="Unconfirmed-Password-2026!",
-        ):
-            result = engine.run()
-
-        self.assertTrue(result.success)
-        self.assertEqual(result.password, "")
-        self.assertEqual(email_service.committed_password, "")
-        self.assertTrue(engine.password_reset_required)
-
     def test_totp_with_mail_access_login_resets_rejected_password_and_keeps_totp(self):
         email_service = PasswordTotpWithMailEmailService()
         engine = self._make_engine(
@@ -817,13 +769,6 @@ class ExistingAccountLoginTests(unittest.TestCase):
         engine._extract_account_info = mock.Mock(
             return_value={"email": "reset-user@icloud.com", "account_id": "account-1"}
         )
-        successful_tokens = oauth_client.login_and_get_tokens.return_value
-
-        def finish_reset(*args, **kwargs):
-            self.assertTrue(kwargs["on_password_reset"](args[1]))
-            return successful_tokens
-
-        oauth_client.login_and_get_tokens.side_effect = finish_reset
 
         result = engine.run()
 
@@ -834,6 +779,9 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertTrue(call.kwargs["password_reset_required"])
         self.assertTrue(call.kwargs["force_password_login"])
         self.assertFalse(call.kwargs["prefer_passwordless_login"])
+        self.assertTrue(
+            call.kwargs["on_password_reset"]("Fresh-Password-123!")
+        )
         self.assertEqual(email_service.committed_password, "Fresh-Password-123!")
 
     def test_password_totp_access_stage_passes_credentials_to_web_login(self):
@@ -1745,67 +1693,6 @@ class ExistingAccountLoginTests(unittest.TestCase):
             "Fresh-Password-123!",
         )
         self.assertIs(complete_reset.call_args.kwargs["on_password_reset"], commit)
-
-    def test_web_login_resets_password_when_entry_starts_on_email_otp(self):
-        client = ChatGPTClient(verbose=False)
-        client.visit_homepage = mock.Mock(return_value=True)
-        client.get_csrf_token = mock.Mock(return_value="csrf-token")
-        client.signin = mock.Mock(
-            side_effect=[
-                "https://auth.openai.com/email-verification",
-                "https://auth.openai.com/add-phone",
-            ]
-        )
-        client.authorize = mock.Mock(
-            side_effect=[
-                "https://auth.openai.com/email-verification",
-                "https://auth.openai.com/add-phone",
-            ]
-        )
-        client.last_authorize_status = 200
-        client._get_cookie_value = mock.Mock(return_value="login-session")
-        client.fetch_chatgpt_session = mock.Mock(
-            return_value=(True, {"accessToken": "access-token"})
-        )
-        client.get_next_auth_session_token = mock.Mock(return_value="session-token")
-        reset_success = FlowState(page_type="reset_password_success")
-        add_phone_state = FlowState(
-            page_type="add_phone",
-            current_url="https://auth.openai.com/add-phone",
-        )
-        commit = mock.Mock(return_value=True)
-
-        with mock.patch.object(
-            OAuthClient,
-            "_complete_password_reset",
-            return_value=reset_success,
-        ) as complete_reset, mock.patch.object(
-            OAuthClient,
-            "_handle_otp_verification",
-            return_value=add_phone_state,
-        ) as handle_login_otp, mock.patch.object(
-            OAuthClient,
-            "prepare_phone_verification_transaction",
-            return_value=None,
-        ):
-            ok, result = client.login_existing_account_and_get_session(
-                "reset-user@icloud.com",
-                mock.Mock(),
-                password="Fresh-Password-123!",
-                password_reset_required=True,
-                on_password_reset=commit,
-            )
-
-        self.assertTrue(ok)
-        self.assertEqual(result["access_token"], "access-token")
-        self.assertEqual(client.signin.call_count, 2)
-        complete_reset.assert_called_once()
-        self.assertEqual(
-            complete_reset.call_args.args[0].page_type,
-            "email_otp_verification",
-        )
-        self.assertIs(complete_reset.call_args.kwargs["on_password_reset"], commit)
-        handle_login_otp.assert_not_called()
 
     def test_web_login_retries_transient_homepage_failure(self):
         client = ChatGPTClient(verbose=False)

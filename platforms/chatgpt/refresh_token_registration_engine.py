@@ -359,19 +359,6 @@ class RefreshTokenRegistrationEngine:
             "warning",
         )
 
-    def _durable_password(self) -> str:
-        """Return a password only after the remote reset was committed.
-
-        Password-reset flows need a generated value while the authentication
-        state machine is running.  That value is provisional until the
-        provider confirms the reset and ``_commit_password_reset`` clears the
-        pending flag.  Never expose the provisional value through a successful
-        registration result, where callers persist it as an account password.
-        """
-        if self.password_reset_required:
-            return ""
-        return str(self.password or "")
-
     def _create_email(self, *, existing_account_login_only: bool = False) -> bool:
         action = "加载" if existing_account_login_only else "创建"
         self._email_error_message = ""
@@ -1018,7 +1005,7 @@ class RefreshTokenRegistrationEngine:
 
         result.success = True
         result.email = self.email or ""
-        result.password = self._durable_password()
+        result.password = self.password or ""
         result.access_token = str(tokens.get("access_token") or "").strip()
         result.refresh_token = str(tokens.get("refresh_token") or "").strip()
         result.id_token = str(tokens.get("id_token") or "").strip()
@@ -1518,7 +1505,6 @@ class RefreshTokenRegistrationEngine:
                 self._log(f"读取邮箱登录上下文失败: {exc}", "warning")
 
         result.success = True
-        result.password = self._durable_password()
         result.access_token = access_token
         result.refresh_token = ""
         result.session_token = str(session_data.get("session_token") or "").strip()
@@ -1624,7 +1610,7 @@ class RefreshTokenRegistrationEngine:
                 self.password = self.password or ""
             else:
                 self.password = self.password or generate_random_password(16)
-            result.password = self._durable_password()
+            result.password = self.password
 
             email_adapter = EmailServiceAdapter(
                 self.email_service,

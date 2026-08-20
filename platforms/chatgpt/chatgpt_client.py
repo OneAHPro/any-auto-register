@@ -998,43 +998,39 @@ class ChatGPTClient:
                 self.last_registration_state = state
                 break
 
-            if password_reset_required and (
-                helper._state_is_login_password(state)
-                or helper._state_is_email_otp(state)
-            ):
-                if int(_password_reset_depth or 0) >= 1:
-                    return False, "密码重置后仍返回重置入口，已停止循环"
-                reset_state = helper._complete_password_reset(
-                    state,
-                    email=email,
-                    new_password=str(password or ""),
-                    skymail_client=skymail_client,
-                    device_id=self.device_id,
-                    user_agent=self.ua,
-                    sec_ch_ua=self.sec_ch_ua,
-                    impersonate=self.impersonate,
-                    on_password_reset=on_password_reset,
-                )
-                if not reset_state:
-                    return False, helper.last_error or "ChatGPT 密码重置失败"
-                return self.login_existing_account_and_get_session(
-                    email,
-                    skymail_client,
-                    password=str(password or ""),
-                    totp_secret=str(totp_secret or ""),
-                    mfa_recovery_code=str(mfa_recovery_code or ""),
-                    on_mfa_totp_staged=on_mfa_totp_staged,
-                    on_mfa_totp_activated=on_mfa_totp_activated,
-                    on_mfa_recovery_code=on_mfa_recovery_code,
-                    password_reset_required=False,
-                    on_password_reset=on_password_reset,
-                    otp_wait_timeout=otp_wait_timeout,
-                    otp_resend_wait_timeout=otp_resend_wait_timeout,
-                    prepare_phone_oauth=prepare_phone_oauth,
-                    _password_reset_depth=int(_password_reset_depth or 0) + 1,
-                )
-
             if helper._state_is_login_password(state):
+                if password_reset_required:
+                    if int(_password_reset_depth or 0) >= 1:
+                        return False, "密码重置后仍返回重置入口，已停止循环"
+                    reset_state = helper._complete_password_reset(
+                        state,
+                        email=email,
+                        new_password=str(password or ""),
+                        skymail_client=skymail_client,
+                        device_id=self.device_id,
+                        user_agent=self.ua,
+                        sec_ch_ua=self.sec_ch_ua,
+                        impersonate=self.impersonate,
+                        on_password_reset=on_password_reset,
+                    )
+                    if not reset_state:
+                        return False, helper.last_error or "ChatGPT 密码重置失败"
+                    return self.login_existing_account_and_get_session(
+                        email,
+                        skymail_client,
+                        password=str(password or ""),
+                        totp_secret=str(totp_secret or ""),
+                        mfa_recovery_code=str(mfa_recovery_code or ""),
+                        on_mfa_totp_staged=on_mfa_totp_staged,
+                        on_mfa_totp_activated=on_mfa_totp_activated,
+                        on_mfa_recovery_code=on_mfa_recovery_code,
+                        password_reset_required=False,
+                        on_password_reset=on_password_reset,
+                        otp_wait_timeout=otp_wait_timeout,
+                        otp_resend_wait_timeout=otp_resend_wait_timeout,
+                        prepare_phone_oauth=prepare_phone_oauth,
+                        _password_reset_depth=int(_password_reset_depth or 0) + 1,
+                    )
                 if password_login:
                     next_state = helper._submit_password_verify(
                         str(password or ""),

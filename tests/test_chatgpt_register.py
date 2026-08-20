@@ -321,66 +321,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         send_passwordless.assert_called_once()
         submit_password.assert_not_called()
 
-    def test_login_and_get_tokens_resets_password_when_entry_starts_on_email_otp(self):
-        client = self._make_client()
-        email_otp_state = FlowState(
-            page_type="email_otp_verification",
-            continue_url="https://auth.openai.com/email-verification",
-            current_url="https://auth.openai.com/email-verification",
-        )
-        reset_success = FlowState(page_type="reset_password_success")
-        consent_state = FlowState(
-            page_type="consent",
-            continue_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-            current_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
-        )
-        commit = mock.Mock(return_value=True)
-
-        with mock.patch.object(
-            client,
-            "_bootstrap_oauth_session",
-            return_value="https://auth.openai.com/log-in",
-        ), mock.patch.object(
-            client,
-            "_submit_authorize_continue",
-            side_effect=[email_otp_state, consent_state],
-        ) as submit_continue, mock.patch.object(
-            client,
-            "_complete_password_reset",
-            return_value=reset_success,
-        ) as complete_reset, mock.patch.object(
-            client,
-            "_handle_otp_verification",
-            return_value=consent_state,
-        ) as handle_login_otp, mock.patch.object(
-            client,
-            "_oauth_submit_workspace_and_org",
-            return_value=("auth-code", None),
-        ), mock.patch.object(
-            client,
-            "_exchange_code_for_tokens",
-            return_value={"access_token": "at", "refresh_token": "rt"},
-        ):
-            tokens = client.login_and_get_tokens(
-                "reset-user@example.com",
-                "Fresh-Password-123!",
-                "device-fixed",
-                skymail_client=mock.Mock(),
-                password_reset_required=True,
-                on_password_reset=commit,
-                allow_phone_verification=False,
-            )
-
-        self.assertEqual(tokens["refresh_token"], "rt")
-        self.assertEqual(submit_continue.call_count, 2)
-        complete_reset.assert_called_once()
-        self.assertEqual(
-            complete_reset.call_args.args[0].page_type,
-            "email_otp_verification",
-        )
-        self.assertIs(complete_reset.call_args.kwargs["on_password_reset"], commit)
-        handle_login_otp.assert_not_called()
-
     def test_login_and_get_tokens_completes_google_federated_redirect_with_password(self):
         client = self._make_client()
         google_state = FlowState(
