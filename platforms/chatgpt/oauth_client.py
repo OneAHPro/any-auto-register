@@ -3737,7 +3737,10 @@ class OAuthClient:
                     self._log("换取 tokens 失败")
                 return tokens
 
-            if password_reset_required and self._state_is_login_password(state):
+            if password_reset_required and (
+                self._state_is_login_password(state)
+                or self._state_is_email_otp(state)
+            ):
                 if int(_password_reset_depth or 0) >= 1:
                     self._set_error("密码重置后仍返回重置入口，已停止循环")
                     return None

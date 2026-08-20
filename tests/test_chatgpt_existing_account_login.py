@@ -1746,6 +1746,67 @@ class ExistingAccountLoginTests(unittest.TestCase):
         )
         self.assertIs(complete_reset.call_args.kwargs["on_password_reset"], commit)
 
+    def test_web_login_resets_password_when_entry_starts_on_email_otp(self):
+        client = ChatGPTClient(verbose=False)
+        client.visit_homepage = mock.Mock(return_value=True)
+        client.get_csrf_token = mock.Mock(return_value="csrf-token")
+        client.signin = mock.Mock(
+            side_effect=[
+                "https://auth.openai.com/email-verification",
+                "https://auth.openai.com/add-phone",
+            ]
+        )
+        client.authorize = mock.Mock(
+            side_effect=[
+                "https://auth.openai.com/email-verification",
+                "https://auth.openai.com/add-phone",
+            ]
+        )
+        client.last_authorize_status = 200
+        client._get_cookie_value = mock.Mock(return_value="login-session")
+        client.fetch_chatgpt_session = mock.Mock(
+            return_value=(True, {"accessToken": "access-token"})
+        )
+        client.get_next_auth_session_token = mock.Mock(return_value="session-token")
+        reset_success = FlowState(page_type="reset_password_success")
+        add_phone_state = FlowState(
+            page_type="add_phone",
+            current_url="https://auth.openai.com/add-phone",
+        )
+        commit = mock.Mock(return_value=True)
+
+        with mock.patch.object(
+            OAuthClient,
+            "_complete_password_reset",
+            return_value=reset_success,
+        ) as complete_reset, mock.patch.object(
+            OAuthClient,
+            "_handle_otp_verification",
+            return_value=add_phone_state,
+        ) as handle_login_otp, mock.patch.object(
+            OAuthClient,
+            "prepare_phone_verification_transaction",
+            return_value=None,
+        ):
+            ok, result = client.login_existing_account_and_get_session(
+                "reset-user@icloud.com",
+                mock.Mock(),
+                password="Fresh-Password-123!",
+                password_reset_required=True,
+                on_password_reset=commit,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(client.signin.call_count, 2)
+        complete_reset.assert_called_once()
+        self.assertEqual(
+            complete_reset.call_args.args[0].page_type,
+            "email_otp_verification",
+        )
+        self.assertIs(complete_reset.call_args.kwargs["on_password_reset"], commit)
+        handle_login_otp.assert_not_called()
+
     def test_web_login_retries_transient_homepage_failure(self):
         client = ChatGPTClient(verbose=False)
         client.visit_homepage = mock.Mock(side_effect=[False, True])
