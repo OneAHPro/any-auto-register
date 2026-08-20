@@ -2373,7 +2373,22 @@ def _run_chatgpt_relogin_task_inner(
                 fetch_codex2api_quota_accounts,
             )
 
-            final_quota_accounts = fetch_codex2api_quota_accounts()
+            final_quota_accounts = None
+            for quota_attempt in range(3):
+                try:
+                    final_quota_accounts = fetch_codex2api_quota_accounts()
+                    break
+                except Exception:
+                    if quota_attempt >= 2:
+                        raise
+                    if quota_attempt == 0:
+                        _log(
+                            task_id,
+                            "Codex2API 额度字段仍在刷新，正在自动重试读取",
+                        )
+                    time.sleep(1.0)
+            if final_quota_accounts is None:
+                raise RuntimeError("Codex2API 额度读取未返回结果")
             quota_report = summarize_available_quota(final_quota_accounts)
             quota_query_succeeded = True
         except Exception as exc:

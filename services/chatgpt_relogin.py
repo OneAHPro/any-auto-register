@@ -737,12 +737,21 @@ class _GoogleFederatedEmailService:
 
     def create_email(self, config=None):
         del config
+        context_extra = dict(self._mailbox_context.get("extra") or {})
         return {
             "email": self._email,
             "service_id": self._email,
             "token": "",
             "account_type": "chatgpt_google_password",
             "password": self._password,
+            "totp_secret": _text(
+                context_extra.get("totp_secret")
+                or context_extra.get("mfa_secret")
+                or context_extra.get("totp")
+            ),
+            "mfa_recovery_code": _text(
+                context_extra.get("mfa_recovery_code")
+            ),
         }
 
     def get_verification_code(self, **kwargs):
@@ -754,6 +763,30 @@ class _GoogleFederatedEmailService:
 
     def get_mailbox_metadata(self):
         return dict(self._mailbox_context)
+
+    def commit_mfa_rotation(
+        self,
+        *,
+        totp_secret="",
+        recovery_code="",
+        rotated_at="",
+    ):
+        secret = _text(totp_secret)
+        if not secret:
+            raise ValueError("轮换后的 MFA 密钥为空")
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        context_extra.update({
+            "totp_secret": secret,
+            "mfa_recovery_code": _text(recovery_code),
+            "chatgpt_mfa_managed": True,
+            "mfa_rotated_at": _text(rotated_at),
+            "mailbox_control_risk": "no_email_recovery",
+        })
+        context_extra.pop("totp_url", None)
+        context_extra.pop("mfa_secret", None)
+        context_extra.pop("totp", None)
+        self._mailbox_context["extra"] = context_extra
+        return True
 
 
 class _PersistedEmailService:
@@ -1373,6 +1406,28 @@ def _saved_account_supports_password_reset(saved: Mapping[str, Any]) -> bool:
     )
 
 
+def _saved_account_requires_managed_mfa_repair(
+    saved: Mapping[str, Any],
+) -> bool:
+    """Repair snapshots that saved recovery metadata but lost the TOTP secret."""
+    mailbox_context = saved.get("mailbox_context")
+    if not isinstance(mailbox_context, Mapping):
+        return False
+    context_extra = mailbox_context.get("extra")
+    if not isinstance(context_extra, Mapping):
+        return False
+    managed = context_extra.get("chatgpt_mfa_managed") is True
+    has_totp = bool(
+        _text(
+            context_extra.get("totp_secret")
+            or context_extra.get("mfa_secret")
+            or context_extra.get("totp")
+        )
+    )
+    has_recovery = bool(_text(context_extra.get("mfa_recovery_code")))
+    return managed and has_recovery and not has_totp
+
+
 def _is_explicit_saved_password_rejection(detail: str) -> bool:
     normalized = _text(detail).lower()
     if "invalid_credentials" in normalized:
@@ -1791,6 +1846,13 @@ def _relogin_chatgpt_account_locked(
         saved = _load_saved_account(account_id)
         email = saved["email"]
         _emit_observer(log_fn, f"开始使用已保存的邮箱凭据重新登录 {email}")
+        if not rotate_mfa and _saved_account_requires_managed_mfa_repair(saved):
+            rotate_mfa = True
+            _emit_observer(
+                log_fn,
+                "检测到旧记录只保存了 MFA 恢复码，"
+                "本次登录成功后将自动补建并保存新的 TOTP",
+            )
 
         def _login_log(message: str) -> None:
             _emit_observer(log_fn, message)

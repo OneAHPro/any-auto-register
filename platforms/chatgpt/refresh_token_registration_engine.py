@@ -418,7 +418,9 @@ class RefreshTokenRegistrationEngine:
                     if not password:
                         raise ValueError("Google 联邦登录记录缺少邮箱密码")
                     self.password = password
-                    self.totp_secret = ""
+                    self.totp_secret = str(
+                        self.email_info.get("totp_secret") or ""
+                    ).strip()
                     self.password_reset_required = False
                     self._log(
                         "已识别企业域名 Google 联邦登录凭据；"

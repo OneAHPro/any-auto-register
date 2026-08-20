@@ -883,6 +883,8 @@ class ChatGPTReloginTests(unittest.TestCase):
                 "extra": {
                     "account_type": "chatgpt_google_password",
                     "password": "supplier-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_recovery_code": "RECOVERY-CODE",
                 },
             },
         }
@@ -895,7 +897,23 @@ class ChatGPTReloginTests(unittest.TestCase):
             "chatgpt_google_password",
         )
         self.assertEqual(email_info["password"], "supplier-password")
+        self.assertEqual(email_info["totp_secret"], "JBSWY3DPEHPK3PXP")
+        self.assertEqual(email_info["mfa_recovery_code"], "RECOVERY-CODE")
         self.assertFalse(service.supports_email_verification())
+
+        self.assertTrue(
+            service.commit_mfa_rotation(
+                totp_secret="NEW-TOTP-SECRET",
+                recovery_code="NEW-RECOVERY-CODE",
+                rotated_at="2026-08-21T03:00:00Z",
+            )
+        )
+        stored_extra = service.get_mailbox_metadata()["extra"]
+        self.assertEqual(stored_extra["totp_secret"], "NEW-TOTP-SECRET")
+        self.assertEqual(
+            stored_extra["mfa_recovery_code"],
+            "NEW-RECOVERY-CODE",
+        )
 
     def test_password_totp_with_mail_url_reads_email_otp_during_relogin(self):
         mail_api_url = "https://mail.example.test/messages/token"
@@ -1439,6 +1457,44 @@ class ChatGPTReloginTests(unittest.TestCase):
             return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
         ), mock.patch("services.chatgpt_relogin.engine", self.engine):
             result = relogin_chatgpt_account(self.account_id, rotate_mfa=True)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["mfa_rotated"])
+        self.assertTrue(login.call_args.kwargs["rotate_mfa"])
+
+    def test_full_relogin_repairs_legacy_managed_mfa_without_totp_secret(self):
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            extra = account.get_extra()
+            extra["mailbox_login_context"] = {
+                "provider": "chatgpt_credentials",
+                "email": account.email,
+                "extra": {
+                    "account_type": "chatgpt_google_password",
+                    "password": "supplier-password",
+                    "chatgpt_mfa_managed": True,
+                    "mfa_recovery_code": "RECOVERY-CODE",
+                },
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        tokens = self._fresh_tokens()
+        tokens["metadata"] = {
+            "mfa_rotation": {
+                "managed": True,
+                "rotated_at": "2026-08-21T03:00:00+00:00",
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ) as login, mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ), mock.patch("services.chatgpt_relogin.engine", self.engine):
+            result = relogin_chatgpt_account(self.account_id)
 
         self.assertTrue(result["ok"])
         self.assertTrue(result["mfa_rotated"])

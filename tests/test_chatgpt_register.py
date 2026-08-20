@@ -526,6 +526,38 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         )
         submit_email.assert_not_called()
 
+    def test_submit_mfa_uses_recovery_code_when_browser_state_only_has_url(self):
+        client = self._make_client()
+        expected_state = FlowState(page_type="consent")
+        challenge_state = FlowState(
+            page_type="mfa_challenge",
+            current_url=(
+                "https://auth.openai.com/mfa-challenge/"
+                "challenge-from-browser"
+            ),
+        )
+
+        with mock.patch.object(
+            client,
+            "_submit_recovery_code_mfa_challenge",
+            return_value=expected_state,
+        ) as submit_recovery:
+            state = client._submit_mfa_challenge(
+                challenge_state,
+                email="user@example.com",
+                skymail_client=None,
+                totp_secret="",
+                mfa_recovery_code="RECOVERY-CODE",
+                device_id="device-fixed",
+            )
+
+        self.assertIs(state, expected_state)
+        submit_recovery.assert_called_once()
+        self.assertEqual(
+            submit_recovery.call_args.kwargs["factor"],
+            {"id": "challenge-from-browser", "type": "recovery_code"},
+        )
+
     def test_submit_recovery_code_mfa_challenge_never_logs_code(self):
         client = self._make_client()
         logs = []

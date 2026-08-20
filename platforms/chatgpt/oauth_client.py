@@ -2596,6 +2596,26 @@ class OAuthClient:
             None,
         )
         recovery_code = str(mfa_recovery_code or "").strip()
+        fallback_factor_id = self._extract_totp_factor_id(state)
+        if not factors and fallback_factor_id:
+            if str(totp_secret or "").strip():
+                totp_factor = {
+                    "id": fallback_factor_id,
+                    "type": "totp",
+                }
+                if recovery_code:
+                    recovery_factor = {
+                        "id": fallback_factor_id,
+                        "type": "recovery_code",
+                    }
+            elif recovery_code:
+                recovery_factor = {
+                    "id": fallback_factor_id,
+                    "type": "recovery_code",
+                }
+            self._log(
+                "ChatGPT MFA 页面仅返回挑战地址，已按项目保存的验证凭据继续"
+            )
         totp_code_provider = getattr(skymail_client, "get_totp_code", None)
         supports_totp_code = getattr(
             skymail_client,

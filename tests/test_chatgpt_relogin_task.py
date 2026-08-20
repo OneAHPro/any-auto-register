@@ -1285,6 +1285,48 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertFalse(snapshot["meta"]["quota_data_available"])
         self.assertNotIn("secret detail", "\n".join(snapshot["logs"]))
 
+    def test_final_quota_query_retries_until_remote_data_is_ready(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [244],
+            source="schedule",
+            automation=True,
+        )
+        final_rows = [
+            {
+                "email": "ready@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            }
+        ]
+        self.final_quota_reader.side_effect = [
+            RuntimeError("quota fields are still refreshing"),
+            final_rows,
+        ]
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                244: {
+                    "account_id": 244,
+                    "email": "ready@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            },
+        ), mock.patch("api.tasks.time.sleep") as sleep:
+            _run_chatgpt_relogin_task(task_id, [244])
+
+        self.assertEqual(self.final_quota_reader.call_count, 2)
+        sleep.assert_called_once()
+        meta = _task_store.snapshot(task_id)["meta"]
+        self.assertTrue(meta["quota_data_available"])
+        self.assertEqual(meta["estimated_remaining_usd"], "10.00")
+
     def test_quota_alert_exception_does_not_change_terminal_task_outcome(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
