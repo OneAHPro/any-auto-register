@@ -27,6 +27,7 @@ from core.task_runtime import (
 )
 from core.sms_pool import SmsPoolExhaustedError, mask_sms_code, sms_pool_service
 from core.chatgpt_task_gate import chatgpt_task_gate
+from core.chatgpt_login_context import promote_managed_mfa_login_context
 from platforms.chatgpt.log_sanitizer import sanitize_chatgpt_log_message
 import time, json, asyncio, threading, logging, re
 
@@ -3674,6 +3675,7 @@ def _load_chatgpt_retry_mailbox_context(
             if row is None or str(row.email or "").strip().lower() != normalized_email:
                 return {}
             account_context = {}
+            saved_password = ""
             account = None
             if int(row.account_id or 0) > 0:
                 account = session.get(AccountModel, int(row.account_id))
@@ -3684,6 +3686,7 @@ def _load_chatgpt_retry_mailbox_context(
                     .where(AccountModel.email == expected_email)
                 ).first()
             if account is not None:
+                saved_password = str(account.password or "")
                 account_extra = account.get_extra()
                 candidate = account_extra.get("mailbox_login_context")
                 if isinstance(candidate, dict):
@@ -3695,6 +3698,10 @@ def _load_chatgpt_retry_mailbox_context(
 
     if not isinstance(context, dict):
         return {}
+    context = promote_managed_mfa_login_context(
+        context,
+        saved_password=saved_password,
+    )
     context_email = str(context.get("email") or expected_email or "").strip()
     if not context_email or context_email.lower() != normalized_email:
         return {}

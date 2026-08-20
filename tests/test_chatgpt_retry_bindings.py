@@ -20,7 +20,11 @@ from api.tasks import (
     _retryable_chatgpt_bindings,
     _upsert_chatgpt_attempt_binding,
 )
-from core.db import ChatGPTAttemptBindingModel, _recover_chatgpt_attempt_bindings
+from core.db import (
+    AccountModel,
+    ChatGPTAttemptBindingModel,
+    _recover_chatgpt_attempt_bindings,
+)
 
 
 class ChatGPTRetryBindingTests(unittest.TestCase):
@@ -68,6 +72,73 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
 
         self.assertEqual(restored, context)
         self.assertEqual(mismatched, {})
+
+    def test_retry_promotes_saved_password_and_managed_totp_over_legacy_mailapi_context(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        context = {
+            "provider": "microsoft",
+            "email": "managed@example.com",
+            "account_id": "mailbox-8",
+            "extra": {
+                "provider": "microsoft",
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/TOKEN",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "mfa_recovery_code": "RECOVERY-CODE",
+                "chatgpt_mfa_managed": True,
+            },
+        }
+        with Session(test_engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="managed@example.com",
+                password="Saved-ChatGPT-Password",
+            )
+            account.set_extra({"mailbox_login_context": context})
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            row = ChatGPTAttemptBindingModel(
+                task_id="task-original",
+                attempt_index=0,
+                email="managed@example.com",
+                account_id=int(account.id),
+                leadbee_code="aar_" + "a" * 32,
+                status="failed",
+                mailbox_context_json=json.dumps(context),
+            )
+            session.add(row)
+            session.commit()
+            session.refresh(row)
+            binding_id = int(row.id)
+
+        with mock.patch("api.tasks.engine", test_engine):
+            restored = _load_chatgpt_retry_mailbox_context(
+                binding_id,
+                "managed@example.com",
+            )
+
+        self.assertEqual(
+            restored["extra"]["account_type"],
+            "chatgpt_password_totp",
+        )
+        self.assertEqual(
+            restored["extra"]["password"],
+            "Saved-ChatGPT-Password",
+        )
+        self.assertEqual(
+            restored["extra"]["totp_secret"],
+            "JBSWY3DPEHPK3PXP",
+        )
+        self.assertEqual(
+            restored["extra"]["mail_api_url"],
+            "https://mail.example.test/TOKEN",
+        )
 
     def test_api_phone_auto_retry_requires_released_terminal_order(self):
         result = {

@@ -1009,7 +1009,7 @@ class ChatGPTReloginTests(unittest.TestCase):
         email_info = service.create_email()
         self.assertEqual(
             email_info["account_type"],
-            "chatgpt_password_url_otp",
+            "chatgpt_password_totp",
         )
         self.assertEqual(
             email_info["password"],

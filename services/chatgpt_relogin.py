@@ -15,6 +15,7 @@ from sqlmodel import Session, select
 from core.applemail_pool import load_applemail_pool_records
 from core.base_mailbox import MailboxAccount, create_mailbox
 from core.config_store import config_store
+from core.chatgpt_login_context import promote_managed_mfa_login_context
 from core.db import AccountModel, OutlookAccountModel, engine
 from core.task_runtime import TaskInterruption
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
@@ -1165,6 +1166,12 @@ def _build_email_service(
             f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
         )
     context_extra = dict(mailbox_context.get("extra") or {})
+    if not force_password_reset:
+        mailbox_context = promote_managed_mfa_login_context(
+            mailbox_context,
+            saved_password=str(saved.get("password") or ""),
+        )
+        context_extra = dict(mailbox_context.get("extra") or {})
     if _text(context_extra.get("account_type")).lower() == "mailapi_url":
         saved_password = str(
             context_extra.get("password") or saved.get("password") or ""
