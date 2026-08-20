@@ -1570,6 +1570,59 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertIsNone(code)
 
     @mock.patch("requests.get")
+    def test_mailapi_logs_the_same_old_message_only_once_per_challenge(self, mock_get):
+        logs = []
+        mailbox = OutlookMailbox()
+        mailbox._log_fn = logs.append
+        account = MailboxAccount(
+            email="demo@icloud.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/messages",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text=json.dumps(
+                {
+                    "email": "demo@icloud.com",
+                    "msg": "Enter this temporary verification code: 246810",
+                    "received_at": "2026-08-21T00:03:30+08:00",
+                    "request_id": "message-old",
+                    "status": True,
+                    "subject": "Your temporary ChatGPT login code",
+                }
+            ),
+        )
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-21T00:04:06+08:00"
+        ).timestamp()
+
+        def poll_twice(**kwargs):
+            self.assertIsNone(kwargs["poll_once"]())
+            return kwargs["poll_once"]()
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=poll_twice,
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=set(),
+                otp_sent_at=otp_sent_at,
+            )
+
+        self.assertIsNone(code)
+        self.assertEqual(
+            logs.count(
+                "[MailAPI] 当前只有发送前的旧验证码，继续等待新邮件"
+            ),
+            1,
+        )
+
+    @mock.patch("requests.get")
     def test_mailapi_json_accepts_new_message_even_if_baseline_raced(self, mock_get):
         mailbox = OutlookMailbox()
         account = MailboxAccount(

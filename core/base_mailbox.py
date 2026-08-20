@@ -4018,6 +4018,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
     def __init__(self, mailbox: "OutlookMailbox"):
         super().__init__(mailbox)
         self._detail_discovery_log_keys: set[tuple[str, tuple[str, ...]]] = set()
+        self._old_message_log_keys: set[tuple[str, str, float]] = set()
 
     @staticmethod
     def _code_key(code: str) -> str:
@@ -5253,7 +5254,21 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 and received_at
                 and float(received_at) < otp_sent_at - 5.0
             ):
-                self.mailbox._log("[MailAPI] 跳过发送验证码之前收到的旧邮件")
+                old_message_identity = str(
+                    message.get("message_id") or self._code_key(code)
+                )
+                old_log_key = (
+                    str(account.email or "").strip().lower(),
+                    old_message_identity,
+                    round(otp_sent_at, 3),
+                )
+                if old_log_key not in self._old_message_log_keys:
+                    if len(self._old_message_log_keys) >= 512:
+                        self._old_message_log_keys.clear()
+                    self._old_message_log_keys.add(old_log_key)
+                    self.mailbox._log(
+                        "[MailAPI] 当前只有发送前的旧验证码，继续等待新邮件"
+                    )
                 return None
             received_after_challenge = bool(
                 otp_sent_at
