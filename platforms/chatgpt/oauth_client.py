@@ -1906,6 +1906,57 @@ class OAuthClient:
     ):
         """Start OpenAI's password-reset flow for the current auth session."""
         self._enter_stage("password_reset", "send_otp")
+        if self._state_is_email_otp(state):
+            reset_page_url = f"{self.oauth_issuer}/reset-password"
+            reset_headers = self._headers(
+                reset_page_url,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept=(
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                    "image/avif,image/webp,*/*;q=0.8"
+                ),
+                referer=(
+                    state.current_url
+                    or state.continue_url
+                    or f"{self.oauth_issuer}/email-verification"
+                ),
+                navigation=True,
+            )
+            try:
+                reset_kwargs = {
+                    "headers": reset_headers,
+                    "timeout": 30,
+                    "allow_redirects": True,
+                }
+                if impersonate:
+                    reset_kwargs["impersonate"] = impersonate
+                self._browser_pause()
+                reset_response = self.session.get(reset_page_url, **reset_kwargs)
+                reset_current_url = str(reset_response.url or reset_page_url)
+                self._log(
+                    "/reset-password -> "
+                    f"{reset_response.status_code}, final={reset_current_url[:120]}"
+                )
+                if reset_response.status_code != 200:
+                    self._set_error(
+                        "进入密码重置页面失败: "
+                        f"HTTP {reset_response.status_code}"
+                    )
+                    return None
+                if urlparse(reset_current_url).path.rstrip("/") != "/reset-password":
+                    self._set_error(
+                        "认证服务未进入密码重置步骤: "
+                        f"{reset_current_url[:160]}"
+                    )
+                    return None
+                state = self._state_from_url(reset_current_url)
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                self._set_error(f"进入密码重置页面异常: {exc}")
+                return None
+
         request_url = f"{self.oauth_issuer}/api/accounts/password/send-otp"
         headers = self._headers(
             request_url,

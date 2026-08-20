@@ -73,6 +73,50 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
         self.assertIn("HTTP 400", self.client.last_error)
         self.assertIn("RESET_REQUEST_DETAIL", self.client.last_error)
 
+    def test_password_reset_from_login_email_otp_enters_reset_page_first(self):
+        self.client.session.get.return_value = _response(
+            {},
+            url="https://auth.openai.com/reset-password",
+        )
+        self.client.session.post.return_value = _response(
+            {
+                "page": {
+                    "type": "email_otp_verification",
+                    "payload": {"url": "/email-verification"},
+                }
+            },
+            url="https://auth.openai.com/api/accounts/password/send-otp",
+        )
+        state = FlowState(
+            page_type="email_otp_verification",
+            current_url="https://auth.openai.com/email-verification",
+        )
+
+        result = self.client._request_password_reset_otp(
+            state,
+            device_id="device-id",
+            user_agent="ua",
+            sec_ch_ua='"Chromium";v="136"',
+            impersonate=None,
+        )
+
+        self.assertEqual(result.page_type, "email_otp_verification")
+        self.client.session.get.assert_called_once()
+        reset_page_call = self.client.session.get.call_args
+        self.assertEqual(
+            reset_page_call.args[0],
+            "https://auth.openai.com/reset-password",
+        )
+        self.assertEqual(
+            reset_page_call.kwargs["headers"]["Referer"],
+            "https://auth.openai.com/email-verification",
+        )
+        send_otp_call = self.client.session.post.call_args
+        self.assertEqual(
+            send_otp_call.kwargs["headers"]["Referer"],
+            "https://auth.openai.com/reset-password",
+        )
+
     def test_password_reset_submits_new_password_with_sentinel(self):
         self.client.session.post.return_value = _response(
             {
