@@ -85,13 +85,14 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
     def descriptor(self) -> MailImportProviderDescriptor:
         return MailImportProviderDescriptor(
             type="applemail",
-            label="ChatGPT 密码 + MFA / AppleMail",
+            label="ChatGPT 密码 / MFA / AppleMail",
             description=(
-                "导入本地账号池；支持 ChatGPT 密码 + TOTP、URL 收件/2FA，"
+                "导入本地账号池；支持 Google 联邦邮箱+密码、ChatGPT 密码 + TOTP、URL 收件/2FA，"
                 "以及 AppleMail OAuth 凭据。"
             ),
             helper_text=(
                 "支持数组/对象 JSON，也支持每行一条；TXT 字段可使用完整的 `---` 或 `----` 分隔符："
+                "Google 联邦登录使用 `email----Google密码`；"
                 "ChatGPT 使用 `email----ChatGPT密码----MFA秘钥`；"
                 "远程 MFA 使用 `email----ChatGPT密码----MFA查询URL`；"
                 "URL 凭据使用 `email----密码----收件URL----2FA URL`；"
@@ -102,6 +103,7 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
                 '[\n  {\n    "email": "demo@example.com",\n    "clientId": "xxxx",\n'
                 '    "refreshToken": "xxxx",\n    "folder": "INBOX"\n  }\n]\n\n'
                 "或粘贴 TXT:\n"
+                "worker@company.example----Google登录密码\n"
                 "demo@icloud.com----ChatGPT密码----BASE32_MFA_SECRET\n"
                 "demo@example.com----password----client_id----refresh_token"
             ),

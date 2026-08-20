@@ -39,7 +39,10 @@ from .utils import (
     seed_oai_device_cookie,
 )
 from .sentinel_token import build_sentinel_token
-from .sentinel_browser import get_sentinel_token_via_browser
+from .sentinel_browser import (
+    complete_google_federated_login_via_browser,
+    get_sentinel_token_via_browser,
+)
 
 
 def _is_password_verify_deactivation_response(
@@ -575,6 +578,54 @@ class OAuthClient:
 
     def _state_is_login_password(self, state: FlowState):
         return state.page_type == "login_password"
+
+    @staticmethod
+    def _state_is_google_federated(state: FlowState) -> bool:
+        target = str(state.continue_url or state.current_url or "").strip()
+        try:
+            return (
+                str(urlparse(target).hostname or "").lower()
+                == "accounts.google.com"
+            )
+        except ValueError:
+            return False
+
+    def _complete_google_federated_login(
+        self,
+        state: FlowState,
+        *,
+        email: str,
+        password: str,
+        user_agent: str,
+    ) -> FlowState | None:
+        self._enter_stage("google_federated_login")
+        self._log("检测到企业域名 Google 联邦登录，自动提交邮箱和密码")
+        try:
+            final_url = complete_google_federated_login_via_browser(
+                session=self.session,
+                start_url=str(state.continue_url or state.current_url or ""),
+                email=email,
+                password=password,
+                proxy=self.proxy,
+                user_agent=user_agent,
+                headless=self.browser_mode != "headed",
+                timeout_ms=90_000,
+                log_fn=lambda message: self._log(
+                    f"Google 联邦登录: {message}"
+                ),
+            )
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            self._set_error(
+                "Google 联邦登录失败: "
+                f"{str(exc).strip() or type(exc).__name__}"
+            )
+            return None
+        if not final_url:
+            self._set_error("Google 联邦登录完成后未返回 OpenAI 授权地址")
+            return None
+        return self._state_from_url(final_url)
 
     def _state_is_password_reset_new_password(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
@@ -3708,6 +3759,22 @@ class OAuthClient:
                     _continue_depth=0,
                     _password_reset_depth=int(_password_reset_depth or 0) + 1,
                 )
+
+            if self._state_is_google_federated(state):
+                if not str(password or ""):
+                    self._set_error("Google 联邦登录缺少邮箱密码")
+                    return None
+                next_state = self._complete_google_federated_login(
+                    state,
+                    email=email,
+                    password=password,
+                    user_agent=user_agent,
+                )
+                if not next_state:
+                    return None
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                continue
 
             if prefer_passwordless_login and (not force_password_login) and self._state_is_login_password(state):
                 next_state = self._send_passwordless_login_otp(

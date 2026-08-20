@@ -369,7 +369,18 @@ class RefreshTokenRegistrationEngine:
                 account_type = str(
                     self.email_info.get("account_type") or ""
                 ).strip()
-                if account_type == "chatgpt_password_totp":
+                if account_type == "chatgpt_google_password":
+                    password = str(self.email_info.get("password") or "")
+                    if not password:
+                        raise ValueError("Google 联邦登录记录缺少邮箱密码")
+                    self.password = password
+                    self.totp_secret = ""
+                    self.password_reset_required = False
+                    self._log(
+                        "已识别企业域名 Google 联邦登录凭据；"
+                        "将从 OpenAI 邮箱入口自动跳转 Google 登录"
+                    )
+                elif account_type == "chatgpt_password_totp":
                     password = str(self.email_info.get("password") or "")
                     totp_secret = str(self.email_info.get("totp_secret") or "")
                     if not password or not totp_secret:

@@ -257,6 +257,13 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
             email=email,
             raw_content=line,
         )
+    if len(parts) == 2 and parts[1].strip():
+        return _resolved_apple_row(
+            line_number=line_number,
+            email=email,
+            raw_content=line,
+            fallback_account_type="chatgpt_google_password",
+        )
 
     if len(parts) == 3:
         second, third = parts[1:3]

@@ -59,6 +59,34 @@ class PasswordTotpEmailService:
         }
 
 
+class GoogleFederatedEmailService:
+    service_type = type("ServiceType", (), {"value": "chatgpt_credentials"})()
+
+    def create_email(self):
+        return {
+            "email": "worker@custom-google-domain.example",
+            "service_id": "worker@custom-google-domain.example",
+            "account_type": "chatgpt_google_password",
+            "password": "supplier-password",
+        }
+
+    def get_verification_code(self, **kwargs):
+        raise AssertionError("Google 联邦登录不应读取邮箱验证码")
+
+    def supports_email_verification(self):
+        return False
+
+    def get_mailbox_metadata(self):
+        return {
+            "provider": "chatgpt_credentials",
+            "email": "worker@custom-google-domain.example",
+            "account_id": "worker@custom-google-domain.example",
+            "extra": {
+                "account_type": "chatgpt_google_password",
+                "password": "supplier-password",
+            },
+        }
+
 class PasswordTotpWithMailEmailService(PasswordTotpEmailService):
     def __init__(self):
         self.committed_password = ""
@@ -367,6 +395,27 @@ class ExistingAccountLoginTests(unittest.TestCase):
             call.kwargs["mfa_recovery_code"],
             "RECOVERY-CODE",
         )
+        self.assertFalse(call.kwargs["prefer_passwordless_login"])
+        self.assertTrue(call.kwargs["force_password_login"])
+
+    def test_google_federated_credentials_force_password_login_without_totp(self):
+        engine = self._make_engine(email_service=GoogleFederatedEmailService())
+        oauth_client = self._successful_oauth_client()
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._extract_account_info = mock.Mock(
+            return_value={
+                "email": "worker@custom-google-domain.example",
+                "account_id": "account-1",
+            }
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(result.password, "supplier-password")
+        call = oauth_client.login_and_get_tokens.call_args
+        self.assertEqual(call.args[1], "supplier-password")
+        self.assertEqual(call.kwargs["totp_secret"], "")
         self.assertFalse(call.kwargs["prefer_passwordless_login"])
         self.assertTrue(call.kwargs["force_password_login"])
 

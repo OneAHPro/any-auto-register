@@ -281,6 +281,23 @@ def _normalize_remote_totp_credential(
     }
 
 
+def _normalize_google_federated_credential(
+    *,
+    email: str,
+    password: str,
+    mailbox: str = "INBOX",
+) -> dict[str, Any]:
+    normalized_password = str(password or "").strip()
+    if not normalized_password:
+        raise ValueError(f"{email} 缺少 Google 登录密码")
+    return {
+        "email": email,
+        "password": normalized_password,
+        "account_type": "chatgpt_google_password",
+        "mailbox": _normalize_mailbox(mailbox),
+    }
+
+
 def _normalize_record(entry: Any) -> dict[str, str]:
     if isinstance(entry, str):
         return _normalize_text_record(entry)
@@ -361,6 +378,12 @@ def _normalize_record(entry: Any) -> dict[str, str]:
             account_type="chatgpt_password_url_otp",
             mailbox=mailbox,
         ), entry)
+    if account_type == "chatgpt_google_password":
+        return _copy_pool_metadata(_normalize_google_federated_credential(
+            email=email,
+            password=password,
+            mailbox=mailbox,
+        ), entry)
     if password and mfa_secret and account_type == "icloud_web":
         return _copy_pool_metadata({
             "email": email,
@@ -406,8 +429,14 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
         values.pop()
     if not any(values):
         raise ValueError("空邮箱记录")
-    if len(values) < 3:
+    if len(values) < 2:
         raise ValueError("邮箱记录字段不足")
+    if len(values) == 2:
+        email, password = values
+        return _normalize_google_federated_credential(
+            email=email,
+            password=password,
+        )
     if len(values) == 3:
         email, second, third = values
         if _looks_like_http_url(third):

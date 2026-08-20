@@ -872,6 +872,31 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertFalse(service.supports_email_verification())
         mailbox.get_current_ids.assert_not_called()
 
+    def test_google_federated_service_relogin_uses_saved_password_without_mail_receiver(self):
+        saved = {
+            "email": "worker@custom-google-domain.example",
+            "password": "supplier-password",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "chatgpt_credentials",
+                "email": "worker@custom-google-domain.example",
+                "extra": {
+                    "account_type": "chatgpt_google_password",
+                    "password": "supplier-password",
+                },
+            },
+        }
+
+        service = _build_email_service(saved, {}, log_fn=None)
+        email_info = service.create_email()
+
+        self.assertEqual(
+            email_info["account_type"],
+            "chatgpt_google_password",
+        )
+        self.assertEqual(email_info["password"], "supplier-password")
+        self.assertFalse(service.supports_email_verification())
+
     def test_password_totp_with_mail_url_reads_email_otp_during_relogin(self):
         mail_api_url = "https://mail.example.test/messages/token"
         saved = {

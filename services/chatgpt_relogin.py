@@ -224,6 +224,10 @@ def _mailbox_context_has_usable_credentials(
         mailbox_context,
         context_extra,
     )
+    if account_type == "chatgpt_google_password":
+        return bool(
+            _text(context_extra.get("password") or saved.get("password"))
+        )
     if account_type == "chatgpt_password_remote_totp":
         return bool(
             _text(context_extra.get("password") or saved.get("password"))
@@ -717,6 +721,41 @@ class _PasswordTotpEmailService:
         return True
 
 
+class _GoogleFederatedEmailService:
+    service_type = type("ServiceType", (), {"value": "chatgpt_credentials"})()
+
+    def __init__(
+        self,
+        *,
+        email: str,
+        password: str,
+        mailbox_context: dict[str, Any],
+    ) -> None:
+        self._email = str(email or "").strip()
+        self._password = str(password or "")
+        self._mailbox_context = mailbox_context
+
+    def create_email(self, config=None):
+        del config
+        return {
+            "email": self._email,
+            "service_id": self._email,
+            "token": "",
+            "account_type": "chatgpt_google_password",
+            "password": self._password,
+        }
+
+    def get_verification_code(self, **kwargs):
+        del kwargs
+        raise RuntimeError("当前账号使用 Google 联邦密码重登，不读取邮箱验证码")
+
+    def supports_email_verification(self):
+        return False
+
+    def get_mailbox_metadata(self):
+        return dict(self._mailbox_context)
+
+
 class _PersistedEmailService:
     def __init__(
         self,
@@ -1097,6 +1136,19 @@ def _build_email_service(
         mailbox_context,
         context_extra,
     )
+    if account_type == "chatgpt_google_password":
+        password = str(
+            context_extra.get("password") or saved.get("password") or ""
+        )
+        if not password:
+            raise RuntimeError(
+                f"账号 {saved['email']} 的 Google 联邦登录凭据缺少密码"
+            )
+        return _GoogleFederatedEmailService(
+            email=_text(mailbox_context.get("email")) or saved["email"],
+            password=password,
+            mailbox_context=mailbox_context,
+        )
     if account_type == "chatgpt_password_remote_totp":
         password = _text(
             context_extra.get("password") or saved.get("password")
@@ -1465,6 +1517,7 @@ def _login_with_saved_credentials(
                 if isinstance(context_extra, dict) and _text(
                     context_extra.get("account_type")
                 ).lower() in {
+                    "chatgpt_google_password",
                     "chatgpt_password_totp",
                     "chatgpt_password_url_otp",
                     "chatgpt_password_reset_url_mail",

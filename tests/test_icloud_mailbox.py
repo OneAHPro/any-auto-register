@@ -892,6 +892,30 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
         self.assertEqual(records[0]["account_type"], "chatgpt_password_totp")
         self.assertEqual(records[0]["mail_api_url"], mail_url)
 
+    def test_google_federated_password_account_has_no_mailbox_receive_dependency(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                "worker@custom-google-domain.example----supplier-password",
+                pool_dir=tmp_dir,
+                filename="google-federated.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="google-federated.json",
+            )
+
+            account = mailbox.get_email()
+            current_ids = mailbox.get_current_ids(account)
+
+        self.assertEqual(current_ids, set())
+        self.assertEqual(
+            account.extra["account_type"],
+            "chatgpt_google_password",
+        )
+        self.assertEqual(account.extra["provider"], "chatgpt_credentials")
+        self.assertEqual(account.extra["password"], "supplier-password")
+        self.assertNotIn("totp_secret", account.extra)
+
     def test_nn_provider_history_selects_newest_verification_message(self):
         parsed = MailApiUrlOtpBackend._parse_mailapi_message(json.dumps({
             "ok": True,

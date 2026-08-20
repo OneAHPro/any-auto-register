@@ -5,6 +5,25 @@ from services.mail_imports.auto_detection import detect_mail_import_content
 
 
 class MailImportAutoDetectionTests(unittest.TestCase):
+    def test_detects_google_federated_email_password_as_applemail(self):
+        password = "supplier-google-password"
+
+        result = detect_mail_import_content(
+            f"worker@custom-google-domain.example----{password}"
+        )
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(
+            result.counts,
+            {"microsoft": 0, "applemail": 1, "unresolved": 0},
+        )
+        self.assertEqual(result.rows[0].provider, "applemail")
+        self.assertEqual(
+            result.rows[0].account_type,
+            "chatgpt_google_password",
+        )
+        self.assertNotIn(password, json.dumps(result.to_public_dict()))
+
     def test_detects_microsoft_mailapi_url_without_exposing_url(self):
         secret_url = "https://mail.example.test/messages?token=super-secret"
 

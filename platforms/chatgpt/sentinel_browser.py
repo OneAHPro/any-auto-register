@@ -7,10 +7,12 @@ import os
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from core.browser_runtime import (
     ensure_browser_display_available,
@@ -531,5 +533,209 @@ def get_sentinel_token_via_browser(
                 playwright.stop()
             except Exception as e:
                 logger(f"Sentinel Browser 驱动停止异常: {e}")
+        unregister_interrupt()
+        checkpoint_current_task_attempt()
+
+
+def complete_google_federated_login_via_browser(
+    *,
+    session: Any,
+    start_url: str,
+    email: str,
+    password: str,
+    proxy: Optional[str] = None,
+    user_agent: str = "",
+    headless: bool = True,
+    timeout_ms: int = 90_000,
+    log_fn: Optional[Callable[[str], None]] = None,
+) -> str:
+    """Complete a Google IdP redirect and return its OpenAI callback URL."""
+    logger = log_fn or (lambda _msg: None)
+    target = str(start_url or "").strip()
+    parsed_target = urlparse(target)
+    if parsed_target.scheme != "https" or parsed_target.hostname != "accounts.google.com":
+        raise ValueError("Google 联邦登录地址无效")
+    normalized_email = str(email or "").strip()
+    normalized_password = str(password or "")
+    if not normalized_email or not normalized_password:
+        raise ValueError("Google 联邦登录缺少邮箱或密码")
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError("Google 联邦登录浏览器组件未安装") from exc
+
+    effective_headless, reason = resolve_browser_headless(headless)
+    ensure_browser_display_available(effective_headless)
+    logger(
+        "Google 联邦登录浏览器模式: "
+        f"{'headless' if effective_headless else 'headed'} ({reason})"
+    )
+
+    launch_args: dict[str, Any] = {
+        "headless": effective_headless,
+        "args": [
+            "--no-sandbox",
+            "--disable-blink-features=AutomationControlled",
+        ],
+    }
+    proxy_config = build_playwright_proxy_config(proxy)
+    if proxy and not proxy_config:
+        raise RuntimeError("当前代理格式不支持 Google 联邦浏览器登录")
+    if proxy_config:
+        launch_args["proxy"] = proxy_config
+
+    playwright = None
+    browser = None
+    unregister_interrupt = lambda: None
+    try:
+        playwright = sync_playwright().start()
+        unregister_interrupt = _register_current_attempt_driver_interrupt(playwright)
+        browser = playwright.chromium.launch(**launch_args)
+        context = browser.new_context(
+            viewport={"width": 1440, "height": 900},
+            user_agent=(
+                user_agent
+                or "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/136.0.7103.92 Safari/537.36"
+            ),
+            ignore_https_errors=True,
+        )
+
+        browser_cookies: list[dict[str, Any]] = []
+        session_cookies = getattr(session, "cookies", None)
+        cookie_jar = getattr(session_cookies, "jar", None)
+        if cookie_jar is None:
+            cookie_jar = session_cookies
+        try:
+            cookie_iterator = iter(cookie_jar or [])
+        except TypeError:
+            cookie_iterator = iter(())
+        for cookie in cookie_iterator:
+            name = str(getattr(cookie, "name", "") or "").strip()
+            value = str(getattr(cookie, "value", "") or "")
+            domain = str(getattr(cookie, "domain", "") or "").strip().lower()
+            if not name or not value or not any(
+                allowed in domain for allowed in ("openai.com", "chatgpt.com")
+            ):
+                continue
+            browser_cookies.append(
+                {
+                    "name": name,
+                    "value": value,
+                    "domain": domain,
+                    "path": str(getattr(cookie, "path", "/") or "/"),
+                    "secure": bool(getattr(cookie, "secure", False)),
+                }
+            )
+        if browser_cookies:
+            context.add_cookies(browser_cookies)
+
+        page = context.new_page()
+        bounded_timeout = min(max(int(timeout_ms or 90_000), 30_000), 180_000)
+        page.goto(
+            target,
+            wait_until="domcontentloaded",
+            timeout=bounded_timeout,
+        )
+
+        deadline = time.monotonic() + (bounded_timeout / 1000)
+
+        def wait_for_field(
+            selector: str,
+            label: str,
+            *,
+            alternate_selector: str = "",
+        ):
+            while time.monotonic() < deadline:
+                checkpoint_current_task_attempt()
+                locator = page.locator(selector)
+                if locator.count():
+                    return locator.first
+                if alternate_selector and page.locator(alternate_selector).count():
+                    return None
+                current_host = str(urlparse(str(page.url or "")).hostname or "").lower()
+                if current_host in {"auth.openai.com", "chatgpt.com", "localhost"}:
+                    return None
+                page.wait_for_timeout(250)
+            raise RuntimeError(f"Google 联邦登录未出现{label}输入框")
+
+        email_field = wait_for_field(
+            "input#identifierId, input[type='email'], input[name='identifier']",
+            "邮箱",
+            alternate_selector="input[name='Passwd'], input[type='password']",
+        )
+        if email_field is not None:
+            email_field.fill(normalized_email)
+            email_field.press("Enter")
+            logger("Google 联邦登录已提交邮箱")
+
+        password_field = wait_for_field(
+            "input[name='Passwd'], input[type='password']",
+            "密码",
+        )
+        if password_field is not None:
+            password_field.fill(normalized_password)
+            password_field.press("Enter")
+            logger("Google 联邦登录已提交密码")
+
+        final_url = ""
+        while time.monotonic() < deadline:
+            checkpoint_current_task_attempt()
+            current_url = str(page.url or "").strip()
+            current = urlparse(current_url)
+            current_host = str(current.hostname or "").lower()
+            if current_host in {"auth.openai.com", "chatgpt.com", "localhost"}:
+                final_url = current_url
+                break
+            page.wait_for_timeout(250)
+
+        if not final_url:
+            current_url = str(page.url or "").strip()
+            current_path = str(urlparse(current_url).path or "").lower()
+            if "/challenge/" in current_path:
+                raise RuntimeError("Google 账号要求额外验证，当前凭据只有邮箱和密码")
+            raise RuntimeError("Google 联邦登录未返回 OpenAI 授权流程")
+
+        synchronized = 0
+        for cookie in context.cookies():
+            domain = str(cookie.get("domain") or "").strip().lower()
+            if not any(
+                allowed in domain for allowed in ("openai.com", "chatgpt.com")
+            ):
+                continue
+            name = str(cookie.get("name") or "").strip()
+            value = str(cookie.get("value") or "")
+            if not name or not value:
+                continue
+            try:
+                session.cookies.set(
+                    name,
+                    value,
+                    domain=domain,
+                    path=str(cookie.get("path") or "/"),
+                    secure=bool(cookie.get("secure", False)),
+                )
+                synchronized += 1
+            except Exception:
+                continue
+        if not synchronized:
+            raise RuntimeError("Google 登录已通过，但 OpenAI 会话 Cookie 未同步")
+        logger("Google 联邦登录已返回 OpenAI 授权流程")
+        return final_url
+    except TaskInterruption:
+        raise
+    finally:
+        if browser is not None:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright is not None:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
         unregister_interrupt()
         checkpoint_current_task_attempt()

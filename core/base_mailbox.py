@@ -611,6 +611,7 @@ class AppleMailMailbox(BaseMailbox):
     def _is_chatgpt_password_totp_account(account: MailboxAccount) -> bool:
         extra = account.extra or {}
         return str(extra.get("account_type") or "").strip() in {
+            "chatgpt_google_password",
             "chatgpt_password_totp",
             "chatgpt_password_remote_totp",
         }
@@ -748,6 +749,7 @@ class AppleMailMailbox(BaseMailbox):
         account_type = str(record.get("account_type") or "").strip()
         direct_icloud = account_type == "icloud_web"
         chatgpt_credentials = account_type in {
+            "chatgpt_google_password",
             "chatgpt_password_totp",
             "chatgpt_password_remote_totp",
         }
@@ -756,7 +758,7 @@ class AppleMailMailbox(BaseMailbox):
             "chatgpt_password_reset_url_mail",
         }
         provider_label = (
-            "ChatGPT MFA"
+            "ChatGPT 登录"
             if chatgpt_credentials or url_credentials
             else "iCloud"
             if direct_icloud
@@ -804,7 +806,7 @@ class AppleMailMailbox(BaseMailbox):
             }
             if account_type == "chatgpt_password_totp":
                 extra["totp_secret"] = record["totp_secret"]
-            else:
+            elif account_type == "chatgpt_password_remote_totp":
                 extra["totp_url"] = str(record["totp_url"] or "")
             mail_api_url = str(record.get("mail_api_url") or "").strip()
             if mail_api_url:

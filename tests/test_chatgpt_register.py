@@ -321,6 +321,72 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         send_passwordless.assert_called_once()
         submit_password.assert_not_called()
 
+    def test_login_and_get_tokens_completes_google_federated_redirect_with_password(self):
+        client = self._make_client()
+        google_state = FlowState(
+            page_type="external_url",
+            continue_url=(
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id=demo"
+            ),
+            current_url=(
+                "https://accounts.google.com/o/oauth2/v2/auth?client_id=demo"
+            ),
+        )
+        consent_state = FlowState(
+            page_type="consent",
+            continue_url=(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+            ),
+            current_url=(
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+            ),
+        )
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            return_value=google_state,
+        ), mock.patch.object(
+            client,
+            "_complete_google_federated_login",
+            return_value=consent_state,
+        ) as google_login, mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ), mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at", "refresh_token": "rt"},
+        ), mock.patch.object(client, "_follow_flow_state") as follow_state:
+            tokens = client.login_and_get_tokens(
+                "worker@custom-google-domain.example",
+                "supplier-password",
+                "device-fixed",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                prefer_passwordless_login=False,
+                force_password_login=True,
+                allow_phone_verification=False,
+            )
+
+        self.assertEqual(tokens["refresh_token"], "rt")
+        google_login.assert_called_once()
+        self.assertEqual(
+            google_login.call_args.kwargs["email"],
+            "worker@custom-google-domain.example",
+        )
+        self.assertEqual(
+            google_login.call_args.kwargs["password"],
+            "supplier-password",
+        )
+        follow_state.assert_not_called()
+
     def test_login_and_get_tokens_dispatches_mfa_with_mailbox_and_totp_context(self):
         client = self._make_client()
         mailbox = mock.Mock()

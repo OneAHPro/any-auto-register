@@ -714,6 +714,55 @@ class ChatGPTPluginTests(unittest.TestCase):
         )
         self.assertEqual(adapter.build_account.call_args.args[1], "")
 
+    def test_existing_google_federated_account_uses_password_without_mailbox_otp(self):
+        mailbox = _TrackingMailbox()
+        mailbox.account.extra = {
+            "provider": "chatgpt_credentials",
+            "account_type": "chatgpt_google_password",
+            "password": "supplier-password",
+        }
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "chatgpt_existing_account_login_only": True,
+                }
+            ),
+            mailbox=mailbox,
+        )
+        adapter = mock.Mock()
+        captured = {}
+
+        def run(context):
+            adapter.context = context
+            captured["email_info"] = context.email_service.create_email()
+            return mock.Mock(success=True)
+
+        adapter.run.side_effect = run
+        adapter.build_account.return_value = Account(
+            platform="chatgpt",
+            email="demo@example.com",
+            password="supplier-password",
+            token="access-token",
+            extra={"access_token": "access-token", "refresh_token": "rt"},
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            platform.register()
+
+        self.assertEqual(
+            captured["email_info"]["account_type"],
+            "chatgpt_google_password",
+        )
+        self.assertEqual(
+            captured["email_info"]["password"],
+            "supplier-password",
+        )
+        self.assertFalse(adapter.context.email_service.supports_email_verification())
+
     def test_successful_chatgpt_flow_persists_consumed_mailbox_credentials(self):
         mailbox = _CredentialMailbox()
         platform = ChatGPTPlatform(

@@ -965,6 +965,20 @@ class ChatGPTClient:
                 state = next_state
                 continue
 
+            if helper._state_is_google_federated(state):
+                next_state = helper._complete_google_federated_login(
+                    state,
+                    email=email,
+                    password=str(password or ""),
+                    user_agent=self.ua,
+                )
+                if not next_state:
+                    return False, helper.last_error or "Google 联邦登录失败"
+                referer = state.current_url or state.continue_url or referer
+                state = next_state
+                self.last_registration_state = state
+                continue
+
             if (
                 state.page_type == "external_url"
                 and self._state_requires_navigation(state)

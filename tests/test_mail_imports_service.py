@@ -224,6 +224,31 @@ class MailImportServiceTests(unittest.TestCase):
         self.assertEqual(payload[0]["password"], "chatgpt-password")
         self.assertEqual(payload[0]["totp_secret"], "JBSWY3DPEHPK3PXP")
 
+    def test_applemail_strategy_accepts_google_federated_email_password_rows(self):
+        from services.mail_imports.providers import AppleMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        strategy = AppleMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            response = strategy.execute(
+                MailImportExecuteRequest(
+                    type="applemail",
+                    content="worker@custom-google-domain.example----supplier-password",
+                    pool_dir=tmp_dir,
+                    filename="google-federated.json",
+                    bind_to_config=False,
+                )
+            )
+            payload = json.loads(
+                Path(tmp_dir, "google-federated.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(response.summary.success, 1)
+        self.assertEqual(response.summary.failed, 0)
+        self.assertEqual(payload[0]["account_type"], "chatgpt_google_password")
+        self.assertEqual(payload[0]["password"], "supplier-password")
+        self.assertNotIn("totp_secret", payload[0])
+
     def test_applemail_strategy_imports_url_and_reset_credentials_after_header(self):
         from services.mail_imports.providers import AppleMailImportStrategy
         from services.mail_imports.schemas import MailImportExecuteRequest

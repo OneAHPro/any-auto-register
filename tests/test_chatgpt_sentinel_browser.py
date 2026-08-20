@@ -11,6 +11,7 @@ from core.task_runtime import (
 )
 from platforms.chatgpt.sentinel_browser import (
     _register_current_attempt_driver_interrupt,
+    complete_google_federated_login_via_browser,
     get_sentinel_token_via_browser,
 )
 
@@ -372,3 +373,162 @@ def test_stop_during_browser_cleanup_still_interrupts_and_propagates():
         playwright.browser.release_close.set()
         worker.join(timeout=1)
         control.finish_attempt(attempt_id)
+
+
+class _FakeGoogleLocator:
+    def __init__(self, page, field):
+        self.page = page
+        self.field = field
+
+    def count(self):
+        return int(self.page.stage == self.field)
+
+    @property
+    def first(self):
+        return self
+
+    def fill(self, value):
+        self.page.filled[self.field] = value
+
+    def press(self, key):
+        assert key == "Enter"
+        if self.field == "email":
+            self.page.stage = "password"
+        else:
+            self.page.stage = "complete"
+            self.page.url = (
+                "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+            )
+
+
+class _FakeGooglePage:
+    def __init__(self, *, initial_stage="email"):
+        self.url = "about:blank"
+        self.stage = initial_stage
+        self.filled = {}
+
+    def goto(self, url, **_kwargs):
+        self.url = str(url)
+
+    def locator(self, selector):
+        field = "password" if "password" in str(selector).lower() else "email"
+        return _FakeGoogleLocator(self, field)
+
+    def wait_for_timeout(self, _milliseconds):
+        return None
+
+    def title(self):
+        return "Sign in"
+
+
+class _FakeGoogleContext:
+    def __init__(self, page):
+        self.page = page
+        self.seeded_cookies = []
+
+    def add_cookies(self, cookies):
+        self.seeded_cookies.extend(cookies)
+
+    def new_page(self):
+        return self.page
+
+    def cookies(self):
+        return [
+            {
+                "name": "login_session",
+                "value": "updated-session",
+                "domain": ".auth.openai.com",
+                "path": "/",
+                "secure": True,
+            }
+        ]
+
+
+class _FakeGoogleBrowser(_FakeBrowser):
+    def __init__(self, page):
+        super().__init__(page)
+        self.context = _FakeGoogleContext(page)
+
+    def new_context(self, **_kwargs):
+        return self.context
+
+
+class _FakeGooglePlaywright(_FakePlaywright):
+    def __init__(self, page):
+        self.driver = _FakeDriverProcess(threading.Event())
+        self.browser = _FakeGoogleBrowser(page)
+        self.chromium = _FakeChromium(self.browser)
+        self.stop_calls = 0
+        self._impl_obj = SimpleNamespace(
+            _connection=SimpleNamespace(
+                _transport=SimpleNamespace(_proc=self.driver)
+            )
+        )
+
+
+def test_google_federated_browser_submits_email_and_password_and_syncs_openai_cookie():
+    import requests
+
+    page = _FakeGooglePage()
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    session.cookies.set(
+        "login_session",
+        "original-session",
+        domain="auth.openai.com",
+        path="/",
+    )
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch:
+        final_url = complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?client_id=demo",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert final_url == (
+        "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+    )
+    assert page.filled == {
+        "email": "worker@custom-google-domain.example",
+        "password": "supplier-password",
+    }
+    assert session.cookies.get(
+        "login_session",
+        domain=".auth.openai.com",
+        path="/",
+    ) == "updated-session"
+    assert any(
+        cookie["name"] == "login_session"
+        for cookie in playwright.browser.context.seeded_cookies
+    )
+
+
+def test_google_federated_browser_accepts_password_first_redirect():
+    import requests
+
+    page = _FakeGooglePage(initial_stage="password")
+    playwright = _FakeGooglePlaywright(page)
+    manager = _FakePlaywrightManager(playwright)
+    session = requests.Session()
+    sync_patch, headless_patch, display_patch = _browser_patches(manager)
+
+    with sync_patch, headless_patch, display_patch:
+        final_url = complete_google_federated_login_via_browser(
+            session=session,
+            start_url="https://accounts.google.com/o/oauth2/v2/auth?login_hint=worker",
+            email="worker@custom-google-domain.example",
+            password="supplier-password",
+            user_agent="UA",
+            headless=True,
+            timeout_ms=30_000,
+        )
+
+    assert final_url.startswith("https://auth.openai.com/")
+    assert page.filled == {"password": "supplier-password"}
