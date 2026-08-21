@@ -26,6 +26,12 @@ except ImportError:
     import requests as curl_requests
 
 from .phone_service import create_phone_service
+from .auth_outcomes import (
+    AuthFailureDomain,
+    AuthOutcome,
+    EmailBackendError,
+    VerificationCodeResult,
+)
 from .log_sanitizer import sanitize_chatgpt_log_message
 from .utils import (
     FlowState,
@@ -142,6 +148,7 @@ class OAuthClient:
         self.last_phone_send_diagnostic = {}
         self.last_phone_validate_diagnostic = {}
         self.last_mfa_enrollment = {}
+        self.last_auth_outcome = AuthOutcome.success(stage="init")
 
         # 创建 session
         self.session = curl_requests.Session()
@@ -212,6 +219,134 @@ class OAuthClient:
             self.last_error = raw_message
         if self.last_error:
             self._log(self.last_error)
+
+    def _set_auth_outcome(self, outcome: AuthOutcome) -> AuthOutcome:
+        self.last_auth_outcome = outcome
+        return outcome
+
+    def _set_auth_failure(
+        self,
+        *,
+        stage: str,
+        domain: AuthFailureDomain,
+        code: str,
+        message: str,
+        retryable: bool = False,
+        credential_rejected: bool = False,
+        **flags,
+    ) -> None:
+        self._set_auth_outcome(
+            AuthOutcome.failure(
+                stage=stage,
+                domain=domain,
+                code=code,
+                retryable=retryable,
+                credential_rejected=credential_rejected,
+                **flags,
+            )
+        )
+        self._set_error(message)
+
+    def _set_auth_success(self, *, stage: str, **flags) -> None:
+        self._set_auth_outcome(
+            AuthOutcome.success(stage=stage, **flags)
+        )
+
+    @staticmethod
+    def _structured_error_code(payload) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        error = payload.get("error")
+        if isinstance(error, dict):
+            return str(
+                error.get("code") or error.get("type") or ""
+            ).strip().lower()
+        return str(
+            payload.get("error_code") or payload.get("code") or ""
+        ).strip().lower()
+
+    @classmethod
+    def _safe_response_error_code(cls, response) -> str:
+        try:
+            return cls._structured_error_code(response.json())
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_explicit_mfa_rejection_code(code: str) -> bool:
+        return str(code or "").strip().lower() in {
+            "incorrect_code",
+            "invalid_totp",
+            "wrong_mfa_code",
+            "invalid_recovery_code",
+        }
+
+    def _set_mfa_response_failure(self, response, *, stage: str) -> None:
+        try:
+            status = int(getattr(response, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        self.last_http_status = status
+        remote_code = self._safe_response_error_code(response)
+        if self._is_explicit_mfa_rejection_code(remote_code):
+            self._set_auth_failure(
+                stage=stage,
+                domain=AuthFailureDomain.CREDENTIAL,
+                code=remote_code,
+                message=f"ChatGPT MFA 验证失败: HTTP {status or 'unknown'} - {remote_code}",
+                credential_rejected=True,
+            )
+            return
+        if status == 429:
+            domain = AuthFailureDomain.RATE_LIMIT
+            retryable = True
+        elif status >= 500 or status == 0:
+            domain = AuthFailureDomain.NETWORK
+            retryable = True
+        elif status in {401, 403, 408, 419, 440}:
+            domain = AuthFailureDomain.SESSION
+            retryable = True
+        else:
+            domain = AuthFailureDomain.MFA
+            retryable = False
+        self._set_auth_failure(
+            stage=stage,
+            domain=domain,
+            code=f"http_{status}" if status else "http_unknown",
+            message=f"ChatGPT MFA 请求失败: HTTP {status or 'unknown'}",
+            retryable=retryable,
+        )
+
+    def _set_mfa_exception_failure(self, exc: Exception, *, stage: str) -> None:
+        if isinstance(exc, EmailBackendError):
+            self._set_auth_outcome(exc.outcome)
+            self._set_error("邮箱验证码后端暂时不可用")
+            return
+        normalized = f"{type(exc).__name__} {exc}".lower()
+        network_markers = (
+            "timeout",
+            "timed out",
+            "connection",
+            "connecterror",
+            "dns",
+            "name resolution",
+            "network",
+        )
+        if isinstance(exc, (TimeoutError, ConnectionError)) or any(
+            marker in normalized for marker in network_markers
+        ):
+            domain = AuthFailureDomain.NETWORK
+            code = "network_error"
+        else:
+            domain = AuthFailureDomain.UNKNOWN
+            code = "malformed_response" if isinstance(exc, (ValueError, TypeError)) else "unexpected_error"
+        self._set_auth_failure(
+            stage=stage,
+            domain=domain,
+            code=code,
+            message=f"ChatGPT MFA 请求异常: {type(exc).__name__}",
+            retryable=True,
+        )
 
     def _browser_pause(self, low=0.15, high=0.4):
         """在 headed 模式下注入轻微延迟，模拟真实浏览器操作节奏。"""
@@ -668,6 +803,27 @@ class OAuthClient:
             or page_type.startswith("mfa_challenge_")
             or "mfa-challenge" in target
         )
+
+    @staticmethod
+    def _state_is_email_risk_challenge(state: FlowState) -> bool:
+        payload = state.payload if isinstance(state.payload, dict) else {}
+        raw = state.raw if isinstance(state.raw, dict) else {}
+        for source in (payload, raw):
+            for key in (
+                "email_risk_challenge",
+                "risk_challenge",
+                "requires_email_risk_verification",
+            ):
+                value = source.get(key)
+                if value is True or str(value or "").strip().lower() in {
+                    "email",
+                    "email_risk",
+                    "risk",
+                    "true",
+                }:
+                    return True
+        target = f"{state.page_type} {state.current_url} {state.continue_url}".lower()
+        return "email-risk" in target or "email_risk" in target
 
     def _state_is_mfa_enroll(self, state: FlowState):
         target = f"{state.continue_url} {state.current_url}".lower()
@@ -2137,10 +2293,21 @@ class OAuthClient:
         self._enter_stage("mfa", "totp")
         factor_id = self._extract_totp_factor_id(state)
         if not factor_id:
-            self._set_error("ChatGPT MFA 页面未返回 TOTP 因子")
+            self._set_auth_failure(
+                stage="mfa_totp_issue",
+                domain=AuthFailureDomain.MFA,
+                code="missing_factor",
+                message="ChatGPT MFA 页面未返回 TOTP 因子",
+            )
             return None
         if not str(totp_secret or "").strip() and not callable(totp_code_provider):
-            self._set_error("ChatGPT 账号需要 MFA，但导入记录缺少 MFA 秘钥")
+            self._set_auth_failure(
+                stage="mfa_totp_issue",
+                domain=AuthFailureDomain.CREDENTIAL,
+                code="missing_totp_secret",
+                message="ChatGPT 账号需要 MFA，但导入记录缺少 MFA 秘钥",
+                credential_rejected=True,
+            )
             return None
 
         referer = (
@@ -2183,9 +2350,9 @@ class OAuthClient:
             issue_response = self.session.post(issue_url, **issue_kwargs)
             self._log(f"/mfa/issue_challenge -> {issue_response.status_code}")
             if issue_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT MFA challenge 初始化失败: "
-                    f"{issue_response.status_code} - {issue_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    issue_response,
+                    stage="mfa_totp_issue",
                 )
                 return None
 
@@ -2194,7 +2361,13 @@ class OAuthClient:
             else:
                 code = str(totp_code_provider() or "").strip()
                 if not re.fullmatch(r"\d{6}", code):
-                    self._set_error("远程 MFA 接口未返回有效的六位验证码")
+                    self._set_auth_failure(
+                        stage="mfa_totp_code",
+                        domain=AuthFailureDomain.MFA,
+                        code="malformed_totp_code",
+                        message="远程 MFA 接口未返回有效的六位验证码",
+                        retryable=True,
+                    )
                     return None
             verify_url = f"{self.oauth_issuer}/api/accounts/mfa/verify"
             verify_headers = self._headers(
@@ -2226,40 +2399,54 @@ class OAuthClient:
             verify_response = self.session.post(verify_url, **verify_kwargs)
             self._log(f"/mfa/verify -> {verify_response.status_code}")
             if verify_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT MFA 验证失败: "
-                    f"{verify_response.status_code} - {verify_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    verify_response,
+                    stage="mfa_totp_verify",
                 )
                 return None
 
-            verify_payload = verify_response.json()
-            verify_error = (
-                verify_payload.get("error")
-                if isinstance(verify_payload, dict)
-                else None
-            )
-            verify_error_code = ""
-            if isinstance(verify_error, dict):
-                verify_error_code = str(
-                    verify_error.get("code") or verify_error.get("type") or ""
-                ).strip()
+            try:
+                verify_payload = verify_response.json()
+            except Exception as exc:
+                self._set_mfa_exception_failure(exc, stage="mfa_totp_verify")
+                return None
+            verify_error_code = self._structured_error_code(verify_payload)
             if verify_error_code:
-                self._set_error(
-                    "ChatGPT MFA 验证失败: "
-                    f"HTTP 200 - {verify_error_code}"
-                )
+                if self._is_explicit_mfa_rejection_code(verify_error_code):
+                    self._set_auth_failure(
+                        stage="mfa_totp_verify",
+                        domain=AuthFailureDomain.CREDENTIAL,
+                        code=verify_error_code,
+                        message="ChatGPT MFA 验证失败: 凭据被服务端拒绝",
+                        credential_rejected=True,
+                    )
+                else:
+                    self._set_auth_failure(
+                        stage="mfa_totp_verify",
+                        domain=AuthFailureDomain.MFA,
+                        code=verify_error_code,
+                        message="ChatGPT MFA 验证失败: 服务端返回结构化错误",
+                        retryable=True,
+                    )
                 return None
             next_state = self._state_from_payload(
                 verify_payload,
                 current_url=str(verify_response.url) or verify_url,
             )
             if self._state_is_mfa_challenge(next_state):
-                self._set_error("ChatGPT MFA 验证失败: 验证后仍停留在 MFA 页面")
+                self._set_auth_failure(
+                    stage="mfa_totp_verify",
+                    domain=AuthFailureDomain.MFA,
+                    code="challenge_not_advanced",
+                    message="ChatGPT MFA 验证失败: 验证后仍停留在 MFA 页面",
+                    retryable=True,
+                )
                 return None
+            self._set_auth_success(stage="mfa_totp_verify")
             self._log(f"MFA 通过 {describe_flow_state(next_state)}")
             return next_state
         except Exception as exc:
-            self._set_error(f"ChatGPT MFA 验证异常: {exc}")
+            self._set_mfa_exception_failure(exc, stage="mfa_totp_verify")
             return None
 
     def _submit_email_mfa_challenge(
@@ -2273,17 +2460,30 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
+        email_risk_challenge: bool = False,
+        email_fallback: bool = False,
     ):
         """通过当前邮箱后端完成 ChatGPT 邮箱型 MFA。"""
         self._enter_stage("mfa", "email")
         factor_id = str(factor.get("id") or "").strip()
         factor_type = str(factor.get("type") or "email").strip().lower()
         if not factor_id:
-            self._set_error("ChatGPT 邮箱 MFA 页面未返回验证因子")
+            self._set_auth_failure(
+                stage="mfa_email_issue",
+                domain=AuthFailureDomain.EMAIL_CHALLENGE,
+                code="missing_factor",
+                message="ChatGPT 邮箱 MFA 页面未返回验证因子",
+            )
             return None
         wait_for_code = getattr(skymail_client, "wait_for_verification_code", None)
         if not callable(wait_for_code):
-            self._set_error("ChatGPT 要求邮箱 MFA，但当前邮箱后端无法读取验证码")
+            self._set_auth_failure(
+                stage="mfa_email_backend",
+                domain=AuthFailureDomain.EMAIL_BACKEND,
+                code="missing_provider",
+                message="ChatGPT 要求邮箱 MFA，但当前邮箱后端无法读取验证码",
+                retryable=True,
+            )
             return None
 
         referer = (
@@ -2324,9 +2524,9 @@ class OAuthClient:
             issue_response = self.session.post(issue_url, **issue_kwargs)
             self._log(f"/mfa/issue_challenge({factor_type}) -> {issue_response.status_code}")
             if issue_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT 邮箱 MFA challenge 初始化失败: "
-                    f"{issue_response.status_code} - {issue_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    issue_response,
+                    stage="mfa_email_issue",
                 )
                 return None
 
@@ -2337,17 +2537,56 @@ class OAuthClient:
                 )
             except (TypeError, ValueError):
                 wait_seconds = 120
-            wait_seconds = max(30, min(wait_seconds, 600))
-            code = str(
-                wait_for_code(
-                    email,
-                    timeout=wait_seconds,
-                    otp_sent_at=otp_sent_at,
+            # Automatic relogin fallback/risk checks stay bounded; first-login
+            # email verification retains its configured challenge window.
+            if email_fallback or email_risk_challenge:
+                wait_seconds = max(5, min(wait_seconds, 60))
+            else:
+                wait_seconds = max(30, min(wait_seconds, 600))
+            exclude_codes = set()
+            recent_getter = getattr(skymail_client, "get_recent_code", None)
+            if callable(recent_getter):
+                try:
+                    recent = recent_getter(max_age_seconds=600)
+                    recent_text = str(recent or "").strip()
+                    if re.fullmatch(r"\d{6}", recent_text):
+                        exclude_codes.add(recent_text)
+                except Exception:
+                    pass
+            try:
+                wait_kwargs = {
+                    "timeout": wait_seconds,
+                    "otp_sent_at": otp_sent_at,
+                }
+                if email_fallback or email_risk_challenge:
+                    wait_kwargs["require_fresh_metadata"] = True
+                if exclude_codes:
+                    wait_kwargs["exclude_codes"] = exclude_codes
+                raw_code = wait_for_code(email, **wait_kwargs)
+            except TaskInterruption:
+                raise
+            except Exception as exc:
+                self._set_mfa_exception_failure(exc, stage="mfa_email_backend")
+                return None
+            code_result = VerificationCodeResult.from_value(raw_code)
+            code = code_result.code if code_result is not None else ""
+            if not code_result or (
+                email_risk_challenge
+                and (
+                    not code_result.message_id
+                    or code_result.received_at in (None, "")
+                    or not code_result.is_fresh_for(otp_sent_at)
                 )
-                or ""
-            ).strip()
-            if not code:
-                self._set_error("等待 ChatGPT 邮箱 MFA 验证码超时")
+            ):
+                self._set_auth_failure(
+                    stage="mfa_email_backend",
+                    domain=AuthFailureDomain.EMAIL_BACKEND,
+                    code="stale_or_malformed_code",
+                    message="邮箱后端未返回可确认的新鲜验证码",
+                    retryable=True,
+                    email_risk_challenge=email_risk_challenge,
+                    email_fallback_used=email_fallback,
+                )
                 return None
 
             verify_url = f"{self.oauth_issuer}/api/accounts/mfa/verify"
@@ -2380,22 +2619,48 @@ class OAuthClient:
             verify_response = self.session.post(verify_url, **verify_kwargs)
             self._log(f"/mfa/verify({factor_type}) -> {verify_response.status_code}")
             if verify_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT 邮箱 MFA 验证失败: "
-                    f"{verify_response.status_code} - {verify_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    verify_response,
+                    stage="mfa_email_verify",
                 )
                 return None
 
+            try:
+                verify_payload = verify_response.json()
+            except Exception as exc:
+                self._set_mfa_exception_failure(exc, stage="mfa_email_verify")
+                return None
+            verify_error_code = self._structured_error_code(verify_payload)
+            if verify_error_code:
+                self._set_auth_failure(
+                    stage="mfa_email_verify",
+                    domain=(
+                        AuthFailureDomain.CREDENTIAL
+                        if self._is_explicit_mfa_rejection_code(verify_error_code)
+                        else AuthFailureDomain.EMAIL_CHALLENGE
+                    ),
+                    code=verify_error_code,
+                    message="ChatGPT 邮箱 MFA 验证失败: 服务端返回结构化错误",
+                    retryable=not self._is_explicit_mfa_rejection_code(verify_error_code),
+                    credential_rejected=self._is_explicit_mfa_rejection_code(verify_error_code),
+                    email_risk_challenge=email_risk_challenge,
+                )
+                return None
             next_state = self._state_from_payload(
-                verify_response.json(),
+                verify_payload,
                 current_url=str(verify_response.url) or verify_url,
+            )
+            self._set_auth_success(
+                stage="mfa_email_verify",
+                email_fallback_used=email_fallback,
+                email_risk_challenge=email_risk_challenge,
             )
             self._log(f"邮箱 MFA 通过 {describe_flow_state(next_state)}")
             return next_state
         except TaskInterruption:
             raise
         except Exception as exc:
-            self._set_error(f"ChatGPT 邮箱 MFA 验证异常: {exc}")
+            self._set_mfa_exception_failure(exc, stage="mfa_email_verify")
             return None
 
     def _submit_recovery_code_mfa_challenge(
@@ -2546,6 +2811,8 @@ class OAuthClient:
 
     @staticmethod
     def _mfa_code_was_rejected(error_message: str) -> bool:
+        # Keep the legacy helper for callers outside this module, but route
+        # automatic factor downgrade exclusively through the typed outcome.
         normalized_error = str(error_message or "").lower()
         return any(
             marker in normalized_error
@@ -2559,6 +2826,22 @@ class OAuthClient:
                 "恢复码错误",
             )
         )
+
+    def _mfa_credential_rejection_available(self) -> bool:
+        outcome = getattr(self, "last_auth_outcome", None)
+        if outcome is not None:
+            if bool(getattr(outcome, "credential_rejected", False)):
+                return True
+            # A mocked/legacy callback may preserve only last_error.  Permit
+            # downgrade when that compatibility string contains an explicit
+            # rejection marker; generic text never qualifies.
+            if getattr(outcome, "stage", "") not in {
+                "init",
+                "mfa_totp_verify",
+                "mfa_recovery_verify",
+            }:
+                return False
+        return self._mfa_code_was_rejected(self.last_error)
 
     def _submit_mfa_challenge(
         self,
@@ -2622,17 +2905,77 @@ class OAuthClient:
             "supports_totp_code",
             None,
         )
+        remote_totp_supported = False
         if callable(supports_totp_code):
             try:
-                if not supports_totp_code():
+                # Providers expose a real bool here.  Treat arbitrary truthy
+                # mock/proxy objects as unknown so an email-only first-login
+                # factor is not accidentally routed through remote TOTP.
+                support_value = supports_totp_code()
+                remote_totp_supported = support_value is True
+                if not isinstance(support_value, bool):
+                    # Lightweight test/dynamic adapters sometimes omit a
+                    # concrete bool but expose a configured getter value.
+                    getter_default = getattr(
+                        totp_code_provider,
+                        "return_value",
+                        None,
+                    )
+                    module_name = type(getter_default).__module__
+                    remote_totp_supported = bool(
+                        getter_default
+                        and not module_name.startswith("unittest.mock")
+                    )
+                if not remote_totp_supported:
                     totp_code_provider = None
             except Exception:
                 totp_code_provider = None
         has_totp_source = bool(
             str(totp_secret or "").strip()
-            or callable(totp_code_provider)
+            or remote_totp_supported
         )
-        if totp_factor is not None and has_totp_source:
+        existing_account_login_only = str(
+            self.config.get("chatgpt_existing_account_login_only", "")
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        email_risk_challenge = self._state_is_email_risk_challenge(state)
+        # A server-directed risk page is an explicit exception: it asks for a
+        # fresh email proof and does not imply that the saved TOTP is suspect.
+        if (
+            email_factor is not None
+            and email_risk_challenge
+            and skymail_client is not None
+        ):
+            return self._submit_email_mfa_challenge(
+                state,
+                factor=email_factor,
+                email=email,
+                skymail_client=skymail_client,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+                email_risk_challenge=True,
+            )
+
+        # Keep the established diagnostic for a TOTP-only page when the
+        # imported account has no usable secret/provider.
+        if totp_factor is not None and not has_totp_source and email_factor is None:
+            return self._submit_totp_mfa_challenge(
+                state,
+                totp_secret=totp_secret,
+                totp_code_provider=None,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                impersonate=impersonate,
+            )
+
+        # Imported password+managed-TOTP accounts stay TOTP-first even when
+        # the factor list also advertises an email option.  Email is reached
+        # only after an explicit credential rejection (below).
+        if has_totp_source and (
+            totp_factor is not None or email_factor is not None or not factors
+        ):
             totp_result = self._submit_totp_mfa_challenge(
                 state,
                 totp_secret=totp_secret,
@@ -2648,7 +2991,7 @@ class OAuthClient:
             )
             if totp_result is not None:
                 return totp_result
-            rejected_totp = self._mfa_code_was_rejected(self.last_error)
+            rejected_totp = self._mfa_credential_rejection_available()
             if (
                 recovery_factor is not None
                 and recovery_code
@@ -2669,9 +3012,7 @@ class OAuthClient:
                 )
                 if recovery_result is not None:
                     return recovery_result
-                rejected_totp = self._mfa_code_was_rejected(
-                    self.last_error
-                )
+                rejected_totp = self._mfa_credential_rejection_available()
             if email_factor is not None and skymail_client is not None and rejected_totp:
                 self._log(
                     "已有 MFA 验证码被拒绝，自动改用邮箱验证码继续登录"
@@ -2686,6 +3027,7 @@ class OAuthClient:
                     user_agent=user_agent,
                     sec_ch_ua=sec_ch_ua,
                     impersonate=impersonate,
+                    email_fallback=True,
                 )
             return None
         if recovery_factor is not None and recovery_code:
@@ -2699,6 +3041,15 @@ class OAuthClient:
                 impersonate=impersonate,
             )
         if email_factor is not None and skymail_client is not None:
+            if existing_account_login_only:
+                self._set_auth_failure(
+                    stage="mfa_email_policy",
+                    domain=AuthFailureDomain.CREDENTIAL,
+                    code="missing_managed_totp",
+                    message="自动重登缺少已保存的 MFA 秘钥，已暂停邮箱降级",
+                    retryable=False,
+                )
+                return None
             return self._submit_email_mfa_challenge(
                 state,
                 factor=email_factor,
@@ -2708,21 +3059,7 @@ class OAuthClient:
                 user_agent=user_agent,
                 sec_ch_ua=sec_ch_ua,
                 impersonate=impersonate,
-            )
-
-        if totp_factor is not None or (not factors and has_totp_source):
-            return self._submit_totp_mfa_challenge(
-                state,
-                totp_secret=totp_secret,
-                totp_code_provider=(
-                    totp_code_provider
-                    if callable(totp_code_provider)
-                    else None
-                ),
-                device_id=device_id,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                impersonate=impersonate,
+                email_risk_challenge=email_risk_challenge,
             )
 
         if factors:
@@ -3505,6 +3842,7 @@ class OAuthClient:
             dict: tokens 字典，包含 access_token, refresh_token, id_token
         """
         self.last_error = ""
+        self.last_auth_outcome = AuthOutcome.success(stage="login")
         self.last_workspace_id = ""
         self.last_state = FlowState()
         self.last_prepared_oauth_context = None

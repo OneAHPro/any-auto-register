@@ -14,8 +14,16 @@ from core.base_mailbox import MailboxAccount, OutlookMailbox
 from core.db import AccountModel, OutlookAccountModel
 from core.task_runtime import RegisterTaskControl, StopTaskRequested
 from platforms.chatgpt.oauth_client import OAuthClient
+from platforms.chatgpt.auth_outcomes import AuthFailureDomain, EmailBackendError
 from platforms.chatgpt.utils import FlowState
 from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
+from services.chatgpt_auth_state import (
+    ChatGPTMfaOperationStatus,
+    commit_auth_projection,
+    ensure_chatgpt_auth_state,
+    stage_mfa_operation,
+    transition_mfa_operation,
+)
 from services.chatgpt_relogin import (
     ChatGPTMailboxOTPTimeoutError,
     _build_email_service,
@@ -179,6 +187,67 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(
             saved["mailbox_context"]["extra"]["mailapi_token"],
             "header.payload.existing-context-signature",
+        )
+
+    def test_load_saved_account_prefers_canonical_active_mfa_by_local_account_id(self):
+        email = "canonical-mfa@example.com"
+        account_id = self._add_eligibility_account(
+            email,
+            password="canonical-password",
+            extra={
+                "refresh_token": "saved-chatgpt-rt",
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": email,
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "canonical-password",
+                        "totp_secret": "LEGACY-SECRET",
+                        "mfa_recovery_code": "LEGACY-RECOVERY",
+                    },
+                },
+            },
+        )
+        with Session(self.engine) as session:
+            state = ensure_chatgpt_auth_state(
+                account_id,
+                primary_confirmed=True,
+                session=session,
+            )
+            operation = stage_mfa_operation(
+                account_id,
+                email,
+                "CANONICAL-SECRET",
+                base_auth_version=state.auth_version,
+                session=session,
+            )
+            self.assertTrue(
+                transition_mfa_operation(
+                    operation.operation_id,
+                    expected_state=ChatGPTMfaOperationStatus.STAGED,
+                    new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
+                    expected_generation=operation.generation,
+                    recovery_code="CANONICAL-RECOVERY",
+                    session=session,
+                )
+            )
+            commit_auth_projection(
+                account_id,
+                expected_version=state.auth_version,
+                active_operation_id=operation.operation_id,
+                session=session,
+            )
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+
+        context_extra = saved["mailbox_context"]["extra"]
+        self.assertEqual(saved["chatgpt_local_account_id"], account_id)
+        self.assertEqual(context_extra["totp_secret"], "CANONICAL-SECRET")
+        self.assertEqual(
+            context_extra["mfa_recovery_code"],
+            "CANONICAL-RECOVERY",
         )
 
     def test_password_totp_context_is_eligible(self):
@@ -925,6 +994,63 @@ class ChatGPTReloginTests(unittest.TestCase):
         )
         self.assertTrue(any("后台等待" in message for message in logs))
 
+    def test_persisted_email_service_baseline_failure_is_typed_and_fails_fast(self):
+        from services.chatgpt_relogin import _PersistedEmailService
+
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.side_effect = ConnectionError("mail API unavailable")
+        mailbox.wait_for_code.return_value = "123456"
+        service = _PersistedEmailService(
+            mailbox=mailbox,
+            mailbox_account=MailboxAccount(
+                email="backend-failure@example.com",
+                account_id="backend-failure@example.com",
+                extra={"account_type": "chatgpt_password_url_otp"},
+            ),
+            mailbox_context={},
+            provider="fixture",
+            log_fn=lambda _message: None,
+            otp_timeout_seconds=300,
+        )
+
+        service.create_email()
+        self.assertTrue(service._baseline_ready.wait(timeout=1))
+        with self.assertRaises(EmailBackendError):
+            service.get_verification_code(timeout=60)
+        mailbox.wait_for_code.assert_not_called()
+        self.assertEqual(
+            service.last_auth_outcome.domain,
+            AuthFailureDomain.EMAIL_BACKEND,
+        )
+
+    def test_persisted_email_service_can_require_fresh_metadata_for_risk_code(self):
+        from services.chatgpt_relogin import _PersistedEmailService
+
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox.wait_for_code.return_value = "123456"
+        service = _PersistedEmailService(
+            mailbox=mailbox,
+            mailbox_account=MailboxAccount(
+                email="risk@example.com",
+                account_id="risk@example.com",
+                extra={"account_type": "chatgpt_password_url_otp"},
+            ),
+            mailbox_context={},
+            provider="fixture",
+            log_fn=lambda _message: None,
+            otp_timeout_seconds=60,
+        )
+        service.create_email()
+        self.assertTrue(service._baseline_ready.wait(timeout=1))
+
+        with self.assertRaises(EmailBackendError):
+            service.get_verification_code(
+                timeout=30,
+                otp_sent_at=time.time(),
+                require_fresh_metadata=True,
+            )
+
     def test_url_mailbox_service_binds_task_control_and_timeout_budget(self):
         saved = {
             "email": "url@example.com",
@@ -1100,7 +1226,11 @@ class ChatGPTReloginTests(unittest.TestCase):
             service._account.extra["mailapi_token"],
             "yisen-mailapi-token",
         )
-        self.assertTrue(service._baseline_ready.wait(timeout=1))
+        # Constructing the imported password+TOTP service must not touch the
+        # persisted mailbox.  The strict baseline starts only for an explicit
+        # email challenge.
+        mailbox.get_current_ids.assert_not_called()
+        self.assertFalse(service._baseline_ready.is_set())
         self.assertEqual(
             service.get_verification_code(
                 email="mfa-mail@example.com",
@@ -1108,6 +1238,7 @@ class ChatGPTReloginTests(unittest.TestCase):
             ),
             "123456",
         )
+        mailbox.get_current_ids.assert_called_once()
         mailbox.wait_for_code.assert_called_once()
 
     def test_legacy_mailapi_context_promotes_saved_password_and_managed_totp(self):

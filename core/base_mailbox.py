@@ -21,6 +21,32 @@ class MailboxAccount:
     extra: dict = None  # 平台额外信息
 
 
+@dataclass(frozen=True)
+class MailboxVerificationResult:
+    """Code plus provider freshness metadata; legacy callers still receive str."""
+
+    code: str
+    message_id: str = ""
+    received_at: Any = None
+
+
+class MailboxBackendError(RuntimeError):
+    """A mailbox transport/auth/parse failure with a secret-free code."""
+
+    error_code = "mailbox_backend"
+
+    def __init__(
+        self,
+        message: str = "邮箱后端不可用",
+        *,
+        code: str = "mailbox_backend",
+        http_status: int = 0,
+    ) -> None:
+        self.code = str(code or "mailbox_backend")
+        self.http_status = int(http_status or 0)
+        super().__init__(str(message or "邮箱后端不可用"))
+
+
 class MailboxClaimScope:
     """Remember and serialize normal mailbox claims within one task."""
 
@@ -5153,10 +5179,28 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             request_kwargs["cookies"] = cookies
         if headers:
             request_kwargs["headers"] = dict(headers)
-        response = requests.get(url, **request_kwargs)
+        try:
+            response = requests.get(url, **request_kwargs)
+        except requests.Timeout as exc:
+            raise MailboxBackendError(
+                "MailAPI 请求超时",
+                code="timeout",
+            ) from exc
+        except requests.ConnectionError as exc:
+            raise MailboxBackendError(
+                "MailAPI 网络连接失败",
+                code="transport",
+            ) from exc
+        except Exception as exc:
+            raise MailboxBackendError(
+                "MailAPI 请求失败",
+                code="transport",
+            ) from exc
         if response.status_code >= 400:
-            raise RuntimeError(
-                f"MailAPI 取码请求失败: HTTP {response.status_code}"
+            raise MailboxBackendError(
+                "MailAPI 取码请求被拒绝",
+                code=f"http_{int(response.status_code)}",
+                http_status=int(response.status_code),
             )
         return response
 
@@ -5427,6 +5471,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 detail_message = self._parse_mailapi_message(detail_text)
                 if self._extract_message_code(detail_message, detail_text, None):
                     return detail_text
+            except MailboxBackendError:
+                raise
             except Exception:
                 continue
         # A discovered detail may be stale, inaccessible, or a tracking page.
@@ -5503,7 +5549,13 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         account_email = str(account.email or "").strip().lower()
         return bool(response_email and account_email and response_email == account_email)
 
-    def get_current_ids(self, account: MailboxAccount) -> set:
+    def get_current_ids(
+        self,
+        account: MailboxAccount,
+        *,
+        strict_backend_errors: bool = False,
+    ) -> set:
+        del strict_backend_errors
         try:
             text = self._fetch_mailapi_text(account)
             from urllib.parse import urlsplit
@@ -5521,8 +5573,13 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 return set()
             message_id = str(message.get("message_id") or "").strip()
             return {message_id or self._code_key(code)}
-        except Exception:
-            return set()
+        except MailboxBackendError:
+            raise
+        except Exception as exc:
+            raise MailboxBackendError(
+                "MailAPI 邮件基线解析失败",
+                code="parse_error",
+            ) from exc
 
     def wait_for_code(
         self,
@@ -5533,6 +5590,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         code_pattern: str | None = None,
         **kwargs,
     ) -> str:
+        kwargs.pop("strict_backend_errors", None)
         seen = {str(mid) for mid in (before_ids or set())}
         exclude_codes = {
             str(code).strip()
@@ -5540,6 +5598,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             if str(code or "").strip()
         }
         keyword_lower = str(keyword or "").strip().lower()
+        return_metadata = bool(kwargs.get("return_metadata"))
         try:
             otp_sent_at = float(kwargs.get("otp_sent_at") or 0)
         except (TypeError, ValueError):
@@ -5553,6 +5612,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         def poll_once() -> Optional[str]:
             try:
                 text = self._fetch_mailapi_text(account)
+            except MailboxBackendError:
+                raise
             except Exception as exc:
                 self.mailbox._log(
                     f"[MailAPI] 拉取失败: {type(exc).__name__ or 'Error'}"
@@ -5625,7 +5686,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             code_seen_before = code_key in seen
             message_seen_before = bool(message_id and message_id in seen)
             yisen_history_message = bool(
-                is_yisen and message.get("mailapi_history")
+                is_yisen and message.get("mailapi_history") and not otp_sent_at
             )
             baseline_raced_with_new_message = bool(
                 received_after_challenge
@@ -5661,6 +5722,12 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             except Exception:
                 safe_log = "[MailAPI] 收到验证码: [验证码已隐藏]"
             self.mailbox._log(safe_log)
+            if return_metadata:
+                return MailboxVerificationResult(
+                    code=code,
+                    message_id=message_id,
+                    received_at=received_at,
+                )
             return code
 
         return self.mailbox._run_polling_wait(
@@ -6556,11 +6623,27 @@ class OutlookMailbox(BaseMailbox):
         combined = (subject + " " + " ".join(body_chunks)).strip()
         return self._decode_raw_content(combined)
 
-    def get_current_ids(self, account: MailboxAccount) -> set:
+    def get_current_ids(
+        self,
+        account: MailboxAccount,
+        *,
+        strict_backend_errors: bool = False,
+    ) -> set:
         try:
             backend = self._resolve_backend(account)
             self._log(f"[微软邮箱] 当前收信后端: {backend.backend_name}")
+            if strict_backend_errors:
+                try:
+                    return backend.get_current_ids(
+                        account,
+                        strict_backend_errors=True,
+                    )
+                except TypeError as exc:
+                    if "strict_backend_errors" not in str(exc):
+                        raise
             return backend.get_current_ids(account)
+        except MailboxBackendError:
+            raise
         except Exception as exc:
             self._log(f"[微软邮箱] 获取当前邮件 ID 失败: {exc}")
             return set()

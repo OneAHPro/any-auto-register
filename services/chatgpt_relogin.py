@@ -13,7 +13,11 @@ from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from core.applemail_pool import load_applemail_pool_records
-from core.base_mailbox import MailboxAccount, create_mailbox
+from core.base_mailbox import (
+    MailboxAccount,
+    MailboxBackendError,
+    create_mailbox,
+)
 from core.config_store import config_store
 from core.chatgpt_login_context import promote_managed_mfa_login_context
 from core.db import AccountModel, OutlookAccountModel, engine
@@ -23,10 +27,16 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     build_chatgpt_registration_mode_adapter,
 )
 from platforms.chatgpt.token_refresh import TokenRefreshManager
+from platforms.chatgpt.auth_outcomes import (
+    AuthOutcome,
+    EmailBackendError,
+    VerificationCodeResult,
+)
 from services.chatgpt_account_state import (
     ChatGPTAccountDeactivatedError,
     account_is_visible_in_default_list,
 )
+from services.chatgpt_auth_state import load_login_mfa_candidate
 from services.chatgpt_account_coordination import (
     chatgpt_account_operation_lock,
     codex2api_account_mutation_lock,
@@ -531,8 +541,37 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             account.updated_at = datetime.now(timezone.utc)
             session.add(account)
             session.commit()
+        candidate = load_login_mfa_candidate(normalized_id, session=session)
+        if candidate is not None:
+            context = (
+                dict(mailbox_context)
+                if isinstance(mailbox_context, dict)
+                else {
+                    "provider": "chatgpt_credentials",
+                    "email": email,
+                    "account_id": email,
+                }
+            )
+            context_extra = dict(context.get("extra") or {})
+            context_extra.update(
+                {
+                    "account_type": "chatgpt_password_totp",
+                    "password": str(account.password or ""),
+                    "totp_secret": candidate.totp_secret,
+                    "mfa_recovery_code": candidate.recovery_code,
+                    "chatgpt_mfa_managed": True,
+                    "chatgpt_mfa_generation": candidate.generation,
+                }
+            )
+            context_extra.pop("totp_url", None)
+            context_extra.pop("mfa_secret", None)
+            context_extra.pop("totp", None)
+            context["extra"] = context_extra
+            context["email"] = email
+            mailbox_context = context
         return {
             "id": normalized_id,
+            "chatgpt_local_account_id": normalized_id,
             "email": email,
             "created_at": account.created_at,
             "updated_at": account.updated_at,
@@ -867,6 +906,8 @@ class _PersistedEmailService:
         self._before_ids: set[Any] = set()
         self._baseline_ready = threading.Event()
         self._baseline_started = False
+        self._baseline_error: EmailBackendError | None = None
+        self.last_auth_outcome = AuthOutcome.success(stage="email_backend")
         self._otp_remaining_seconds = float(
             max(30, min(int(otp_timeout_seconds or 300), 3600))
         )
@@ -874,17 +915,59 @@ class _PersistedEmailService:
 
     def _load_baseline(self) -> None:
         try:
-            self._before_ids = set(
-                self._mailbox.get_current_ids(self._account) or []
+            try:
+                self._before_ids = set(
+                    self._mailbox.get_current_ids(
+                        self._account,
+                        strict_backend_errors=True,
+                    )
+                    or []
+                )
+            except TypeError as exc:
+                if "strict_backend_errors" not in str(exc):
+                    raise
+                self._before_ids = set(
+                    self._mailbox.get_current_ids(self._account) or []
+                )
+        except MailboxBackendError as exc:
+            self._before_ids = set()
+            code = str(getattr(exc, "code", "mailbox_backend") or "mailbox_backend")
+            self._baseline_error = EmailBackendError(
+                "邮箱后端基线不可用",
+                code=code,
             )
+            self._baseline_error.__cause__ = exc
+            self.last_auth_outcome = self._baseline_error.outcome
+            _emit(self._log_fn, "邮箱后端基线不可用")
         except Exception as exc:
             self._before_ids = set()
+            self._baseline_error = EmailBackendError(
+                "邮箱旧邮件基线读取失败",
+                code="baseline_unavailable",
+            )
+            self.last_auth_outcome = self._baseline_error.outcome
             _emit(
                 self._log_fn,
-                f"邮箱旧邮件基线读取失败，将继续等待新验证码: {exc}",
+                f"邮箱旧邮件基线读取失败: {type(exc).__name__}",
             )
         finally:
             self._baseline_ready.set()
+
+    def _start_baseline(self) -> None:
+        """Start the mailbox baseline probe exactly once.
+
+        Managed password+TOTP relogin does not need the mailbox at all on the
+        normal path.  Keeping the probe behind this small gate prevents merely
+        constructing an email service from touching a persisted MailAPI URL.
+        """
+        if self._baseline_started:
+            return
+        self._baseline_started = True
+        threading.Thread(
+            target=self._load_baseline,
+            name="chatgpt-relogin-mailbox-baseline",
+            daemon=True,
+        ).start()
 
     def create_email(self, config=None):
         del config
@@ -893,13 +976,13 @@ class _PersistedEmailService:
             self._baseline_started = True
             self._before_ids = set()
             self._baseline_ready.set()
-        elif not self._baseline_started:
-            self._baseline_started = True
-            threading.Thread(
-                target=self._load_baseline,
-                name="chatgpt-relogin-mailbox-baseline",
-                daemon=True,
-            ).start()
+        elif account_type == "chatgpt_password_totp":
+            # Existing imported password+managed-TOTP records are the primary
+            # relogin path.  Do not probe a potentially shared mailbox until a
+            # server-directed email factor/risk challenge actually needs it.
+            pass
+        else:
+            self._start_baseline()
         result = {
             "email": self._account.email,
             "service_id": self._account.account_id,
@@ -1039,8 +1122,12 @@ class _PersistedEmailService:
         pattern=None,
         otp_sent_at=None,
         exclude_codes=None,
+        require_fresh_metadata: bool = False,
     ):
         del email, email_id
+        # Lazy managed-TOTP services start their strict baseline only when the
+        # caller explicitly requests an email code.
+        self._start_baseline()
         requested_timeout = max(int(timeout or 120), 1)
         if self._otp_remaining_seconds <= 0:
             raise TimeoutError(
@@ -1057,10 +1144,14 @@ class _PersistedEmailService:
             30,
         )
         if not self._baseline_ready.wait(timeout=baseline_wait):
-            _emit(
-                self._log_fn,
-                "邮箱旧邮件基线仍未返回，先开始轮询新验证码",
+            error = EmailBackendError(
+                "邮箱旧邮件基线读取超时",
+                code="baseline_timeout",
             )
+            self.last_auth_outcome = error.outcome
+            raise error
+        if self._baseline_error is not None:
+            raise self._baseline_error
         baseline_elapsed = max(0.0, time.monotonic() - baseline_started_at)
         self._otp_remaining_seconds = max(
             0.0,
@@ -1092,17 +1183,50 @@ class _PersistedEmailService:
             timed_out = False
             code = None
             try:
-                code = self._mailbox.wait_for_code(
-                    self._account,
-                    keyword="",
-                    timeout=wait_seconds,
-                    before_ids=set(self._before_ids),
-                    code_pattern=pattern,
-                    otp_sent_at=otp_sent_at,
-                    exclude_codes=exclude_codes,
-                    poll_interval=poll_interval,
-                )
+                wait_kwargs = {
+                    "keyword": "",
+                    "timeout": wait_seconds,
+                    "before_ids": set(self._before_ids),
+                    "code_pattern": pattern,
+                    "otp_sent_at": otp_sent_at,
+                    "exclude_codes": exclude_codes,
+                    "poll_interval": poll_interval,
+                }
+                if require_fresh_metadata:
+                    wait_kwargs.update(
+                        {
+                            "return_metadata": True,
+                            "strict_backend_errors": True,
+                        }
+                    )
+                try:
+                    code = self._mailbox.wait_for_code(
+                        self._account,
+                        **wait_kwargs,
+                    )
+                except TypeError as exc:
+                    unsupported = str(exc)
+                    if require_fresh_metadata and (
+                        "return_metadata" in unsupported
+                        or "strict_backend_errors" in unsupported
+                    ):
+                        wait_kwargs.pop("return_metadata", None)
+                        wait_kwargs.pop("strict_backend_errors", None)
+                        code = self._mailbox.wait_for_code(
+                            self._account,
+                            **wait_kwargs,
+                        )
+                    else:
+                        raise
                 return code
+            except MailboxBackendError as exc:
+                error = EmailBackendError(
+                    "邮箱后端取码失败",
+                    code=str(getattr(exc, "code", "mailbox_backend") or "mailbox_backend"),
+                )
+                error.__cause__ = exc
+                self.last_auth_outcome = error.outcome
+                raise error
             except TimeoutError:
                 timed_out = True
                 raise
@@ -1134,6 +1258,22 @@ class _PersistedEmailService:
             except TimeoutError:
                 code = None
         if code:
+            if require_fresh_metadata and VerificationCodeResult.from_value(code) is not None:
+                result = VerificationCodeResult.from_value(code)
+                if not result.message_id or result.received_at in (None, ""):
+                    error = EmailBackendError(
+                        "邮箱后端未返回验证码新鲜度元数据",
+                        code="freshness_unavailable",
+                    )
+                    self.last_auth_outcome = error.outcome
+                    raise error
+            elif require_fresh_metadata:
+                error = EmailBackendError(
+                    "邮箱后端未返回验证码新鲜度元数据",
+                    code="freshness_unavailable",
+                )
+                self.last_auth_outcome = error.outcome
+                raise error
             return code
 
         background_timeout = max(
@@ -1169,6 +1309,22 @@ class _PersistedEmailService:
         except TimeoutError:
             code = None
         if code:
+            if require_fresh_metadata and VerificationCodeResult.from_value(code) is not None:
+                result = VerificationCodeResult.from_value(code)
+                if not result.message_id or result.received_at in (None, ""):
+                    error = EmailBackendError(
+                        "邮箱后端未返回验证码新鲜度元数据",
+                        code="freshness_unavailable",
+                    )
+                    self.last_auth_outcome = error.outcome
+                    raise error
+            elif require_fresh_metadata:
+                error = EmailBackendError(
+                    "邮箱后端未返回验证码新鲜度元数据",
+                    code="freshness_unavailable",
+                )
+                self.last_auth_outcome = error.outcome
+                raise error
             return code
         raise TimeoutError(
             f"等待邮箱新验证码超时 ({requested_timeout}s)"
@@ -1659,6 +1815,13 @@ def _login_with_saved_credentials(
             ),
             "chatgpt_existing_account_rotate_mfa": bool(rotate_mfa),
             "chatgpt_existing_account_skip_managed_mfa_rotation": False,
+            "chatgpt_local_account_id": (
+                saved.get("chatgpt_local_account_id") or saved.get("id") or ""
+            ),
+            # Keep canonical identity resolution on the same SQLite engine as
+            # the maintenance operation (important for isolated workers and
+            # in-memory test databases).
+            "_chatgpt_auth_engine": engine,
         }
     )
     try:

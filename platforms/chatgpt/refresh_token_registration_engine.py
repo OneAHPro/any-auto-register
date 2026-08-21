@@ -14,6 +14,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 
+from sqlmodel import Session
+
 from core.task_runtime import TaskInterruption
 from core.db import (
     load_chatgpt_mfa_rotation,
@@ -28,6 +30,7 @@ from services.chatgpt_auth_state import (
 )
 
 from .chatgpt_client import ChatGPTClient
+from .auth_outcomes import VerificationCodeResult
 from .log_sanitizer import sanitize_chatgpt_log_message
 from .mfa_manager import ChatGPTMfaManager, MfaRotationError, MfaRotationResult
 from .oauth import OAuthManager
@@ -151,20 +154,34 @@ class EmailServiceAdapter:
         timeout: int = 90,
         otp_sent_at: float | None = None,
         exclude_codes=None,
+        require_fresh_metadata: bool = False,
     ):
         excluded = set(exclude_codes) if exclude_codes is not None else set(self._used_codes)
         self.log_fn(f"正在等待邮箱 {email} 的验证码 ({timeout}s)...")
-        code = self.email_service.get_verification_code(
-            email=email,
-            timeout=timeout,
-            otp_sent_at=otp_sent_at,
-            exclude_codes=excluded,
-        )
-        if code:
-            code = str(code).strip()
-            self._remember_code(code, successful=False)
-            self.log_fn(f"成功获取验证码: {code}")
-        return code
+        kwargs = {
+            "email": email,
+            "timeout": timeout,
+            "otp_sent_at": otp_sent_at,
+            "exclude_codes": excluded,
+        }
+        if require_fresh_metadata:
+            kwargs["require_fresh_metadata"] = True
+        try:
+            raw_code = self.email_service.get_verification_code(**kwargs)
+        except TypeError as exc:
+            if not require_fresh_metadata or "require_fresh_metadata" not in str(exc):
+                raise
+            kwargs.pop("require_fresh_metadata", None)
+            raw_code = self.email_service.get_verification_code(**kwargs)
+        result = VerificationCodeResult.from_value(raw_code)
+        if result is not None:
+            self._remember_code(result.code, successful=False)
+            self.log_fn("成功获取邮箱验证码")
+            # Registration/legacy callers expect the six-digit string.  The
+            # structured result is opt-in for strict automatic-relogin email
+            # fallback and risk challenges.
+            return result if require_fresh_metadata else result.code
+        return ""
 
     def get_totp_code(self) -> str:
         getter = getattr(self.email_service, "get_totp_code", None)
@@ -413,7 +430,32 @@ class RefreshTokenRegistrationEngine:
                     self.extra_config.get("chatgpt_local_account_id")
                     or self.email_info.get("chatgpt_local_account_id")
                 )
-                resolved_account_id = resolve_chatgpt_auth_account_id(email_value)
+                # Relogin may be running against an injected/isolated SQLite
+                # engine (tests and maintenance workers do this deliberately).
+                # Resolve the identity in that same database when supplied;
+                # otherwise retain the canonical Task1 resolver.
+                auth_engine = self.extra_config.get("_chatgpt_auth_engine")
+                if auth_engine is not None:
+                    with Session(auth_engine) as auth_session:
+                        resolved_account_id = resolve_chatgpt_auth_account_id(
+                            email_value,
+                            session=auth_session,
+                        )
+                        candidate = (
+                            load_login_mfa_candidate_by_email(
+                                email_value,
+                                session=auth_session,
+                            )
+                            if resolved_account_id is not None
+                            else None
+                        )
+                else:
+                    resolved_account_id = resolve_chatgpt_auth_account_id(email_value)
+                    candidate = (
+                        load_login_mfa_candidate_by_email(email_value)
+                        if resolved_account_id is not None
+                        else None
+                    )
                 if local_account_id in (None, ""):
                     normalized_account_id = resolved_account_id
                 else:
@@ -430,11 +472,14 @@ class RefreshTokenRegistrationEngine:
                         raise ChatGPTAuthIdentityConflict(
                             "ChatGPT local account identity does not match login email"
                         )
-                candidate = (
-                    load_login_mfa_candidate_by_email(email_value)
-                    if normalized_account_id is not None
-                    else None
-                )
+                if auth_engine is not None and normalized_account_id != resolved_account_id:
+                    candidate = None
+                elif auth_engine is None:
+                    candidate = (
+                        load_login_mfa_candidate_by_email(email_value)
+                        if normalized_account_id is not None
+                        else None
+                    )
                 if candidate is not None and (
                     str(candidate.email or "").strip().lower()
                     != email_value.lower()

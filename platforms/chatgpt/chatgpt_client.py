@@ -30,6 +30,7 @@ from .utils import (
     random_delay,
     seed_oai_device_cookie,
 )
+from .auth_outcomes import AuthOutcome
 
 
 # Chrome 指纹配置
@@ -132,6 +133,7 @@ class ChatGPTClient:
         self.last_registration_state = FlowState()
         self.last_stage = ""
         self.last_authorize_status = 0
+        self.last_auth_outcome = AuthOutcome.success(stage="init")
         self.phone_oauth_resume_context = None
         self.phone_oauth_resume_error = ""
         self.phone_oauth_browser_context = {}
@@ -671,6 +673,8 @@ class ChatGPTClient:
         """通过 ChatGPT Web 登录获取 AT，不发起 offline_access token exchange。"""
         from .oauth_client import OAuthClient
 
+        self.last_auth_outcome = AuthOutcome.success(stage="login")
+
         if not str(email or "").strip():
             return False, "邮箱地址为空"
         password_login = bool(str(password or "").strip())
@@ -1138,6 +1142,7 @@ class ChatGPTClient:
                     sec_ch_ua=self.sec_ch_ua,
                     impersonate=self.impersonate,
                 )
+                self.last_auth_outcome = helper.last_auth_outcome
                 if not next_state:
                     return False, helper.last_error or "ChatGPT MFA 验证失败"
                 if prepare_phone_oauth:

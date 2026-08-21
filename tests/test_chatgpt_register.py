@@ -13,6 +13,7 @@ smstome_tool_stub.wait_for_otp = lambda *args, **kwargs: None
 sys.modules.setdefault("smstome_tool", smstome_tool_stub)
 
 from platforms.chatgpt.oauth_client import OAuthClient
+from platforms.chatgpt.auth_outcomes import AuthFailureDomain, AuthOutcome
 from platforms.chatgpt.chatgpt_client import ChatGPTClient
 from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
@@ -239,6 +240,19 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
 class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):
         return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
+
+    def test_auth_outcome_records_retryable_failure_without_credential_rejection(self):
+        outcome = AuthOutcome.failure(
+            stage="mfa_totp_verify",
+            domain=AuthFailureDomain.NETWORK,
+            code="http_503",
+            retryable=True,
+        )
+
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.domain, AuthFailureDomain.NETWORK)
+        self.assertTrue(outcome.retryable)
+        self.assertFalse(outcome.credential_rejected)
 
     def test_submit_signup_register_uses_json_with_authenticated_browser_headers(self):
         client = self._make_client()
@@ -525,6 +539,249 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "RECOVERY-CODE",
         )
         submit_email.assert_not_called()
+
+    def test_network_failure_does_not_fall_back_to_email(self):
+        client = self._make_client()
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = False
+        client.session.post = mock.Mock(side_effect=TimeoutError("upstream timed out"))
+
+        with mock.patch.object(
+            client,
+            "_submit_email_mfa_challenge",
+        ) as submit_email:
+            state = client._submit_mfa_challenge(
+                FlowState(
+                    page_type="mfa_challenge",
+                    payload={
+                        "factors": [
+                            {"id": "totp-1", "factor_type": "totp"},
+                            {"id": "email-1", "factor_type": "email"},
+                        ]
+                    },
+                ),
+                email="user@example.com",
+                skymail_client=mailbox,
+                totp_secret="JBSWY3DPEHPK3PXP",
+                device_id="device-fixed",
+            )
+
+        self.assertIsNone(state)
+        submit_email.assert_not_called()
+        self.assertEqual(
+            client.last_auth_outcome.domain,
+            AuthFailureDomain.NETWORK,
+        )
+        self.assertTrue(client.last_auth_outcome.retryable)
+        self.assertFalse(client.last_auth_outcome.credential_rejected)
+
+    def test_explicit_totp_rejection_can_fall_back_to_email_once(self):
+        client = self._make_client()
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = False
+        expected_state = FlowState(page_type="consent")
+        calls = []
+
+        def reject_totp(*args, **kwargs):
+            del args, kwargs
+            calls.append("totp")
+            client.last_error = "[stage=mfa] typed TOTP rejection"
+            client.last_auth_outcome = AuthOutcome.failure(
+                stage="mfa_totp_verify",
+                domain=AuthFailureDomain.CREDENTIAL,
+                code="incorrect_code",
+                credential_rejected=True,
+            )
+            return None
+
+        def reject_recovery(*args, **kwargs):
+            del args, kwargs
+            calls.append("recovery")
+            client.last_error = "[stage=mfa] typed recovery rejection"
+            client.last_auth_outcome = AuthOutcome.failure(
+                stage="mfa_recovery_verify",
+                domain=AuthFailureDomain.CREDENTIAL,
+                code="incorrect_code",
+                credential_rejected=True,
+            )
+            return None
+
+        def accept_email(*args, **kwargs):
+            del args, kwargs
+            calls.append("email")
+            client.last_auth_outcome = AuthOutcome.success(
+                stage="mfa_email_verify",
+                email_fallback_used=True,
+            )
+            return expected_state
+
+        with mock.patch.object(
+            client,
+            "_submit_totp_mfa_challenge",
+            side_effect=reject_totp,
+        ) as submit_totp, mock.patch.object(
+            client,
+            "_submit_recovery_code_mfa_challenge",
+            side_effect=reject_recovery,
+        ) as submit_recovery, mock.patch.object(
+            client,
+            "_submit_email_mfa_challenge",
+            side_effect=accept_email,
+        ) as submit_email:
+            state = client._submit_mfa_challenge(
+                FlowState(
+                    page_type="mfa_challenge",
+                    payload={
+                        "factors": [
+                            {"id": "totp-1", "factor_type": "totp"},
+                            {
+                                "id": "recovery-1",
+                                "factor_type": "recovery_code",
+                            },
+                            {"id": "email-1", "factor_type": "email"},
+                        ]
+                    },
+                ),
+                email="user@example.com",
+                skymail_client=mailbox,
+                totp_secret="OUTDATED-TOTP-SECRET",
+                mfa_recovery_code="RECOVERY-CODE",
+                device_id="device-fixed",
+            )
+
+        self.assertIs(state, expected_state)
+        self.assertEqual(calls, ["totp", "recovery", "email"])
+        submit_totp.assert_called_once()
+        submit_recovery.assert_called_once()
+        submit_email.assert_called_once()
+        self.assertTrue(client.last_auth_outcome.email_fallback_used)
+
+    def test_mfa_retryable_statuses_and_malformed_json_are_not_rejections(self):
+        cases = (
+            (429, AuthFailureDomain.RATE_LIMIT, "http_429"),
+            (503, AuthFailureDomain.NETWORK, "http_503"),
+            (401, AuthFailureDomain.SESSION, "http_401"),
+        )
+        for status, expected_domain, expected_code in cases:
+            with self.subTest(status=status):
+                client = self._make_client()
+                logs = []
+                client._log = logs.append
+                response = mock.Mock(
+                    status_code=status,
+                    url="https://auth.openai.com/api/accounts/mfa/issue_challenge",
+                    text='{"error":{"code":"secret-server-detail"}}',
+                )
+                response.json.return_value = {
+                    "error": {"code": "secret-server-detail"}
+                }
+                client.session.post = mock.Mock(return_value=response)
+
+                state = client._submit_totp_mfa_challenge(
+                    FlowState(
+                        page_type="mfa_challenge",
+                        payload={
+                            "factors": [
+                                {"id": "totp-1", "factor_type": "totp"}
+                            ]
+                        },
+                    ),
+                    totp_secret="JBSWY3DPEHPK3PXP",
+                    device_id="device-fixed",
+                )
+
+                self.assertIsNone(state)
+                self.assertEqual(client.last_auth_outcome.domain, expected_domain)
+                self.assertEqual(client.last_auth_outcome.code, expected_code)
+                self.assertTrue(client.last_auth_outcome.retryable)
+                self.assertFalse(client.last_auth_outcome.credential_rejected)
+                self.assertNotIn("secret-server-detail", "\n".join(logs))
+
+        client = self._make_client()
+        issue = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/issue_challenge",
+            text="{}",
+        )
+        verify = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/verify",
+            text="not-json",
+        )
+        verify.json.side_effect = ValueError("malformed body")
+        client.session.post = mock.Mock(side_effect=[issue, verify])
+
+        state = client._submit_totp_mfa_challenge(
+            FlowState(
+                page_type="mfa_challenge",
+                payload={
+                    "factors": [
+                        {"id": "totp-1", "factor_type": "totp"}
+                    ]
+                },
+            ),
+            totp_secret="JBSWY3DPEHPK3PXP",
+            device_id="device-fixed",
+        )
+
+        self.assertIsNone(state)
+        self.assertEqual(client.last_auth_outcome.domain, AuthFailureDomain.UNKNOWN)
+        self.assertEqual(client.last_auth_outcome.code, "malformed_response")
+        self.assertTrue(client.last_auth_outcome.retryable)
+        self.assertFalse(client.last_auth_outcome.credential_rejected)
+
+    def test_server_email_risk_challenge_uses_fresh_mailbox_code(self):
+        client = OAuthClient(
+            {"chatgpt_oauth_mfa_otp_wait_seconds": 600},
+            verbose=False,
+        )
+        issue = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/issue_challenge",
+            text="{}",
+        )
+        verify = mock.Mock(
+            status_code=200,
+            url="https://auth.openai.com/api/accounts/mfa/verify",
+            text='{"page":{"type":"consent"}}',
+        )
+        verify.json.return_value = {"page": {"type": "consent"}}
+        client.session.post = mock.Mock(side_effect=[issue, verify])
+        mailbox = mock.Mock()
+        mailbox.get_recent_code.return_value = "111111"
+        mailbox.wait_for_verification_code.return_value = {
+            "code": "222222",
+            "message_id": "message-new",
+            "received_at": 2_000_000_001.0,
+        }
+
+        with mock.patch.object(
+            client,
+            "_state_from_payload",
+            return_value=FlowState(page_type="consent"),
+        ), mock.patch(
+            "platforms.chatgpt.oauth_client.time.time",
+            return_value=2_000_000_000.0,
+        ):
+            state = client._submit_email_mfa_challenge(
+                FlowState(page_type="mfa_challenge"),
+                factor={"id": "email-1", "type": "email"},
+                email="user@example.com",
+                skymail_client=mailbox,
+                device_id="device-fixed",
+                email_risk_challenge=True,
+            )
+
+        self.assertEqual(state.page_type, "consent")
+        issue_call, verify_call = client.session.post.call_args_list
+        self.assertTrue(issue_call.kwargs["json"]["force_fresh_challenge"])
+        self.assertEqual(verify_call.kwargs["json"]["code"], "222222")
+        wait_kwargs = mailbox.wait_for_verification_code.call_args.kwargs
+        self.assertEqual(wait_kwargs["otp_sent_at"], 2_000_000_000.0)
+        self.assertIn("111111", wait_kwargs["exclude_codes"])
+        self.assertLessEqual(wait_kwargs["timeout"], 60)
+        self.assertTrue(client.last_auth_outcome.email_risk_challenge)
+        self.assertFalse(client.last_auth_outcome.email_fallback_used)
 
     def test_submit_mfa_uses_recovery_code_when_browser_state_only_has_url(self):
         client = self._make_client()

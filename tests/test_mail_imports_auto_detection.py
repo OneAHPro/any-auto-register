@@ -120,6 +120,16 @@ class MailImportAutoDetectionTests(unittest.TestCase):
         self.assertEqual(result.rows[0].account_type, "chatgpt_password_totp")
         self.assertNotIn(secret, json.dumps(result.to_public_dict()))
 
+    def test_preserve_existing_imported_mfa_fixture_as_password_totp(self):
+        result = detect_mail_import_content(
+            "graceful.cedar205@xeramail.com----dshsdj34h34fh----"
+            "J7L5SKBAX6FTDJKK64ZRNCAJRRACL4WB"
+        )
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(result.rows[0].provider, "applemail")
+        self.assertEqual(result.rows[0].account_type, "chatgpt_password_totp")
+
     def test_detects_chatgpt_password_remote_mfa_url_as_applemail(self):
         lookup_url = (
             "https://2fa.nloop.cc/api/mfa/lookup"
