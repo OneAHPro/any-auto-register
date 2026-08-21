@@ -29,6 +29,20 @@ class _FakeResponse:
 
 
 class OutlookMailboxOAuthTests(unittest.TestCase):
+    def test_mailapi_accepts_bare_six_digit_plain_text_response(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        response_text = "795097\n"
+
+        message = backend._parse_mailapi_message(response_text)
+        code = backend._extract_message_code(
+            message,
+            response_text,
+            None,
+        )
+
+        self.assertEqual(code, "795097")
+
     @mock.patch("requests.get")
     def test_yisen_mailapi_request_uses_jwt_and_browser_headers(self, mock_get):
         token = "header.payload.fixture-signature"

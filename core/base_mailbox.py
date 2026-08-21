@@ -5311,7 +5311,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             raw_visible = self.mailbox._decode_raw_content(str(raw_text or "")) or str(
                 raw_text or ""
             )
-            normalized = " ".join(f"{visible} {raw_visible}".split())
+            normalized_visible = " ".join(visible.split())
+            normalized_raw_visible = " ".join(raw_visible.split())
+            normalized = (
+                normalized_visible
+                if normalized_visible == normalized_raw_visible
+                else " ".join(
+                    f"{normalized_visible} {normalized_raw_visible}".split()
+                )
+            )
         semantic_otp = re.search(
             r"(?is)\b(?:verification|authentication|login|security)\s+code\b|"
             r"\b(?:temporary|one[-\s]*time)\b.{0,32}\b(?:code|password)\b|"
