@@ -621,6 +621,22 @@ class ChatGPTPlatform(BasePlatform):
                                 credential_snapshot[managed_key] = account_extra[
                                     managed_key
                                 ]
+                        # Durable Outlook lease fencing metadata is an
+                        # internal pointer, not a credential.  Preserve it in
+                        # the account projection so the post-save task can
+                        # atomically bind the claimed mailbox to AccountModel.
+                        for lease_key in (
+                            "_outlook_row_id",
+                            "_outlook_lease_owner",
+                            "_outlook_lease_version",
+                            "_outlook_state",
+                            "_outlook_bound_account_id",
+                            "_outlook_lease_expires_at",
+                        ):
+                            if lease_key in account_extra:
+                                credential_snapshot[lease_key] = account_extra[
+                                    lease_key
+                                ]
                         account_extra = credential_snapshot
                     return {
                         "provider": provider,
@@ -726,7 +742,26 @@ class ChatGPTPlatform(BasePlatform):
             mailbox_account = getattr(email_service, "_acct", None)
             requeue = getattr(self.mailbox, "requeue_account", None)
             if mailbox_account is not None and callable(requeue):
-                requeue(mailbox_account)
+                detail = f"{error_code} {error}".lower()
+                uncertain = any(
+                    marker in detail
+                    for marker in (
+                        "timeout",
+                        "timed out",
+                        "network",
+                        "mailbox_backend",
+                        "activation_unknown",
+                        "mfa_rotation",
+                        "session expired",
+                        "429",
+                        "502",
+                        "503",
+                    )
+                )
+                try:
+                    requeue(mailbox_account, uncertain=uncertain)
+                except TypeError:
+                    requeue(mailbox_account)
 
         try:
             result = adapter.run(context)

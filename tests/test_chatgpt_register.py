@@ -575,8 +575,9 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertTrue(client.last_auth_outcome.retryable)
         self.assertFalse(client.last_auth_outcome.credential_rejected)
 
-    def test_explicit_totp_rejection_can_fall_back_to_email_once(self):
+    def test_explicit_totp_rejection_does_not_use_optional_email_factor(self):
         client = self._make_client()
+        client.config["chatgpt_existing_account_login_only"] = True
         mailbox = mock.Mock()
         mailbox.supports_totp_code.return_value = False
         expected_state = FlowState(page_type="consent")
@@ -606,15 +607,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             )
             return None
 
-        def accept_email(*args, **kwargs):
-            del args, kwargs
-            calls.append("email")
-            client.last_auth_outcome = AuthOutcome.success(
-                stage="mfa_email_verify",
-                email_fallback_used=True,
-            )
-            return expected_state
-
         with mock.patch.object(
             client,
             "_submit_totp_mfa_challenge",
@@ -626,7 +618,6 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         ) as submit_recovery, mock.patch.object(
             client,
             "_submit_email_mfa_challenge",
-            side_effect=accept_email,
         ) as submit_email:
             state = client._submit_mfa_challenge(
                 FlowState(
@@ -649,12 +640,12 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
                 device_id="device-fixed",
             )
 
-        self.assertIs(state, expected_state)
-        self.assertEqual(calls, ["totp", "recovery", "email"])
+        self.assertIsNone(state)
+        self.assertEqual(calls, ["totp", "recovery"])
         submit_totp.assert_called_once()
         submit_recovery.assert_called_once()
-        submit_email.assert_called_once()
-        self.assertTrue(client.last_auth_outcome.email_fallback_used)
+        submit_email.assert_not_called()
+        self.assertTrue(client.last_auth_outcome.credential_rejected)
 
     def test_mfa_retryable_statuses_and_malformed_json_are_not_rejections(self):
         cases = (
@@ -1178,6 +1169,36 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
         self.assertIs(state, expected_state)
         submit_email.assert_called_once()
         submit_totp.assert_not_called()
+
+    def test_existing_account_uses_email_when_server_offers_only_email(self):
+        client = self._make_client()
+        client.config["chatgpt_existing_account_login_only"] = True
+        expected_state = FlowState(page_type="consent")
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = False
+
+        with mock.patch.object(
+            client,
+            "_submit_email_mfa_challenge",
+            return_value=expected_state,
+        ) as submit_email:
+            state = client._submit_mfa_challenge(
+                FlowState(
+                    page_type="mfa_challenge",
+                    payload={
+                        "factors": [
+                            {"id": "email-1", "factor_type": "email"},
+                        ]
+                    },
+                ),
+                email="user@example.com",
+                skymail_client=mailbox,
+                totp_secret="JBSWY3DPEHPK3PXP",
+                device_id="device-fixed",
+            )
+
+        self.assertIs(state, expected_state)
+        self.assertTrue(submit_email.call_args.kwargs["email_fallback"])
 
     def test_submit_mfa_totp_only_without_secret_reports_missing_secret(self):
         client = self._make_client()

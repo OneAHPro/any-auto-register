@@ -36,7 +36,13 @@ from services.chatgpt_account_state import (
     ChatGPTAccountDeactivatedError,
     account_is_visible_in_default_list,
 )
-from services.chatgpt_auth_state import load_login_mfa_candidate
+from services.chatgpt_auth_state import (
+    chatgpt_auth_retry_allowed,
+    clear_chatgpt_auth_failure,
+    load_chatgpt_auth_state,
+    load_login_mfa_candidate,
+    record_chatgpt_auth_failure,
+)
 from services.chatgpt_account_coordination import (
     chatgpt_account_operation_lock,
     codex2api_account_mutation_lock,
@@ -142,7 +148,7 @@ def _mailbox_context_from_outlook(
     imported = session.exec(
         select(OutlookAccountModel)
         .where(func.lower(OutlookAccountModel.email) == email.lower())
-        .where(OutlookAccountModel.enabled == True)  # noqa: E712
+        .where(OutlookAccountModel.state.in_(["available", "bound"]))
     ).first()
     if imported is None:
         return None
@@ -159,6 +165,11 @@ def _mailbox_context_from_outlook(
             "mailapi_url": _text(imported.mailapi_url),
             "mailapi_token": _text(
                 getattr(imported, "mailapi_token", "")
+            ),
+            "_outlook_row_id": str(imported.id or ""),
+            "_outlook_state": str(getattr(imported, "state", "") or ""),
+            "_outlook_bound_account_id": int(
+                getattr(imported, "bound_account_id", 0) or 0
             ),
         },
     }
@@ -370,7 +381,9 @@ def _is_saved_chatgpt_account_relogin_eligible_in_session(
     imported = session.exec(
         select(OutlookAccountModel)
         .where(func.lower(OutlookAccountModel.email) == _text(account.email).lower())
-        .where(OutlookAccountModel.enabled == True)  # noqa: E712
+        .where(
+            OutlookAccountModel.state.in_(["available", "bound"])
+        )
     ).first()
     return bool(
         imported is not None
@@ -446,7 +459,7 @@ def list_auto_maintenance_account_ids(
     session: Session | None = None,
     database_engine=None,
 ) -> list[int]:
-    """List every visible ChatGPT account that has a Refresh Token."""
+    """List visible accounts whose durable auth circuit is ready to run."""
 
     def _list(active_session: Session) -> list[int]:
         accounts = active_session.exec(
@@ -460,6 +473,7 @@ def list_auto_maintenance_account_ids(
             if account.id is not None
             and _text(account.email)
             and account_is_visible_in_default_list(account)
+            and _auth_maintenance_retry_allowed(active_session, int(account.id))
         ]
 
     if session is not None:
@@ -467,6 +481,18 @@ def list_auto_maintenance_account_ids(
     resolved_engine = engine if database_engine is None else database_engine
     with Session(resolved_engine) as owned_session:
         return _list(owned_session)
+
+
+def _auth_maintenance_retry_allowed(session: Session, account_id: int) -> bool:
+    """Best-effort state gate; legacy databases without the table stay usable."""
+    try:
+        return chatgpt_auth_retry_allowed(account_id, session=session)
+    except Exception as exc:
+        # A schema migration may be running during process startup.  Do not
+        # turn a read-only scheduler tick into a cohort-wide failure.
+        if type(exc).__name__ in {"OperationalError", "ProgrammingError"}:
+            return True
+        return True
 
 
 def _load_saved_account(account_id: int) -> dict[str, Any]:
@@ -553,10 +579,14 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
                 }
             )
             context_extra = dict(context.get("extra") or {})
+            saved_password = _text(account.password) or _text(
+                context_extra.get("password")
+                or (mailbox_context.get("extra") if isinstance(mailbox_context, dict) else {}).get("password")
+            )
             context_extra.update(
                 {
                     "account_type": "chatgpt_password_totp",
-                    "password": str(account.password or ""),
+                    "password": saved_password,
                     "totp_secret": candidate.totp_secret,
                     "mfa_recovery_code": candidate.recovery_code,
                     "chatgpt_mfa_managed": True,
@@ -569,6 +599,47 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             context["extra"] = context_extra
             context["email"] = email
             mailbox_context = context
+        else:
+            # Compatibility promotion for accounts created before the
+            # canonical MFA table existed.  A record that already contains a
+            # saved primary password and managed TOTP must never be routed to
+            # the mailbox merely because its old context still says
+            # ``mailapi_url``/URL-OTP.  The mailbox remains a risk-challenge
+            # fallback only; the normal automatic path is password + TOTP.
+            context = dict(mailbox_context or {})
+            context_extra = dict(context.get("extra") or {})
+            legacy_password = _text(
+                context_extra.get("password") or account.password
+            )
+            legacy_totp = _text(
+                context_extra.get("totp_secret")
+                or context_extra.get("mfa_secret")
+                or context_extra.get("totp")
+            )
+            legacy_type = _text(context_extra.get("account_type")).lower()
+            legacy_managed = context_extra.get("chatgpt_mfa_managed") is True
+            if legacy_password and legacy_totp and (
+                legacy_managed
+                or legacy_type in {
+                    "mailapi_url",
+                    "chatgpt_password_url_otp",
+                    "chatgpt_password_totp",
+                }
+            ):
+                context_extra.update(
+                    {
+                        "account_type": "chatgpt_password_totp",
+                        "password": legacy_password,
+                        "totp_secret": legacy_totp,
+                        "chatgpt_mfa_managed": True,
+                    }
+                )
+                context_extra.pop("totp_url", None)
+                context_extra.pop("mfa_secret", None)
+                context_extra.pop("totp", None)
+                context["extra"] = context_extra
+                context["email"] = email
+                mailbox_context = context
         return {
             "id": normalized_id,
             "chatgpt_local_account_id": normalized_id,
@@ -655,6 +726,12 @@ def _recover_password_totp_credentials(
             or record.get("mail_api_url")
             or record.get("mailapi_url")
         )
+        mailapi_token = _text(
+            context_extra.get("mailapi_token")
+            or record.get("mailapi_token")
+        )
+    else:
+        mailapi_token = _text(context_extra.get("mailapi_token"))
 
     if not password or not totp_secret:
         raise RuntimeError(f"账号 {email} 缺少邮箱登录凭据：密码或 MFA 秘钥为空")
@@ -665,6 +742,8 @@ def _recover_password_totp_credentials(
     }
     if mail_api_url:
         credentials["mail_api_url"] = mail_api_url
+    if mailapi_token:
+        credentials["mailapi_token"] = mailapi_token
     if pool_file:
         credentials["pool_file"] = pool_file
     return credentials
@@ -897,6 +976,7 @@ class _PersistedEmailService:
         provider: str,
         log_fn: LogFn | None,
         otp_timeout_seconds: int = 300,
+        defer_mailbox_claim: bool = False,
     ) -> None:
         self.service_type = type("ServiceType", (), {"value": provider})()
         self._mailbox = mailbox
@@ -912,6 +992,44 @@ class _PersistedEmailService:
             max(30, min(int(otp_timeout_seconds or 300), 3600))
         )
         self._foreground_remaining_seconds = 20.0
+        self._defer_mailbox_claim = bool(defer_mailbox_claim)
+
+    def _ensure_mailbox_claimed(self) -> None:
+        """Claim a file-pool receiver only when an email factor is requested."""
+        if not self._defer_mailbox_claim:
+            return
+        extra = dict(self._account.extra or {})
+        if extra.get("_pool_claim_id") or extra.get("_outlook_row_id"):
+            self._defer_mailbox_claim = False
+            return
+        target = _text(self._account.email)
+        selector = getattr(self._mailbox, "get_email_by_address", None)
+        if not target or not callable(selector):
+            self._defer_mailbox_claim = False
+            return
+        try:
+            claimed = selector(target)
+        except MailboxBackendError as exc:
+            error = EmailBackendError(
+                "邮箱领取失败",
+                code=str(getattr(exc, "code", "mailbox_claim_failed") or "mailbox_claim_failed"),
+            )
+            error.__cause__ = exc
+            self.last_auth_outcome = error.outcome
+            raise error
+        except Exception as exc:
+            error = EmailBackendError(
+                "邮箱领取失败",
+                code="mailbox_claim_failed",
+            )
+            error.__cause__ = exc
+            self.last_auth_outcome = error.outcome
+            raise error
+        claimed_extra = dict(getattr(claimed, "extra", None) or {})
+        claimed_extra.update(extra)
+        claimed.extra = claimed_extra
+        self._account = claimed
+        self._defer_mailbox_claim = False
 
     def _load_baseline(self) -> None:
         try:
@@ -1125,6 +1243,7 @@ class _PersistedEmailService:
         require_fresh_metadata: bool = False,
     ):
         del email, email_id
+        self._ensure_mailbox_claimed()
         # Lazy managed-TOTP services start their strict baseline only when the
         # caller explicitly requests an email code.
         self._start_baseline()
@@ -1584,16 +1703,14 @@ def _build_email_service(
             )
             setattr(mailbox, "_log_fn", log_fn)
             _bind_mailbox_task_control(mailbox, task_control, attempt_id)
-            if credentials.get("pool_file"):
-                mailbox_account = mailbox.get_email_by_address(
-                    credentials["email"]
-                )
-            else:
-                mailbox_account = MailboxAccount(
-                    email=credentials["email"],
-                    account_id=credentials["email"],
-                    extra={},
-                )
+            # Do not claim a file-pool receiver while the normal password +
+            # TOTP path is being assembled.  An explicit server email factor
+            # invokes ``_ensure_mailbox_claimed`` just before polling.
+            mailbox_account = MailboxAccount(
+                email=credentials["email"],
+                account_id=credentials["email"],
+                extra={},
+            )
             # Preserve persisted mailbox credentials when a managed MFA
             # context is rebuilt as a password + TOTP service.  In particular,
             # Yisen MailAPI needs its bearer token during an email OTP step.
@@ -1609,6 +1726,8 @@ def _build_email_service(
                     "mailapi_url": credentials["mail_api_url"],
                 }
             )
+            if credentials.get("mailapi_token"):
+                account_extra["mailapi_token"] = credentials["mailapi_token"]
             if credentials.get("pool_file"):
                 account_extra["pool_file"] = credentials["pool_file"]
             mailbox_account.extra = account_extra
@@ -1619,6 +1738,7 @@ def _build_email_service(
                 provider="chatgpt_credentials",
                 log_fn=log_fn,
                 otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+                defer_mailbox_claim=bool(credentials.get("pool_file")),
             )
         return _PasswordTotpEmailService(credentials, mailbox_context)
 
@@ -2588,6 +2708,59 @@ def _refresh_or_relogin_chatgpt_account_locked(
     }
 
 
+def _record_auth_maintenance_outcome(
+    account_id: int,
+    result: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Update the durable circuit once per maintenance attempt."""
+    normalized = dict(result or {})
+    try:
+        succeeded = bool(normalized.get("relogin_ok")) or (
+            bool(normalized.get("refresh_ok"))
+            and str(normalized.get("stage") or "") in {"completed", "codex2api_sync"}
+        )
+        if succeeded:
+            clear_chatgpt_auth_failure(account_id)
+            return normalized
+        stage = _text(normalized.get("stage"))
+        code = _text(
+            normalized.get("error_code")
+            or normalized.get("refresh_error_code")
+            or normalized.get("code")
+            or stage
+            or "auth_failed"
+        )
+        domain = _text(normalized.get("failure_domain"))
+        if not domain:
+            if stage in {"refresh_deferred", "remote_probe_deferred", "codex2api_sync"}:
+                domain = "network"
+            elif "mail" in stage or "otp" in stage:
+                domain = "email_backend"
+            else:
+                domain = "credential"
+        permanent = code in {
+            "missing_managed_totp",
+            "account_deactivated",
+            "invalid_credentials",
+            "blocked_missing_primary",
+        } or stage in {"account_removed", "account_deactivated"}
+        state = record_chatgpt_auth_failure(
+            account_id,
+            failure_domain=domain,
+            error_code=code,
+            retryable=not permanent,
+        )
+        normalized["auth_retry_at"] = (
+            state.next_retry_at.isoformat() if state.next_retry_at else ""
+        )
+        normalized["auth_circuit_state"] = state.circuit_state
+    except Exception:
+        # Maintenance result delivery must remain independent from the
+        # business result; a temporary DB lock is retried by the next tick.
+        pass
+    return normalized
+
+
 def refresh_or_relogin_chatgpt_account(
     account_id: int,
     *,
@@ -2610,7 +2783,7 @@ def refresh_or_relogin_chatgpt_account(
                 "email": "",
                 "message": "认证维护失败: 该账号正在重登或刷新，请等待当前任务完成",
             }
-        return _refresh_or_relogin_chatgpt_account_locked(
+        result = _refresh_or_relogin_chatgpt_account_locked(
             account_id,
             log_fn=log_fn,
             task_control=task_control,
@@ -2619,6 +2792,7 @@ def refresh_or_relogin_chatgpt_account(
                 codex2api_delete_on_account_remove_enabled
             ),
         )
+        return _record_auth_maintenance_outcome(account_id, result)
 
 
 def relogin_chatgpt_account(
@@ -2642,7 +2816,7 @@ def relogin_chatgpt_account(
                 "email": "",
                 "message": "重登失败: 该账号正在重登并同步，请等待当前任务完成",
             }
-        return _relogin_chatgpt_account_locked(
+        result = _relogin_chatgpt_account_locked(
             account_id,
             log_fn=log_fn,
             task_control=task_control,
@@ -2653,3 +2827,4 @@ def relogin_chatgpt_account(
             remove_on_mailbox_otp_timeout=remove_on_mailbox_otp_timeout,
             rotate_mfa=rotate_mfa,
         )
+        return _record_auth_maintenance_outcome(account_id, result)

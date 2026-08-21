@@ -11,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
 from core.base_mailbox import MailboxAccount, OutlookMailbox
-from core.db import AccountModel, OutlookAccountModel
+from core.db import AccountModel, ChatGPTAuthStateModel, OutlookAccountModel
 from core.task_runtime import RegisterTaskControl, StopTaskRequested
 from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.auth_outcomes import AuthFailureDomain, EmailBackendError
@@ -3064,6 +3064,28 @@ class ChatGPTReloginTests(unittest.TestCase):
         )
 
         self.assertIn(account_id, account_ids)
+
+    def test_auto_maintenance_skips_account_during_durable_backoff(self):
+        account_id = self._add_eligibility_account(
+            "cooldown@example.com",
+            extra={"refresh_token": "rt-only-token"},
+        )
+        with Session(self.engine) as session:
+            session.add(
+                ChatGPTAuthStateModel(
+                    account_id=account_id,
+                    failure_count=3,
+                    circuit_state="open",
+                    next_retry_at=datetime(2099, 1, 1, tzinfo=timezone.utc),
+                )
+            )
+            session.commit()
+
+        account_ids = list_auto_maintenance_account_ids(
+            database_engine=self.engine,
+        )
+
+        self.assertNotIn(account_id, account_ids)
 
     def test_auto_maintenance_treats_missing_rt_as_full_login_candidate(self):
         account_id = self._add_eligibility_account(

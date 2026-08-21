@@ -19,10 +19,13 @@ from services.chatgpt_auth_state import (
     ChatGPTAuthIdentityConflict,
     ChatGPTAuthVersionConflict,
     commit_auth_projection,
+    clear_chatgpt_auth_failure,
     ensure_chatgpt_auth_state,
     load_login_mfa_candidate,
     load_login_mfa_candidate_by_email,
     quarantine_legacy_staged_journals,
+    promote_successful_chatgpt_account_auth,
+    record_chatgpt_auth_failure,
     resolve_chatgpt_auth_account_id,
     stage_mfa_operation,
     transition_mfa_operation,
@@ -620,3 +623,63 @@ def test_quarantine_legacy_staged_journals_preserves_migration_data_without_logg
 
     assert totp_secret not in caplog.text
     assert recovery_code not in caplog.text
+
+
+def test_auth_failure_backoff_persists_and_success_clears(database_engine):
+    with Session(database_engine) as session:
+        _create_chatgpt_account(session)
+        session.commit()
+        first = record_chatgpt_auth_failure(
+            7,
+            failure_domain="email_backend",
+            error_code="mailapi_timeout",
+            session=session,
+        )
+        session.commit()
+        assert first.failure_count == 1
+        assert first.circuit_state == "open"
+        assert first.next_retry_at is not None
+
+        cleared = clear_chatgpt_auth_failure(7, session=session)
+        session.commit()
+        assert cleared.failure_count == 0
+        assert cleared.circuit_state == "closed"
+        assert cleared.next_retry_at is None
+        assert cleared.failure_domain == ""
+        assert cleared.error_code == ""
+
+
+def test_successful_legacy_login_promotes_password_totp_to_canonical_state(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "demo@example.com",
+                    "extra": {
+                        "account_type": "mailapi_url",
+                        "mailapi_url": "https://mail.example.test/inbox",
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "REMOTE-VERIFIED-TOTP",
+                        "mfa_recovery_code": "REMOTE-RECOVERY",
+                        "chatgpt_mfa_managed": True,
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+
+    with Session(database_engine) as session:
+        promoted = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        candidate = load_login_mfa_candidate(7, session=session)
+
+    assert promoted.primary_state.value == "confirmed"
+    assert promoted.mfa_state.value == "active"
+    assert candidate is not None
+    assert candidate.totp_secret == "REMOTE-VERIFIED-TOTP"
+    assert candidate.recovery_code == "REMOTE-RECOVERY"

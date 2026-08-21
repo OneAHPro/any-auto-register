@@ -1599,7 +1599,7 @@ def _load_account_and_email_service(account_id: int):
             imported_mailbox = session.exec(
                 select(OutlookAccountModel)
                 .where(func.lower(OutlookAccountModel.email) == account_email.lower())
-                .where(OutlookAccountModel.enabled == True)
+                .where(OutlookAccountModel.state.in_(["available", "bound"]))
             ).first()
             if imported_mailbox is not None:
                 mailbox_extra = {
@@ -1616,6 +1616,13 @@ def _load_account_and_email_service(account_id: int):
                     ),
                     "mailapi_token": str(
                         getattr(imported_mailbox, "mailapi_token", "") or ""
+                    ),
+                    "_outlook_row_id": str(imported_mailbox.id or ""),
+                    "_outlook_state": str(
+                        getattr(imported_mailbox, "state", "") or ""
+                    ),
+                    "_outlook_bound_account_id": int(
+                        getattr(imported_mailbox, "bound_account_id", 0) or 0
                     ),
                 }
                 mailbox_context = {

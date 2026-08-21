@@ -2938,6 +2938,12 @@ class OAuthClient:
             self.config.get("chatgpt_existing_account_login_only", "")
         ).strip().lower() in {"1", "true", "yes", "on"}
         email_risk_challenge = self._state_is_email_risk_challenge(state)
+        server_requires_email = bool(
+            email_factor is not None
+            and totp_factor is None
+            and not (recovery_factor is not None and recovery_code)
+            and bool(factors)
+        )
         # A server-directed risk page is an explicit exception: it asks for a
         # fresh email proof and does not imply that the saved TOTP is suspect.
         if (
@@ -2973,9 +2979,7 @@ class OAuthClient:
         # Imported password+managed-TOTP accounts stay TOTP-first even when
         # the factor list also advertises an email option.  Email is reached
         # only after an explicit credential rejection (below).
-        if has_totp_source and (
-            totp_factor is not None or email_factor is not None or not factors
-        ):
+        if has_totp_source and (totp_factor is not None or not factors):
             totp_result = self._submit_totp_mfa_challenge(
                 state,
                 totp_secret=totp_secret,
@@ -3013,10 +3017,20 @@ class OAuthClient:
                 if recovery_result is not None:
                     return recovery_result
                 rejected_totp = self._mfa_credential_rejection_available()
-            if email_factor is not None and skymail_client is not None and rejected_totp:
-                self._log(
-                    "已有 MFA 验证码被拒绝，自动改用邮箱验证码继续登录"
-                )
+            # A page that still offers TOTP does not require email.  Keep the
+            # credential failure isolated for repair/backoff; touching an
+            # imported receiver here would recreate the historical 300-second
+            # mailbox stall.  Email is reserved for an explicit risk page or
+            # a server response whose only factor is email (below).  The
+            # non-automation signup/reset flow retains its historical one-time
+            # fallback after an explicit TOTP rejection.
+            if (
+                email_factor is not None
+                and skymail_client is not None
+                and rejected_totp
+                and not existing_account_login_only
+            ):
+                self._log("已有 MFA 验证码被拒绝，自动改用邮箱验证码继续登录")
                 self.last_error = ""
                 return self._submit_email_mfa_challenge(
                     state,
@@ -3041,7 +3055,7 @@ class OAuthClient:
                 impersonate=impersonate,
             )
         if email_factor is not None and skymail_client is not None:
-            if existing_account_login_only:
+            if existing_account_login_only and not server_requires_email:
                 self._set_auth_failure(
                     stage="mfa_email_policy",
                     domain=AuthFailureDomain.CREDENTIAL,
@@ -3050,6 +3064,10 @@ class OAuthClient:
                     retryable=False,
                 )
                 return None
+            if server_requires_email and existing_account_login_only:
+                self._log(
+                    "ChatGPT 本次仅提供邮箱验证因子，按服务端要求启用邮箱兜底"
+                )
             return self._submit_email_mfa_challenge(
                 state,
                 factor=email_factor,
@@ -3060,6 +3078,7 @@ class OAuthClient:
                 sec_ch_ua=sec_ch_ua,
                 impersonate=impersonate,
                 email_risk_challenge=email_risk_challenge,
+                email_fallback=(server_requires_email and existing_account_login_only),
             )
 
         if factors:

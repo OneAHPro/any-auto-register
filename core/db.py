@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 import os
 from typing import Optional
-from sqlalchemy import delete, event, func
+from sqlalchemy import delete, event, func, update
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -552,6 +552,14 @@ def _migrate_outlook_accounts_schema() -> None:
                 "WHEN enabled = 1 THEN 'available' ELSE 'disabled' END "
                 "WHERE state IS NULL OR TRIM(state) = ''"
             )
+        # A few import versions wrote ``enabled=False`` before the state
+        # column existed (or while relying on its ORM default of ``available``).
+        # Preserve that explicit disablement instead of resurrecting it when
+        # the compatibility projection is synchronized below.
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET state = 'disabled' "
+            "WHERE state = 'available' AND enabled = 0"
+        )
         conn.exec_driver_sql(
             "UPDATE outlook_accounts SET lease_owner = '' WHERE lease_owner IS NULL"
         )
@@ -659,6 +667,54 @@ def recover_expired_outlook_leases(
         if recovered:
             session.commit()
         return recovered
+
+
+def sync_bound_outlook_credentials(
+    account_id: int,
+    email: str,
+    *,
+    password: str | None = None,
+    mailapi_url: str | None = None,
+    mailapi_token: str | None = None,
+    database_engine=None,
+) -> bool:
+    """Refresh non-authoritative mailbox projections for a bound account.
+
+    The ChatGPT account remains the canonical credential source.  This small
+    CAS-by-identity projection keeps a bound Outlook/MailAPI row usable for a
+    future explicit email-risk fallback without re-opening its lease.
+    """
+    target_engine = database_engine or engine
+    normalized_email = str(email or "").strip().lower()
+    try:
+        normalized_account_id = int(account_id)
+    except (TypeError, ValueError):
+        return False
+    if normalized_account_id <= 0 or not normalized_email:
+        return False
+    values: dict[str, object] = {"updated_at": _utcnow()}
+    if password is not None and str(password):
+        values["password"] = str(password)
+    if mailapi_url is not None and str(mailapi_url):
+        values["mailapi_url"] = str(mailapi_url)
+    if mailapi_token is not None and str(mailapi_token):
+        values["mailapi_token"] = str(mailapi_token)
+    if len(values) == 1:
+        return False
+    with Session(target_engine) as session:
+        result = session.exec(
+            update(OutlookAccountModel)
+            .where(OutlookAccountModel.state == "bound")
+            .where(OutlookAccountModel.bound_account_id == normalized_account_id)
+            .where(func.lower(OutlookAccountModel.email) == normalized_email)
+            .values(**values)
+        )
+        changed = int(getattr(result, "rowcount", 0) or 0) == 1
+        if changed:
+            session.commit()
+        else:
+            session.rollback()
+        return changed
 
 
 def _migrate_chatgpt_auth_state_schema() -> None:

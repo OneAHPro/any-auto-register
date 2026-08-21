@@ -6,7 +6,7 @@ import hashlib
 import hmac
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from enum import StrEnum
 from typing import Any, Iterator, Mapping
 from uuid import uuid4
@@ -84,6 +84,10 @@ class ChatGPTAuthState:
     error_code: str
     created_at: datetime
     updated_at: datetime
+    failure_count: int = 0
+    next_retry_at: datetime | None = None
+    circuit_state: str = "closed"
+    last_failure_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +214,10 @@ def _auth_snapshot(row: ChatGPTAuthStateModel) -> ChatGPTAuthState:
         error_code=str(row.error_code or ""),
         created_at=row.created_at,
         updated_at=row.updated_at,
+        failure_count=int(getattr(row, "failure_count", 0) or 0),
+        next_retry_at=getattr(row, "next_retry_at", None),
+        circuit_state=str(getattr(row, "circuit_state", "closed") or "closed"),
+        last_failure_at=getattr(row, "last_failure_at", None),
     )
 
 
@@ -893,3 +901,209 @@ def quarantine_legacy_staged_journals(
         elif owns_session:
             active_session.rollback()
         return changed
+
+
+def load_chatgpt_auth_state(
+    account_id: int,
+    *,
+    session: Session | None = None,
+) -> ChatGPTAuthState | None:
+    """Read the canonical state without creating a row."""
+    normalized_id = _normalize_account_id(account_id)
+    with _session_scope(session) as (active_session, _owns_session):
+        row = active_session.exec(
+            select(ChatGPTAuthStateModel).where(
+                ChatGPTAuthStateModel.account_id == normalized_id
+            )
+        ).first()
+        return _auth_snapshot(row) if row is not None else None
+
+
+def chatgpt_auth_retry_allowed(
+    account_id: int,
+    *,
+    now: datetime | None = None,
+    session: Session | None = None,
+) -> bool:
+    """Return whether an automatic maintenance attempt may start now."""
+    state = load_chatgpt_auth_state(account_id, session=session)
+    if state is None:
+        return True
+    if state.circuit_state in {"blocked", "open_permanent"}:
+        return False
+    current = now or _utcnow()
+    retry_at = state.next_retry_at
+    if retry_at is None:
+        return True
+    if retry_at.tzinfo is None:
+        retry_at = retry_at.replace(tzinfo=timezone.utc)
+    return retry_at <= current
+
+
+def record_chatgpt_auth_failure(
+    account_id: int,
+    *,
+    failure_domain: str = "unknown",
+    error_code: str = "auth_failed",
+    retryable: bool = True,
+    session: Session | None = None,
+) -> ChatGPTAuthState:
+    """Persist account-level failure state with bounded exponential backoff.
+
+    The record intentionally stores only a domain and code.  Credential and
+    mailbox secrets never enter the maintenance state or scheduler metadata.
+    """
+    normalized_id = _normalize_account_id(account_id)
+    with _session_scope(session) as (active_session, owns_session):
+        state = ensure_chatgpt_auth_state(normalized_id, session=active_session)
+        now = _utcnow()
+        count = max(int(state.failure_count), 0) + 1
+        if retryable:
+            # 2m, 4m, 8m ... capped at 6h.  A bad account therefore leaves
+            # the next scheduler cohort quickly instead of blocking it.
+            delay_seconds = min(6 * 60 * 60, 120 * (2 ** min(count - 1, 8)))
+            next_retry = now + timedelta(seconds=delay_seconds)
+            circuit = "open"
+        else:
+            # Permanent credential/state failures stay isolated until an
+            # explicit successful login clears them.
+            next_retry = None
+            circuit = "blocked"
+        result = active_session.exec(
+            update(ChatGPTAuthStateModel)
+            .where(ChatGPTAuthStateModel.account_id == normalized_id)
+            .where(ChatGPTAuthStateModel.auth_version == state.auth_version)
+            .values(
+                failure_count=count,
+                next_retry_at=next_retry,
+                circuit_state=circuit,
+                failure_domain=str(failure_domain or "unknown")[:80],
+                error_code=str(error_code or "auth_failed")[:120],
+                last_failure_at=now,
+                updated_at=now,
+            )
+        )
+        if int(getattr(result, "rowcount", 0) or 0) != 1:
+            raise ChatGPTAuthVersionConflict(
+                "ChatGPT authentication state changed while recording failure"
+            )
+        _finish_write(active_session, owns_session)
+        row = active_session.exec(
+            select(ChatGPTAuthStateModel).where(
+                ChatGPTAuthStateModel.account_id == normalized_id
+            )
+        ).one()
+        return _auth_snapshot(row)
+
+
+def clear_chatgpt_auth_failure(
+    account_id: int,
+    *,
+    session: Session | None = None,
+) -> ChatGPTAuthState:
+    """Close the account circuit after a verified login/refresh succeeds."""
+    normalized_id = _normalize_account_id(account_id)
+    with _session_scope(session) as (active_session, owns_session):
+        state = ensure_chatgpt_auth_state(normalized_id, session=active_session)
+        now = _utcnow()
+        result = active_session.exec(
+            update(ChatGPTAuthStateModel)
+            .where(ChatGPTAuthStateModel.account_id == normalized_id)
+            .where(ChatGPTAuthStateModel.auth_version == state.auth_version)
+            .values(
+                failure_count=0,
+                next_retry_at=None,
+                circuit_state="closed",
+                failure_domain="",
+                error_code="",
+                last_failure_at=None,
+                last_success_at=now,
+                updated_at=now,
+            )
+        )
+        if int(getattr(result, "rowcount", 0) or 0) != 1:
+            raise ChatGPTAuthVersionConflict(
+                "ChatGPT authentication state changed while clearing failure"
+            )
+        _finish_write(active_session, owns_session)
+        row = active_session.exec(
+            select(ChatGPTAuthStateModel).where(
+                ChatGPTAuthStateModel.account_id == normalized_id
+            )
+        ).one()
+        return _auth_snapshot(row)
+
+
+def promote_successful_chatgpt_account_auth(
+    account_id: int,
+    *,
+    session: Session | None = None,
+) -> ChatGPTAuthState:
+    """Promote credentials from a freshly successful login into canonical state.
+
+    This is the compatibility bridge for first-login flows that still build an
+    ``AccountModel`` projection before a local account id exists.  It runs only
+    after that authenticated result is saved, so imported/staged TOTP material
+    is never promoted merely because it is present in the mailbox pool.
+    """
+    normalized_id = _normalize_account_id(account_id)
+    with _session_scope(session) as (active_session, owns_session):
+        account = active_session.get(AccountModel, normalized_id)
+        if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+            raise ChatGPTAuthIdentityConflict("ChatGPT account identity is missing")
+        extra = dict(account.get_extra() or {})
+        mailbox_context = extra.get("mailbox_login_context")
+        context = dict(mailbox_context) if isinstance(mailbox_context, Mapping) else {}
+        context_extra = dict(context.get("extra") or {})
+        password = str(account.password or context_extra.get("password") or "")
+        totp_secret = str(
+            context_extra.get("totp_secret")
+            or context_extra.get("mfa_secret")
+            or context_extra.get("totp")
+            or ""
+        ).strip()
+        recovery_code = str(context_extra.get("mfa_recovery_code") or "").strip()
+
+        state = ensure_chatgpt_auth_state(
+            normalized_id,
+            primary_confirmed=bool(password),
+            session=active_session,
+        )
+        current_candidate = _candidate_in_session(normalized_id, active_session)
+        # Once a generation is canonical and committed, an older mailbox
+        # projection is only a compatibility view.  Never let that stale copy
+        # replace the active factor after a duplicate/imported login.
+        if not totp_secret or current_candidate is not None:
+            if owns_session:
+                active_session.commit()
+            return state
+
+        operation = stage_mfa_operation(
+            normalized_id,
+            str(account.email or ""),
+            totp_secret,
+            base_auth_version=state.auth_version,
+            session=active_session,
+        )
+        if not transition_mfa_operation(
+            operation.operation_id,
+            expected_state=ChatGPTMfaOperationStatus.STAGED,
+            new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
+            expected_generation=operation.generation,
+            recovery_code=recovery_code,
+            session=active_session,
+        ):
+            raise ChatGPTMfaOperationConflict(
+                "ChatGPT MFA proof changed before canonical promotion"
+            )
+        promoted = commit_auth_projection(
+            normalized_id,
+            expected_version=state.auth_version,
+            password=password,
+            mailbox_context=context or None,
+            active_operation_id=operation.operation_id,
+            session=active_session,
+        )
+        if owns_session:
+            active_session.commit()
+        return promoted

@@ -3905,12 +3905,14 @@ class _PersistedChatGPTRetryMailbox:
         return self._account
 
     def requeue_account(self, account) -> bool:
-        del account
-        return True
+        target = account if account is not None else self._account
+        delegate = getattr(self._delegate, "requeue_account", None)
+        return bool(delegate(target)) if callable(delegate) else False
 
     def mark_account_used(self, account) -> bool:
-        del account
-        return True
+        target = account if account is not None else self._account
+        delegate = getattr(self._delegate, "mark_account_used", None)
+        return bool(delegate(target)) if callable(delegate) else False
 
 
 def _bind_chatgpt_retry_mailbox(
@@ -3958,14 +3960,15 @@ def _requeue_chatgpt_login_mailbox(mailbox, account) -> bool:
     account_extra = context.get("extra")
     if not email or not isinstance(account_extra, dict):
         return False
-    requeue(
-        MailboxAccount(
-            email=email,
-            account_id=str(context.get("account_id") or ""),
-            extra=dict(account_extra),
-        )
+    mailbox_account = MailboxAccount(
+        email=email,
+        account_id=str(context.get("account_id") or ""),
+        extra=dict(account_extra),
     )
-    return True
+    try:
+        return bool(requeue(mailbox_account, uncertain=True))
+    except TypeError:
+        return bool(requeue(mailbox_account))
 
 
 def _run_register(task_id: str, req: RegisterTaskRequest):
@@ -4035,6 +4038,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     from core.base_mailbox import MailboxClaimScope, create_mailbox
     from core.proxy_utils import normalize_proxy_url
     from services.chatgpt_account_state import chatgpt_account_refresh_token
+    from services.chatgpt_auth_state import promote_successful_chatgpt_account_auth
 
     control = _task_store.control_for(task_id)
     with _sms_pool_quarantine_lock:
@@ -4545,6 +4549,62 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             saved_account_extra_snapshot = raw_saved_extra
                 else:
                     saved_account = save_account(account)
+                # The mailbox claim is intentionally bound only after the
+                # ChatGPT row has a stable local id.  This closes the window
+                # where a successful first login could leave the receiver
+                # leased forever, while keeping the credential+MFA promotion
+                # canonical for all import formats (including
+                # ``email----mailbox-url`` records).
+                try:
+                    saved_id = int(getattr(saved_account, "id", 0) or 0)
+                    if saved_id > 0:
+                        promote_successful_chatgpt_account_auth(saved_id)
+                    mark_claimed = getattr(_mailbox, "mark_account_used", None)
+                    if saved_id > 0 and callable(mark_claimed):
+                        marked = mark_claimed(saved_account)
+                        if marked is False:
+                            _log(
+                                task_id,
+                                "[WARN] 邮箱租约绑定未确认；保留当前租约，避免重复分配",
+                            )
+                        context = (
+                            (saved_account.get_extra() or {}).get(
+                                "mailbox_login_context"
+                            )
+                            if hasattr(saved_account, "get_extra")
+                            else None
+                        )
+                        context_extra = (
+                            context.get("extra")
+                            if isinstance(context, dict)
+                            else None
+                        )
+                        if isinstance(context_extra, dict):
+                            from core.db import sync_bound_outlook_credentials
+
+                            sync_bound_outlook_credentials(
+                                saved_id,
+                                str(getattr(saved_account, "email", "") or ""),
+                                password=str(
+                                    context_extra.get("password")
+                                    or getattr(saved_account, "password", "")
+                                    or ""
+                                ),
+                                mailapi_url=str(
+                                    context_extra.get("mailapi_url")
+                                    or context_extra.get("mail_api_url")
+                                    or ""
+                                ),
+                                mailapi_token=str(
+                                    context_extra.get("mailapi_token") or ""
+                                ),
+                            )
+                except Exception as exc:
+                    _log(
+                        task_id,
+                        "[WARN] 登录凭据已保存，但 MFA/邮箱租约绑定待后续恢复"
+                        f"（{type(exc).__name__}）",
+                    )
                 try:
                     from core.db import finalize_chatgpt_mfa_rotation
 
