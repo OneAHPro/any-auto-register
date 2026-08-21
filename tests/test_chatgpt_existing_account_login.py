@@ -847,6 +847,21 @@ class ExistingAccountLoginTests(unittest.TestCase):
         login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
         self.assertTrue(login_kwargs["allow_phone_verification"])
 
+    def test_sms_pool_request_enables_existing_phone_verification(self):
+        engine = self._make_engine()
+        engine.extra_config["chatgpt_existing_account_sms_mode"] = "pool"
+        oauth_client = self._successful_oauth_client()
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "existing@example.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        login_kwargs = oauth_client.login_and_get_tokens.call_args.kwargs
+        self.assertTrue(login_kwargs["allow_phone_verification"])
+
     def test_access_token_stage_uses_web_login_and_succeeds_without_refresh_token(self):
         engine = self._make_engine(login_stage="access_token")
         chatgpt_client = mock.Mock()

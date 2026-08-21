@@ -1570,13 +1570,31 @@ def _login_with_saved_credentials(
         force_password_reset=bootstrap_password,
     )
     extra_config = dict(config)
+    allow_phone_from_config = str(
+        config.get("chatgpt_existing_account_allow_phone_verification", "")
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    sms_pool_requested = (
+        str(config.get("chatgpt_existing_account_sms_mode", "") or "")
+        .strip()
+        .lower()
+        == "pool"
+        or str(
+            config.get("chatgpt_existing_account_use_sms_pool", "")
+        ).strip().lower()
+        in {"1", "true", "yes", "on"}
+    )
     extra_config.update(
         {
             "chatgpt_registration_mode": "refresh_token",
             "chatgpt_has_refresh_token_solution": True,
             "chatgpt_existing_account_login_only": True,
             "chatgpt_existing_account_login_stage": "refresh_token",
-            "chatgpt_existing_account_allow_phone_verification": False,
+            # Existing-account relogin stays phone-free by default, but an
+            # explicit phone/SMS-pool request must reach the OAuth engine so
+            # accounts that require add_phone can finish the login flow.
+            "chatgpt_existing_account_allow_phone_verification": (
+                allow_phone_from_config or sms_pool_requested
+            ),
             "chatgpt_existing_account_rotate_mfa": bool(rotate_mfa),
             "chatgpt_existing_account_skip_managed_mfa_rotation": False,
         }
