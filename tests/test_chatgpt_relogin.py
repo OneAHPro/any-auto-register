@@ -747,6 +747,7 @@ class ChatGPTReloginTests(unittest.TestCase):
                     "mailapi_url": "https://mail.example.test/reset",
                     "totp_secret": "JBSWY3DPEHPK3PXP",
                     "mfa_recovery_code": "RECOVERY-CODE",
+                    "chatgpt_mfa_managed": True,
                 },
             },
         }
@@ -780,6 +781,16 @@ class ChatGPTReloginTests(unittest.TestCase):
             email_info["totp_secret"],
             "JBSWY3DPEHPK3PXP",
         )
+        self.assertEqual(
+            email_info["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
+        metadata_extra = service.get_mailbox_metadata()["extra"]
+        self.assertEqual(
+            metadata_extra["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
+        self.assertTrue(metadata_extra["chatgpt_mfa_managed"])
 
     def test_persisted_reset_url_service_prefers_email_mfa_without_totp_url(self):
         from services.chatgpt_relogin import _PersistedEmailService

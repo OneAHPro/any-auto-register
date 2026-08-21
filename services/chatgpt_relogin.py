@@ -1309,7 +1309,8 @@ def _build_email_service(
                 account_id=credentials["email"],
                 extra={},
             )
-        account_extra = dict(mailbox_account.extra or {})
+        account_extra = dict(context_extra)
+        account_extra.update(dict(mailbox_account.extra or {}))
         account_extra.update(
             {
                 "provider": "chatgpt_credentials",
