@@ -2,11 +2,18 @@ import types
 import unittest
 from unittest import mock
 
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine
 
 from core.db import (
+    AccountModel,
     stage_chatgpt_mfa_rotation,
     update_chatgpt_mfa_rotation_recovery_code,
+)
+from services.chatgpt_auth_state import (
+    commit_auth_projection,
+    ensure_chatgpt_auth_state,
+    stage_mfa_operation,
+    transition_mfa_operation,
 )
 from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
@@ -1929,6 +1936,51 @@ class ExistingAccountLoginTests(unittest.TestCase):
         emitted = "\n".join(engine.logs)
         self.assertNotIn("LEGACY-STAGED-TOTP", emitted)
         self.assertNotIn("LEGACY-STAGED-RECOVERY", emitted)
+
+    def test_explicit_local_account_id_must_match_login_email(self):
+        database_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(database_engine)
+        with Session(database_engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="other@example.com",
+                password="other-password",
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            state = ensure_chatgpt_auth_state(account.id, session=session)
+            operation = stage_mfa_operation(
+                account.id,
+                account.email,
+                "OTHER-ACCOUNT-TOTP",
+                base_auth_version=state.auth_version,
+                session=session,
+            )
+            self.assertTrue(transition_mfa_operation(
+                operation.operation_id,
+                expected_state="staged",
+                new_state="activated_remote",
+                expected_generation=operation.generation,
+                session=session,
+            ))
+            commit_auth_projection(
+                account.id,
+                expected_version=state.auth_version,
+                active_operation_id=operation.operation_id,
+                session=session,
+            )
+            session.commit()
+            local_account_id = account.id
+
+        engine = self._make_engine(email_service=PasswordTotpEmailService())
+        engine.extra_config["chatgpt_local_account_id"] = local_account_id
+
+        with mock.patch("core.db.engine", database_engine):
+            created = engine._create_email(existing_account_login_only=True)
+
+        self.assertFalse(created)
+        self.assertNotIn("OTHER-ACCOUNT-TOTP", "\n".join(engine.logs))
 
 
 if __name__ == "__main__":

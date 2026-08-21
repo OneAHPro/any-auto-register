@@ -9,7 +9,7 @@ from enum import StrEnum
 from typing import Any, Iterator, Mapping
 from uuid import uuid4
 
-from sqlalchemy import func, inspect, update
+from sqlalchemy import func, insert, inspect, update
 from sqlmodel import Session, select
 
 from core import db
@@ -252,7 +252,7 @@ def ensure_chatgpt_auth_state(
             )
         ).first()
         if row is None:
-            row = ChatGPTAuthStateModel(
+            initial = ChatGPTAuthStateModel(
                 account_id=normalized_id,
                 primary_state=(
                     ChatGPTPrimaryState.CONFIRMED.value
@@ -260,15 +260,49 @@ def ensure_chatgpt_auth_state(
                     else ChatGPTPrimaryState.ABSENT.value
                 ),
             )
-            active_session.add(row)
+            active_session.exec(
+                insert(ChatGPTAuthStateModel)
+                .values(**initial.model_dump(exclude={"id"}))
+                .prefix_with("OR IGNORE")
+            )
             _finish_write(active_session, owns_session)
-            if owns_session:
-                active_session.refresh(row)
-        elif primary_confirmed and row.primary_state != ChatGPTPrimaryState.CONFIRMED:
-            row.primary_state = ChatGPTPrimaryState.CONFIRMED.value
-            row.updated_at = _utcnow()
-            active_session.add(row)
-            _finish_write(active_session, owns_session)
+            row = active_session.exec(
+                select(ChatGPTAuthStateModel).where(
+                    ChatGPTAuthStateModel.account_id == normalized_id
+                )
+            ).one()
+        if primary_confirmed and row.primary_state != ChatGPTPrimaryState.CONFIRMED:
+            expected_version = int(row.auth_version)
+            next_version = expected_version + 1
+            result = active_session.exec(
+                update(ChatGPTAuthStateModel)
+                .where(ChatGPTAuthStateModel.account_id == normalized_id)
+                .where(ChatGPTAuthStateModel.auth_version == expected_version)
+                .where(
+                    ChatGPTAuthStateModel.primary_state
+                    != ChatGPTPrimaryState.CONFIRMED.value
+                )
+                .values(
+                    auth_version=next_version,
+                    primary_state=ChatGPTPrimaryState.CONFIRMED.value,
+                    credential_revision=_credential_revision(
+                        account_id=normalized_id,
+                        auth_version=next_version,
+                        has_password=True,
+                        has_mfa=bool(row.active_mfa_generation),
+                        has_mailbox=False,
+                        has_tokens=False,
+                    ),
+                    updated_at=_utcnow(),
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) == 1:
+                _finish_write(active_session, owns_session)
+            row = active_session.exec(
+                select(ChatGPTAuthStateModel).where(
+                    ChatGPTAuthStateModel.account_id == normalized_id
+                )
+            ).one()
         return _auth_snapshot(row)
 
 
@@ -287,17 +321,21 @@ def stage_mfa_operation(
         raise ValueError("MFA operation requires email and TOTP credentials")
 
     with _session_scope(session) as (active_session, owns_session):
+        state = ensure_chatgpt_auth_state(
+            normalized_id,
+            session=active_session,
+        )
         if base_auth_version is None:
-            state = ensure_chatgpt_auth_state(
-                normalized_id,
-                session=active_session,
-            )
             resolved_version = state.auth_version
         else:
             try:
                 resolved_version = int(base_auth_version)
             except (TypeError, ValueError) as exc:
                 raise ValueError("base_auth_version must be an integer") from exc
+            if resolved_version <= 0 or resolved_version != state.auth_version:
+                raise ChatGPTAuthVersionConflict(
+                    "ChatGPT authentication state changed before MFA staging"
+                )
         now = _utcnow()
         row = ChatGPTMfaOperationModel(
             operation_id=uuid4().hex,
@@ -439,18 +477,14 @@ def load_login_mfa_candidate_by_email(
             .where(func.lower(AccountModel.email) == normalized_email)
             .order_by(AccountModel.id)
         ).all()
-        candidates = [
-            candidate
-            for account_id in account_ids
-            if account_id is not None
-            for candidate in [_candidate_in_session(int(account_id), active_session)]
-            if candidate is not None
-        ]
-        return candidates[0] if len(candidates) == 1 else None
+        if len(account_ids) != 1 or account_ids[0] is None:
+            return None
+        return _candidate_in_session(int(account_ids[0]), active_session)
 
 
 def _credential_revision(
     *,
+    account_id: int,
     auth_version: int,
     has_password: bool,
     has_mfa: bool,
@@ -460,7 +494,7 @@ def _credential_revision(
     """Return a non-secret canonical change token based on field presence."""
 
     return (
-        f"chatgpt-auth-v{auth_version}"
+        f"chatgpt-auth:a{account_id}:v{auth_version}"
         f":p{int(has_password)}"
         f":m{int(has_mfa)}"
         f":b{int(has_mailbox)}"
@@ -653,6 +687,7 @@ def commit_auth_projection(
                     )
                 next_version = normalized_version + 1
                 revision = _credential_revision(
+                    account_id=normalized_id,
                     auth_version=next_version,
                     has_password=has_password,
                     has_mfa=bool(next_generation),

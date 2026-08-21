@@ -423,6 +423,13 @@ class RefreshTokenRegistrationEngine:
                         candidate = load_login_mfa_candidate(
                             normalized_account_id
                         )
+                if candidate is not None and (
+                    str(candidate.email or "").strip().lower()
+                    != email_value.lower()
+                ):
+                    raise ValueError(
+                        "账号确认 MFA 凭据与当前登录邮箱不匹配"
+                    )
                 if candidate is not None:
                     self.email_info["totp_secret"] = candidate.totp_secret
                     self.email_info["mfa_recovery_code"] = (
