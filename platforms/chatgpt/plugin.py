@@ -228,6 +228,14 @@ class ChatGPTPlatform(BasePlatform):
                     ).strip()
                     if managed_totp:
                         result["totp_secret"] = managed_totp
+                    mailapi_token = str(
+                        account_extra.get("mailapi_token") or ""
+                    ).strip()
+                    if mailapi_token:
+                        # Keep the bearer credential attached to the internal
+                        # mailbox context.  It is only used if the provider
+                        # explicitly requests an email factor.
+                        result["mailapi_token"] = mailapi_token
                     return result
 
                 def _load_baseline(self, get_current_ids):

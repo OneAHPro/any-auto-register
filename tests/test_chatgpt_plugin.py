@@ -714,6 +714,49 @@ class ChatGPTPluginTests(unittest.TestCase):
         )
         self.assertEqual(adapter.build_account.call_args.args[1], "")
 
+    def test_existing_mailapi_login_preserves_mailapi_token_for_explicit_email_factor(self):
+        mailbox = _TrackingMailbox()
+        mailbox.account.extra = {
+            "provider": "microsoft",
+            "account_type": "mailapi_url",
+            "password": "chatgpt-password",
+            "mailapi_url": "https://mail.yisen.uk/api/mails?login=worker%40custom.test",
+            "mailapi_token": "fixture.yisen.jwt",
+        }
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "chatgpt_existing_account_login_only": True,
+                }
+            ),
+            mailbox=mailbox,
+        )
+        adapter = mock.Mock()
+        captured = {}
+
+        def run(context):
+            adapter.context = context
+            captured["email_info"] = context.email_service.create_email()
+            return mock.Mock(success=True)
+
+        adapter.run.side_effect = run
+        adapter.build_account.return_value = Account(
+            platform="chatgpt",
+            email="worker@custom.test",
+            password="chatgpt-password",
+            token="access-token",
+            extra={"access_token": "access-token", "refresh_token": ""},
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            platform.register()
+
+        self.assertEqual(captured["email_info"]["mailapi_token"], "fixture.yisen.jwt")
+
     def test_existing_google_federated_account_uses_password_without_mailbox_otp(self):
         mailbox = _TrackingMailbox()
         mailbox.account.extra = {

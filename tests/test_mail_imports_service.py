@@ -368,6 +368,27 @@ class MailImportServiceTests(unittest.TestCase):
             "https://mail.example.test/messages",
         )
 
+    def test_parse_custom_email_with_yisen_link_extracts_jwt_and_uses_api_endpoint(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        email = "worker@custom-mail.test"
+        token = fixture_yisen_jwt(email)
+        link = f"https://mail.yisen.uk/?jwt={token}"
+
+        record = parse_microsoft_import_line(
+            1,
+            f"{email}----chatgpt-password----[{link}]({link})",
+        )
+
+        self.assertEqual(record.account_type, "mailapi_url")
+        self.assertEqual(record.password, "chatgpt-password")
+        self.assertEqual(record.mailapi_token, token)
+        self.assertEqual(
+            record.mailapi_url,
+            "https://mail.yisen.uk/api/mails"
+            "?login=worker%40custom-mail.test&limit=20&offset=0",
+        )
+
     def test_three_dash_delimiter_preserves_single_and_double_hyphens(self):
         rules_module = load_microsoft_import_rules_module()
         parse_microsoft_import_line = rules_module.parse_microsoft_import_line

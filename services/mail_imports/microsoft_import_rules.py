@@ -3,7 +3,7 @@ import json
 import re
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
-from urllib.parse import urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from core.mail_import_delimiters import (
     MAIL_IMPORT_DASH_DELIMITER_RE,
@@ -101,6 +101,35 @@ def _build_yisen_mailapi_url(email: str) -> str:
     return f"https://mail.yisen.uk/api/mails?{query}"
 
 
+def _extract_yisen_url_credentials(
+    *,
+    line_number: int,
+    email: str,
+    url: str,
+) -> tuple[str, str]:
+    """Extract a Yisen JWT from a copied mailbox link.
+
+    Suppliers commonly provide the frontend link (``/?jwt=...``), while the
+    polling backend uses the authenticated ``/api/mails`` endpoint.  Keep the
+    bearer token separate from the URL so it is not duplicated in projections
+    or logs.
+    """
+    normalized_url = str(url or "").strip()
+    parsed = urlparse(normalized_url)
+    if str(parsed.hostname or "").lower() != "mail.yisen.uk":
+        return normalized_url, ""
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    raw_token = str((query.get("jwt") or [""])[0] or "").strip()
+    if not raw_token:
+        return normalized_url, ""
+    token = _parse_yisen_mailapi_token(
+        line_number=line_number,
+        email=email,
+        token=raw_token,
+    )
+    return _build_yisen_mailapi_url(email), token
+
+
 class MicrosoftOAuthRowParser:
     def parse(self, line_number: int, line: str) -> MicrosoftMailImportRecord:
         parts = split_mail_import_dash_fields(line)
@@ -152,6 +181,12 @@ class MailApiUrlRowParser:
                 f"行 {line_number}: 无效的 mailapi_url（需为 http/https）：{mailapi_url}"
             )
 
+        mailapi_url, mailapi_token = _extract_yisen_url_credentials(
+            line_number=line_number,
+            email=email,
+            url=mailapi_url,
+        )
+
         return MicrosoftMailImportRecord(
             line_number=line_number,
             email=email,
@@ -160,6 +195,7 @@ class MailApiUrlRowParser:
             refresh_token="",
             account_type=ACCOUNT_TYPE_MAILAPI_URL,
             mailapi_url=mailapi_url,
+            mailapi_token=mailapi_token,
         )
 
 
@@ -216,12 +252,18 @@ class AutoDetectRowParser:
                     "行 "
                     f"{line_number}: 无效的 mailapi_url（需为 http/https）"
                 )
+            mailapi_url, mailapi_token = _extract_yisen_url_credentials(
+                line_number=line_number,
+                email=email,
+                url=mailapi_credential,
+            )
             return MicrosoftMailImportRecord(
                 line_number=line_number,
                 email=email,
                 password=password,
                 account_type=ACCOUNT_TYPE_MAILAPI_URL,
-                mailapi_url=mailapi_credential,
+                mailapi_url=mailapi_url,
+                mailapi_token=mailapi_token,
             )
         if len(parts) >= 4:
             return self._oauth_parser.parse(line_number, line)

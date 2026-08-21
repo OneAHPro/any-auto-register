@@ -792,6 +792,10 @@ def _recover_url_login_credentials(
         or record.get("mail_api_url")
         or record.get("mailapi_url")
     )
+    mailapi_token = _text(
+        context_extra.get("mailapi_token")
+        or record.get("mailapi_token")
+    )
     totp_url = _text(
         context_extra.get("totp_url") or record.get("totp_url")
     )
@@ -828,6 +832,7 @@ def _recover_url_login_credentials(
         "email": email,
         "password": password,
         "mail_api_url": mail_api_url,
+        "mailapi_token": mailapi_token,
         "totp_url": totp_url,
         "totp_secret": totp_secret,
         "account_type": account_type,
@@ -1154,6 +1159,9 @@ class _PersistedEmailService:
                     "mailapi_url": mail_api_url,
                     "totp_secret": _text(account_extra.get("totp_secret")),
                 })
+        mailapi_token = _text(account_extra.get("mailapi_token"))
+        if mailapi_token:
+            result["mailapi_token"] = mailapi_token
         managed_totp = _text(account_extra.get("totp_secret"))
         if managed_totp:
             result["totp_secret"] = managed_totp
@@ -1657,6 +1665,8 @@ def _build_email_service(
                 "totp_secret": credentials["totp_secret"],
             }
         )
+        if credentials.get("mailapi_token"):
+            account_extra["mailapi_token"] = credentials["mailapi_token"]
         if credentials["pool_file"]:
             account_extra["pool_file"] = credentials["pool_file"]
         if credentials["totp_url"]:
