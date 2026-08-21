@@ -78,6 +78,78 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(request_kwargs["headers"]["x-lang"], "zh-CN")
         self.assertIn("Mozilla/5.0", request_kwargs["headers"]["User-Agent"])
 
+    @mock.patch("requests.get")
+    @mock.patch("requests.Session")
+    def test_quickmail_private_link_authenticates_and_reads_latest_mail(
+        self,
+        mock_session_factory,
+        mock_get,
+    ):
+        source_url = (
+            "https://mail.aa8.pl/quick/#/open/"
+            "qm_c62905d50476162a11c248a563219a77ed374272df4198994ac1c995ea648187/"
+            "7vi1ow2qzl@77885.asia"
+        )
+        mailbox_id = "a98cc092-a85d-494a-afc4-2cfaf485451a"
+        session = mock.Mock()
+        session.proxies = {}
+        session.post.return_value = _FakeResponse(
+            200,
+            payload={
+                "mailbox": {
+                    "mailbox_id": mailbox_id,
+                    "full_address": "7vi1ow2qzl@77885.asia",
+                }
+            },
+        )
+        session.get.return_value = _FakeResponse(
+            200,
+            payload={
+                "data": [
+                    {
+                        "subject": "Your temporary ChatGPT login code",
+                        "body_text": (
+                            "Enter this temporary verification code to continue: 204019"
+                        ),
+                        "received_at": "2026-08-20T09:56:15.181071Z",
+                    }
+                ]
+            },
+        )
+        mock_session_factory.return_value = session
+        mock_get.return_value = _FakeResponse(
+            200,
+            text="<html><main id='app'></main></html>",
+        )
+
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        account = MailboxAccount(
+            email="7vi1ow2qzl@77885.asia",
+            extra={"account_type": "mailapi_url", "mailapi_url": source_url},
+        )
+
+        text = backend._fetch_mailapi_text(account)
+        message = backend._parse_mailapi_message(text)
+        code = backend._extract_message_code(message, text, None)
+
+        self.assertEqual(code, "204019")
+        self.assertEqual(message["response_email"], "7vi1ow2qzl@77885.asia")
+        session.post.assert_called_once_with(
+            "https://mail.aa8.pl/quick/api/token-auth",
+            json={
+                "token": (
+                    "qm_c62905d50476162a11c248a563219a77ed374272df4198994ac1c995ea648187"
+                )
+            },
+            timeout=15,
+        )
+        session.get.assert_called_once_with(
+            f"https://mail.aa8.pl/quick/api/mailboxes/{mailbox_id}/emails",
+            params={"address": "7vi1ow2qzl@77885.asia"},
+            timeout=15,
+        )
+
     def test_yisen_mailapi_results_parse_newest_openai_code(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]

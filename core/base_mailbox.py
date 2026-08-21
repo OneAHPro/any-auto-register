@@ -5161,6 +5161,157 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         return response
 
     @staticmethod
+    def _parse_quickmail_private_url(
+        value: Any,
+    ) -> Optional[tuple[str, str, str]]:
+        """Parse QuickMail's fragment-only private inbox link."""
+        import re
+        from urllib.parse import unquote, urlsplit
+
+        raw = str(value or "").strip()
+        try:
+            parsed = urlsplit(raw)
+        except ValueError:
+            return None
+        route = str(parsed.fragment or "").lstrip("/")
+        if not route.startswith("open/"):
+            return None
+        parts = route.split("/", 2)
+        if len(parts) < 2:
+            return None
+        token = unquote(parts[1]).strip()
+        if not re.fullmatch(r"qm_[A-Za-z0-9_-]{32,128}", token):
+            return None
+        hinted_email = unquote(parts[2]).strip() if len(parts) > 2 else ""
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            return None
+        api_root = (
+            f"{parsed.scheme}://{parsed.netloc}"
+            f"{(parsed.path or '/quick/').rstrip('/')}/api"
+        )
+        return api_root, token, hinted_email
+
+    def _fetch_quickmail_private_text(
+        self,
+        account: MailboxAccount,
+        *,
+        api_root: str,
+        token: str,
+        hinted_email: str,
+    ) -> str:
+        import json
+        from urllib.parse import quote
+
+        import requests
+
+        session = requests.Session()
+        proxy_config = getattr(self.mailbox, "_proxy", None)
+        if proxy_config:
+            session.proxies.update(proxy_config)
+
+        auth_response = session.post(
+            f"{api_root}/token-auth",
+            json={"token": token},
+            timeout=15,
+        )
+        if auth_response.status_code >= 400:
+            raise RuntimeError(
+                f"QuickMail 私密链接认证失败: HTTP {auth_response.status_code}"
+            )
+        try:
+            auth_payload = auth_response.json()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("QuickMail 私密链接认证返回非 JSON") from exc
+
+        mailbox = (
+            auth_payload.get("mailbox")
+            if isinstance(auth_payload, dict)
+            else None
+        )
+        if not isinstance(mailbox, dict):
+            config_response = session.get(f"{api_root}/config", timeout=15)
+            if config_response.status_code >= 400:
+                raise RuntimeError(
+                    f"QuickMail 收件箱配置读取失败: HTTP {config_response.status_code}"
+                )
+            try:
+                config_payload = config_response.json()
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError("QuickMail 收件箱配置返回非 JSON") from exc
+            mailbox = (
+                config_payload.get("mailbox")
+                if isinstance(config_payload, dict)
+                else None
+            )
+        if not isinstance(mailbox, dict):
+            raise RuntimeError("QuickMail 私密链接未返回收件箱")
+
+        mailbox_id = str(
+            mailbox.get("mailbox_id") or mailbox.get("id") or ""
+        ).strip()
+        response_email = str(
+            mailbox.get("full_address")
+            or hinted_email
+            or account.email
+            or ""
+        ).strip()
+        account_email = str(account.email or "").strip()
+        if account_email and response_email.lower() != account_email.lower():
+            raise RuntimeError("QuickMail 私密链接邮箱与当前账号不一致")
+        if not mailbox_id or not response_email:
+            raise RuntimeError("QuickMail 收件箱标识不完整")
+
+        emails_response = session.get(
+            f"{api_root}/mailboxes/{quote(mailbox_id, safe='')}/emails",
+            params={"address": response_email},
+            timeout=15,
+        )
+        if emails_response.status_code >= 400:
+            raise RuntimeError(
+                f"QuickMail 邮件列表读取失败: HTTP {emails_response.status_code}"
+            )
+        try:
+            emails_payload = emails_response.json()
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("QuickMail 邮件列表返回非 JSON") from exc
+
+        rows = (
+            emails_payload.get("data")
+            if isinstance(emails_payload, dict)
+            else None
+        )
+        normalized_messages = []
+        for item in rows if isinstance(rows, list) else []:
+            if not isinstance(item, dict):
+                continue
+            subject = str(item.get("subject") or "").strip()
+            body = " ".join(
+                str(item.get(key) or "")
+                for key in ("body_text", "body_html", "text", "content")
+            )
+            code = self._extract_code(f"{subject} {body}", None)
+            if not code:
+                continue
+            normalized_messages.append(
+                {
+                    "verificationCode": code,
+                    "subject": subject,
+                    "receivedAt": item.get("received_at")
+                    or item.get("receivedAt")
+                    or item.get("created_at")
+                    or item.get("createdAt"),
+                }
+            )
+        return json.dumps(
+            {
+                "ok": True,
+                "email": response_email,
+                "messages": normalized_messages,
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
     def _collect_mailapi_cookies(response: Any):
         import requests
 
@@ -5201,6 +5352,15 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         url = str(extra.get("mailapi_url") or "").strip()
         if not url:
             raise RuntimeError("mailapi_url 为空，无法轮询取码")
+        quickmail_private = self._parse_quickmail_private_url(url)
+        if quickmail_private is not None:
+            api_root, token, hinted_email = quickmail_private
+            return self._fetch_quickmail_private_text(
+                account,
+                api_root=api_root,
+                token=token,
+                hinted_email=hinted_email,
+            )
         headers = None
         is_yisen = str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk"
         if is_yisen:
