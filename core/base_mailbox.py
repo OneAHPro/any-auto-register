@@ -5911,7 +5911,7 @@ class OutlookMailbox(BaseMailbox):
         credentials remain in ``outlook_accounts`` for restart recovery; only
         the allocation state changes.
         """
-        from sqlalchemy import func, update
+        from sqlalchemy import func, or_, update
         from sqlmodel import Session, select
         from core.db import OutlookAccountModel, engine
 
@@ -5933,6 +5933,15 @@ class OutlookMailbox(BaseMailbox):
                 # by older/import paths that set enabled=False without
                 # explicitly setting the new state column.
                 query = query.where(OutlookAccountModel.enabled == True)
+                # Never hand out a row that already carries a local-account
+                # binding, even if an older writer left its state projection
+                # inconsistent.
+                query = query.where(
+                    or_(
+                        OutlookAccountModel.bound_account_id == 0,
+                        OutlookAccountModel.bound_account_id.is_(None),
+                    )
+                )
                 if normalized_email:
                     query = query.where(
                         func.lower(OutlookAccountModel.email) == normalized_email

@@ -108,6 +108,24 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             self.assertEqual(row.state, "available")
             self.assertFalse(row.enabled)
 
+    def test_claim_skips_row_with_existing_local_binding_even_if_state_is_stale(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="stale-state@example.com",
+                    password="mail-password",
+                    state="available",
+                    enabled=True,
+                    bound_account_id=99,
+                )
+            )
+            session.commit()
+
+        with mock.patch("core.db.engine", test_engine):
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+
     def test_bound_mailbox_is_not_reallocated_and_stale_release_is_rejected(self):
         test_engine = self._lease_engine()
         with Session(test_engine) as session:
