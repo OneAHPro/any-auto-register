@@ -5548,14 +5548,18 @@ class OutlookMailbox(BaseMailbox):
         account_extra = dict(getattr(account, "extra", None) or {})
         client_id = str(account_extra.get("client_id") or "")
         refresh_token = str(account_extra.get("refresh_token") or "")
-        account_type = self._normalize_account_type(
-            account_extra.get("account_type")
-        )
         mailapi_url = str(
             account_extra.get("mailapi_url")
             or account_extra.get("mail_api_url")
             or ""
         ).strip()
+        account_type = (
+            "mailapi_url"
+            if mailapi_url
+            else self._normalize_account_type(
+                account_extra.get("account_type")
+            )
+        )
         with self._lock:
             with Session(engine) as session:
                 existing = session.exec(

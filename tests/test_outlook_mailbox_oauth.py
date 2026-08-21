@@ -132,6 +132,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                 "claimed-reset@example.com"
             )
             claimed.extra.update({
+                "account_type": "chatgpt_password_reset_url_mail",
                 "password_reset_required": True,
                 "new_password": "Replacement-Password-2026!",
             })
