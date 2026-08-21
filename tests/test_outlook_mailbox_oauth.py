@@ -111,6 +111,32 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(parsed["message_id"], "mailapi_message:mail-8")
         self.assertTrue(parsed["mailapi_history"])
 
+    def test_yisen_naive_created_at_is_interpreted_as_utc(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        payload = {
+            "count": 1,
+            "results": [
+                {
+                    "id": 7,
+                    "message_id": "mail-7",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your temporary ChatGPT login code"}
+                    ),
+                    "source": "Your login code is 246810",
+                    "created_at": "2026-08-21 08:00:13",
+                }
+            ],
+        }
+
+        parsed = backend._parse_mailapi_message(json.dumps(payload), yisen=True)
+
+        self.assertEqual(
+            parsed["received_at"],
+            datetime.fromisoformat("2026-08-21T08:00:13+00:00").timestamp(),
+        )
+
     def test_yisen_mailapi_results_decode_base64_raw_mime(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]

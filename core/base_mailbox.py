@@ -4555,7 +4555,22 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 if not code:
                     continue
                 received_value = item.get("created_at")
-                received_at = cls._parse_timestamp(received_value)
+                received_at = None
+                if isinstance(received_value, str):
+                    import re
+
+                    timestamp_text = received_value.strip()
+                    if timestamp_text and not re.search(
+                        r"(?:Z|[+-]\d{2}:?\d{2})$",
+                        timestamp_text,
+                        re.IGNORECASE,
+                    ):
+                        # Yisen returns naive `created_at` values in UTC.
+                        received_at = cls._parse_timestamp(
+                            f"{timestamp_text}Z"
+                        )
+                if received_at is None:
+                    received_at = cls._parse_timestamp(received_value)
                 if received_at is None:
                     continue
                 raw_id = str(
