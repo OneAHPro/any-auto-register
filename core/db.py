@@ -594,7 +594,7 @@ def recover_expired_outlook_leases(
     cutoff = now or _utcnow()
     if cutoff.tzinfo is None:
         cutoff = cutoff.replace(tzinfo=timezone.utc)
-    from sqlalchemy import update
+    from sqlalchemy import or_, update
 
     try:
         session_context = Session(target_engine)
@@ -608,7 +608,12 @@ def recover_expired_outlook_leases(
                 # A row that is already associated with a local ChatGPT
                 # account is fenced permanently.  Only leases with no
                 # binding may be reclaimed after a worker crash.
-                .where(OutlookAccountModel.bound_account_id == 0)
+                .where(
+                    or_(
+                        OutlookAccountModel.bound_account_id == 0,
+                        OutlookAccountModel.bound_account_id.is_(None),
+                    )
+                )
                 .where(OutlookAccountModel.lease_expires_at.is_not(None))
             ).all()
         except Exception as exc:
