@@ -141,6 +141,9 @@ def _mailbox_context_from_outlook(
             "refresh_token": _text(imported.refresh_token),
             "account_type": _text(imported.account_type) or "microsoft_oauth",
             "mailapi_url": _text(imported.mailapi_url),
+            "mailapi_token": _text(
+                getattr(imported, "mailapi_token", "")
+            ),
         },
     }
 

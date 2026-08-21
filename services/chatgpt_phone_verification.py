@@ -1614,6 +1614,9 @@ def _load_account_and_email_service(account_id: int):
                     "mailapi_url": str(
                         getattr(imported_mailbox, "mailapi_url", "") or ""
                     ),
+                    "mailapi_token": str(
+                        getattr(imported_mailbox, "mailapi_token", "") or ""
+                    ),
                 }
                 mailbox_context = {
                     "provider": "microsoft",

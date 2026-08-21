@@ -428,6 +428,9 @@ class MailboxContextRecoveryTests(unittest.TestCase):
                     password="mail-password",
                     client_id="mail-client",
                     refresh_token="mail-refresh",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.yisen.uk/api/mails?login=legacy",
+                    mailapi_token="header.payload.phone-signature",
                 )
             )
             session.commit()
@@ -450,6 +453,10 @@ class MailboxContextRecoveryTests(unittest.TestCase):
         self.assertEqual(context["provider"], "microsoft")
         self.assertEqual(context["extra"]["client_id"], "mail-client")
         self.assertEqual(context["extra"]["refresh_token"], "mail-refresh")
+        self.assertEqual(
+            context["extra"]["mailapi_token"],
+            "header.payload.phone-signature",
+        )
         self.assertEqual(email_service.create_email()["email"], "legacy@example.com")
         with Session(test_engine) as session:
             saved = session.get(AccountModel, account_id)

@@ -19,6 +19,7 @@ from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
 from services.chatgpt_relogin import (
     ChatGPTMailboxOTPTimeoutError,
     _build_email_service,
+    _load_saved_account,
     _login_with_saved_credentials,
     _recover_url_login_credentials,
     is_saved_chatgpt_account_relogin_eligible,
@@ -111,6 +112,36 @@ class ChatGPTReloginTests(unittest.TestCase):
                 account_id,
                 database_engine=self.engine,
             )
+        )
+
+    def test_load_saved_account_recovers_yisen_mailapi_token(self):
+        email = "relogin@yisen.uk"
+        account_id = self._add_eligibility_account(
+            email,
+            password="chatgpt-password",
+            extra={"refresh_token": "saved-chatgpt-rt"},
+        )
+        with Session(self.engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url=(
+                        "https://mail.yisen.uk/api/mails"
+                        "?login=relogin%40yisen.uk&limit=20&offset=0"
+                    ),
+                    mailapi_token="header.payload.relogin-signature",
+                )
+            )
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+
+        self.assertEqual(
+            saved["mailbox_context"]["extra"]["mailapi_token"],
+            "header.payload.relogin-signature",
         )
 
     def test_password_totp_context_is_eligible(self):
