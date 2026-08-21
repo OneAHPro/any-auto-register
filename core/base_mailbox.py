@@ -6,6 +6,8 @@ import json
 import random
 import threading
 import time
+import uuid
+from datetime import datetime, timedelta, timezone
 
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
@@ -419,6 +421,8 @@ def create_mailbox(
             backend=extra.get("outlook_backend", ""),
             graph_api_base=extra.get("outlook_graph_api_base", ""),
             proxy=proxy,
+            lease_owner=extra.get("mailbox_lease_owner", ""),
+            lease_seconds=extra.get("mailbox_lease_seconds", 900),
         )
     else:  # laoudo
         return LaoudoMailbox(
@@ -5766,8 +5770,23 @@ class OutlookMailbox(BaseMailbox):
         backend: str = "graph",
         graph_api_base: str = "",
         proxy: str = None,
+        lease_owner: str = "",
+        lease_seconds: int = 900,
     ):
         self._lock = threading.Lock()
+        self._active_lease_account: MailboxAccount | None = None
+        self._last_lease_renew_monotonic = 0.0
+        self._lease_owner = str(lease_owner or "").strip()[:160]
+        try:
+            self._lease_seconds = max(1, int(lease_seconds or 900))
+        except (TypeError, ValueError):
+            self._lease_seconds = 900
+        # Renew at least once per third of the lease lifetime.  The upper
+        # bound keeps normal polling inexpensive while still handling short
+        # TTLs used by tests or deliberately aggressive workers.
+        self._lease_renew_interval = max(
+            1.0, min(30.0, float(self._lease_seconds) / 3.0)
+        )
         self._proxy = build_requests_proxy_config(proxy)
         self._imap_servers = []
         if imap_server:
@@ -5806,6 +5825,18 @@ class OutlookMailbox(BaseMailbox):
             "mailapi_url": MailApiUrlOtpBackend(self),
         }
 
+    def _checkpoint(self, *, consume_skip: bool = True) -> None:
+        """Renew a live mailbox lease while a long OTP wait is running."""
+        super()._checkpoint(consume_skip=consume_skip)
+        account = self._active_lease_account
+        if account is None:
+            return
+        now = time.monotonic()
+        if now - self._last_lease_renew_monotonic < self._lease_renew_interval:
+            return
+        if self.renew_account_lease(account):
+            self._last_lease_renew_monotonic = now
+
     @staticmethod
     def _normalize_backend_name(value: Any) -> str:
         backend = str(value or "graph").strip().lower() or "graph"
@@ -5825,48 +5856,149 @@ class OutlookMailbox(BaseMailbox):
             return True
         return bool(str(extra.get("mailapi_url") or "").strip())
 
-    def _pop_account(self, email: str = "") -> dict:
-        from sqlmodel import Session, select
-        from core.db import engine, OutlookAccountModel
+    @staticmethod
+    def _utcnow() -> datetime:
+        return datetime.now(timezone.utc)
 
-        target_email = str(email or "").strip()
+    def _resolve_lease_owner(self, lease_owner: str = "") -> str:
+        owner = str(
+            lease_owner
+            or self._lease_owner
+            or getattr(self, "_task_attempt_token", "")
+            or ""
+        ).strip()
+        if owner:
+            if not self._lease_owner:
+                self._lease_owner = owner[:160]
+            return owner[:160]
+        self._lease_owner = f"mailbox-{uuid.uuid4().hex}"
+        return self._lease_owner
+
+    @staticmethod
+    def _lease_extra(account: MailboxAccount) -> dict[str, Any]:
+        extra = getattr(account, "extra", None)
+        return extra if isinstance(extra, dict) else {}
+
+    @staticmethod
+    def _payload_from_row(row) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "email": row.email,
+            "password": row.password,
+            "client_id": row.client_id,
+            "refresh_token": row.refresh_token,
+            "account_type": getattr(row, "account_type", "microsoft_oauth"),
+            "mailapi_url": getattr(row, "mailapi_url", ""),
+            "mailapi_token": getattr(row, "mailapi_token", ""),
+            "state": str(getattr(row, "state", "available") or "available"),
+            "lease_owner": str(getattr(row, "lease_owner", "") or ""),
+            "lease_expires_at": getattr(row, "lease_expires_at", None),
+            "lease_version": int(getattr(row, "lease_version", 0) or 0),
+            "bound_account_id": int(getattr(row, "bound_account_id", 0) or 0),
+            "bound_at": getattr(row, "bound_at", None),
+        }
+
+    def _claim_account_payload(
+        self,
+        *,
+        target_email: str = "",
+        lease_owner: str = "",
+        lease_seconds: int | None = None,
+    ) -> dict[str, Any]:
+        """Claim one row with a cross-process SQLite CAS.
+
+        Selection and mutation happen in a short transaction.  The email
+        credentials remain in ``outlook_accounts`` for restart recovery; only
+        the allocation state changes.
+        """
+        from sqlalchemy import func, update
+        from sqlmodel import Session, select
+        from core.db import OutlookAccountModel, engine
+
+        owner = self._resolve_lease_owner(lease_owner)
+        try:
+            ttl = max(1, int(lease_seconds or self._lease_seconds))
+        except (TypeError, ValueError):
+            ttl = self._lease_seconds
+        normalized_email = str(target_email or "").strip().lower()
+        now = self._utcnow()
+        expires = now + timedelta(seconds=ttl)
         with OutlookMailbox._pop_lock:
             with Session(engine) as session:
                 query = select(OutlookAccountModel).where(
-                    OutlookAccountModel.enabled == True
+                    OutlookAccountModel.state == "available"
                 )
-                if target_email:
-                    query = query.where(OutlookAccountModel.email == target_email)
-                account = session.exec(query.order_by(OutlookAccountModel.id)).first()
-                if not account:
-                    if target_email:
-                        raise RuntimeError(
-                            f"指定邮箱不在本地池中: {target_email}"
+                if normalized_email:
+                    query = query.where(
+                        func.lower(OutlookAccountModel.email) == normalized_email
+                    )
+                candidates = session.exec(
+                    query.order_by(OutlookAccountModel.id)
+                ).all()
+                for candidate in candidates:
+                    old_version = int(candidate.lease_version or 0)
+                    result = session.exec(
+                        update(OutlookAccountModel)
+                        .where(OutlookAccountModel.id == candidate.id)
+                        .where(OutlookAccountModel.state == "available")
+                        .where(OutlookAccountModel.lease_version == old_version)
+                        .values(
+                            state="leased",
+                            enabled=False,
+                            lease_owner=owner,
+                            lease_expires_at=expires,
+                            lease_version=old_version + 1,
+                            quarantine_reason="",
+                            last_error="",
+                            updated_at=now,
                         )
-                    raise RuntimeError("微软邮箱账号池为空，请先在设置页批量导入")
+                    )
+                    if int(getattr(result, "rowcount", 0) or 0) != 1:
+                        session.rollback()
+                        continue
+                    session.commit()
+                    row = session.get(OutlookAccountModel, candidate.id)
+                    if row is None:
+                        break
+                    return self._payload_from_row(row)
+        if normalized_email:
+            raise RuntimeError(f"指定邮箱不在可用池中: {target_email}")
+        raise RuntimeError("微软邮箱账号池为空，请先在设置页批量导入")
 
-                payload = {
-                    "id": account.id,
-                    "email": account.email,
-                    "password": account.password,
-                    "client_id": account.client_id,
-                    "refresh_token": account.refresh_token,
-                    "account_type": getattr(account, "account_type", "microsoft_oauth"),
-                    "mailapi_url": getattr(account, "mailapi_url", ""),
-                    "mailapi_token": getattr(account, "mailapi_token", ""),
-                }
-                session.delete(account)
-                session.commit()
-                return payload
+    def claim_account(
+        self,
+        target_email: str = "",
+        lease_owner: str = "",
+        lease_seconds: int | None = None,
+        **kwargs,
+    ) -> MailboxAccount:
+        """Lease a mailbox without deleting its credentials row."""
+        if not target_email and kwargs.get("email"):
+            target_email = kwargs["email"]
+        if not lease_owner and kwargs.get("owner"):
+            lease_owner = kwargs["owner"]
+        if lease_seconds is None:
+            lease_seconds = kwargs.get(
+                "lease_ttl",
+                kwargs.get("ttl_seconds", kwargs.get("ttl")),
+            )
+        payload = self._claim_account_payload(
+            target_email=target_email,
+            lease_owner=lease_owner,
+            lease_seconds=lease_seconds,
+        )
+        return self._mailbox_account_from_payload(payload)
+
+    def _pop_account(self, email: str = "") -> dict:
+        """Legacy payload API backed by :meth:`claim_account`."""
+        return self._claim_account_payload(target_email=email)
 
     def get_email(self) -> MailboxAccount:
-        payload = self._pop_account()
-        return self._mailbox_account_from_payload(payload)
+        return self.claim_account()
 
     def get_email_by_address(self, email: str) -> MailboxAccount:
-        """Atomically pop the exact mailbox used by a persisted retry binding."""
-        payload = self._pop_account(email=email)
-        return self._mailbox_account_from_payload(payload)
+        """Claim the exact available mailbox used by a retry binding."""
+        return self.claim_account(target_email=email)
 
     def _mailbox_account_from_payload(self, payload: dict) -> MailboxAccount:
         email = str(payload.get("email") or "").strip()
@@ -5878,12 +6010,17 @@ class OutlookMailbox(BaseMailbox):
         account_type = self._normalize_account_type(payload.get("account_type"))
         mailapi_url = str(payload.get("mailapi_url") or "").strip()
         mailapi_token = str(payload.get("mailapi_token") or "").strip()
+        state = str(payload.get("state") or "leased").strip().lower() or "leased"
+        lease_owner = str(payload.get("lease_owner") or "").strip()
+        lease_version = int(payload.get("lease_version") or 0)
+        bound_account_id = int(payload.get("bound_account_id") or 0)
+        lease_expires_at = payload.get("lease_expires_at")
         auth_mode = (
             "mailapi_url"
             if account_type == "mailapi_url"
             else ("oauth" if client_id and refresh_token else "password")
         )
-        self._log(f"[微软邮箱] 取出账号: {email}（已从本地池移除）")
+        self._log(f"[微软邮箱] 领取账号: {email}（租约状态={state}）")
         self._log(
             "[微软邮箱] 账号认证信息: "
             f"has_password={bool(password)} "
@@ -5894,7 +6031,7 @@ class OutlookMailbox(BaseMailbox):
             f"account_type={account_type} "
             f"auth_mode={auth_mode}"
         )
-        return MailboxAccount(
+        account = MailboxAccount(
             email=email,
             account_id=str(payload.get("id") or ""),
             extra={
@@ -5906,57 +6043,397 @@ class OutlookMailbox(BaseMailbox):
                 "mailapi_url": mailapi_url,
                 "mailapi_token": mailapi_token,
                 "outlook_backend": self._backend_name,
+                "_outlook_row_id": str(payload.get("id") or ""),
+                "_outlook_lease_owner": lease_owner,
+                "_outlook_lease_version": lease_version,
+                "_outlook_state": state,
+                "_outlook_bound_account_id": bound_account_id,
+                "_outlook_lease_expires_at": (
+                    lease_expires_at.isoformat()
+                    if isinstance(lease_expires_at, datetime)
+                    else str(lease_expires_at or "")
+                ),
             },
         )
+        self._active_lease_account = account
+        self._last_lease_renew_monotonic = time.monotonic()
+        return account
 
-    def requeue_account(self, account: MailboxAccount) -> None:
-        from sqlmodel import Session, select
-        from core.db import _utcnow, engine, OutlookAccountModel
+    def _lease_identity(self, account: MailboxAccount) -> tuple[int, str, int, int]:
+        extra = self._lease_extra(account)
+        try:
+            row_id = int(extra.get("_outlook_row_id") or getattr(account, "account_id", 0) or 0)
+        except (TypeError, ValueError):
+            row_id = 0
+        try:
+            version = int(extra.get("_outlook_lease_version") or 0)
+        except (TypeError, ValueError):
+            version = 0
+        try:
+            bound_id = int(
+                extra.get("_outlook_bound_account_id")
+                or extra.get("chatgpt_local_account_id")
+                or 0
+            )
+        except (TypeError, ValueError):
+            bound_id = 0
+        owner = str(extra.get("_outlook_lease_owner") or "").strip()
+        return row_id, owner, version, bound_id
 
-        email = str(getattr(account, "email", "") or "").strip()
-        extra = getattr(account, "extra", None) or {}
-        if not email:
-            return
+    @staticmethod
+    def _set_lease_projection(
+        account: MailboxAccount,
+        *,
+        state: str,
+        lease_owner: str = "",
+        lease_version: int = 0,
+        bound_account_id: int = 0,
+        lease_expires_at=None,
+    ) -> None:
+        extra = dict(getattr(account, "extra", None) or {})
+        extra.update(
+            {
+                "_outlook_state": str(state or ""),
+                "_outlook_lease_owner": str(lease_owner or ""),
+                "_outlook_lease_version": int(lease_version or 0),
+                "_outlook_bound_account_id": int(bound_account_id or 0),
+                "_outlook_lease_expires_at": (
+                    lease_expires_at.isoformat()
+                    if isinstance(lease_expires_at, datetime)
+                    else str(lease_expires_at or "")
+                ),
+            }
+        )
+        account.extra = extra
 
-        password = str(extra.get("password") or "")
-        client_id = str(extra.get("client_id") or "")
-        refresh_token = str(extra.get("refresh_token") or "")
-        account_type = self._normalize_account_type(extra.get("account_type"))
-        mailapi_url = str(extra.get("mailapi_url") or "")
-        mailapi_token = str(extra.get("mailapi_token") or "")
+    def bind_account(self, account: MailboxAccount, account_id: int) -> bool:
+        """Fence a lease to the ChatGPT account that consumed it."""
+        from sqlalchemy import update
+        from sqlmodel import Session
+        from core.db import OutlookAccountModel, engine
 
+        try:
+            local_account_id = int(account_id or 0)
+        except (TypeError, ValueError):
+            return False
+        row_id, owner, version, _bound_id = self._lease_identity(account)
+        if row_id <= 0 or local_account_id <= 0:
+            return False
         with self._lock:
             with Session(engine) as session:
-                existing = session.exec(
-                    select(OutlookAccountModel).where(OutlookAccountModel.email == email)
-                ).first()
-                if existing:
-                    existing.password = password
-                    existing.client_id = client_id
-                    existing.refresh_token = refresh_token
-                    existing.account_type = account_type
-                    existing.mailapi_url = mailapi_url
-                    existing.mailapi_token = mailapi_token
-                    existing.enabled = True
-                    existing.updated_at = _utcnow()
-                    session.add(existing)
-                else:
-                    session.add(
-                        OutlookAccountModel(
-                            email=email,
-                            password=password,
-                            client_id=client_id,
-                            refresh_token=refresh_token,
-                            account_type=account_type,
-                            mailapi_url=mailapi_url,
-                            mailapi_token=mailapi_token,
-                            enabled=True,
-                            created_at=_utcnow(),
-                            updated_at=_utcnow(),
+                row = session.get(OutlookAccountModel, row_id)
+                if row is None:
+                    return False
+                current_version = int(row.lease_version or 0)
+                if (
+                    str(row.state or "").lower() == "bound"
+                    and int(row.bound_account_id or 0) == local_account_id
+                ):
+                    self._set_lease_projection(
+                        account,
+                        state="bound",
+                        lease_version=current_version,
+                        bound_account_id=local_account_id,
+                    )
+                    if self._active_lease_account is account:
+                        self._active_lease_account = None
+                    return True
+                if (
+                    str(row.state or "").lower() == "bound"
+                    and int(row.bound_account_id or 0) == 0
+                    and str(row.email or "").strip().lower()
+                    == str(getattr(account, "email", "") or "").strip().lower()
+                ):
+                    # Persisted projections from older callers may not carry
+                    # a fencing version.  If one is present, require an
+                    # exact match so a stale retry cannot bind a newer row.
+                    if version > 0 and version != current_version:
+                        return False
+                    result = session.exec(
+                        update(OutlookAccountModel)
+                        .where(OutlookAccountModel.id == row_id)
+                        .where(OutlookAccountModel.state == "bound")
+                        .where(OutlookAccountModel.bound_account_id == 0)
+                        .where(OutlookAccountModel.lease_version == current_version)
+                        .values(
+                            bound_account_id=local_account_id,
+                            lease_version=current_version + 1,
+                            bound_at=row.bound_at or self._utcnow(),
+                            updated_at=self._utcnow(),
                         )
                     )
+                    if int(getattr(result, "rowcount", 0) or 0) != 1:
+                        session.rollback()
+                        return False
+                    session.commit()
+                    self._set_lease_projection(
+                        account,
+                        state="bound",
+                        lease_version=current_version + 1,
+                        bound_account_id=local_account_id,
+                    )
+                    if self._active_lease_account is account:
+                        self._active_lease_account = None
+                    return True
+                if (
+                    str(row.state or "").lower() != "leased"
+                    or not owner
+                    or version != current_version
+                ):
+                    return False
+                new_version = int(row.lease_version or 0) + 1
+                result = session.exec(
+                    update(OutlookAccountModel)
+                    .where(OutlookAccountModel.id == row_id)
+                    .where(OutlookAccountModel.state == "leased")
+                    .where(OutlookAccountModel.lease_owner == owner)
+                    .where(OutlookAccountModel.lease_version == version)
+                    .values(
+                        state="bound",
+                        enabled=False,
+                        lease_owner="",
+                        lease_expires_at=None,
+                        lease_version=new_version,
+                        bound_account_id=local_account_id,
+                        bound_at=self._utcnow(),
+                        last_used=self._utcnow(),
+                        updated_at=self._utcnow(),
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
                 session.commit()
-        self._log(f"[微软邮箱] 账号已回退到本地池: {email}")
+                self._set_lease_projection(
+                    account,
+                    state="bound",
+                    lease_version=new_version,
+                    bound_account_id=local_account_id,
+                )
+                if self._active_lease_account is account:
+                    self._active_lease_account = None
+                return True
+
+    def release_account(self, account: MailboxAccount, *, uncertain: bool = False) -> bool:
+        """Release an owned lease, or quarantine it when remote state is unclear."""
+        from sqlalchemy import update
+        from sqlmodel import Session
+        from core.db import OutlookAccountModel, engine
+
+        row_id, owner, version, _bound_id = self._lease_identity(account)
+        if row_id <= 0 or not owner:
+            return False
+        state = "quarantined" if uncertain else "available"
+        reason = "remote_state_uncertain" if uncertain else "login_failed_before_commit"
+        extra = self._lease_extra(account)
+        last_error = str(extra.get("_outlook_last_error") or "")[:500]
+        # A persisted retry context can intentionally contain only the lease
+        # pointer.  Do not turn missing credential keys into blank values and
+        # erase the durable mailbox credentials during release.
+        credential_values: dict[str, Any] = {}
+        if "password" in extra:
+            credential_values["password"] = str(extra.get("password") or "")
+        if "client_id" in extra:
+            credential_values["client_id"] = str(extra.get("client_id") or "")
+        if "refresh_token" in extra:
+            credential_values["refresh_token"] = str(
+                extra.get("refresh_token") or ""
+            )
+        if "account_type" in extra:
+            credential_values["account_type"] = self._normalize_account_type(
+                extra.get("account_type")
+            )
+        if "mailapi_url" in extra or "mail_api_url" in extra:
+            credential_values["mailapi_url"] = str(
+                extra.get("mailapi_url") or extra.get("mail_api_url") or ""
+            )
+        if "mailapi_token" in extra:
+            credential_values["mailapi_token"] = str(
+                extra.get("mailapi_token") or ""
+            )
+        with self._lock:
+            with Session(engine) as session:
+                result = session.exec(
+                    update(OutlookAccountModel)
+                    .where(OutlookAccountModel.id == row_id)
+                    .where(OutlookAccountModel.state == "leased")
+                    .where(OutlookAccountModel.lease_owner == owner)
+                    .where(OutlookAccountModel.lease_version == version)
+                    .values(
+                        **credential_values,
+                        state=state,
+                        enabled=(state == "available"),
+                        lease_owner="",
+                        lease_expires_at=None,
+                        lease_version=version + 1,
+                        bound_account_id=0,
+                        bound_at=None,
+                        quarantine_reason=reason if uncertain else "",
+                        last_error=last_error,
+                        updated_at=self._utcnow(),
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
+                session.commit()
+        self._set_lease_projection(
+            account,
+            state=state,
+            lease_version=version + 1,
+        )
+        if self._active_lease_account is account:
+            self._active_lease_account = None
+        return True
+
+    def renew_account_lease(
+        self,
+        account: MailboxAccount,
+        lease_seconds: int | None = None,
+    ) -> bool:
+        """Extend a live lease and advance its fencing version."""
+        from sqlalchemy import update
+        from sqlmodel import Session
+        from core.db import OutlookAccountModel, engine
+
+        row_id, owner, version, _bound_id = self._lease_identity(account)
+        if row_id <= 0 or not owner:
+            return False
+        try:
+            ttl = max(1, int(lease_seconds or self._lease_seconds))
+        except (TypeError, ValueError):
+            ttl = self._lease_seconds
+        now = self._utcnow()
+        expires = now + timedelta(seconds=ttl)
+        with self._lock:
+            with Session(engine) as session:
+                result = session.exec(
+                    update(OutlookAccountModel)
+                    .where(OutlookAccountModel.id == row_id)
+                    .where(OutlookAccountModel.state == "leased")
+                    .where(OutlookAccountModel.lease_owner == owner)
+                    .where(OutlookAccountModel.lease_version == version)
+                    .where(OutlookAccountModel.lease_expires_at > now)
+                    .values(
+                        lease_expires_at=expires,
+                        lease_version=version + 1,
+                        updated_at=self._utcnow(),
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
+                session.commit()
+        self._set_lease_projection(
+            account,
+            state="leased",
+            lease_owner=owner,
+            lease_version=version + 1,
+            lease_expires_at=expires,
+        )
+        return True
+
+    def recover_expired_leases(self, now: datetime | None = None) -> int:
+        from core.db import recover_expired_outlook_leases
+
+        return recover_expired_outlook_leases(now=now)
+
+    def _seal_account_bound(self, account: MailboxAccount) -> bool:
+        """Make a consumed lease non-allocatable before its local ID exists."""
+        from sqlalchemy import update
+        from sqlmodel import Session
+        from core.db import OutlookAccountModel, engine
+
+        row_id, owner, version, _bound_id = self._lease_identity(account)
+        if row_id <= 0 or not owner:
+            return False
+        now = self._utcnow()
+        with self._lock:
+            with Session(engine) as session:
+                result = session.exec(
+                    update(OutlookAccountModel)
+                    .where(OutlookAccountModel.id == row_id)
+                    .where(OutlookAccountModel.state == "leased")
+                    .where(OutlookAccountModel.lease_owner == owner)
+                    .where(OutlookAccountModel.lease_version == version)
+                    .values(
+                        state="bound",
+                        enabled=False,
+                        lease_owner="",
+                        lease_expires_at=None,
+                        lease_version=version + 1,
+                        bound_account_id=0,
+                        bound_at=now,
+                        last_used=now,
+                        updated_at=now,
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
+                session.commit()
+        self._set_lease_projection(
+            account,
+            state="bound",
+            lease_version=version + 1,
+        )
+        return True
+
+    def mark_account_used(self, account) -> bool:
+        """Bind a claimed mailbox to a persisted ChatGPT account.
+
+        The registration code historically calls this method with either the
+        transient ``MailboxAccount`` or the saved platform ``AccountModel``;
+        accept both shapes while requiring a concrete local account id before
+        changing a lease to ``bound``.
+        """
+        if isinstance(account, MailboxAccount):
+            mailbox_account = account
+            extra = dict(getattr(account, "extra", None) or {})
+            local_id = extra.get("chatgpt_local_account_id") or extra.get(
+                "_outlook_bound_account_id"
+            )
+        else:
+            try:
+                local_id = int(getattr(account, "id", 0) or 0)
+            except (TypeError, ValueError):
+                local_id = 0
+            saved_extra = {}
+            try:
+                saved_extra = dict(account.get_extra() or {})
+            except Exception:
+                saved_extra = {}
+            context = saved_extra.get("mailbox_login_context")
+            if not isinstance(context, dict):
+                return False
+            context_extra = dict(context.get("extra") or {})
+            mailbox_account = MailboxAccount(
+                email=str(context.get("email") or getattr(account, "email", "")),
+                account_id=str(context.get("account_id") or ""),
+                extra=context_extra,
+            )
+            context_extra["chatgpt_local_account_id"] = local_id
+            mailbox_account.extra = context_extra
+        try:
+            local_id = int(local_id or 0)
+        except (TypeError, ValueError):
+            local_id = 0
+        if local_id <= 0:
+            # The transient registration callback runs before AccountModel is
+            # inserted.  Keep the lease owned until the caller can bind it to
+            # the real local account id; sealing here would lose the owner and
+            # make the post-save CAS impossible.
+            return False
+        return self.bind_account(mailbox_account, local_id)
+
+    def requeue_account(
+        self,
+        account: MailboxAccount,
+        *,
+        uncertain: bool = False,
+    ) -> bool:
+        """Compatibility wrapper for releasing the exact owned lease."""
+        return self.release_account(account, uncertain=uncertain)
 
     def commit_password_reset(
         self,
@@ -5964,63 +6441,51 @@ class OutlookMailbox(BaseMailbox):
         new_password: str = "",
     ) -> bool:
         """Persist a ChatGPT password alongside a MailAPI mailbox record."""
+        from sqlalchemy import update
+        from sqlmodel import Session
         from core.db import _utcnow, engine, OutlookAccountModel
-        from sqlmodel import Session, select
 
-        email = str(getattr(account, "email", "") or "").strip()
         password = str(new_password or "").strip()
-        if not email or len(password) < 12:
+        if not str(getattr(account, "email", "") or "").strip() or len(password) < 12:
             return False
         account_extra = dict(getattr(account, "extra", None) or {})
-        client_id = str(account_extra.get("client_id") or "")
-        refresh_token = str(account_extra.get("refresh_token") or "")
-        mailapi_url = str(
-            account_extra.get("mailapi_url")
-            or account_extra.get("mail_api_url")
-            or ""
-        ).strip()
         mailapi_token = str(account_extra.get("mailapi_token") or "").strip()
-        account_type = (
-            "mailapi_url"
-            if mailapi_url
-            else self._normalize_account_type(
-                account_extra.get("account_type")
-            )
-        )
+        row_id, owner, version, bound_id = self._lease_identity(account)
+        if row_id <= 0:
+            return False
+        now = _utcnow()
         with self._lock:
             with Session(engine) as session:
-                existing = session.exec(
-                    select(OutlookAccountModel).where(
-                        OutlookAccountModel.email == email
-                    )
-                ).first()
-                if existing is None:
-                    now = _utcnow()
-                    session.add(
-                        OutlookAccountModel(
-                            email=email,
-                            password=password,
-                            client_id=client_id,
-                            refresh_token=refresh_token,
-                            account_type=account_type,
-                            mailapi_url=mailapi_url,
-                            mailapi_token=mailapi_token,
-                            enabled=False,
-                            created_at=now,
-                            updated_at=now,
-                        )
+                values = {
+                    "password": password,
+                    "updated_at": now,
+                    "lease_version": version + 1,
+                }
+                if mailapi_token:
+                    values["mailapi_token"] = mailapi_token
+                query = update(OutlookAccountModel).where(
+                    OutlookAccountModel.id == row_id
+                ).where(OutlookAccountModel.lease_version == version)
+                if owner:
+                    query = query.where(OutlookAccountModel.state == "leased")
+                    query = query.where(OutlookAccountModel.lease_owner == owner)
+                    query = query.where(OutlookAccountModel.lease_expires_at > now)
+                elif bound_id > 0:
+                    query = query.where(OutlookAccountModel.state == "bound")
+                    query = query.where(
+                        OutlookAccountModel.bound_account_id == bound_id
                     )
                 else:
-                    existing.password = password
-                    if mailapi_token:
-                        existing.mailapi_token = mailapi_token
-                    existing.enabled = False
-                    existing.updated_at = _utcnow()
-                    session.add(existing)
+                    return False
+                result = session.exec(query.values(**values))
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
                 session.commit()
         account_extra["password"] = password
         account_extra["password_reset_required"] = False
         account_extra.pop("new_password", None)
+        account_extra["_outlook_lease_version"] = version + 1
         account.extra = account_extra
         return True
 

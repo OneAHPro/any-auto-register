@@ -150,6 +150,10 @@ class ChatGPTAuthStateModel(SQLModel, table=True):
     last_success_at: Optional[datetime] = None
     failure_domain: str = ""
     error_code: str = ""
+    failure_count: int = 0
+    next_retry_at: Optional[datetime] = Field(default=None, index=True)
+    circuit_state: str = Field(default="closed", index=True)
+    last_failure_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
@@ -202,6 +206,16 @@ class OutlookAccountModel(SQLModel, table=True):
     mailapi_url: str = ""
     mailapi_token: str = ""
     enabled: bool = True
+    # Durable mailbox allocation state. ``enabled`` remains a compatibility
+    # projection for older readers; state/lease fields are authoritative.
+    state: str = Field(default="available", index=True)
+    lease_owner: str = Field(default="", index=True)
+    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    lease_version: int = 0
+    bound_account_id: int = Field(default=0, index=True)
+    bound_at: Optional[datetime] = None
+    quarantine_reason: str = ""
+    last_error: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
     last_used: Optional[datetime] = None
@@ -487,6 +501,7 @@ def _migrate_outlook_accounts_schema() -> None:
         if not rows:
             return
         existing_columns = {str(row[1]) for row in rows}
+        state_was_added = "state" not in existing_columns
         if "account_type" not in existing_columns:
             conn.exec_driver_sql(
                 "ALTER TABLE outlook_accounts ADD COLUMN account_type TEXT DEFAULT 'microsoft_oauth'"
@@ -499,6 +514,22 @@ def _migrate_outlook_accounts_schema() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE outlook_accounts ADD COLUMN mailapi_token TEXT DEFAULT ''"
             )
+        additive_columns = {
+            "enabled": "BOOLEAN DEFAULT 1",
+            "state": "TEXT DEFAULT 'available'",
+            "lease_owner": "TEXT DEFAULT ''",
+            "lease_expires_at": "DATETIME",
+            "lease_version": "INTEGER DEFAULT 0",
+            "bound_account_id": "INTEGER DEFAULT 0",
+            "bound_at": "DATETIME",
+            "quarantine_reason": "TEXT DEFAULT ''",
+            "last_error": "TEXT DEFAULT ''",
+        }
+        for column, definition in additive_columns.items():
+            if column not in existing_columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE outlook_accounts ADD COLUMN {column} {definition}"
+                )
         conn.exec_driver_sql(
             "UPDATE outlook_accounts SET account_type = 'microsoft_oauth' WHERE account_type IS NULL OR TRIM(account_type) = ''"
         )
@@ -507,6 +538,150 @@ def _migrate_outlook_accounts_schema() -> None:
         )
         conn.exec_driver_sql(
             "UPDATE outlook_accounts SET mailapi_token = '' WHERE mailapi_token IS NULL"
+        )
+        # Existing rows were either selectable or deliberately disabled. Do
+        # not resurrect disabled records during a schema upgrade.
+        if state_was_added:
+            conn.exec_driver_sql(
+                "UPDATE outlook_accounts SET state = CASE "
+                "WHEN enabled = 1 THEN 'available' ELSE 'disabled' END"
+            )
+        else:
+            conn.exec_driver_sql(
+                "UPDATE outlook_accounts SET state = CASE "
+                "WHEN enabled = 1 THEN 'available' ELSE 'disabled' END "
+                "WHERE state IS NULL OR TRIM(state) = ''"
+            )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET lease_owner = '' WHERE lease_owner IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET lease_version = 0 WHERE lease_version IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET bound_account_id = 0 "
+            "WHERE bound_account_id IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET quarantine_reason = '' "
+            "WHERE quarantine_reason IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET last_error = '' WHERE last_error IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET enabled = CASE WHEN state = 'available' THEN 1 ELSE 0 END"
+        )
+        for index_name, column in (
+            ("ix_outlook_accounts_state", "state"),
+            ("ix_outlook_accounts_lease_owner", "lease_owner"),
+            ("ix_outlook_accounts_lease_expires_at", "lease_expires_at"),
+            ("ix_outlook_accounts_bound_account_id", "bound_account_id"),
+        ):
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS {index_name} "
+                f"ON outlook_accounts ({column})"
+            )
+
+
+def recover_expired_outlook_leases(
+    *,
+    now: datetime | None = None,
+    database_engine=None,
+) -> int:
+    """Recover only expired, unbound Outlook mailbox leases."""
+    target_engine = database_engine or engine
+    cutoff = now or _utcnow()
+    if cutoff.tzinfo is None:
+        cutoff = cutoff.replace(tzinfo=timezone.utc)
+    from sqlalchemy import update
+
+    try:
+        session_context = Session(target_engine)
+    except Exception:
+        return 0
+    with session_context as session:
+        try:
+            rows = session.exec(
+                select(OutlookAccountModel)
+                .where(OutlookAccountModel.state == "leased")
+                # A row that is already associated with a local ChatGPT
+                # account is fenced permanently.  Only leases with no
+                # binding may be reclaimed after a worker crash.
+                .where(OutlookAccountModel.bound_account_id == 0)
+                .where(OutlookAccountModel.lease_expires_at.is_not(None))
+            ).all()
+        except Exception as exc:
+            # ``init_db`` is also exercised by migration/startup callers that
+            # replace ``create_all``; a missing legacy table simply has no
+            # leases to recover and must not block service startup.
+            if "no such table" in str(exc).lower():
+                session.rollback()
+                return 0
+            raise
+        recovered = 0
+        for row in rows:
+            expires = row.lease_expires_at
+            if expires is None:
+                continue
+            if expires.tzinfo is None:
+                expires = expires.replace(tzinfo=timezone.utc)
+            if expires > cutoff:
+                continue
+            version = int(row.lease_version or 0)
+            result = session.exec(
+                update(OutlookAccountModel)
+                .where(OutlookAccountModel.id == row.id)
+                .where(OutlookAccountModel.state == "leased")
+                .where(OutlookAccountModel.lease_owner == str(row.lease_owner or ""))
+                .where(OutlookAccountModel.lease_version == version)
+                .where(OutlookAccountModel.lease_expires_at == row.lease_expires_at)
+                .values(
+                    state="available",
+                    enabled=True,
+                    lease_owner="",
+                    lease_expires_at=None,
+                    lease_version=version + 1,
+                    bound_account_id=0,
+                    bound_at=None,
+                    quarantine_reason="",
+                    last_error="",
+                    updated_at=_utcnow(),
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) == 1:
+                recovered += 1
+        if recovered:
+            session.commit()
+        return recovered
+
+
+def _migrate_chatgpt_auth_state_schema() -> None:
+    """Add durable retry columns to installations created before backoff."""
+    if engine.url.get_backend_name() != "sqlite":
+        return
+    with engine.begin() as conn:
+        rows = conn.exec_driver_sql("PRAGMA table_info('chatgpt_auth_states')").fetchall()
+        if not rows:
+            return
+        existing_columns = {str(row[1]) for row in rows}
+        additive_columns = {
+            "failure_count": "INTEGER DEFAULT 0",
+            "next_retry_at": "DATETIME",
+            "circuit_state": "TEXT DEFAULT 'closed'",
+            "last_failure_at": "DATETIME",
+        }
+        for column, definition in additive_columns.items():
+            if column not in existing_columns:
+                conn.exec_driver_sql(
+                    f"ALTER TABLE chatgpt_auth_states ADD COLUMN {column} {definition}"
+                )
+        conn.exec_driver_sql(
+            "UPDATE chatgpt_auth_states SET failure_count = 0 WHERE failure_count IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE chatgpt_auth_states SET circuit_state = 'closed' "
+            "WHERE circuit_state IS NULL OR TRIM(circuit_state) = ''"
         )
 
 
@@ -532,6 +707,8 @@ def _recover_chatgpt_attempt_bindings() -> None:
 def init_db():
     SQLModel.metadata.create_all(engine)
     _migrate_outlook_accounts_schema()
+    recover_expired_outlook_leases()
+    _migrate_chatgpt_auth_state_schema()
     _recover_chatgpt_attempt_bindings()
     from core.sms_pool import SmsPoolService
 

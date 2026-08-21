@@ -2,7 +2,7 @@ import base64
 import imaplib
 import json
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 from unittest import mock
 
@@ -29,6 +29,207 @@ class _FakeResponse:
 
 
 class OutlookMailboxOAuthTests(unittest.TestCase):
+    @staticmethod
+    def _lease_engine():
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        return test_engine
+
+    def test_claim_keeps_mailbox_row_and_marks_it_leased(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="lease@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+
+        self.assertEqual(claimed.email, "lease@example.com")
+        self.assertTrue(claimed.extra.get("_outlook_lease_owner"))
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "leased")
+            self.assertFalse(row.enabled)
+            self.assertEqual(row.lease_owner, claimed.extra["_outlook_lease_owner"])
+            self.assertIsNotNone(row.lease_expires_at)
+
+    def test_two_claimers_cannot_lease_same_mailbox(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="single@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        first = OutlookMailbox()
+        second = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            first_claim = first.get_email()
+            with self.assertRaises(RuntimeError):
+                second.get_email()
+        self.assertEqual(first_claim.email, "single@example.com")
+
+    def test_bound_mailbox_is_not_reallocated_and_stale_release_is_rejected(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="bound@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            self.assertTrue(mailbox.bind_account(claimed, 77))
+            self.assertFalse(mailbox.release_account(claimed))
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "bound")
+            self.assertEqual(row.bound_account_id, 77)
+
+    def test_expired_unbound_lease_is_recovered(self):
+        test_engine = self._lease_engine()
+        expired = datetime.now(timezone.utc) - timedelta(minutes=5)
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="expired@example.com",
+                    password="mail-password",
+                    state="leased",
+                    enabled=False,
+                    lease_owner="dead-worker",
+                    lease_expires_at=expired,
+                    lease_version=4,
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            self.assertEqual(mailbox.recover_expired_leases(), 1)
+            claimed = mailbox.get_email()
+        self.assertEqual(claimed.email, "expired@example.com")
+
+    def test_uncertain_release_quarantines_mailbox(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="uncertain@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            self.assertTrue(mailbox.release_account(claimed, uncertain=True))
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "quarantined")
+            self.assertTrue(row.quarantine_reason)
+
+    def test_mark_used_waits_for_local_account_id_before_binding(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="sealed@example.com",
+                    password="mail-password",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            self.assertFalse(mailbox.mark_account_used(claimed))
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "leased")
+            self.assertIsNotNone(row.lease_owner)
+
+    def test_renew_lease_advances_fencing_version(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="renew@example.com",
+                    password="mail-password",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox(lease_seconds=10)
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            old_version = claimed.extra["_outlook_lease_version"]
+            self.assertTrue(mailbox.renew_account_lease(claimed, 120))
+            self.assertEqual(
+                claimed.extra["_outlook_lease_version"],
+                old_version + 1,
+            )
+            self.assertTrue(mailbox.requeue_account(claimed))
+
+    def test_password_reset_updates_owned_leased_mailbox_without_email_upsert(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="reset-lease@example.com",
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            self.assertTrue(
+                mailbox.commit_password_reset(
+                    claimed,
+                    "Replacement-Password-2026!",
+                )
+            )
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.password, "Replacement-Password-2026!")
+            self.assertEqual(row.state, "leased")
+            self.assertEqual(row.email, "reset-lease@example.com")
+
     def test_mailapi_accepts_bare_six_digit_plain_text_response(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]
@@ -389,7 +590,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertNotIn(token, rendered)
         self.assertNotIn(email, rendered)
 
-    def test_requeue_account_restores_removed_outlook_account(self):
+    def test_requeue_account_does_not_recreate_missing_outlook_row(self):
         test_engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
@@ -410,20 +611,17 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         )
 
         with mock.patch("core.db.engine", test_engine):
-            mailbox.requeue_account(account)
+            restored = mailbox.requeue_account(account)
 
         with Session(test_engine) as session:
-            restored = session.exec(
+            rows = session.exec(
                 select(OutlookAccountModel).where(
                     OutlookAccountModel.email == "restore@example.com"
                 )
-            ).one()
+            ).all()
 
-        self.assertEqual(restored.password, "mail-password")
-        self.assertEqual(restored.client_id, "mail-client")
-        self.assertEqual(restored.refresh_token, "mail-refresh")
-        self.assertEqual(restored.mailapi_token, "mailapi-secret-token")
-        self.assertTrue(restored.enabled)
+        self.assertFalse(restored)
+        self.assertEqual(rows, [])
 
     def test_mailapi_account_can_persist_chatgpt_password_after_reset(self):
         test_engine = create_engine(
@@ -444,15 +642,8 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             session.commit()
 
         mailbox = OutlookMailbox()
-        account = MailboxAccount(
-            email="reset@example.com",
-            extra={
-                "password": "",
-                "account_type": "mailapi_url",
-                "mailapi_url": "https://mail.example.test/messages",
-            },
-        )
         with mock.patch("core.db.engine", test_engine):
+            account = mailbox.get_email_by_address("reset@example.com")
             committed = mailbox.commit_password_reset(
                 account,
                 "Replacement-Password-2026!",
@@ -565,7 +756,13 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(selected.extra["mailapi_url"], "https://mail.example.test/second")
         with Session(test_engine) as session:
             remaining = session.exec(select(OutlookAccountModel)).all()
-        self.assertEqual([row.email for row in remaining], ["first@example.com"])
+        self.assertEqual(
+            [(row.email, row.state) for row in remaining],
+            [
+                ("first@example.com", "available"),
+                ("second@example.com", "leased"),
+            ],
+        )
 
     def test_create_mailbox_outlook_defaults_to_graph_backend(self):
         mailbox = create_mailbox("outlook", extra={})
@@ -1040,39 +1237,44 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
 
     def test_get_oauth_access_token_keeps_rotated_refresh_token_on_account(self):
         mailbox = OutlookMailbox(token_endpoint="https://token.example.test")
-        account = MailboxAccount(
-            email="demo@outlook.com",
-            extra={
-                "client_id": "client-id",
-                "refresh_token": "original-refresh-token",
-            },
-        )
-
-        with mock.patch.object(
-            mailbox,
-            "_fetch_oauth_token_bundle",
-            return_value={
-                "access_token": "access-token",
-                "refresh_token": "rotated-refresh-token",
-                "expires_in": 3600,
-                "scope_label": "graph_default",
-            },
-        ):
-            token = mailbox._get_oauth_access_token(account)
-
-        self.assertEqual(token, "access-token")
-        self.assertEqual(
-            account.extra["refresh_token"],
-            "rotated-refresh-token",
-        )
         test_engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},
             poolclass=StaticPool,
         )
         SQLModel.metadata.create_all(test_engine)
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="demo@outlook.com",
+                    password="",
+                    client_id="client-id",
+                    refresh_token="original-refresh-token",
+                )
+            )
+            session.commit()
         with mock.patch("core.db.engine", test_engine):
-            mailbox.requeue_account(account)
+            account = mailbox.get_email_by_address("demo@outlook.com")
+
+            with mock.patch.object(
+                mailbox,
+                "_fetch_oauth_token_bundle",
+                return_value={
+                    "access_token": "access-token",
+                    "refresh_token": "rotated-refresh-token",
+                    "expires_in": 3600,
+                    "scope_label": "graph_default",
+                },
+            ):
+                token = mailbox._get_oauth_access_token(account)
+
+        self.assertEqual(token, "access-token")
+        self.assertEqual(
+            account.extra["refresh_token"],
+            "rotated-refresh-token",
+        )
+        with mock.patch("core.db.engine", test_engine):
+            self.assertTrue(mailbox.requeue_account(account))
         with Session(test_engine) as session:
             persisted = session.exec(
                 select(OutlookAccountModel).where(
