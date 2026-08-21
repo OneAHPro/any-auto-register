@@ -105,6 +105,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                 )
             ).one()
         self.assertEqual(saved.password, "Replacement-Password-2026!")
+        self.assertFalse(saved.enabled)
 
     def test_claimed_mailapi_account_is_restored_after_password_reset(self):
         test_engine = create_engine(

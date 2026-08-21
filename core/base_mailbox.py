@@ -50,6 +50,24 @@ class BaseMailbox(ABC):
         if callable(log_fn):
             log_fn(message)
 
+    @staticmethod
+    def _generate_password_reset_password(length: int = 20) -> str:
+        import secrets
+        import string
+
+        alphabet = string.ascii_letters + string.digits + "!@#$%"
+        required = [
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.digits),
+            secrets.choice("!@#$%"),
+        ]
+        required.extend(
+            secrets.choice(alphabet) for _ in range(max(length - 4, 8))
+        )
+        secrets.SystemRandom().shuffle(required)
+        return "".join(required)
+
     def _checkpoint(self, *, consume_skip: bool = True) -> None:
         task_control = getattr(self, "_task_control", None)
         if task_control is None:
@@ -639,22 +657,6 @@ class AppleMailMailbox(BaseMailbox):
         if self._mailapi_backend is None:
             self._mailapi_backend = MailApiUrlOtpBackend(self)
         return self._mailapi_backend
-
-    @staticmethod
-    def _generate_password_reset_password(length: int = 20) -> str:
-        import secrets
-        import string
-
-        alphabet = string.ascii_letters + string.digits + "!@#$%"
-        required = [
-            secrets.choice(string.ascii_uppercase),
-            secrets.choice(string.ascii_lowercase),
-            secrets.choice(string.digits),
-            secrets.choice("!@#$%"),
-        ]
-        required.extend(secrets.choice(alphabet) for _ in range(max(length - 4, 8)))
-        secrets.SystemRandom().shuffle(required)
-        return "".join(required)
 
     def _get_icloud_client(self, account: MailboxAccount):
         key = str(account.email or "").strip().lower()
@@ -5584,6 +5586,7 @@ class OutlookMailbox(BaseMailbox):
                     )
                 else:
                     existing.password = password
+                    existing.enabled = False
                     existing.updated_at = _utcnow()
                     session.add(existing)
                 session.commit()

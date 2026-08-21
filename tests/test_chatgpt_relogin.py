@@ -10,7 +10,7 @@ from unittest import mock
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine
 
-from core.base_mailbox import MailboxAccount
+from core.base_mailbox import MailboxAccount, OutlookMailbox
 from core.db import AccountModel, OutlookAccountModel
 from core.task_runtime import RegisterTaskControl, StopTaskRequested
 from platforms.chatgpt.oauth_client import OAuthClient
@@ -750,11 +750,8 @@ class ChatGPTReloginTests(unittest.TestCase):
                 },
             },
         }
-        mailbox = mock.Mock()
-        mailbox.get_current_ids.return_value = set()
-        mailbox._generate_password_reset_password.return_value = (
-            "Replacement-Password-2026!"
-        )
+        mailbox = OutlookMailbox()
+        mailbox.get_current_ids = mock.Mock(return_value=set())
 
         with mock.patch(
             "services.chatgpt_relogin.create_mailbox",
@@ -778,10 +775,7 @@ class ChatGPTReloginTests(unittest.TestCase):
             "chatgpt_password_reset_url_mail",
         )
         self.assertTrue(email_info["password_reset_required"])
-        self.assertEqual(
-            email_info["new_password"],
-            "Replacement-Password-2026!",
-        )
+        self.assertGreaterEqual(len(email_info["new_password"]), 12)
         self.assertEqual(
             email_info["totp_secret"],
             "JBSWY3DPEHPK3PXP",
