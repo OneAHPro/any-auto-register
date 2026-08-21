@@ -131,6 +131,7 @@ _task_store = RegisterTaskStore(
     cleanup_threshold=CLEANUP_THRESHOLD,
 )
 _chatgpt_task_enqueue_lock = threading.RLock()
+_chatgpt_mail_provider_reservations: dict[str, dict[str, int]] = {}
 _chatgpt_binding_db_lock = threading.RLock()
 _chatgpt_binding_table_ready = WeakKeyDictionary()
 _task_snapshot_persist_lock = threading.RLock()
@@ -551,6 +552,15 @@ def _chatgpt_mail_provider_available_count(provider: str) -> int:
     return max(0, int(snapshot.count or 0))
 
 
+def _chatgpt_mail_provider_reserved_count(provider: str) -> int:
+    normalized = str(provider or "").strip().lower()
+    with _chatgpt_task_enqueue_lock:
+        return sum(
+            max(0, int(reservations.get(normalized) or 0))
+            for reservations in _chatgpt_mail_provider_reservations.values()
+        )
+
+
 def _validate_chatgpt_mail_provider_capacity(provider_plan: list[str]) -> None:
     from collections import Counter
 
@@ -559,13 +569,103 @@ def _validate_chatgpt_mail_provider_capacity(provider_plan: list[str]) -> None:
         "applemail": "AppleMail 邮箱",
     }
     for provider, required in Counter(provider_plan).items():
-        available = _chatgpt_mail_provider_available_count(provider)
+        available = max(
+            0,
+            _chatgpt_mail_provider_available_count(provider)
+            - _chatgpt_mail_provider_reserved_count(provider),
+        )
         if available < required:
             raise HTTPException(
                 409,
                 f"{labels.get(provider, provider)}可用数量不足"
                 f"（需要 {required} 个，当前 {available} 个），请刷新后重试",
             )
+
+
+def _reserve_chatgpt_mail_provider_capacity(
+    task_id: str,
+    provider_plan: list[str],
+) -> None:
+    from collections import Counter
+
+    if not provider_plan:
+        return
+    with _chatgpt_task_enqueue_lock:
+        _validate_chatgpt_mail_provider_capacity(provider_plan)
+        _chatgpt_mail_provider_reservations[str(task_id)] = dict(
+            Counter(provider_plan)
+        )
+
+
+def _release_chatgpt_mail_provider_reservations(
+    task_id: str,
+    provider: str = "",
+) -> None:
+    normalized_task_id = str(task_id or "").strip()
+    normalized_provider = str(provider or "").strip().lower()
+    if not normalized_task_id:
+        return
+    with _chatgpt_task_enqueue_lock:
+        reservations = _chatgpt_mail_provider_reservations.get(
+            normalized_task_id
+        )
+        if not reservations:
+            return
+        if not normalized_provider:
+            _chatgpt_mail_provider_reservations.pop(normalized_task_id, None)
+            return
+        remaining = max(
+            0,
+            int(reservations.get(normalized_provider) or 0) - 1,
+        )
+        if remaining:
+            reservations[normalized_provider] = remaining
+        else:
+            reservations.pop(normalized_provider, None)
+        if not reservations:
+            _chatgpt_mail_provider_reservations.pop(normalized_task_id, None)
+
+
+def _bind_chatgpt_mail_provider_reservation(
+    mailbox,
+    *,
+    task_id: str,
+    provider: str,
+):
+    """Atomically hand one enqueue reservation to the real mailbox claim."""
+    normalized_provider = str(provider or "").strip().lower()
+    get_email = getattr(mailbox, "get_email", None)
+    with _chatgpt_task_enqueue_lock:
+        task_reservations = _chatgpt_mail_provider_reservations.get(
+            str(task_id or "").strip(),
+            {},
+        )
+        task_has_reservation = bool(
+            int(task_reservations.get(normalized_provider) or 0) > 0
+        )
+    if not normalized_provider or not callable(get_email) or not task_has_reservation:
+        return mailbox
+
+    claim_lock = threading.Lock()
+    reservation_consumed = False
+
+    def get_reserved_email(*args, **kwargs):
+        nonlocal reservation_consumed
+        with claim_lock:
+            if reservation_consumed:
+                return get_email(*args, **kwargs)
+            with _chatgpt_task_enqueue_lock:
+                try:
+                    return get_email(*args, **kwargs)
+                finally:
+                    reservation_consumed = True
+                    _release_chatgpt_mail_provider_reservations(
+                        task_id,
+                        normalized_provider,
+                    )
+
+    mailbox.get_email = get_reserved_email
+    return mailbox
 
 
 def _build_chatgpt_retry_request(
@@ -1375,7 +1475,11 @@ def _enqueue_prepared_register_task(
     meta: dict | None = None,
 ) -> str:
     task_id = f"task_{uuid.uuid4().hex}"
+    provider_plan = _normalize_chatgpt_mail_provider_plan(
+        prepared.extra.get(CHATGPT_MAIL_PROVIDER_PLAN_KEY)
+    )
     try:
+        _reserve_chatgpt_mail_provider_capacity(task_id, provider_plan)
         _attach_sms_pool_reservation(task_id, prepared)
         _create_task_record(task_id, prepared, source, meta)
         if background_tasks is None:
@@ -1386,6 +1490,7 @@ def _enqueue_prepared_register_task(
         else:
             background_tasks.add_task(_run_register, task_id, prepared)
     except Exception as exc:
+        _release_chatgpt_mail_provider_reservations(task_id)
         if _is_truthy(prepared.extra.get(CHATGPT_USE_SMS_POOL_FLAG)):
             sms_pool_service.release_task(task_id)
         if prepared.platform == "chatgpt":
@@ -3910,8 +4015,11 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 else:
                     sms_pool_service.release_task(task_id)
         finally:
-            if lease is not None:
-                chatgpt_task_gate.leave_foreground(lease)
+            try:
+                if lease is not None:
+                    chatgpt_task_gate.leave_foreground(lease)
+            finally:
+                _release_chatgpt_mail_provider_reservations(task_id)
 
 
 def _run_register_inner(task_id: str, req: RegisterTaskRequest):
@@ -4119,6 +4227,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 extra=mailbox_extra,
                 proxy=proxy,
             )
+            if not persisted_context:
+                mailbox = _bind_chatgpt_mail_provider_reservation(
+                    mailbox,
+                    task_id=task_id,
+                    provider=provider,
+                )
             if persisted_context:
                 mailbox = _bind_chatgpt_retry_mailbox(
                     mailbox,

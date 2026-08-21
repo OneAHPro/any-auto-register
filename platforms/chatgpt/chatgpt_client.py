@@ -1003,7 +1003,7 @@ class ChatGPTClient:
                             force_chatgpt_entry=False,
                             screen_hint="login",
                             login_source="web_password_reset_recovery",
-                            stop_after_login=True,
+                            stop_after_password_reset=True,
                         )
                         if password_committed:
                             self._log(

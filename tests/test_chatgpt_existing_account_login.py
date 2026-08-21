@@ -1254,7 +1254,8 @@ class ExistingAccountLoginTests(unittest.TestCase):
             self.assertEqual(password, "Fresh-Password-123!")
             self.assertTrue(kwargs["password_reset_required"])
             self.assertTrue(kwargs["force_new_browser"])
-            self.assertTrue(kwargs["stop_after_login"])
+            self.assertTrue(kwargs["stop_after_password_reset"])
+            self.assertFalse(kwargs.get("stop_after_login", False))
             self.assertTrue(kwargs["on_password_reset"](password))
             return None
 

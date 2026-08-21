@@ -3468,6 +3468,7 @@ class OAuthClient:
         birthdate="",
         login_source="",
         stop_after_login=False,
+        stop_after_password_reset=False,
         prepared_oauth_context=None,
         _continue_depth=0,
         _password_reset_depth=0,
@@ -3523,7 +3524,9 @@ class OAuthClient:
             f"mfa_recovery={'on' if str(mfa_recovery_code or '').strip() else 'off'}, "
             f"force_chatgpt_entry={'on' if force_chatgpt_entry else 'off'}, "
             f"screen_hint={screen_hint or 'login'}, "
-            f"stop_after_login={'on' if stop_after_login else 'off'}"
+            f"stop_after_login={'on' if stop_after_login else 'off'}, "
+            "stop_after_password_reset="
+            f"{'on' if stop_after_password_reset else 'off'}"
         )
 
         if force_new_browser:
@@ -3754,6 +3757,10 @@ class OAuthClient:
                 )
                 if not reset_state:
                     return None
+                if stop_after_password_reset:
+                    self.last_state = reset_state
+                    self._set_error("密码重置完成，按要求停止")
+                    return None
                 return self.login_and_get_tokens(
                     email,
                     password,
@@ -3782,6 +3789,7 @@ class OAuthClient:
                     birthdate=birthdate,
                     login_source=login_source,
                     stop_after_login=stop_after_login,
+                    stop_after_password_reset=False,
                     prepared_oauth_context=None,
                     _continue_depth=0,
                     _password_reset_depth=int(_password_reset_depth or 0) + 1,

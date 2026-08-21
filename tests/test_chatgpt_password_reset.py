@@ -113,6 +113,54 @@ class ChatGPTPasswordResetProtocolTests(unittest.TestCase):
             "sentinel-token",
         )
 
+    def test_reset_only_login_stops_before_second_oauth_entry(self):
+        self.client._bootstrap_oauth_session = mock.Mock(
+            return_value="https://auth.openai.com/log-in/password"
+        )
+        self.client._submit_authorize_continue = mock.Mock(
+            return_value=FlowState(
+                page_type="login_password",
+                current_url="https://auth.openai.com/log-in/password",
+            )
+        )
+        committed = mock.Mock(return_value=True)
+
+        def complete_reset(*_args, **kwargs):
+            self.assertTrue(kwargs["on_password_reset"]("Fresh-Password-123!"))
+            return FlowState(
+                page_type="reset_password_success",
+                current_url="https://auth.openai.com/reset-password/success",
+            )
+
+        self.client._complete_password_reset = mock.Mock(
+            side_effect=complete_reset
+        )
+        self.client._submit_password_verify = mock.Mock(
+            side_effect=AssertionError("must not start a second login")
+        )
+
+        result = self.client.login_and_get_tokens(
+            "reset-user@example.com",
+            "Fresh-Password-123!",
+            device_id="device-id",
+            skymail_client=mock.Mock(),
+            force_new_browser=True,
+            force_password_login=True,
+            password_reset_required=True,
+            on_password_reset=committed,
+            stop_after_password_reset=True,
+        )
+
+        self.assertIsNone(result)
+        self.assertEqual(
+            self.client.last_error,
+            "密码重置完成，按要求停止",
+        )
+        self.client._bootstrap_oauth_session.assert_called_once()
+        self.client._complete_password_reset.assert_called_once()
+        self.client._submit_password_verify.assert_not_called()
+        committed.assert_called_once_with("Fresh-Password-123!")
+
     def test_remote_totp_provider_is_used_without_base32_secret(self):
         issue = _response(
             {

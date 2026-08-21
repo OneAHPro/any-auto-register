@@ -16,7 +16,8 @@ transaction.
 ## Implementation
 
 1. Count only enabled Microsoft mailbox rows in import snapshots.
-2. Validate provider-plan capacity again on task submission.
+2. Validate and atomically reserve provider-plan capacity on task submission;
+   hand each reservation to the real mailbox claim under the same lock.
 3. If password-reset login receives a transient invalid-session response at
    authorize/continue, reset the password through a fresh PKCE OAuth session,
    persist it, then restart the Web login once with the saved password.

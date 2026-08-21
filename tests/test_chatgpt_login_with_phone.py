@@ -5,7 +5,9 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from fastapi import HTTPException
+from fastapi import BackgroundTasks, HTTPException
+
+import api.tasks as tasks_module
 
 from api.tasks import (
     RegisterTaskRequest,
@@ -197,6 +199,53 @@ class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
                 "微软邮箱可用数量不足（需要 3 个，当前 2 个）",
             ):
                 _prepare_register_request(request)
+
+    def test_enqueued_mail_provider_reservation_blocks_second_task(self):
+        request = self._request(count=1, codes=[], enabled=False)
+        request.extra["chatgpt_existing_account_mail_provider_plan"] = [
+            "microsoft",
+        ]
+        request.extra["chatgpt_existing_account_sms_mode"] = "none"
+        task_id = "task_mail_reservation_one"
+
+        with patch(
+            "api.tasks._chatgpt_mail_provider_available_count",
+            return_value=1,
+        ), patch(
+            "api.tasks._create_task_record",
+        ), patch(
+            "api.tasks.uuid.uuid4",
+            return_value=SimpleNamespace(hex="mail_reservation_one"),
+        ):
+            try:
+                prepared = _prepare_register_request(request)
+                created = tasks_module._enqueue_prepared_register_task(
+                    prepared,
+                    background_tasks=BackgroundTasks(),
+                )
+                self.assertEqual(created, task_id)
+
+                with self.assertRaisesRegex(
+                    HTTPException,
+                    "微软邮箱可用数量不足（需要 1 个，当前 0 个）",
+                ):
+                    _prepare_register_request(request)
+
+                mailbox = SimpleNamespace(
+                    get_email=Mock(return_value=SimpleNamespace(email="one"))
+                )
+                tasks_module._bind_chatgpt_mail_provider_reservation(
+                    mailbox,
+                    task_id=task_id,
+                    provider="microsoft",
+                )
+                self.assertEqual(mailbox.get_email().email, "one")
+                prepared_after_claim = _prepare_register_request(request)
+                self.assertEqual(prepared_after_claim.count, 1)
+            finally:
+                tasks_module._release_chatgpt_mail_provider_reservations(
+                    task_id
+                )
 
 
     def test_prepare_rejects_a_card_count_that_differs_from_login_count(self):
