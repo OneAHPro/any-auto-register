@@ -242,6 +242,8 @@ def _resolved_microsoft_row(
 def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
     parts = _split_row(line)
     email = parts[0].strip() if parts else ""
+    if re.search(r"\\+@yisen\.uk$", email, re.IGNORECASE):
+        email = re.sub(r"\\+@", "@", email)
     if not _EMAIL_ADDRESS_RE.fullmatch(email):
         return _unresolved_row(
             line_number=line_number,
@@ -251,6 +253,12 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
         )
 
     domain = _email_domain(email)
+    if domain == "yisen.uk":
+        return _resolved_microsoft_row(
+            line_number=line_number,
+            email=email,
+            raw_content=line,
+        )
     if len(parts) == 2 and _looks_like_http_url(parts[1]):
         return _resolved_microsoft_row(
             line_number=line_number,

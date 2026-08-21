@@ -29,6 +29,191 @@ class _FakeResponse:
 
 
 class OutlookMailboxOAuthTests(unittest.TestCase):
+    @mock.patch("requests.get")
+    def test_yisen_mailapi_request_uses_jwt_and_browser_headers(self, mock_get):
+        token = "header.payload.fixture-signature"
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="worker@yisen.uk",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": (
+                    "https://mail.yisen.uk/api/mails"
+                    "?login=worker%40yisen.uk&limit=20&offset=0"
+                ),
+                "mailapi_token": token,
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            payload={"count": 0, "results": []},
+            text='{"count":0,"results":[]}',
+        )
+
+        mailbox._backends["mailapi_url"]._fetch_mailapi_text(account)
+
+        request_kwargs = mock_get.call_args.kwargs
+        self.assertEqual(
+            request_kwargs["headers"]["Authorization"],
+            f"Bearer {token}",
+        )
+        self.assertEqual(
+            request_kwargs["headers"]["Accept"],
+            "application/json, text/plain, */*",
+        )
+        self.assertEqual(request_kwargs["headers"]["x-lang"], "zh-CN")
+        self.assertIn("Mozilla/5.0", request_kwargs["headers"]["User-Agent"])
+
+    def test_yisen_mailapi_results_parse_newest_openai_code(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        payload = {
+            "count": 3,
+            "results": [
+                {
+                    "id": 7,
+                    "message_id": "mail-7",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your OpenAI verification code"}
+                    ),
+                    "source": "Your verification code is 246810",
+                    "created_at": "2026-08-21T06:30:00Z",
+                },
+                {
+                    "id": 8,
+                    "message_id": "mail-8",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your ChatGPT authentication code"}
+                    ),
+                    "source": "Your authentication code is 975310",
+                    "created_at": "2026-08-21T06:31:00Z",
+                },
+                {
+                    "id": 9,
+                    "message_id": "mail-9",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps({"subject": "Unrelated receipt"}),
+                    "source": "Receipt number 111111",
+                    "created_at": "2026-08-21T06:32:00Z",
+                },
+            ],
+        }
+
+        parsed = backend._parse_mailapi_message(json.dumps(payload))
+
+        self.assertEqual(parsed["content"], "Your ChatGPT authentication code 975310")
+        self.assertEqual(
+            parsed["received_at"],
+            datetime.fromisoformat("2026-08-21T06:31:00+00:00").timestamp(),
+        )
+        self.assertEqual(parsed["message_id"], "mailapi_message:mail-8")
+        self.assertTrue(parsed["mailapi_history"])
+
+    def test_yisen_mailapi_results_decode_base64_raw_mime(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        raw_mime = (
+            "From: no-reply@openai.com\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            "Content-Type: text/plain; charset=utf-8\r\n"
+            "Content-Transfer-Encoding: base64\r\n\r\n"
+            "WW91ciB2ZXJpZmljYXRpb24gY29kZSBpcyAyNDY4MTA="
+        )
+        payload = {
+            "count": 1,
+            "results": [
+                {
+                    "id": 7,
+                    "message_id": "mail-7",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your temporary ChatGPT verification code"}
+                    ),
+                    "source": "bounces@example.test",
+                    "raw": raw_mime,
+                    "created_at": "2026-08-21T06:30:00Z",
+                }
+            ],
+        }
+
+        parsed = backend._parse_mailapi_message(json.dumps(payload))
+        code = backend._extract_message_code(parsed, json.dumps(payload), None)
+
+        self.assertEqual(code, "246810")
+        self.assertTrue(parsed["status"])
+        self.assertEqual(parsed["message_id"], "mailapi_message:mail-7")
+
+    def test_yisen_mailapi_results_extract_code_from_html_mime(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        long_attributes = "x" * 220
+        raw_mime = (
+            "From: no-reply@openai.com\r\n"
+            "Subject: Your temporary ChatGPT verification code\r\n"
+            "Content-Type: text/html; charset=utf-8\r\n"
+            "Content-Transfer-Encoding: quoted-printable\r\n\r\n"
+            "<h1>Your verification code</h1>"
+            f"<div data-layout='{long_attributes}'>246810</div>"
+        )
+        payload = {
+            "count": 1,
+            "results": [
+                {
+                    "id": 7,
+                    "message_id": "mail-7",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your temporary ChatGPT verification code"}
+                    ),
+                    "source": "bounces@example.test",
+                    "raw": raw_mime,
+                    "created_at": "2026-08-21T06:30:00Z",
+                }
+            ],
+        }
+
+        parsed = backend._parse_mailapi_message(json.dumps(payload))
+        code = backend._extract_message_code(parsed, json.dumps(payload), None)
+
+        self.assertEqual(code, "246810")
+        self.assertTrue(parsed["status"])
+        self.assertEqual(parsed["message_id"], "mailapi_message:mail-7")
+
+    @mock.patch("requests.get")
+    def test_yisen_mailapi_403_does_not_expose_token_or_email(self, mock_get):
+        logs = []
+        mailbox = OutlookMailbox()
+        mailbox._log_fn = logs.append
+        token = "header.payload.private-signature"
+        email = "private@yisen.uk"
+        account = MailboxAccount(
+            email=email,
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": (
+                    "https://mail.yisen.uk/api/mails"
+                    "?login=private%40yisen.uk&limit=20&offset=0"
+                ),
+                "mailapi_token": token,
+            },
+        )
+        mock_get.return_value = _FakeResponse(403, text="forbidden")
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(account, timeout=5)
+
+        self.assertIsNone(code)
+        rendered = "\n".join(logs)
+        self.assertIn("[MailAPI] 拉取失败", rendered)
+        self.assertNotIn(token, rendered)
+        self.assertNotIn(email, rendered)
+
     def test_requeue_account_restores_removed_outlook_account(self):
         test_engine = create_engine(
             "sqlite://",
@@ -45,6 +230,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                 "client_id": "mail-client",
                 "refresh_token": "mail-refresh",
                 "account_type": "microsoft_oauth",
+                "mailapi_token": "mailapi-secret-token",
             },
         )
 
@@ -61,6 +247,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertEqual(restored.password, "mail-password")
         self.assertEqual(restored.client_id, "mail-client")
         self.assertEqual(restored.refresh_token, "mail-refresh")
+        self.assertEqual(restored.mailapi_token, "mailapi-secret-token")
         self.assertTrue(restored.enabled)
 
     def test_mailapi_account_can_persist_chatgpt_password_after_reset(self):
@@ -123,6 +310,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                     refresh_token="mail-refresh",
                     account_type="mailapi_url",
                     mailapi_url="https://mail.example.test/claimed",
+                    mailapi_token="mailapi-secret-token",
                 )
             )
             session.commit()
@@ -164,6 +352,8 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             saved.mailapi_url,
             "https://mail.example.test/claimed",
         )
+        self.assertEqual(claimed.extra["mailapi_token"], "mailapi-secret-token")
+        self.assertEqual(saved.mailapi_token, "mailapi-secret-token")
         self.assertFalse(saved.enabled)
 
     def test_get_email_by_address_preserves_retry_binding_order(self):

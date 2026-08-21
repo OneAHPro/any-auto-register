@@ -68,7 +68,7 @@ Run the exact new test node IDs. Expected: unresolved row, missing attribute, or
 Add `mailapi_token: str = ""` to `MicrosoftMailImportRecord` and `OutlookAccountModel`; add the SQLite `ALTER TABLE` and null normalization. Decode only the JWT payload segment without signature verification for structural routing, require the claim address to equal the imported email, and build:
 
 ```python
-https://mail.yisen.uk/api/mails?login=<encoded>&limit=20&offset=0&lite=1
+https://mail.yisen.uk/api/mails?login=<encoded>&limit=20&offset=0
 ```
 
 Store the JWT separately. Do not return it in `MailImportSnapshotItem` or import `meta`.
@@ -110,10 +110,10 @@ Run the new lifecycle node IDs plus `tests/test_chatgpt_plugin.py`.
 
 - [ ] **Step 1: Add failing request and parsing tests**
 
-Use a synthetic JWT and response:
+Use a synthetic JWT and full-message response:
 
 ```json
-{"count":1,"results":[{"id":7,"message_id":"mail-7","address":"worker@yisen.uk","metadata":"{\"subject\":\"Your OpenAI verification code\"}","source":"Your verification code is 246810","created_at":"2026-08-21T06:30:00Z"}]}
+{"count":1,"results":[{"id":7,"message_id":"mail-7","address":"worker@yisen.uk","metadata":"{\"subject\":\"Your OpenAI verification code\"}","raw":"Subject: Your OpenAI verification code\\r\\n\\r\\nYour verification code is 246810","created_at":"2026-08-21T06:30:00Z"}]}
 ```
 
 Assert the request uses `Authorization: Bearer <token>`, browser User-Agent,
@@ -130,8 +130,9 @@ Expected: missing headers and unrecognized `results` payload.
 Allow `_request_mailapi()` to receive headers. In `_fetch_mailapi_text()`, when
 the host is `mail.yisen.uk`, require `mailapi_token` and pass the authenticated
 browser headers. Extend `_parse_mailapi_message()` with a bounded `results`
-branch that parses metadata JSON, filters OpenAI/ChatGPT subjects, requires a
-six-digit code, sorts by parsed `created_at`, and returns the newest candidate.
+branch that parses metadata JSON and MIME text, filters OpenAI/ChatGPT subjects,
+requires a six-digit code, sorts by parsed `created_at`, and returns the newest
+candidate.
 
 - [ ] **Step 4: Verify request/parser tests are GREEN**
 

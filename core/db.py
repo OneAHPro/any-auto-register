@@ -161,6 +161,7 @@ class OutlookAccountModel(SQLModel, table=True):
     refresh_token: str = ""
     account_type: str = "microsoft_oauth"
     mailapi_url: str = ""
+    mailapi_token: str = ""
     enabled: bool = True
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
@@ -455,11 +456,18 @@ def _migrate_outlook_accounts_schema() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE outlook_accounts ADD COLUMN mailapi_url TEXT DEFAULT ''"
             )
+        if "mailapi_token" not in existing_columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE outlook_accounts ADD COLUMN mailapi_token TEXT DEFAULT ''"
+            )
         conn.exec_driver_sql(
             "UPDATE outlook_accounts SET account_type = 'microsoft_oauth' WHERE account_type IS NULL OR TRIM(account_type) = ''"
         )
         conn.exec_driver_sql(
             "UPDATE outlook_accounts SET mailapi_url = '' WHERE mailapi_url IS NULL"
+        )
+        conn.exec_driver_sql(
+            "UPDATE outlook_accounts SET mailapi_token = '' WHERE mailapi_token IS NULL"
         )
 
 

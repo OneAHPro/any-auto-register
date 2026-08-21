@@ -4466,6 +4466,39 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return ""
         return str(match.group(1) or match.group(2) or "").strip()
 
+    @staticmethod
+    def _decode_mailapi_raw_mime(value: Any) -> str:
+        from email import policy
+        from email.parser import Parser
+
+        raw = str(value or "")
+        if not raw:
+            return ""
+        try:
+            message = Parser(policy=policy.default).parsestr(raw)
+        except Exception:
+            return raw
+
+        parts = list(message.walk()) if message.is_multipart() else [message]
+        decoded_parts = []
+        for part in parts:
+            if part.is_multipart():
+                continue
+            content_type = str(part.get_content_type() or "").lower()
+            if content_type not in {"text/plain", "text/html"}:
+                continue
+            try:
+                content = part.get_content()
+            except Exception:
+                payload = part.get_payload(decode=True)
+                if isinstance(payload, bytes):
+                    charset = str(part.get_content_charset() or "utf-8")
+                    content = payload.decode(charset, errors="replace")
+                else:
+                    content = str(payload or "")
+            decoded_parts.append(str(content or ""))
+        return " ".join(decoded_parts).strip() or raw
+
     @classmethod
     def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
         import json
@@ -4485,6 +4518,85 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "received_at": None,
                 "message_id": "",
                 "status": None,
+            }
+
+        yisen_results = payload.get("results")
+        if isinstance(yisen_results, list):
+            candidates = []
+            for index, item in enumerate(yisen_results):
+                if not isinstance(item, dict):
+                    continue
+                metadata = item.get("metadata")
+                if isinstance(metadata, str):
+                    try:
+                        metadata = json.loads(metadata)
+                    except (TypeError, ValueError):
+                        metadata = {}
+                if not isinstance(metadata, dict):
+                    metadata = {}
+                subject = str(metadata.get("subject") or "").strip()
+                if not cls._is_openai_history_subject(subject):
+                    continue
+                source = str(item.get("source") or "").strip()
+                raw_message = str(item.get("raw") or "").strip()
+                decoded_message = cls._decode_mailapi_raw_mime(raw_message)
+                visible_message = cls._mailapi_visible_text(decoded_message)
+                code = cls._mailapi_history_item_code(
+                    {
+                        "subject": subject,
+                        "content": visible_message or source,
+                    }
+                )
+                if not code:
+                    continue
+                received_value = item.get("created_at")
+                received_at = cls._parse_timestamp(received_value)
+                if received_at is None:
+                    continue
+                raw_id = str(
+                    item.get("message_id") or item.get("id") or ""
+                ).strip()
+                if not raw_id:
+                    import hashlib
+
+                    raw_id = hashlib.sha256(
+                        "|".join(
+                            (
+                                str(item.get("address") or "").strip(),
+                                str(received_value or "").strip(),
+                                code,
+                            )
+                        ).encode("utf-8", errors="ignore")
+                    ).hexdigest()
+                candidates.append(
+                    (
+                        received_at,
+                        -index,
+                        {
+                            "content": " ".join(
+                                part
+                                for part in (subject, visible_message, code)
+                                if part
+                            ),
+                            "received_at": received_at,
+                            "message_id": f"mailapi_message:{raw_id}",
+                            "status": True,
+                            "response_email": str(
+                                item.get("address") or ""
+                            ).strip(),
+                            "mailapi_history": True,
+                        },
+                    )
+                )
+            if candidates:
+                return max(candidates, key=lambda candidate: candidate[:2])[2]
+            return {
+                "content": "",
+                "received_at": None,
+                "message_id": "",
+                "status": False,
+                "response_email": "",
+                "mailapi_history": True,
             }
 
         messages = payload.get("messages")
@@ -5008,6 +5120,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         url: str,
         *,
         cookies: Any = None,
+        headers: Optional[dict[str, str]] = None,
         timeout: int = 15,
     ):
         import requests
@@ -5018,6 +5131,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         }
         if cookies:
             request_kwargs["cookies"] = cookies
+        if headers:
+            request_kwargs["headers"] = dict(headers)
         response = requests.get(url, **request_kwargs)
         if response.status_code >= 400:
             raise RuntimeError(
@@ -5060,11 +5175,29 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         )
 
     def _fetch_mailapi_text(self, account: MailboxAccount) -> str:
+        from urllib.parse import urlsplit
+
         extra = account.extra or {}
         url = str(extra.get("mailapi_url") or "").strip()
         if not url:
             raise RuntimeError("mailapi_url 为空，无法轮询取码")
-        response = self._request_mailapi(url)
+        headers = None
+        if str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk":
+            token = str(extra.get("mailapi_token") or "").strip()
+            if not token:
+                raise RuntimeError("Yisen MailAPI 凭据缺失")
+            headers = {
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json, text/plain, */*",
+                "Content-Type": "application/json",
+                "x-lang": "zh-CN",
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/136.0.0.0 Safari/537.36"
+                ),
+            }
+        response = self._request_mailapi(url, headers=headers)
         text = str(response.text or "")
         direct_message = self._parse_mailapi_message(text)
         direct_content = str(direct_message.get("content") or "")
@@ -5436,6 +5569,7 @@ class OutlookMailbox(BaseMailbox):
                     "refresh_token": account.refresh_token,
                     "account_type": getattr(account, "account_type", "microsoft_oauth"),
                     "mailapi_url": getattr(account, "mailapi_url", ""),
+                    "mailapi_token": getattr(account, "mailapi_token", ""),
                 }
                 session.delete(account)
                 session.commit()
@@ -5459,6 +5593,7 @@ class OutlookMailbox(BaseMailbox):
         refresh_token = str(payload.get("refresh_token") or "")
         account_type = self._normalize_account_type(payload.get("account_type"))
         mailapi_url = str(payload.get("mailapi_url") or "").strip()
+        mailapi_token = str(payload.get("mailapi_token") or "").strip()
         auth_mode = (
             "mailapi_url"
             if account_type == "mailapi_url"
@@ -5471,6 +5606,7 @@ class OutlookMailbox(BaseMailbox):
             f"has_client_id={bool(client_id)} "
             f"has_refresh_token={bool(refresh_token)} "
             f"has_mailapi_url={bool(mailapi_url)} "
+            f"has_mailapi_token={bool(mailapi_token)} "
             f"account_type={account_type} "
             f"auth_mode={auth_mode}"
         )
@@ -5484,6 +5620,7 @@ class OutlookMailbox(BaseMailbox):
                 "refresh_token": refresh_token,
                 "account_type": account_type,
                 "mailapi_url": mailapi_url,
+                "mailapi_token": mailapi_token,
                 "outlook_backend": self._backend_name,
             },
         )
@@ -5502,6 +5639,7 @@ class OutlookMailbox(BaseMailbox):
         refresh_token = str(extra.get("refresh_token") or "")
         account_type = self._normalize_account_type(extra.get("account_type"))
         mailapi_url = str(extra.get("mailapi_url") or "")
+        mailapi_token = str(extra.get("mailapi_token") or "")
 
         with self._lock:
             with Session(engine) as session:
@@ -5514,6 +5652,7 @@ class OutlookMailbox(BaseMailbox):
                     existing.refresh_token = refresh_token
                     existing.account_type = account_type
                     existing.mailapi_url = mailapi_url
+                    existing.mailapi_token = mailapi_token
                     existing.enabled = True
                     existing.updated_at = _utcnow()
                     session.add(existing)
@@ -5526,6 +5665,7 @@ class OutlookMailbox(BaseMailbox):
                             refresh_token=refresh_token,
                             account_type=account_type,
                             mailapi_url=mailapi_url,
+                            mailapi_token=mailapi_token,
                             enabled=True,
                             created_at=_utcnow(),
                             updated_at=_utcnow(),
@@ -5555,6 +5695,7 @@ class OutlookMailbox(BaseMailbox):
             or account_extra.get("mail_api_url")
             or ""
         ).strip()
+        mailapi_token = str(account_extra.get("mailapi_token") or "").strip()
         account_type = (
             "mailapi_url"
             if mailapi_url
@@ -5579,6 +5720,7 @@ class OutlookMailbox(BaseMailbox):
                             refresh_token=refresh_token,
                             account_type=account_type,
                             mailapi_url=mailapi_url,
+                            mailapi_token=mailapi_token,
                             enabled=False,
                             created_at=now,
                             updated_at=now,
@@ -5586,6 +5728,8 @@ class OutlookMailbox(BaseMailbox):
                     )
                 else:
                     existing.password = password
+                    if mailapi_token:
+                        existing.mailapi_token = mailapi_token
                     existing.enabled = False
                     existing.updated_at = _utcnow()
                     session.add(existing)

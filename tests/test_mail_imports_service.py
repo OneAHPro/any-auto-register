@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import json
 import os
@@ -15,6 +16,20 @@ from core.db import OutlookAccountModel
 from core.applemail_pool import parse_applemail_pool_import_content
 
 
+def fixture_yisen_jwt(address: str) -> str:
+    def encode(payload: dict) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "HS256", "typ": "JWT"}),
+            encode({"address": address, "address_id": 12345}),
+            "fixture-signature",
+        )
+    )
+
+
 def load_microsoft_import_rules_module():
     module_path = (
         Path(__file__).resolve().parents[1]
@@ -30,6 +45,155 @@ def load_microsoft_import_rules_module():
 
 
 class MailImportServiceTests(unittest.TestCase):
+    def test_outlook_schema_migration_adds_mailapi_token_to_existing_table(self):
+        import core.db as db_module
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'legacy-mail-imports.db'}"
+            )
+            try:
+                with test_engine.begin() as connection:
+                    connection.exec_driver_sql(
+                        "CREATE TABLE outlook_accounts ("
+                        "id INTEGER PRIMARY KEY, email TEXT, password TEXT, "
+                        "account_type TEXT, mailapi_url TEXT)"
+                    )
+                    connection.exec_driver_sql(
+                        "INSERT INTO outlook_accounts "
+                        "(email, password, account_type, mailapi_url) VALUES "
+                        "('legacy@example.test', 'password', 'mailapi_url', NULL)"
+                    )
+
+                with patch.object(db_module, "engine", test_engine):
+                    db_module._migrate_outlook_accounts_schema()
+
+                with test_engine.connect() as connection:
+                    columns = {
+                        str(row[1])
+                        for row in connection.exec_driver_sql(
+                            "PRAGMA table_info('outlook_accounts')"
+                        ).fetchall()
+                    }
+                    row = connection.exec_driver_sql(
+                        "SELECT mailapi_url, mailapi_token "
+                        "FROM outlook_accounts WHERE email = 'legacy@example.test'"
+                    ).one()
+                self.assertIn("mailapi_token", columns)
+                self.assertEqual(tuple(row), ("", ""))
+            finally:
+                test_engine.dispose()
+
+    def test_parse_microsoft_import_line_supports_yisen_password_and_jwt(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        token = fixture_yisen_jwt("worker@yisen.uk")
+
+        record = parse_microsoft_import_line(
+            1,
+            f"worker@yisen.uk----login-password----{token}",
+        )
+
+        self.assertEqual(record.email, "worker@yisen.uk")
+        self.assertEqual(record.password, "login-password")
+        self.assertEqual(record.account_type, "mailapi_url")
+        self.assertEqual(record.mailapi_token, token)
+        self.assertEqual(
+            record.mailapi_url,
+            "https://mail.yisen.uk/api/mails"
+            "?login=worker%40yisen.uk&limit=20&offset=0",
+        )
+
+    def test_parse_yisen_row_restores_markdown_escaped_email_and_jwt(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        token = fixture_yisen_jwt("worker@yisen.uk").replace(
+            "fixture-signature",
+            "fixture_signature",
+        )
+        escaped_token = token.replace("_", r"\\\_")
+
+        record = parse_microsoft_import_line(
+            1,
+            rf"worker\\\@yisen.uk----login-password----{escaped_token}",
+        )
+
+        self.assertEqual(record.email, "worker@yisen.uk")
+        self.assertEqual(record.mailapi_token, token)
+
+    def test_parse_yisen_row_preserves_dash_runs_inside_jwt_signature(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        token = fixture_yisen_jwt("worker@yisen.uk").replace(
+            "fixture-signature",
+            "fixture---signature",
+        )
+
+        record = parse_microsoft_import_line(
+            1,
+            f"worker@yisen.uk----login-password----{token}",
+        )
+
+        self.assertEqual(record.mailapi_token, token)
+
+    def test_parse_microsoft_import_line_rejects_mismatched_yisen_jwt(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        token = fixture_yisen_jwt("other@yisen.uk")
+
+        with self.assertRaisesRegex(ValueError, "邮箱不匹配"):
+            parse_microsoft_import_line(
+                1,
+                f"worker@yisen.uk----login-password----{token}",
+            )
+
+    def test_parse_microsoft_import_line_rejects_malformed_yisen_jwt_safely(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+
+        with self.assertRaisesRegex(ValueError, "JWT 格式无效"):
+            parse_microsoft_import_line(
+                1,
+                "worker@yisen.uk----login-password----@@@.%%%.signature",
+            )
+
+    def test_microsoft_strategy_persists_yisen_token_without_exposing_it(self):
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        token = fixture_yisen_jwt("worker@yisen.uk")
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'mail-imports.db'}"
+            )
+            SQLModel.metadata.create_all(test_engine)
+            try:
+                with patch("services.mail_imports.providers.engine", test_engine):
+                    response = strategy.execute(
+                        MailImportExecuteRequest(
+                            type="microsoft",
+                            content=(
+                                "worker@yisen.uk----login-password----"
+                                f"{token}"
+                            ),
+                            bind_to_config=False,
+                        )
+                    )
+
+                self.assertEqual(response.summary.success, 1)
+                self.assertNotIn(token, response.model_dump_json())
+                with Session(test_engine) as session:
+                    imported = session.exec(
+                        select(OutlookAccountModel).where(
+                            OutlookAccountModel.email == "worker@yisen.uk"
+                        )
+                    ).one()
+                self.assertEqual(imported.account_type, "mailapi_url")
+                self.assertEqual(imported.mailapi_token, token)
+            finally:
+                test_engine.dispose()
+
     def test_microsoft_snapshot_only_counts_enabled_accounts(self):
         from services.mail_imports.providers import MicrosoftMailImportStrategy
         from services.mail_imports.schemas import MailImportSnapshotRequest

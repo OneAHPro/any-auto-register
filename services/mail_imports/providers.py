@@ -326,6 +326,7 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                         refresh_token=record.refresh_token,
                         account_type=record.account_type,
                         mailapi_url=record.mailapi_url,
+                        mailapi_token=record.mailapi_token,
                     )
                 )
         return expanded
@@ -540,6 +541,7 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                         refresh_token=record.refresh_token,
                         account_type=str(record.account_type or ACCOUNT_TYPE_MICROSOFT_OAUTH),
                         mailapi_url=str(record.mailapi_url or ""),
+                        mailapi_token=str(record.mailapi_token or ""),
                         enabled=bool(request.enabled),
                         created_at=_utcnow(),
                         updated_at=_utcnow(),

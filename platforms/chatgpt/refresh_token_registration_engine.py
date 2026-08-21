@@ -268,8 +268,20 @@ class RefreshTokenRegistrationEngine:
             False,
         )
         if isinstance(value, bool):
-            return value
-        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+            enabled = value
+        else:
+            enabled = str(value or "").strip().lower() in {
+                "1",
+                "true",
+                "yes",
+                "on",
+            }
+        if enabled:
+            return True
+        sms_mode = str(
+            self.extra_config.get("chatgpt_existing_account_sms_mode") or ""
+        ).strip().lower()
+        return sms_mode == "pool"
 
     def _existing_account_rotate_mfa_enabled(self) -> bool:
         value = self.extra_config.get(

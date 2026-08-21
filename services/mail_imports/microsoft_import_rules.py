@@ -1,8 +1,15 @@
+import base64
+import json
+import re
 from dataclasses import dataclass
 from typing import Any, Optional, Protocol
-from urllib.parse import urlparse
+from urllib.parse import urlencode, urlparse
 
-from core.mail_import_delimiters import split_mail_import_dash_fields
+from core.mail_import_delimiters import (
+    MAIL_IMPORT_DASH_DELIMITER_RE,
+    normalize_mail_import_field,
+    split_mail_import_dash_fields,
+)
 
 
 ACCOUNT_TYPE_MICROSOFT_OAUTH = "microsoft_oauth"
@@ -18,6 +25,7 @@ class MicrosoftMailImportRecord:
     refresh_token: str = ""
     account_type: str = ACCOUNT_TYPE_MICROSOFT_OAUTH
     mailapi_url: str = ""
+    mailapi_token: str = ""
 
 
 class MicrosoftMailImportRule(Protocol):
@@ -42,6 +50,51 @@ def _is_valid_mailapi_url(url: str) -> bool:
     text = str(url or "").strip()
     parsed = urlparse(text)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def _is_yisen_email(email: str) -> bool:
+    return str(email or "").strip().lower().rpartition("@")[2] == "yisen.uk"
+
+
+def _decode_jwt_part(value: str) -> Any:
+    normalized = str(value or "").strip()
+    padding = "=" * (-len(normalized) % 4)
+    decoded = base64.urlsafe_b64decode((normalized + padding).encode())
+    return json.loads(decoded.decode("utf-8"))
+
+
+def _parse_yisen_mailapi_token(
+    *,
+    line_number: int,
+    email: str,
+    token: str,
+) -> str:
+    normalized = re.sub(r"\\+([_-])", r"\1", str(token or "").strip())
+    parts = normalized.split(".")
+    if len(parts) != 3 or not all(parts):
+        raise ValueError(f"行 {line_number}: Yisen 邮箱 JWT 格式无效")
+    try:
+        header = _decode_jwt_part(parts[0])
+        payload = _decode_jwt_part(parts[1])
+    except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+        raise ValueError(f"行 {line_number}: Yisen 邮箱 JWT 格式无效") from None
+    if not isinstance(header, dict) or not isinstance(payload, dict):
+        raise ValueError(f"行 {line_number}: Yisen 邮箱 JWT 格式无效")
+    token_address = str(payload.get("address") or "").strip().lower()
+    if token_address != str(email or "").strip().lower():
+        raise ValueError(f"行 {line_number}: Yisen JWT 邮箱不匹配")
+    return normalized
+
+
+def _build_yisen_mailapi_url(email: str) -> str:
+    query = urlencode(
+        {
+            "login": str(email or "").strip(),
+            "limit": 20,
+            "offset": 0,
+        }
+    )
+    return f"https://mail.yisen.uk/api/mails?{query}"
 
 
 class MicrosoftOAuthRowParser:
@@ -116,25 +169,55 @@ class AutoDetectRowParser:
         self._mailapi_parser = mailapi_parser or MailApiUrlRowParser()
 
     def parse(self, line_number: int, line: str) -> MicrosoftMailImportRecord:
-        parts = split_mail_import_dash_fields(line)
+        raw = str(line or "")
+        first_field = MAIL_IMPORT_DASH_DELIMITER_RE.split(raw, maxsplit=1)[0]
+        normalized_first = normalize_mail_import_field(first_field)
+        normalized_yisen_first = re.sub(r"\\+@", "@", normalized_first)
+        if _is_yisen_email(normalized_yisen_first):
+            parts = [
+                normalize_mail_import_field(part)
+                for part in MAIL_IMPORT_DASH_DELIMITER_RE.split(
+                    raw,
+                    maxsplit=2,
+                )
+            ]
+        else:
+            parts = split_mail_import_dash_fields(raw)
         if len(parts) == 2:
             return self._mailapi_parser.parse(line_number, line)
         if len(parts) == 3:
-            email, password, mailapi_url = parts
+            email, password, mailapi_credential = parts
+            if re.search(r"\\+@yisen\.uk$", str(email or ""), re.IGNORECASE):
+                email = re.sub(r"\\+@", "@", str(email))
             if not _is_valid_email(email):
                 raise ValueError(f"行 {line_number}: 无效的邮箱地址: {email}")
             if not password:
                 raise ValueError(f"行 {line_number}: 缺少 ChatGPT 登录密码")
-            if not _is_valid_mailapi_url(mailapi_url):
+            if _is_yisen_email(email):
+                mailapi_token = _parse_yisen_mailapi_token(
+                    line_number=line_number,
+                    email=email,
+                    token=mailapi_credential,
+                )
+                return MicrosoftMailImportRecord(
+                    line_number=line_number,
+                    email=email,
+                    password=password,
+                    account_type=ACCOUNT_TYPE_MAILAPI_URL,
+                    mailapi_url=_build_yisen_mailapi_url(email),
+                    mailapi_token=mailapi_token,
+                )
+            if not _is_valid_mailapi_url(mailapi_credential):
                 raise ValueError(
-                    f"行 {line_number}: 无效的 mailapi_url（需为 http/https）：{mailapi_url}"
+                    "行 "
+                    f"{line_number}: 无效的 mailapi_url（需为 http/https）"
                 )
             return MicrosoftMailImportRecord(
                 line_number=line_number,
                 email=email,
                 password=password,
                 account_type=ACCOUNT_TYPE_MAILAPI_URL,
-                mailapi_url=mailapi_url,
+                mailapi_url=mailapi_credential,
             )
         if len(parts) >= 4:
             return self._oauth_parser.parse(line_number, line)

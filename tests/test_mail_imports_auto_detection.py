@@ -1,10 +1,52 @@
+import base64
 import json
 import unittest
 
 from services.mail_imports.auto_detection import detect_mail_import_content
 
 
+def _fixture_yisen_jwt(address: str) -> str:
+    def encode(payload: dict) -> str:
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        return base64.urlsafe_b64encode(raw).decode().rstrip("=")
+
+    return ".".join(
+        (
+            encode({"alg": "HS256", "typ": "JWT"}),
+            encode({"address": address, "address_id": 12345}),
+            "fixture-signature",
+        )
+    )
+
+
 class MailImportAutoDetectionTests(unittest.TestCase):
+    def test_detects_yisen_password_and_jwt_as_microsoft_mailapi(self):
+        token = _fixture_yisen_jwt("worker@yisen.uk")
+
+        result = detect_mail_import_content(
+            f"worker@yisen.uk----login-password----{token}"
+        )
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(
+            result.counts,
+            {"microsoft": 1, "applemail": 0, "unresolved": 0},
+        )
+        self.assertEqual(result.rows[0].provider, "microsoft")
+        self.assertEqual(result.rows[0].account_type, "mailapi_url")
+        self.assertNotIn(token, json.dumps(result.to_public_dict()))
+
+    def test_rejects_yisen_jwt_for_a_different_address(self):
+        token = _fixture_yisen_jwt("other@yisen.uk")
+
+        result = detect_mail_import_content(
+            f"worker@yisen.uk----login-password----{token}"
+        )
+
+        self.assertFalse(result.can_import)
+        self.assertEqual(result.counts["unresolved"], 1)
+        self.assertNotIn(token, json.dumps(result.to_public_dict()))
+
     def test_detects_google_federated_email_password_as_applemail(self):
         password = "supplier-google-password"
 

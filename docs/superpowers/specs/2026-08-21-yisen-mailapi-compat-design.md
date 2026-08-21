@@ -9,13 +9,15 @@ email verification codes without exposing mailbox JWTs.
 ## Confirmed protocol
 
 - The supplier JWT contains the mailbox address and address identifier.
-- Mail is listed with `GET /api/mails?login=<email>&limit=20&offset=0&lite=1`.
+- Mail is listed with `GET /api/mails?login=<email>&limit=20&offset=0`.
 - The request requires `Authorization: Bearer <jwt>`.
 - Production receives HTTP 403 with the default Python client fingerprint and
   HTTP 200 with the browser-style headers used by the Yisen frontend.
 - The response is `{count, results}`. Each result contains `message_id`,
-  `metadata`, `source`, and `created_at`; `metadata` is a JSON string whose
-  `subject` identifies OpenAI mail, and `source` contains the message text.
+  `metadata`, `raw`, and `created_at`; `metadata` is a JSON string whose
+  `subject` identifies OpenAI mail, while `raw` contains the complete MIME
+  message. The optional `lite=1` response omits `raw` and therefore cannot be
+  used for OTP extraction.
 
 ## Data model and import
 
@@ -33,7 +35,7 @@ Yisen when all of these conditions hold:
    `address` claim matches the first field.
 
 The resulting record keeps `account_type=mailapi_url`, stores
-`https://mail.yisen.uk/api/mails?login=<email>&limit=20&offset=0&lite=1` as the
+`https://mail.yisen.uk/api/mails?login=<email>&limit=20&offset=0` as the
 MailAPI URL, and stores the JWT in `mailapi_token`. Invalid or mismatched JWT
 rows fail with a credential-safe error.
 
@@ -44,10 +46,11 @@ saved mailbox context paths. `MailApiUrlOtpBackend` recognizes the Yisen host,
 adds the Authorization and browser-compatible request headers, and never logs
 the token.
 
-Extend MailAPI parsing for `results` responses. Parse `metadata.subject`, use
-`source` as bounded content, parse `created_at`, and derive stable message IDs
-from `message_id` or the record identifier. Only OpenAI/ChatGPT authentication
-subjects with a six-digit code are eligible; newest eligible mail wins.
+Extend MailAPI parsing for `results` responses. Parse `metadata.subject`, decode
+the text/plain or text/html part of the bounded `raw` MIME message, parse
+`created_at`, and derive stable message IDs from `message_id` or the record
+identifier. Only OpenAI/ChatGPT authentication subjects with a six-digit code
+are eligible; newest eligible mail wins.
 
 ## Error handling and security
 
