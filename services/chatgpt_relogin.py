@@ -495,12 +495,20 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
                     imported_extra.get("mailapi_url")
                     or imported_extra.get("mail_api_url")
                 )
-                if not _text(context_extra.get("mailapi_url")) and imported_url:
+                account_type = _text(context_extra.get("account_type")).lower()
+                mailapi_context = bool(current_url) or account_type in {
+                    "mailapi_url",
+                    "chatgpt_password_totp",
+                    "chatgpt_password_url_otp",
+                    "chatgpt_password_reset_url_mail",
+                }
+                if mailapi_context and not current_url and imported_url:
                     context_extra["mailapi_url"] = imported_url
                     current_url = imported_url
                     context_changed = True
                 if (
-                    not _text(context_extra.get("mailapi_token"))
+                    mailapi_context
+                    and not _text(context_extra.get("mailapi_token"))
                     and _text(imported_extra.get("mailapi_token"))
                     and (
                         not current_url
