@@ -181,6 +181,56 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         self.assertTrue(parsed["status"])
         self.assertEqual(parsed["message_id"], "mailapi_message:mail-7")
 
+    @mock.patch("requests.get")
+    def test_yisen_wait_accepts_latest_message_marked_by_baseline(self, mock_get):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        token = "header.payload.fixture-signature"
+        account = MailboxAccount(
+            email="worker@yisen.uk",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": (
+                    "https://mail.yisen.uk/api/mails"
+                    "?login=worker%40yisen.uk&limit=20&offset=0"
+                ),
+                "mailapi_token": token,
+            },
+        )
+        payload = {
+            "count": 1,
+            "results": [
+                {
+                    "id": 7,
+                    "message_id": "mail-7",
+                    "address": "worker@yisen.uk",
+                    "metadata": json.dumps(
+                        {"subject": "Your temporary ChatGPT login code"}
+                    ),
+                    "source": "Your login code is 246810",
+                    "created_at": "2026-08-21T06:30:00Z",
+                }
+            ],
+        }
+        mock_get.return_value = _FakeResponse(
+            200,
+            payload=payload,
+            text=json.dumps(payload),
+        )
+        baseline = backend.get_current_ids(account)
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = backend.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=baseline,
+            )
+
+        self.assertEqual(code, "246810")
+
     def test_generic_mailapi_results_key_preserves_top_level_content(self):
         mailbox = OutlookMailbox()
         backend = mailbox._backends["mailapi_url"]

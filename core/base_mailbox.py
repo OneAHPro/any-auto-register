@@ -5441,6 +5441,9 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             message_id = str(message.get("message_id") or "").strip()
             code_seen_before = code_key in seen
             message_seen_before = bool(message_id and message_id in seen)
+            yisen_history_message = bool(
+                is_yisen and message.get("mailapi_history")
+            )
             baseline_raced_with_new_message = bool(
                 received_after_challenge
             )
@@ -5451,12 +5454,14 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 code_seen_before
                 and not baseline_raced_with_new_message
                 and not baseline_freshness_is_unverifiable
+                and not yisen_history_message
             ):
                 return None
             if (
                 message_seen_before
                 and received_at
                 and not baseline_raced_with_new_message
+                and not yisen_history_message
             ):
                 return None
             seen.add(code_key)
