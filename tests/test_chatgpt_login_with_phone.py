@@ -18,6 +18,7 @@ from api.tasks import (
     _task_action_terms,
     _task_store,
 )
+from services.mail_imports.schemas import MailImportSnapshotRequest
 from core.base_platform import Account, AccountStatus, BasePlatform
 from core.sms_pool import SmsPoolExhaustedError
 from core.task_runtime import StopTaskRequested
@@ -199,6 +200,22 @@ class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
                 "微软邮箱可用数量不足（需要 3 个，当前 2 个）",
             ):
                 _prepare_register_request(request)
+
+    def test_provider_capacity_uses_valid_snapshot_preview_limit(self):
+        with patch(
+            "services.mail_imports.mail_import_registry.get"
+        ) as get_strategy:
+            strategy = get_strategy.return_value
+            strategy.get_snapshot.side_effect = lambda request: (
+                self.assertIsInstance(request, MailImportSnapshotRequest),
+                self.assertGreaterEqual(request.preview_limit, 1),
+                SimpleNamespace(count=1),
+            )[-1]
+            self.assertEqual(
+                tasks_module._chatgpt_mail_provider_available_count("microsoft"),
+                1,
+            )
+            strategy.get_snapshot.assert_called_once()
 
     def test_enqueued_mail_provider_reservation_blocks_second_task(self):
         request = self._request(count=1, codes=[], enabled=False)

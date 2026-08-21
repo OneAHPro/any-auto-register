@@ -546,7 +546,9 @@ def _chatgpt_mail_provider_available_count(provider: str) -> int:
     snapshot = strategy.get_snapshot(
         MailImportSnapshotRequest(
             type=normalized,
-            preview_limit=0,
+            # The schema requires at least one preview item; count is still
+            # authoritative and independent of the preview size.
+            preview_limit=1,
         )
     )
     return max(0, int(snapshot.count or 0))
