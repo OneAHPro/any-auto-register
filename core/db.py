@@ -134,6 +134,45 @@ class ChatGPTMfaRotationJournalModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+class ChatGPTAuthStateModel(SQLModel, table=True):
+    """Canonical, versioned authentication state for one ChatGPT account."""
+
+    __tablename__ = "chatgpt_auth_states"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    account_id: int = Field(index=True, sa_column_kwargs={"unique": True})
+    auth_version: int = 1
+    primary_state: str = Field(default="absent", index=True)
+    mfa_state: str = Field(default="absent", index=True)
+    active_mfa_generation: str = ""
+    email_recovery_state: str = "unverified"
+    credential_revision: str = ""
+    last_success_at: Optional[datetime] = None
+    failure_domain: str = ""
+    error_code: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class ChatGPTMfaOperationModel(SQLModel, table=True):
+    """One immutable-generation MFA enrollment or recovery operation."""
+
+    __tablename__ = "chatgpt_mfa_operations"
+
+    operation_id: str = Field(primary_key=True)
+    account_id: int = Field(default=0, index=True)
+    email: str = Field(default="", index=True)
+    generation: str = Field(index=True)
+    base_auth_version: int = 0
+    status: str = Field(default="staged", index=True)
+    totp_secret: str
+    recovery_code: str = ""
+    recovery_code_state: str = "available"
+    remote_activated_at: Optional[datetime] = None
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
 class SmsPoolItemModel(SQLModel, table=True):
     """A LeadBee card and its receive endpoint managed by the local SMS pool."""
 

@@ -2,6 +2,12 @@ import types
 import unittest
 from unittest import mock
 
+from sqlmodel import SQLModel, create_engine
+
+from core.db import (
+    stage_chatgpt_mfa_rotation,
+    update_chatgpt_mfa_rotation_recovery_code,
+)
 from platforms.chatgpt.refresh_token_registration_engine import (
     RefreshTokenRegistrationEngine,
 )
@@ -1895,6 +1901,34 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertFalse(result.success)
         register_client.register_complete_flow.assert_called_once()
         engine._build_oauth_client.assert_not_called()
+
+    def test_legacy_staged_journal_never_overrides_saved_totp(self):
+        database_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(database_engine)
+        stage_chatgpt_mfa_rotation(
+            "mfa-user@icloud.com",
+            "LEGACY-STAGED-TOTP",
+            database_engine=database_engine,
+        )
+        update_chatgpt_mfa_rotation_recovery_code(
+            "mfa-user@icloud.com",
+            "LEGACY-STAGED-RECOVERY",
+            database_engine=database_engine,
+        )
+        engine = self._make_engine(email_service=PasswordTotpEmailService())
+
+        with mock.patch("core.db.engine", database_engine):
+            created = engine._create_email(existing_account_login_only=True)
+
+        self.assertTrue(created)
+        self.assertEqual(engine.totp_secret, "JBSWY3DPEHPK3PXP")
+        self.assertEqual(
+            engine.email_info["mfa_recovery_code"],
+            "RECOVERY-CODE",
+        )
+        emitted = "\n".join(engine.logs)
+        self.assertNotIn("LEGACY-STAGED-TOTP", emitted)
+        self.assertNotIn("LEGACY-STAGED-RECOVERY", emitted)
 
 
 if __name__ == "__main__":

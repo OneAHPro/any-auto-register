@@ -21,6 +21,10 @@ from core.db import (
     stage_chatgpt_mfa_rotation,
     update_chatgpt_mfa_rotation_recovery_code,
 )
+from services.chatgpt_auth_state import (
+    load_login_mfa_candidate,
+    load_login_mfa_candidate_by_email,
+)
 
 from .chatgpt_client import ChatGPTClient
 from .log_sanitizer import sanitize_chatgpt_log_message
@@ -404,23 +408,35 @@ class RefreshTokenRegistrationEngine:
             self.email_info["email"] = email_value
             self.email = email_value
             if existing_account_login_only:
-                journal = load_chatgpt_mfa_rotation(email_value)
-                journal_secret = str(journal.get("totp_secret") or "").strip()
-                if journal_secret:
-                    self.email_info["totp_secret"] = journal_secret
-                    self.email_info["mfa_recovery_code"] = str(
-                        journal.get("recovery_code") or ""
-                    ).strip()
-                    self.email_info["chatgpt_mfa_managed"] = (
-                        str(journal.get("status") or "") == "activated"
+                local_account_id = (
+                    self.extra_config.get("chatgpt_local_account_id")
+                    or self.email_info.get("chatgpt_local_account_id")
+                )
+                if local_account_id in (None, ""):
+                    candidate = load_login_mfa_candidate_by_email(email_value)
+                else:
+                    try:
+                        normalized_account_id = int(local_account_id)
+                    except (TypeError, ValueError):
+                        candidate = None
+                    else:
+                        candidate = load_login_mfa_candidate(
+                            normalized_account_id
+                        )
+                if candidate is not None:
+                    self.email_info["totp_secret"] = candidate.totp_secret
+                    self.email_info["mfa_recovery_code"] = (
+                        candidate.recovery_code
                     )
-                    self.email_info["mfa_rotated_at"] = str(
-                        journal.get("rotated_at") or ""
-                    ).strip()
+                    self.email_info["chatgpt_mfa_managed"] = True
+                    self.email_info["mfa_rotated_at"] = (
+                        candidate.remote_activated_at.isoformat()
+                        if candidate.remote_activated_at is not None
+                        else ""
+                    )
                     self.email_info.pop("totp_url", None)
                     self._log(
-                        "检测到未完成落库的 MFA 写前记录，已恢复本地密钥继续登录",
-                        "warning",
+                        "已加载账号确认生效的 MFA 凭据继续登录"
                     )
                 account_type = str(
                     self.email_info.get("account_type") or ""
