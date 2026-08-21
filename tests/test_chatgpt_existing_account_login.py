@@ -601,7 +601,7 @@ class ExistingAccountLoginTests(unittest.TestCase):
         rejected_client = mock.Mock()
         rejected_client.login_and_get_tokens.return_value = None
         rejected_client.last_error = (
-            '触发 passwordless OTP 失败: 409 - '
+            '[stage=authorize_continue] 提交邮箱失败: 409 - '
             '{"error":{"message":"Your sign-in session is no longer valid. '
             'Please start over to continue.","code":"invalid_auth_step"}}'
         )
@@ -1210,6 +1210,91 @@ class ExistingAccountLoginTests(unittest.TestCase):
             submit_email.call_args.args[2],
             "https://auth.openai.com/log-in",
         )
+
+    def test_password_reset_rebuilds_fresh_oauth_after_web_session_409(self):
+        client = ChatGPTClient(verbose=False)
+        client.visit_homepage = mock.Mock(return_value=True)
+        client.get_csrf_token = mock.Mock(return_value="csrf-token")
+        authorize_endpoint = (
+            "https://auth.openai.com/api/accounts/authorize"
+            "?client_id=app-demo&state=stale&screen_hint=login"
+        )
+        client.signin = mock.Mock(
+            side_effect=[
+                authorize_endpoint,
+                "https://auth.openai.com/add-phone",
+            ]
+        )
+        client.authorize = mock.Mock(
+            side_effect=[
+                authorize_endpoint,
+                "https://auth.openai.com/add-phone",
+            ]
+        )
+        client.last_authorize_status = 403
+        client._get_cookie_value = mock.Mock(return_value="")
+        client.fetch_chatgpt_session = mock.Mock(
+            return_value=(True, {"accessToken": "access-token"})
+        )
+        client.get_next_auth_session_token = mock.Mock(
+            return_value="session-token"
+        )
+        client._reset_session = mock.Mock()
+        commit = mock.Mock(return_value=True)
+
+        def reject_stale_session(helper, *_args, **_kwargs):
+            helper.last_error = (
+                "提交邮箱失败: 409 - Your sign-in session is no longer valid. "
+                "Please start over to continue."
+            )
+            return None
+
+        def complete_fresh_reset(_helper, email, password, **kwargs):
+            self.assertEqual(email, "reset-user@example.com")
+            self.assertEqual(password, "Fresh-Password-123!")
+            self.assertTrue(kwargs["password_reset_required"])
+            self.assertTrue(kwargs["force_new_browser"])
+            self.assertTrue(kwargs["stop_after_login"])
+            self.assertTrue(kwargs["on_password_reset"](password))
+            return None
+
+        with mock.patch.object(
+            OAuthClient,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            OAuthClient,
+            "_get_cookie_value",
+            return_value="login-session",
+        ), mock.patch.object(
+            OAuthClient,
+            "_submit_authorize_continue",
+            autospec=True,
+            side_effect=reject_stale_session,
+        ), mock.patch.object(
+            OAuthClient,
+            "login_and_get_tokens",
+            autospec=True,
+            side_effect=complete_fresh_reset,
+        ) as fresh_reset, mock.patch.object(
+            OAuthClient,
+            "prepare_phone_verification_transaction",
+            return_value=None,
+        ):
+            ok, result = client.login_existing_account_and_get_session(
+                "reset-user@example.com",
+                mock.Mock(),
+                password="Fresh-Password-123!",
+                password_reset_required=True,
+                on_password_reset=commit,
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(result["access_token"], "access-token")
+        fresh_reset.assert_called_once()
+        commit.assert_called_once_with("Fresh-Password-123!")
+        client._reset_session.assert_called_once()
+        self.assertEqual(client.signin.call_count, 2)
 
     def test_web_login_follows_external_callback_before_fetching_session(self):
         client = ChatGPTClient(verbose=False)

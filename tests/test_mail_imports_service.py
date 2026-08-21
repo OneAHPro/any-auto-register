@@ -30,6 +30,54 @@ def load_microsoft_import_rules_module():
 
 
 class MailImportServiceTests(unittest.TestCase):
+    def test_microsoft_snapshot_only_counts_enabled_accounts(self):
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportSnapshotRequest
+
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'mail-imports.db'}"
+            )
+            SQLModel.metadata.create_all(test_engine)
+            try:
+                with Session(test_engine) as session:
+                    session.add(
+                        OutlookAccountModel(
+                            email="available@example.com",
+                            password="",
+                            account_type="mailapi_url",
+                            mailapi_url="https://mail.example.test/available",
+                            enabled=True,
+                        )
+                    )
+                    session.add(
+                        OutlookAccountModel(
+                            email="consumed@example.com",
+                            password="",
+                            account_type="mailapi_url",
+                            mailapi_url="https://mail.example.test/consumed",
+                            enabled=False,
+                        )
+                    )
+                    session.commit()
+
+                with patch("services.mail_imports.providers.engine", test_engine):
+                    snapshot = strategy.get_snapshot(
+                        MailImportSnapshotRequest(
+                            type="microsoft",
+                            preview_limit=10,
+                        )
+                    )
+
+                self.assertEqual(snapshot.count, 1)
+                self.assertEqual(
+                    [item.email for item in snapshot.items],
+                    ["available@example.com"],
+                )
+            finally:
+                test_engine.dispose()
+
     def test_parse_microsoft_import_record_requires_oauth_fields(self):
         rules_module = load_microsoft_import_rules_module()
         parse_microsoft_import_record = rules_module.parse_microsoft_import_record

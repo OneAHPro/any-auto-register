@@ -750,9 +750,9 @@ class RefreshTokenRegistrationEngine:
         text = str(message or "").strip().lower()
         return (
             "409" in text
-            and "passwordless" in text
             and (
                 "sign-in session is no longer valid" in text
+                or "invalid_login_session" in text
                 or "invalid_auth_step" in text
             )
         )

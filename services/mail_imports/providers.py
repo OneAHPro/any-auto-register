@@ -390,7 +390,9 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
     def get_snapshot(self, request: MailImportSnapshotRequest) -> MailImportSnapshot:
         with Session(engine) as session:
             accounts = session.exec(
-                select(OutlookAccountModel).order_by(OutlookAccountModel.id)
+                select(OutlookAccountModel)
+                .where(OutlookAccountModel.enabled == True)
+                .order_by(OutlookAccountModel.id)
             ).all()
 
         limit = max(int(request.preview_limit or 0), 0)

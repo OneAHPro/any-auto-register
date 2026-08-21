@@ -180,6 +180,25 @@ class ExistingAccountLoginWithPhoneRequestTests(unittest.TestCase):
         )
         self.assertEqual(_task_action_terms(prepared), ("登录并接码", "登录并接码"))
 
+    def test_prepare_rejects_stale_mail_provider_capacity(self):
+        request = self._request(count=3, codes=["one", "two", "three"])
+        request.extra["chatgpt_existing_account_mail_provider_plan"] = [
+            "microsoft",
+            "microsoft",
+            "microsoft",
+        ]
+
+        with patch(
+            "api.tasks._chatgpt_mail_provider_available_count",
+            return_value=2,
+        ):
+            with self.assertRaisesRegex(
+                HTTPException,
+                "微软邮箱可用数量不足（需要 3 个，当前 2 个）",
+            ):
+                _prepare_register_request(request)
+
+
     def test_prepare_rejects_a_card_count_that_differs_from_login_count(self):
         with self.assertRaisesRegex(HTTPException, "卡密数量需与登录数量一致"):
             _prepare_register_request(self._request(codes=["only-one-card"]))

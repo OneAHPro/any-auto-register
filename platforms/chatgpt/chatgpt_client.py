@@ -960,6 +960,77 @@ class ChatGPTClient:
                     screen_hint="login",
                 )
                 if not next_state:
+                    entry_error = str(helper.last_error or "").strip()
+                    if (
+                        password_reset_required
+                        and int(_password_reset_depth or 0) < 1
+                        and helper._is_transient_oauth_entry_error(entry_error)
+                    ):
+                        self._log(
+                            "密码重置 Web 授权事务已失效，"
+                            "改用全新 PKCE OAuth 会话完成密码重置..."
+                        )
+                        password_committed = False
+
+                        def commit_fresh_password_reset(new_password):
+                            nonlocal password_committed
+                            if callable(on_password_reset):
+                                committed = on_password_reset(new_password)
+                                if committed is False:
+                                    return False
+                            password_committed = True
+                            return True
+
+                        helper.login_and_get_tokens(
+                            email,
+                            str(password or ""),
+                            device_id="",
+                            user_agent=self.ua,
+                            sec_ch_ua=self.sec_ch_ua,
+                            impersonate=self.impersonate,
+                            skymail_client=skymail_client,
+                            prefer_passwordless_login=False,
+                            allow_phone_verification=False,
+                            force_new_browser=True,
+                            force_password_login=True,
+                            totp_secret=str(totp_secret or ""),
+                            mfa_recovery_code=str(mfa_recovery_code or ""),
+                            on_mfa_totp_staged=on_mfa_totp_staged,
+                            on_mfa_totp_activated=on_mfa_totp_activated,
+                            on_mfa_recovery_code=on_mfa_recovery_code,
+                            password_reset_required=True,
+                            on_password_reset=commit_fresh_password_reset,
+                            force_chatgpt_entry=False,
+                            screen_hint="login",
+                            login_source="web_password_reset_recovery",
+                            stop_after_login=True,
+                        )
+                        if password_committed:
+                            self._log(
+                                "新密码已通过独立 OAuth 事务保存，"
+                                "使用新会话重新开始 ChatGPT Web 登录"
+                            )
+                            self._reset_session()
+                            return self.login_existing_account_and_get_session(
+                                email,
+                                skymail_client,
+                                password=str(password or ""),
+                                totp_secret=str(totp_secret or ""),
+                                mfa_recovery_code=str(mfa_recovery_code or ""),
+                                on_mfa_totp_staged=on_mfa_totp_staged,
+                                on_mfa_totp_activated=on_mfa_totp_activated,
+                                on_mfa_recovery_code=on_mfa_recovery_code,
+                                password_reset_required=False,
+                                on_password_reset=on_password_reset,
+                                otp_wait_timeout=otp_wait_timeout,
+                                otp_resend_wait_timeout=otp_resend_wait_timeout,
+                                prepare_phone_oauth=prepare_phone_oauth,
+                                _password_reset_depth=(
+                                    int(_password_reset_depth or 0) + 1
+                                ),
+                            )
+                        if helper.last_error:
+                            return False, helper.last_error
                     return False, helper.last_error or "提交登录邮箱失败"
                 referer = state.current_url or state.continue_url or referer
                 state = next_state

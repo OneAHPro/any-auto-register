@@ -533,6 +533,41 @@ def _normalize_chatgpt_mail_provider_plan(value) -> list[str]:
     return normalized
 
 
+def _chatgpt_mail_provider_available_count(provider: str) -> int:
+    """Read the authoritative claimable count used by a login task."""
+    from services.mail_imports import (
+        MailImportSnapshotRequest,
+        mail_import_registry,
+    )
+
+    normalized = str(provider or "").strip().lower()
+    strategy = mail_import_registry.get(normalized)
+    snapshot = strategy.get_snapshot(
+        MailImportSnapshotRequest(
+            type=normalized,
+            preview_limit=0,
+        )
+    )
+    return max(0, int(snapshot.count or 0))
+
+
+def _validate_chatgpt_mail_provider_capacity(provider_plan: list[str]) -> None:
+    from collections import Counter
+
+    labels = {
+        "microsoft": "微软邮箱",
+        "applemail": "AppleMail 邮箱",
+    }
+    for provider, required in Counter(provider_plan).items():
+        available = _chatgpt_mail_provider_available_count(provider)
+        if available < required:
+            raise HTTPException(
+                409,
+                f"{labels.get(provider, provider)}可用数量不足"
+                f"（需要 {required} 个，当前 {available} 个），请刷新后重试",
+            )
+
+
 def _build_chatgpt_retry_request(
     bindings,
     concurrency: int = 1,
@@ -1165,6 +1200,7 @@ def _prepare_register_request(req: RegisterTaskRequest) -> RegisterTaskRequest:
     if provider_plan:
         if not is_chatgpt_login or len(provider_plan) != prepared.count:
             raise HTTPException(400, "邮箱来源分配数量与登录数量不一致")
+        _validate_chatgpt_mail_provider_capacity(provider_plan)
         prepared.extra[CHATGPT_MAIL_PROVIDER_PLAN_KEY] = provider_plan
     else:
         prepared.extra.pop(CHATGPT_MAIL_PROVIDER_PLAN_KEY, None)
