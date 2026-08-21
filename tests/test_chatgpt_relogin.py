@@ -144,6 +144,43 @@ class ChatGPTReloginTests(unittest.TestCase):
             "header.payload.relogin-signature",
         )
 
+    def test_load_saved_account_backfills_token_into_existing_mailbox_context(self):
+        email = "existing-context@yisen.uk"
+        account_id = self._add_eligibility_account(
+            email,
+            password="chatgpt-password",
+            extra={
+                "refresh_token": "saved-chatgpt-rt",
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": email,
+                    "extra": {
+                        "account_type": "mailapi_url",
+                        "mailapi_url": "https://mail.yisen.uk/api/mails",
+                    },
+                },
+            },
+        )
+        with Session(self.engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.yisen.uk/api/mails",
+                    mailapi_token="header.payload.existing-context-signature",
+                )
+            )
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+
+        self.assertEqual(
+            saved["mailbox_context"]["extra"]["mailapi_token"],
+            "header.payload.existing-context-signature",
+        )
+
     def test_password_totp_context_is_eligible(self):
         account_id = self._add_eligibility_account(
             "mfa@example.com",

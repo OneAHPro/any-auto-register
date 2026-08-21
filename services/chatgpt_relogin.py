@@ -57,6 +57,12 @@ def _text(value: Any) -> str:
     return str(value or "").strip()
 
 
+def _url_host(value: Any) -> str:
+    from urllib.parse import urlsplit
+
+    return str(urlsplit(_text(value)).hostname or "").strip().lower()
+
+
 def _emit(log_fn: LogFn | None, message: str) -> None:
     if callable(log_fn):
         log_fn(str(message))
@@ -468,14 +474,55 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
             raise RuntimeError("ChatGPT 账号邮箱未填写")
         extra = dict(account.get_extra() or {})
         mailbox_context = extra.get("mailbox_login_context")
+        context_changed = False
         if not isinstance(mailbox_context, dict) or not mailbox_context:
             mailbox_context = _mailbox_context_from_outlook(session, email)
-            if mailbox_context:
-                extra["mailbox_login_context"] = mailbox_context
-                account.set_extra(extra)
-                account.updated_at = datetime.now(timezone.utc)
-                session.add(account)
-                session.commit()
+            context_changed = bool(mailbox_context)
+        else:
+            imported_context = _mailbox_context_from_outlook(session, email)
+            imported_extra = (
+                imported_context.get("extra")
+                if isinstance(imported_context, dict)
+                else None
+            )
+            context_extra = dict(mailbox_context.get("extra") or {})
+            if isinstance(imported_extra, dict):
+                current_url = _text(
+                    context_extra.get("mailapi_url")
+                    or context_extra.get("mail_api_url")
+                )
+                imported_url = _text(
+                    imported_extra.get("mailapi_url")
+                    or imported_extra.get("mail_api_url")
+                )
+                if not _text(context_extra.get("mailapi_url")) and imported_url:
+                    context_extra["mailapi_url"] = imported_url
+                    current_url = imported_url
+                    context_changed = True
+                if (
+                    not _text(context_extra.get("mailapi_token"))
+                    and _text(imported_extra.get("mailapi_token"))
+                    and (
+                        not current_url
+                        or not imported_url
+                        or _url_host(current_url) == _url_host(imported_url)
+                    )
+                ):
+                    context_extra["mailapi_token"] = _text(
+                        imported_extra.get("mailapi_token")
+                    )
+                    context_changed = True
+                if context_changed:
+                    mailbox_context = {
+                        **mailbox_context,
+                        "extra": context_extra,
+                    }
+        if context_changed:
+            extra["mailbox_login_context"] = mailbox_context
+            account.set_extra(extra)
+            account.updated_at = datetime.now(timezone.utc)
+            session.add(account)
+            session.commit()
         return {
             "id": normalized_id,
             "email": email,
