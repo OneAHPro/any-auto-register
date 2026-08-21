@@ -86,6 +86,28 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                 second.get_email()
         self.assertEqual(first_claim.email, "single@example.com")
 
+    def test_claim_skips_legacy_disabled_row_with_available_state(self):
+        """Import records created before state projection must stay disabled."""
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="disabled@example.com",
+                    password="mail-password",
+                    state="available",
+                    enabled=False,
+                )
+            )
+            session.commit()
+
+        with mock.patch("core.db.engine", test_engine):
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "available")
+            self.assertFalse(row.enabled)
+
     def test_bound_mailbox_is_not_reallocated_and_stale_release_is_rejected(self):
         test_engine = self._lease_engine()
         with Session(test_engine) as session:

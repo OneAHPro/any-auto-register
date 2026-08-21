@@ -5928,6 +5928,11 @@ class OutlookMailbox(BaseMailbox):
                 query = select(OutlookAccountModel).where(
                     OutlookAccountModel.state == "available"
                 )
+                # ``enabled`` is a compatibility projection still written by
+                # the import UI.  Keep it as a safety guard for rows created
+                # by older/import paths that set enabled=False without
+                # explicitly setting the new state column.
+                query = query.where(OutlookAccountModel.enabled == True)
                 if normalized_email:
                     query = query.where(
                         func.lower(OutlookAccountModel.email) == normalized_email
