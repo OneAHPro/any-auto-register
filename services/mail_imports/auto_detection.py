@@ -275,19 +275,6 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
 
     if len(parts) == 3:
         second, third = parts[1:3]
-        if (
-            _looks_like_http_url(third)
-            and second
-            and not _is_reset_marker(second)
-            and domain in APPLE_MAIL_DOMAINS
-        ):
-            return _resolved_row(
-                line_number=line_number,
-                email=email,
-                provider="microsoft",
-                account_type="mailapi_url",
-                raw_content=line,
-            )
         if _is_reset_marker(second) and _looks_like_http_url(third):
             return _resolved_apple_row(
                 line_number=line_number,
@@ -301,6 +288,12 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
                 email=email,
                 raw_content=line,
                 fallback_account_type="chatgpt_password_remote_totp",
+            )
+        if _looks_like_http_url(third) and second:
+            return _resolved_microsoft_row(
+                line_number=line_number,
+                email=email,
+                raw_content=line,
             )
         if _looks_like_mfa_secret(third):
             return _resolved_apple_row(
