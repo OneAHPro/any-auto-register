@@ -733,6 +733,60 @@ class ChatGPTReloginTests(unittest.TestCase):
             service.get_mailbox_metadata()["extra"],
         )
 
+    def test_microsoft_mailapi_password_reset_keeps_outlook_backend(self):
+        saved = {
+            "email": "reset@example.com",
+            "password": "",
+            "extra": {},
+            "mailbox_context": {
+                "provider": "microsoft",
+                "email": "reset@example.com",
+                "account_id": "mailbox-1",
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": "https://mail.example.test/reset",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_recovery_code": "RECOVERY-CODE",
+                },
+            },
+        }
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox._generate_password_reset_password.return_value = (
+            "Replacement-Password-2026!"
+        )
+
+        with mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ) as create_mailbox_mock:
+            service = _build_email_service(
+                saved,
+                {},
+                log_fn=None,
+                force_password_reset=True,
+            )
+
+        create_mailbox_mock.assert_called_once_with(
+            "microsoft",
+            extra=mock.ANY,
+            proxy=None,
+        )
+        email_info = service.create_email()
+        self.assertEqual(
+            email_info["account_type"],
+            "chatgpt_password_reset_url_mail",
+        )
+        self.assertTrue(email_info["password_reset_required"])
+        self.assertEqual(
+            email_info["new_password"],
+            "Replacement-Password-2026!",
+        )
+        self.assertEqual(
+            email_info["totp_secret"],
+            "JBSWY3DPEHPK3PXP",
+        )
+
     def test_persisted_reset_url_service_prefers_email_mfa_without_totp_url(self):
         from services.chatgpt_relogin import _PersistedEmailService
 

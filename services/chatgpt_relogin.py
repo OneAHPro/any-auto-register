@@ -1289,7 +1289,16 @@ def _build_email_service(
             _text(config.get("applemail_pool_dir")) or "mail"
         )
         proxy = _text(saved["extra"].get("proxy_used")) or None
-        mailbox = create_mailbox("applemail", extra=mailbox_config, proxy=proxy)
+        mailbox_provider = (
+            "microsoft"
+            if provider in {"microsoft", "outlook"}
+            else "applemail"
+        )
+        mailbox = create_mailbox(
+            mailbox_provider,
+            extra=mailbox_config,
+            proxy=proxy,
+        )
         setattr(mailbox, "_log_fn", log_fn)
         _bind_mailbox_task_control(mailbox, task_control, attempt_id)
         if credentials["pool_file"]:

@@ -106,6 +106,64 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             ).one()
         self.assertEqual(saved.password, "Replacement-Password-2026!")
 
+    def test_claimed_mailapi_account_is_restored_after_password_reset(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="claimed-reset@example.com",
+                    password="",
+                    client_id="mail-client",
+                    refresh_token="mail-refresh",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/claimed",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email_by_address(
+                "claimed-reset@example.com"
+            )
+            claimed.extra.update({
+                "password_reset_required": True,
+                "new_password": "Replacement-Password-2026!",
+            })
+            committed = mailbox.commit_password_reset(
+                claimed,
+                "Replacement-Password-2026!",
+            )
+
+        self.assertTrue(committed)
+        self.assertEqual(
+            claimed.extra["password"],
+            "Replacement-Password-2026!",
+        )
+        self.assertFalse(claimed.extra["password_reset_required"])
+        self.assertNotIn("new_password", claimed.extra)
+        with Session(test_engine) as session:
+            saved = session.exec(
+                select(OutlookAccountModel).where(
+                    OutlookAccountModel.email
+                    == "claimed-reset@example.com"
+                )
+            ).one()
+        self.assertEqual(saved.password, "Replacement-Password-2026!")
+        self.assertEqual(saved.client_id, "mail-client")
+        self.assertEqual(saved.refresh_token, "mail-refresh")
+        self.assertEqual(saved.account_type, "mailapi_url")
+        self.assertEqual(
+            saved.mailapi_url,
+            "https://mail.example.test/claimed",
+        )
+        self.assertFalse(saved.enabled)
+
     def test_get_email_by_address_preserves_retry_binding_order(self):
         test_engine = create_engine(
             "sqlite://",

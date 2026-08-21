@@ -5545,6 +5545,17 @@ class OutlookMailbox(BaseMailbox):
         password = str(new_password or "").strip()
         if not email or len(password) < 12:
             return False
+        account_extra = dict(getattr(account, "extra", None) or {})
+        client_id = str(account_extra.get("client_id") or "")
+        refresh_token = str(account_extra.get("refresh_token") or "")
+        account_type = self._normalize_account_type(
+            account_extra.get("account_type")
+        )
+        mailapi_url = str(
+            account_extra.get("mailapi_url")
+            or account_extra.get("mail_api_url")
+            or ""
+        ).strip()
         with self._lock:
             with Session(engine) as session:
                 existing = session.exec(
@@ -5553,13 +5564,29 @@ class OutlookMailbox(BaseMailbox):
                     )
                 ).first()
                 if existing is None:
-                    return False
-                existing.password = password
-                existing.updated_at = _utcnow()
-                session.add(existing)
+                    now = _utcnow()
+                    session.add(
+                        OutlookAccountModel(
+                            email=email,
+                            password=password,
+                            client_id=client_id,
+                            refresh_token=refresh_token,
+                            account_type=account_type,
+                            mailapi_url=mailapi_url,
+                            enabled=False,
+                            created_at=now,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    existing.password = password
+                    existing.updated_at = _utcnow()
+                    session.add(existing)
                 session.commit()
-        if isinstance(getattr(account, "extra", None), dict):
-            account.extra["password"] = password
+        account_extra["password"] = password
+        account_extra["password_reset_required"] = False
+        account_extra.pop("new_password", None)
+        account.extra = account_extra
         return True
 
     def _token_endpoints(self) -> list[str]:
