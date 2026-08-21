@@ -5555,7 +5555,6 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         *,
         strict_backend_errors: bool = False,
     ) -> set:
-        del strict_backend_errors
         try:
             text = self._fetch_mailapi_text(account)
             from urllib.parse import urlsplit
@@ -5573,13 +5572,21 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 return set()
             message_id = str(message.get("message_id") or "").strip()
             return {message_id or self._code_key(code)}
-        except MailboxBackendError:
-            raise
+        except MailboxBackendError as exc:
+            if strict_backend_errors:
+                raise
+            self.mailbox._log(
+                f"[MailAPI] 邮件基线读取失败: {getattr(exc, 'code', 'backend_error')}"
+            )
+            return set()
         except Exception as exc:
-            raise MailboxBackendError(
-                "MailAPI 邮件基线解析失败",
-                code="parse_error",
-            ) from exc
+            if strict_backend_errors:
+                raise MailboxBackendError(
+                    "MailAPI 邮件基线解析失败",
+                    code="parse_error",
+                ) from exc
+            self.mailbox._log("[MailAPI] 邮件基线解析失败")
+            return set()
 
     def wait_for_code(
         self,
@@ -5590,7 +5597,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         code_pattern: str | None = None,
         **kwargs,
     ) -> str:
-        kwargs.pop("strict_backend_errors", None)
+        strict_backend_errors = bool(kwargs.pop("strict_backend_errors", False))
         seen = {str(mid) for mid in (before_ids or set())}
         exclude_codes = {
             str(code).strip()
@@ -5612,8 +5619,16 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         def poll_once() -> Optional[str]:
             try:
                 text = self._fetch_mailapi_text(account)
-            except MailboxBackendError:
-                raise
+            except MailboxBackendError as exc:
+                if strict_backend_errors:
+                    raise
+                source = getattr(exc, "__cause__", None)
+                source_name = type(source).__name__ if source is not None else type(exc).__name__
+                self.mailbox._log(
+                    f"[MailAPI] 拉取失败: {source_name} "
+                    f"({getattr(exc, 'code', 'backend_error')})"
+                )
+                return None
             except Exception as exc:
                 self.mailbox._log(
                     f"[MailAPI] 拉取失败: {type(exc).__name__ or 'Error'}"
