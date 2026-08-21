@@ -1020,6 +1020,7 @@ class ChatGPTReloginTests(unittest.TestCase):
                     "totp_secret": "JBSWY3DPEHPK3PXP",
                     "mfa_recovery_code": "RECOVERY-CODE",
                     "mail_api_url": mail_api_url,
+                    "mailapi_token": "yisen-mailapi-token",
                     "pool_file": "mfa-mail.json",
                 },
             },
@@ -1058,6 +1059,10 @@ class ChatGPTReloginTests(unittest.TestCase):
             "RECOVERY-CODE",
         )
         self.assertEqual(email_info["mail_api_url"], mail_api_url)
+        self.assertEqual(
+            service._account.extra["mailapi_token"],
+            "yisen-mailapi-token",
+        )
         self.assertTrue(service._baseline_ready.wait(timeout=1))
         self.assertEqual(
             service.get_verification_code(

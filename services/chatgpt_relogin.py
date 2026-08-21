@@ -1383,7 +1383,11 @@ def _build_email_service(
                     account_id=credentials["email"],
                     extra={},
                 )
-            account_extra = dict(mailbox_account.extra or {})
+            # Preserve persisted mailbox credentials when a managed MFA
+            # context is rebuilt as a password + TOTP service.  In particular,
+            # Yisen MailAPI needs its bearer token during an email OTP step.
+            account_extra = dict(context_extra)
+            account_extra.update(dict(mailbox_account.extra or {}))
             account_extra.update(
                 {
                     "provider": "chatgpt_credentials",
