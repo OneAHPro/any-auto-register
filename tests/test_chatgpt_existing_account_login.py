@@ -1982,6 +1982,46 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertFalse(created)
         self.assertNotIn("OTHER-ACCOUNT-TOTP", "\n".join(engine.logs))
 
+    def test_engine_requires_unique_email_identity_before_candidate_lookup(self):
+        database_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(database_engine)
+        with Session(database_engine) as session:
+            account = AccountModel(
+                platform="chatgpt",
+                email="mfa-user@icloud.com",
+                password="chatgpt-password",
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            local_account_id = account.id
+
+        engine = self._make_engine(email_service=PasswordTotpEmailService())
+        engine.extra_config["chatgpt_local_account_id"] = int(local_account_id) + 99
+        with mock.patch("core.db.engine", database_engine):
+            self.assertFalse(
+                engine._create_email(existing_account_login_only=True)
+            )
+
+        with Session(database_engine) as session:
+            duplicate = AccountModel(
+                platform="chatgpt",
+                email="mfa-user@icloud.com",
+                password="duplicate-password",
+            )
+            session.add(duplicate)
+            session.commit()
+
+        duplicate_engine = self._make_engine(
+            email_service=PasswordTotpEmailService()
+        )
+        with mock.patch("core.db.engine", database_engine):
+            self.assertFalse(
+                duplicate_engine._create_email(
+                    existing_account_login_only=True
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

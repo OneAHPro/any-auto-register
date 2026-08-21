@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +32,8 @@ class ChatGPTPrimaryState(StrEnum):
 
 class ChatGPTMfaState(StrEnum):
     ABSENT = "absent"
+    ACTIVE = "active"
+    # Kept for reading rows written by the first projection implementation.
     CONFIRMED = "confirmed"
     SUSPECT = "suspect"
     REPAIR_REQUIRED = "repair_required"
@@ -60,6 +64,10 @@ class ChatGPTAuthVersionConflict(RuntimeError):
 
 class ChatGPTMfaOperationConflict(RuntimeError):
     """The MFA operation no longer matches the state required for commit."""
+
+
+class ChatGPTAuthIdentityConflict(RuntimeError):
+    """The local account identity is missing, ambiguous, or mismatched."""
 
 
 @dataclass(frozen=True)
@@ -121,7 +129,6 @@ _ALLOWED_TRANSITIONS = {
         ChatGPTMfaOperationStatus.QUARANTINED,
     },
     ChatGPTMfaOperationStatus.ACTIVATED_REMOTE: {
-        ChatGPTMfaOperationStatus.COMMITTED,
         ChatGPTMfaOperationStatus.ACTIVATION_UNKNOWN,
         ChatGPTMfaOperationStatus.QUARANTINED,
     },
@@ -369,6 +376,11 @@ def transition_mfa_operation(
         return False
     expected = _as_operation_status(expected_state)
     target = _as_operation_status(new_state)
+    if target is ChatGPTMfaOperationStatus.COMMITTED:
+        # Promotion is deliberately reserved for the auth-version CAS in
+        # commit_auth_projection; retain the historical boolean rejection
+        # shape for callback callers.
+        return False
     if target not in _ALLOWED_TRANSITIONS.get(expected, set()):
         raise ValueError("Invalid ChatGPT MFA operation transition")
 
@@ -412,7 +424,11 @@ def _candidate_in_session(
     ).first()
     if (
         state is None
-        or state.mfa_state != ChatGPTMfaState.CONFIRMED.value
+        or state.mfa_state
+        not in {
+            ChatGPTMfaState.ACTIVE.value,
+            ChatGPTMfaState.CONFIRMED.value,
+        }
         or not str(state.active_mfa_generation or "").strip()
     ):
         return None
@@ -430,14 +446,19 @@ def _candidate_in_session(
     ).first()
     if operation is None or not str(operation.totp_secret or "").strip():
         return None
+    recovery_state = _as_recovery_state(operation.recovery_code_state)
     return ChatGPTLoginMfaCandidate(
         operation_id=str(operation.operation_id),
         account_id=int(operation.account_id),
         email=str(operation.email or ""),
         generation=str(operation.generation or ""),
         totp_secret=str(operation.totp_secret or ""),
-        recovery_code=str(operation.recovery_code or ""),
-        recovery_code_state=_as_recovery_state(operation.recovery_code_state),
+        recovery_code=(
+            str(operation.recovery_code or "")
+            if recovery_state is ChatGPTRecoveryCodeState.AVAILABLE
+            else ""
+        ),
+        recovery_code_state=recovery_state,
         remote_activated_at=operation.remote_activated_at,
     )
 
@@ -463,13 +484,41 @@ def load_login_mfa_candidate_by_email(
     if not normalized_email:
         return None
     with _session_scope(session) as (active_session, _owns_session):
+        account_id = resolve_chatgpt_auth_account_id(
+            normalized_email,
+            session=active_session,
+        )
+        if account_id is None:
+            return None
         inspector = inspect(active_session.connection())
-        required_tables = {
-            AccountModel.__tablename__,
-            ChatGPTAuthStateModel.__tablename__,
-            ChatGPTMfaOperationModel.__tablename__,
-        }
-        if not all(inspector.has_table(table_name) for table_name in required_tables):
+        if not all(
+            inspector.has_table(table_name)
+            for table_name in (
+                ChatGPTAuthStateModel.__tablename__,
+                ChatGPTMfaOperationModel.__tablename__,
+            )
+        ):
+            return None
+        return _candidate_in_session(account_id, active_session)
+
+
+def resolve_chatgpt_auth_account_id(
+    email: str,
+    *,
+    session: Session | None = None,
+) -> int | None:
+    """Resolve exactly one ChatGPT account for an email.
+
+    ``None`` means no account (and is retained for legacy fixtures); more
+    than one matching row is an identity conflict and must fail closed.
+    """
+
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return None
+    with _session_scope(session) as (active_session, _owns_session):
+        inspector = inspect(active_session.connection())
+        if not inspector.has_table(AccountModel.__tablename__):
             return None
         account_ids = active_session.exec(
             select(AccountModel.id)
@@ -477,9 +526,12 @@ def load_login_mfa_candidate_by_email(
             .where(func.lower(AccountModel.email) == normalized_email)
             .order_by(AccountModel.id)
         ).all()
-        if len(account_ids) != 1 or account_ids[0] is None:
-            return None
-        return _candidate_in_session(int(account_ids[0]), active_session)
+        ids = [int(value) for value in account_ids if value is not None]
+        if len(ids) > 1:
+            raise ChatGPTAuthIdentityConflict(
+                "Multiple ChatGPT accounts match the login email"
+            )
+        return ids[0] if ids else None
 
 
 def _credential_revision(
@@ -493,13 +545,16 @@ def _credential_revision(
 ) -> str:
     """Return a non-secret canonical change token based on field presence."""
 
-    return (
-        f"chatgpt-auth:a{account_id}:v{auth_version}"
-        f":p{int(has_password)}"
-        f":m{int(has_mfa)}"
-        f":b{int(has_mailbox)}"
-        f":t{int(has_tokens)}"
-    )
+    canonical = (
+        f"v1|account_id={int(account_id)}|auth_version={int(auth_version)}"
+        f"|password={int(bool(has_password))}|mfa={int(bool(has_mfa))}"
+        f"|mailbox={int(bool(has_mailbox))}|tokens={int(bool(has_tokens))}"
+    ).encode("utf-8")
+    return hmac.new(
+        b"chatgpt-auth-state-credential-revision-v1",
+        canonical,
+        hashlib.sha256,
+    ).hexdigest()
 
 
 def _project_account_values(
@@ -602,6 +657,29 @@ def _project_account_values(
     return values, bool(projected_password), bool(projected_mailbox), has_tokens
 
 
+def _begin_clean_sqlite_transaction(session: Session) -> bool:
+    """Start a real DBAPI transaction only for a clean caller session.
+
+    SQLAlchemy's nested transaction can otherwise release its first savepoint
+    without an actual SQLite outer ``BEGIN``.  Returning whether we started it
+    lets the caller decide whether rollback belongs to this function or to the
+    owner of an already-active transaction.
+    """
+
+    bind = session.get_bind()
+    if getattr(getattr(bind, "dialect", None), "name", "") != "sqlite":
+        return False
+    connection = session.connection()
+    raw_connection = getattr(connection, "connection", None)
+    if raw_connection is None:
+        return False
+    in_transaction = getattr(raw_connection, "in_transaction", True)
+    if not in_transaction:
+        connection.exec_driver_sql("BEGIN")
+        return True
+    return False
+
+
 def commit_auth_projection(
     account_id: int,
     *,
@@ -620,7 +698,9 @@ def commit_auth_projection(
     normalized_operation_id = str(active_operation_id or "").strip()
 
     with _session_scope(session) as (active_session, owns_session):
+        started_outer = False
         try:
+            started_outer = _begin_clean_sqlite_transaction(active_session)
             with active_session.begin_nested():
                 current = active_session.exec(
                     select(ChatGPTAuthStateModel).where(
@@ -630,6 +710,17 @@ def commit_auth_projection(
                 if current is None or int(current.auth_version) != normalized_version:
                     raise ChatGPTAuthVersionConflict(
                         "ChatGPT authentication state changed before commit"
+                    )
+
+                account = active_session.get(AccountModel, normalized_id)
+                if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+                    raise ChatGPTAuthIdentityConflict(
+                        "ChatGPT account identity is missing or not ChatGPT"
+                    )
+                account_email = str(account.email or "").strip().lower()
+                if not account_email:
+                    raise ChatGPTAuthIdentityConflict(
+                        "ChatGPT account email identity is missing"
                     )
 
                 active_operation = None
@@ -656,8 +747,15 @@ def commit_auth_projection(
                         raise ChatGPTMfaOperationConflict(
                             "ChatGPT MFA operation is not eligible for commit"
                         )
-                    next_mfa_state = ChatGPTMfaState.CONFIRMED.value
+                    if str(active_operation.email or "").strip().lower() != account_email:
+                        raise ChatGPTAuthIdentityConflict(
+                            "ChatGPT MFA operation email does not match account"
+                        )
+                    next_mfa_state = ChatGPTMfaState.ACTIVE.value
                     next_generation = str(active_operation.generation or "")
+                elif str(current.mfa_state or "") == ChatGPTMfaState.CONFIRMED.value:
+                    # Normalize legacy rows on the next projection write.
+                    next_mfa_state = ChatGPTMfaState.ACTIVE.value
 
                 next_primary_state = str(
                     current.primary_state or ChatGPTPrimaryState.ABSENT
@@ -670,7 +768,6 @@ def commit_auth_projection(
                     )
 
                 now = _utcnow()
-                account = active_session.get(AccountModel, normalized_id)
                 account_values, has_password, has_mailbox, has_tokens = (
                     _project_account_values(
                         account,
@@ -681,10 +778,6 @@ def commit_auth_projection(
                         now=now,
                     )
                 )
-                if account is None:
-                    has_password = bool(password) or (
-                        next_primary_state == ChatGPTPrimaryState.CONFIRMED.value
-                    )
                 next_version = normalized_version + 1
                 revision = _credential_revision(
                     account_id=normalized_id,
@@ -751,6 +844,10 @@ def commit_auth_projection(
                     account_result = active_session.exec(
                         update(AccountModel)
                         .where(AccountModel.id == normalized_id)
+                        .where(
+                            func.lower(AccountModel.platform) == "chatgpt"
+                        )
+                        .where(func.lower(AccountModel.email) == account_email)
                         .values(**account_values)
                     )
                     if int(getattr(account_result, "rowcount", 0) or 0) != 1:
@@ -761,9 +858,12 @@ def commit_auth_projection(
             if owns_session:
                 active_session.commit()
             else:
+                # The caller owns an existing transaction.  A clean SQLite
+                # session gets a real outer BEGIN above, but remains caller-
+                # controlled so rollback can undo this projection.
                 active_session.flush()
         except Exception:
-            if owns_session:
+            if owns_session or started_outer:
                 active_session.rollback()
             raise
 

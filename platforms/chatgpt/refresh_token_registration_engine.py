@@ -22,8 +22,9 @@ from core.db import (
     update_chatgpt_mfa_rotation_recovery_code,
 )
 from services.chatgpt_auth_state import (
-    load_login_mfa_candidate,
+    ChatGPTAuthIdentityConflict,
     load_login_mfa_candidate_by_email,
+    resolve_chatgpt_auth_account_id,
 )
 
 from .chatgpt_client import ChatGPTClient
@@ -412,22 +413,33 @@ class RefreshTokenRegistrationEngine:
                     self.extra_config.get("chatgpt_local_account_id")
                     or self.email_info.get("chatgpt_local_account_id")
                 )
+                resolved_account_id = resolve_chatgpt_auth_account_id(email_value)
                 if local_account_id in (None, ""):
-                    candidate = load_login_mfa_candidate_by_email(email_value)
+                    normalized_account_id = resolved_account_id
                 else:
                     try:
                         normalized_account_id = int(local_account_id)
-                    except (TypeError, ValueError):
-                        candidate = None
-                    else:
-                        candidate = load_login_mfa_candidate(
-                            normalized_account_id
+                    except (TypeError, ValueError) as exc:
+                        raise ChatGPTAuthIdentityConflict(
+                            "ChatGPT local account identity is invalid"
+                        ) from exc
+                    if (
+                        resolved_account_id is None
+                        or normalized_account_id != resolved_account_id
+                    ):
+                        raise ChatGPTAuthIdentityConflict(
+                            "ChatGPT local account identity does not match login email"
                         )
+                candidate = (
+                    load_login_mfa_candidate_by_email(email_value)
+                    if normalized_account_id is not None
+                    else None
+                )
                 if candidate is not None and (
                     str(candidate.email or "").strip().lower()
                     != email_value.lower()
                 ):
-                    raise ValueError(
+                    raise ChatGPTAuthIdentityConflict(
                         "账号确认 MFA 凭据与当前登录邮箱不匹配"
                     )
                 if candidate is not None:
