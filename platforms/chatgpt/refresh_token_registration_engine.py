@@ -571,6 +571,22 @@ class RefreshTokenRegistrationEngine:
                         )
                     else:
                         self._log("已加载此前重置并保存的 ChatGPT 登录密码")
+                elif account_type == "mailapi_url":
+                    # Three-field imports (email----password----MailAPI URL)
+                    # carry a real ChatGPT primary password.  Keep it as the
+                    # login credential; the MailAPI URL is only a fallback
+                    # receiver when the server explicitly asks for email.
+                    password = str(self.email_info.get("password") or "")
+                    self.password = password
+                    self.totp_secret = str(
+                        self.email_info.get("totp_secret") or ""
+                    ).strip()
+                    self.password_reset_required = False
+                    if password:
+                        self._log(
+                            "已识别 ChatGPT 密码 + MailAPI 接码地址；"
+                            "常规登录使用密码，只有服务端要求邮箱验证时才取码"
+                        )
                 managed_totp_secret = str(
                     self.email_info.get("totp_secret") or ""
                 ).strip()

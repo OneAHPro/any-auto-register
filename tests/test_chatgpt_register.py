@@ -43,6 +43,28 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_mailapi_url_record_uses_imported_chatgpt_password(self):
+        class MailApiEmailService:
+            service_type = type("ST", (), {"value": "microsoft"})()
+
+            def create_email(self):
+                return {
+                    "email": "worker@custom-mail.test",
+                    "account_type": "mailapi_url",
+                    "password": "Imported-ChatGPT-Password",
+                    "mail_api_url": "https://mail.example.test/inbox",
+                }
+
+        engine = RefreshTokenRegistrationEngine(
+            email_service=MailApiEmailService(),
+            callback_logger=lambda _message: None,
+            extra_config={"chatgpt_existing_account_login_only": True},
+        )
+
+        self.assertTrue(engine._create_email(existing_account_login_only=True))
+        self.assertEqual(engine.password, "Imported-ChatGPT-Password")
+        self.assertFalse(engine.password_reset_required)
+
     def test_oauth_logs_are_sanitized_before_every_engine_sink(self):
         callback_messages = []
         engine = RefreshTokenRegistrationEngine(
