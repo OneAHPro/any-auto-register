@@ -157,6 +157,17 @@ class MailImportServiceTests(unittest.TestCase):
                 "worker@yisen.uk----login-password----@@@.%%%.signature",
             )
 
+    def test_parse_microsoft_import_line_rejects_invalid_yisen_signature(self):
+        rules_module = load_microsoft_import_rules_module()
+        parse_microsoft_import_line = rules_module.parse_microsoft_import_line
+        token = fixture_yisen_jwt("worker@yisen.uk").rsplit(".", 1)[0]
+
+        with self.assertRaisesRegex(ValueError, "JWT 格式无效"):
+            parse_microsoft_import_line(
+                1,
+                f"worker@yisen.uk----login-password----{token}.bad signature@@",
+            )
+
     def test_microsoft_strategy_persists_yisen_token_without_exposing_it(self):
         from services.mail_imports.providers import MicrosoftMailImportStrategy
         from services.mail_imports.schemas import MailImportExecuteRequest
@@ -191,6 +202,71 @@ class MailImportServiceTests(unittest.TestCase):
                     ).one()
                 self.assertEqual(imported.account_type, "mailapi_url")
                 self.assertEqual(imported.mailapi_token, token)
+            finally:
+                test_engine.dispose()
+
+    def test_microsoft_strategy_sanitizes_database_errors_for_yisen_token(self):
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        token = fixture_yisen_jwt("worker@yisen.uk")
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'mail-import-errors.db'}"
+            )
+            SQLModel.metadata.create_all(test_engine)
+            try:
+                with patch("services.mail_imports.providers.engine", test_engine), patch(
+                    "services.mail_imports.providers.Session.commit",
+                    side_effect=RuntimeError(f"bound parameters: {token}"),
+                ):
+                    response = strategy.execute(
+                        MailImportExecuteRequest(
+                            type="microsoft",
+                            content=(
+                                "worker@yisen.uk----login-password----"
+                                f"{token}"
+                            ),
+                            bind_to_config=False,
+                        )
+                    )
+
+                self.assertEqual(response.summary.failed, 1)
+                self.assertNotIn(token, response.model_dump_json())
+                self.assertEqual(response.errors, ["行 1: 创建失败，请检查数据库状态"])
+            finally:
+                test_engine.dispose()
+
+    def test_microsoft_strategy_does_not_alias_yisen_token_records(self):
+        from services.mail_imports.providers import MicrosoftMailImportStrategy
+        from services.mail_imports.schemas import MailImportExecuteRequest
+
+        token = fixture_yisen_jwt("worker@yisen.uk")
+        strategy = MicrosoftMailImportStrategy()
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            test_engine = create_engine(
+                f"sqlite:///{Path(tmp_dir) / 'mail-import-alias.db'}"
+            )
+            SQLModel.metadata.create_all(test_engine)
+            try:
+                with patch("services.mail_imports.providers.engine", test_engine):
+                    response = strategy.execute(
+                        MailImportExecuteRequest(
+                            type="microsoft",
+                            content=(
+                                "worker@yisen.uk----login-password----"
+                                f"{token}"
+                            ),
+                            alias_split_enabled=True,
+                            alias_split_count=5,
+                            alias_include_original=False,
+                            bind_to_config=False,
+                        )
+                    )
+
+                self.assertEqual(response.summary.success, 1)
+                self.assertEqual(response.snapshot.items[0].email, "worker@yisen.uk")
             finally:
                 test_engine.dispose()
 

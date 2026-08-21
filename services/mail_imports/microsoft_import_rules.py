@@ -71,7 +71,11 @@ def _parse_yisen_mailapi_token(
 ) -> str:
     normalized = re.sub(r"\\+([_-])", r"\1", str(token or "").strip())
     parts = normalized.split(".")
-    if len(parts) != 3 or not all(parts):
+    if (
+        len(parts) != 3
+        or not all(parts)
+        or any(not re.fullmatch(r"[A-Za-z0-9_-]+", part) for part in parts)
+    ):
         raise ValueError(f"行 {line_number}: Yisen 邮箱 JWT 格式无效")
     try:
         header = _decode_jwt_part(parts[0])

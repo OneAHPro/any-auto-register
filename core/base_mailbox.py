@@ -4500,7 +4500,12 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         return " ".join(decoded_parts).strip() or raw
 
     @classmethod
-    def _parse_mailapi_message(cls, text: str) -> dict[str, Any]:
+    def _parse_mailapi_message(
+        cls,
+        text: str,
+        *,
+        yisen: bool = False,
+    ) -> dict[str, Any]:
         import json
 
         raw_text = str(text or "")
@@ -4520,10 +4525,10 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 "status": None,
             }
 
-        yisen_results = payload.get("results")
+        yisen_results = payload.get("results") if yisen else None
         if isinstance(yisen_results, list):
             candidates = []
-            for index, item in enumerate(yisen_results):
+            for index, item in enumerate(yisen_results[:50]):
                 if not isinstance(item, dict):
                     continue
                 metadata = item.get("metadata")
@@ -4538,7 +4543,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 if not cls._is_openai_history_subject(subject):
                     continue
                 source = str(item.get("source") or "").strip()
-                raw_message = str(item.get("raw") or "").strip()
+                raw_message = str(item.get("raw") or "")[:1_000_000].strip()
                 decoded_message = cls._decode_mailapi_raw_mime(raw_message)
                 visible_message = cls._mailapi_visible_text(decoded_message)
                 code = cls._mailapi_history_item_code(
@@ -5182,7 +5187,8 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         if not url:
             raise RuntimeError("mailapi_url 为空，无法轮询取码")
         headers = None
-        if str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk":
+        is_yisen = str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk"
+        if is_yisen:
             token = str(extra.get("mailapi_token") or "").strip()
             if not token:
                 raise RuntimeError("Yisen MailAPI 凭据缺失")
@@ -5199,7 +5205,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             }
         response = self._request_mailapi(url, headers=headers)
         text = str(response.text or "")
-        direct_message = self._parse_mailapi_message(text)
+        direct_message = self._parse_mailapi_message(text, yisen=is_yisen)
         direct_content = str(direct_message.get("content") or "")
         if (
             direct_content
@@ -5317,7 +5323,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
     def get_current_ids(self, account: MailboxAccount) -> set:
         try:
             text = self._fetch_mailapi_text(account)
-            message = self._parse_mailapi_message(text)
+            from urllib.parse import urlsplit
+
+            url = str((account.extra or {}).get("mailapi_url") or "")
+            is_yisen = str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk"
+            message = self._parse_mailapi_message(text, yisen=is_yisen)
             if (
                 message.get("status") is False
                 or not self._message_matches_account(message, account)
@@ -5366,7 +5376,11 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                 )
                 return None
 
-            message = self._parse_mailapi_message(text)
+            from urllib.parse import urlsplit
+
+            url = str((account.extra or {}).get("mailapi_url") or "")
+            is_yisen = str(urlsplit(url).hostname or "").lower() == "mail.yisen.uk"
+            message = self._parse_mailapi_message(text, yisen=is_yisen)
             if message.get("status") is False:
                 return None
             if not self._message_matches_account(message, account):

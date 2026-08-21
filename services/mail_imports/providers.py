@@ -295,6 +295,9 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
         target_count = max(1, min(int(alias_count or 1), 5))
 
         for record in records:
+            if str(record.mailapi_token or "").strip():
+                expanded.append(record)
+                continue
             emails: list[str] = []
             seen_emails: set[str] = set()
             if include_original:
@@ -508,7 +511,7 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                     except Exception as exc:
                         oauth_check_results[record.line_number] = {
                             "ok": False,
-                            "message": f"行 {record.line_number}: 微软邮箱可用性检测异常: {exc}",
+                            "message": f"行 {record.line_number}: 微软邮箱可用性检测异常",
                             "reason": "oauth_probe_exception",
                         }
 
@@ -562,10 +565,12 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                         "enabled": account.enabled,
                     })
                     success += 1
-                except Exception as exc:
+                except Exception:
                     session.rollback()
                     failed += 1
-                    errors.append(f"行 {record.line_number}: 创建失败: {str(exc)}")
+                    errors.append(
+                        f"行 {record.line_number}: 创建失败，请检查数据库状态"
+                    )
 
         snapshot = self.get_snapshot(
             MailImportSnapshotRequest(

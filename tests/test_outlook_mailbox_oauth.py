@@ -101,7 +101,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             ],
         }
 
-        parsed = backend._parse_mailapi_message(json.dumps(payload))
+        parsed = backend._parse_mailapi_message(json.dumps(payload), yisen=True)
 
         self.assertEqual(parsed["content"], "Your ChatGPT authentication code 975310")
         self.assertEqual(
@@ -138,7 +138,7 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             ],
         }
 
-        parsed = backend._parse_mailapi_message(json.dumps(payload))
+        parsed = backend._parse_mailapi_message(json.dumps(payload), yisen=True)
         code = backend._extract_message_code(parsed, json.dumps(payload), None)
 
         self.assertEqual(code, "246810")
@@ -174,12 +174,25 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
             ],
         }
 
-        parsed = backend._parse_mailapi_message(json.dumps(payload))
+        parsed = backend._parse_mailapi_message(json.dumps(payload), yisen=True)
         code = backend._extract_message_code(parsed, json.dumps(payload), None)
 
         self.assertEqual(code, "246810")
         self.assertTrue(parsed["status"])
         self.assertEqual(parsed["message_id"], "mailapi_message:mail-7")
+
+    def test_generic_mailapi_results_key_preserves_top_level_content(self):
+        mailbox = OutlookMailbox()
+        backend = mailbox._backends["mailapi_url"]
+        payload = {
+            "results": [],
+            "content": "Your verification code is 246810",
+        }
+
+        parsed = backend._parse_mailapi_message(json.dumps(payload))
+
+        self.assertIn("246810", parsed["content"])
+        self.assertIsNot(parsed.get("status"), False)
 
     @mock.patch("requests.get")
     def test_yisen_mailapi_403_does_not_expose_token_or_email(self, mock_get):
