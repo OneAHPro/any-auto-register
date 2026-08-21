@@ -125,6 +125,18 @@ class MailImportAutoDetectionTests(unittest.TestCase):
         self.assertEqual(result.rows[0].account_type, "mailapi_url")
         self.assertNotIn(secret_url, json.dumps(result.to_public_dict()))
 
+    def test_normalizes_escaped_at_in_custom_domain_mailapi_record(self):
+        secret_url = "https://mail.example.test/?jwt=header.payload.signature"
+
+        result = detect_mail_import_content(
+            r"worker\@custom-mail.test----ChatGPT-Password-2026!----"
+            f"[{secret_url}]({secret_url})"
+        )
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(result.rows[0].email, "worker@custom-mail.test")
+        self.assertEqual(result.rows[0].account_type, "mailapi_url")
+
     def test_detects_chatgpt_password_totp_as_applemail(self):
         secret = "E4MEYUM757WMF6YTEUD43EWRXZK5R7IP"
 

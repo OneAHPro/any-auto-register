@@ -10,6 +10,9 @@ MAIL_IMPORT_DASH_DELIMITER_RE = re.compile(MAIL_IMPORT_DASH_DELIMITER_PATTERN)
 def normalize_mail_import_field(value: str) -> str:
     """Turn a copied Markdown link field back into its underlying HTTP URL."""
     text = str(value or "").strip()
+    # Markdown/text exports often escape the at-sign in an email address.
+    # Treat that presentation escape as formatting, not part of the address.
+    text = text.replace(r"\@", "@")
     match = re.fullmatch(
         r"\[[^\]]*\]\(\s*(?P<url>https?://.+)\s*\)",
         text,
