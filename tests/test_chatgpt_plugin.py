@@ -662,7 +662,30 @@ class ChatGPTPluginTests(unittest.TestCase):
             mailbox=mailbox,
         )
 
-        with self.assertRaisesRegex(RuntimeError, "缺少密码或 MFA 秘钥"):
+        with self.assertRaisesRegex(RuntimeError, "缺少 MFA 秘钥"):
+            platform.register()
+
+        self.assertEqual(mailbox.requeued, [])
+
+    def test_totp_login_without_password_reports_password_specifically(self):
+        mailbox = _RequeueMailbox()
+        mailbox.account.extra = {
+            "provider": "chatgpt_credentials",
+            "account_type": "chatgpt_password_totp",
+            "password": "",
+            "totp_secret": "JBSWY3DPEHPK3PXP",
+        }
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "chatgpt_existing_account_login_only": True,
+                }
+            ),
+            mailbox=mailbox,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "缺少 ChatGPT 密码"):
             platform.register()
 
         self.assertEqual(mailbox.requeued, [])

@@ -725,7 +725,10 @@ class ChatGPTPlatform(BasePlatform):
             extra_config=extra_config,
         )
         def _is_permanent_login_credential_error(error, error_code="") -> bool:
-            if str(error_code or "").strip() == "missing_totp_credentials":
+            if str(error_code or "").strip() in {
+                "missing_totp_credentials",
+                "missing_password_credentials",
+            }:
                 return True
             normalized = str(error or "").strip().lower()
             return any(
@@ -734,6 +737,8 @@ class ChatGPTPlatform(BasePlatform):
                     "缺少 mfa 秘钥",
                     "missing mfa secret",
                     "missing totp secret",
+                    "缺少 chatgpt 密码",
+                    "missing chatgpt password",
                     "密码已在认证服务重置，但本地凭据保存失败",
                 )
             )
@@ -742,10 +747,16 @@ class ChatGPTPlatform(BasePlatform):
             if not login_only:
                 return
             if _is_permanent_login_credential_error(error, error_code):
-                log_fn(
-                    "当前 ChatGPT 账号仅支持 TOTP MFA，但导入记录缺少秘钥；"
-                    "已从自动重试池隔离，请补齐秘钥后重新导入"
-                )
+                if str(error_code or "").strip() == "missing_password_credentials":
+                    log_fn(
+                        "ChatGPT 密码 + MFA 导入记录缺少密码；"
+                        "已从自动重试池隔离，请补齐密码后重新导入"
+                    )
+                else:
+                    log_fn(
+                        "当前 ChatGPT 账号仅支持 TOTP MFA，但导入记录缺少秘钥；"
+                        "已从自动重试池隔离，请补齐秘钥后重新导入"
+                    )
                 return
             mailbox_account = getattr(email_service, "_acct", None)
             requeue = getattr(self.mailbox, "requeue_account", None)

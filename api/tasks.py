@@ -3947,11 +3947,14 @@ def _chatgpt_retry_mailbox_provider(
 class _PersistedChatGPTRetryMailbox:
     """Use one persisted mailbox identity while delegating receive operations."""
 
-    _LOCAL_ATTRIBUTES = frozenset({"_delegate", "_account"})
+    _LOCAL_ATTRIBUTES = frozenset(
+        {"_delegate", "_account", "_rehydrated_claim"}
+    )
 
     def __init__(self, delegate, account) -> None:
         object.__setattr__(self, "_delegate", delegate)
         object.__setattr__(self, "_account", account)
+        object.__setattr__(self, "_rehydrated_claim", False)
 
     def __getattr__(self, name):
         return getattr(self._delegate, name)
@@ -3962,15 +3965,51 @@ class _PersistedChatGPTRetryMailbox:
             return
         setattr(self._delegate, name, value)
 
+    def _rehydrate_sanitized_credentials(self):
+        account = self._account
+        extra = dict(getattr(account, "extra", None) or {})
+        account_type = str(extra.get("account_type") or "").strip().lower()
+        has_totp = bool(
+            str(
+                extra.get("totp_secret")
+                or extra.get("mfa_secret")
+                or extra.get("totp")
+                or ""
+            ).strip()
+        )
+        # Attempt bindings intentionally never store TOTP/recovery secrets.
+        # Before a local AccountModel exists, reclaim the exact original pool
+        # row so a retry gets the full in-memory credential without copying it
+        # into task metadata.
+        if (
+            account_type != "chatgpt_password_totp"
+            or has_totp
+            or not str(extra.get("pool_file") or "").strip()
+        ):
+            return account
+        selector = getattr(self._delegate, "get_email_by_address", None)
+        if not callable(selector):
+            return account
+        bound_email = str(getattr(account, "email", "") or "").strip()
+        reclaimed = selector(bound_email)
+        reclaimed_email = str(
+            getattr(reclaimed, "email", "") or ""
+        ).strip()
+        if not reclaimed_email or reclaimed_email.lower() != bound_email.lower():
+            raise RuntimeError("重试邮箱与原始邮箱池记录不一致")
+        object.__setattr__(self, "_account", reclaimed)
+        object.__setattr__(self, "_rehydrated_claim", True)
+        return reclaimed
+
     def get_email(self):
-        return self._account
+        return self._rehydrate_sanitized_credentials()
 
     def get_email_by_address(self, email: str):
         requested = str(email or "").strip().lower()
         bound = str(getattr(self._account, "email", "") or "").strip().lower()
         if not requested or requested != bound:
             raise RuntimeError("重试绑定邮箱与持久化邮箱凭据不一致")
-        return self._account
+        return self._rehydrate_sanitized_credentials()
 
     def requeue_account(self, account) -> bool:
         target = account if account is not None else self._account
@@ -3978,9 +4017,29 @@ class _PersistedChatGPTRetryMailbox:
         return bool(delegate(target)) if callable(delegate) else False
 
     def mark_account_used(self, account) -> bool:
-        target = account if account is not None else self._account
+        caller = account if account is not None else self._account
+        target = self._account if self._rehydrated_claim else caller
+        if self._rehydrated_claim:
+            target_extra = dict(getattr(caller, "extra", None) or {})
+            if not target_extra and hasattr(caller, "get_extra"):
+                try:
+                    target_extra = dict(caller.get_extra() or {})
+                except Exception:
+                    target_extra = {}
+            refresh_token = str(
+                target_extra.get("refresh_token")
+                or target_extra.get("refreshToken")
+                or ""
+            ).strip()
+            if not refresh_token:
+                # Access Token may be persisted before phone verification. Keep
+                # this exact claim leased so a later failure can return it.
+                return True
         delegate = getattr(self._delegate, "mark_account_used", None)
-        return bool(delegate(target)) if callable(delegate) else False
+        marked = bool(delegate(target)) if callable(delegate) else False
+        if marked:
+            object.__setattr__(self, "_rehydrated_claim", False)
+        return marked
 
 
 def _bind_chatgpt_retry_mailbox(
@@ -5604,7 +5663,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     )
                     if callable(mark_mailbox_used):
                         try:
-                            marked_mailbox_used = mark_mailbox_used(account)
+                            marked_mailbox_used = mark_mailbox_used(final_account)
                             if marked_mailbox_used is False:
                                 _log(
                                     task_id,

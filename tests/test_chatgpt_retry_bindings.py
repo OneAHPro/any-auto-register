@@ -1,4 +1,5 @@
 import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -13,6 +14,7 @@ import api.tasks as tasks_module
 from api.tasks import (
     ChatGPTRetryFailedTaskRequest,
     RegisterTaskRequest,
+    _bind_chatgpt_retry_mailbox,
     _build_chatgpt_retry_request,
     get_retryable_task_bindings,
     _load_chatgpt_retry_mailbox_context,
@@ -20,6 +22,11 @@ from api.tasks import (
     _retryable_chatgpt_bindings,
     _upsert_chatgpt_attempt_binding,
 )
+from core.applemail_pool import (
+    load_applemail_pool_snapshot,
+    save_applemail_pool_json,
+)
+from core.base_mailbox import AppleMailMailbox
 from core.db import (
     AccountModel,
     ChatGPTAttemptBindingModel,
@@ -278,6 +285,206 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
         self.assertNotIn("MUST-NOT-BE-DUPLICATED", row.mailbox_context_json)
         self.assertNotIn("RECOVERY-MUST-NOT-BE-DUPLICATED", row.mailbox_context_json)
         self.assertIn("chatgpt_mfa_managed", row.mailbox_context_json)
+
+    def test_sanitized_password_totp_retry_reclaims_exact_applemail_credentials(self):
+        target_email = "target@example.com"
+        target_password = "target-password"
+        target_totp = "JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps(
+                    [
+                        {
+                            "email": "decoy@example.com",
+                            "password": "decoy-password",
+                            "totp_secret": "GEZDGNBVGY3TQOJQ",
+                            "account_type": "chatgpt_password_totp",
+                        },
+                        {
+                            "email": target_email,
+                            "password": target_password,
+                            "totp_secret": target_totp,
+                            "account_type": "chatgpt_password_totp",
+                        },
+                    ]
+                ),
+                pool_dir=tmp_dir,
+                filename="retry.json",
+            )
+            original_mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="retry.json",
+            )
+            original_account = original_mailbox.get_email_by_address(target_email)
+            mailbox_context = {
+                "provider": "applemail",
+                "email": target_email,
+                "account_id": original_account.account_id,
+                "extra": dict(original_account.extra),
+            }
+
+            test_engine = create_engine(
+                "sqlite://",
+                connect_args={"check_same_thread": False},
+                poolclass=StaticPool,
+            )
+            SQLModel.metadata.create_all(test_engine)
+            with mock.patch("api.tasks.engine", test_engine):
+                row = _upsert_chatgpt_attempt_binding(
+                    task_id="task-password-totp-retry",
+                    attempt_index=0,
+                    email=target_email,
+                    leadbee_code="aar_" + "a" * 32,
+                    status="failed",
+                    mailbox_context=mailbox_context,
+                )
+
+            self.assertTrue(original_mailbox.requeue_account(original_account))
+            persisted_context = json.loads(row.mailbox_context_json)
+            self.assertEqual(
+                persisted_context["extra"]["password"],
+                target_password,
+            )
+            self.assertNotIn("totp_secret", persisted_context["extra"])
+            self.assertNotIn(target_totp, row.mailbox_context_json)
+
+            retry_mailbox = _bind_chatgpt_retry_mailbox(
+                AppleMailMailbox(pool_dir=tmp_dir, pool_file="retry.json"),
+                persisted_context,
+                target_email,
+            )
+            reclaimed = retry_mailbox.get_email()
+
+            self.assertEqual(reclaimed.email, target_email)
+            self.assertEqual(reclaimed.extra["password"], target_password)
+            self.assertEqual(reclaimed.extra["totp_secret"], target_totp)
+            reclaimed_by_address = retry_mailbox.get_email_by_address(
+                target_email.upper()
+            )
+            self.assertEqual(reclaimed_by_address.email, target_email)
+            self.assertEqual(
+                reclaimed_by_address.extra["totp_secret"],
+                target_totp,
+            )
+            snapshot = load_applemail_pool_snapshot(
+                pool_dir=tmp_dir,
+                pool_file="retry.json",
+            )
+            self.assertEqual(
+                [item["email"] for item in snapshot["items"]],
+                ["decoy@example.com"],
+            )
+
+            self.assertTrue(retry_mailbox.requeue_account(reclaimed))
+            requeued = load_applemail_pool_snapshot(
+                pool_dir=tmp_dir,
+                pool_file="retry.json",
+            )
+            self.assertEqual(
+                {item["email"] for item in requeued["items"]},
+                {"decoy@example.com", target_email},
+            )
+
+    def test_rehydrated_claim_stays_claimed_until_refresh_token_is_saved(self):
+        target_email = "deferred@example.com"
+        target_password = "deferred-password"
+        target_totp = "JBSWY3DPEHPK3PXP"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps(
+                    [{
+                        "email": target_email,
+                        "password": target_password,
+                        "totp_secret": target_totp,
+                        "account_type": "chatgpt_password_totp",
+                    }]
+                ),
+                pool_dir=tmp_dir,
+                filename="deferred.json",
+            )
+            source = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="deferred.json",
+            )
+            claimed = source.get_email_by_address(target_email)
+            self.assertTrue(source.requeue_account(claimed))
+            context = {
+                "provider": "applemail",
+                "email": target_email,
+                "extra": {
+                    "account_type": "chatgpt_password_totp",
+                    "password": target_password,
+                    "pool_file": "deferred.json",
+                },
+            }
+            retry = _bind_chatgpt_retry_mailbox(
+                AppleMailMailbox(pool_dir=tmp_dir, pool_file="deferred.json"),
+                context,
+                target_email,
+            )
+            reclaimed = retry.get_email()
+
+            # Access Token may be saved before phone/Refresh Token completion;
+            # this must not burn the rehydrated claim.
+            self.assertTrue(retry.mark_account_used(reclaimed))
+            self.assertEqual(
+                load_applemail_pool_snapshot(
+                    pool_dir=tmp_dir,
+                    pool_file="deferred.json",
+                )["count"],
+                0,
+            )
+            self.assertTrue(retry.requeue_account(reclaimed))
+            self.assertEqual(
+                load_applemail_pool_snapshot(
+                    pool_dir=tmp_dir,
+                    pool_file="deferred.json",
+                )["count"],
+                1,
+            )
+
+    def test_rehydrated_claim_is_consumed_by_final_account_refresh_token(self):
+        target_email = "complete@example.com"
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps(
+                    [{
+                        "email": target_email,
+                        "password": "complete-password",
+                        "totp_secret": "JBSWY3DPEHPK3PXP",
+                        "account_type": "chatgpt_password_totp",
+                    }]
+                ),
+                pool_dir=tmp_dir,
+                filename="complete.json",
+            )
+            retry = _bind_chatgpt_retry_mailbox(
+                AppleMailMailbox(pool_dir=tmp_dir, pool_file="complete.json"),
+                {
+                    "provider": "applemail",
+                    "email": target_email,
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "complete-password",
+                        "pool_file": "complete.json",
+                    },
+                },
+                target_email,
+            )
+            retry.get_email()
+            final_account = AccountModel(
+                platform="chatgpt",
+                email=target_email,
+                password="complete-password",
+            )
+            final_account.set_extra({"refresh_token": "saved-refresh-token"})
+
+            self.assertTrue(retry.mark_account_used(final_account))
+            records = json.loads(
+                open(f"{tmp_dir}/complete.json", encoding="utf-8").read()
+            )
+            self.assertEqual(records[0]["pool_state"], "used")
+            self.assertFalse(records[0]["enabled"])
 
     def test_build_retry_request_preserves_email_card_order(self):
         bindings = [

@@ -50,6 +50,10 @@ class MissingTotpCredentialsError(ValueError):
     error_code = "missing_totp_credentials"
 
 
+class MissingPasswordCredentialsError(ValueError):
+    error_code = "missing_password_credentials"
+
+
 @dataclass
 class RegistrationResult:
     """注册结果。"""
@@ -521,9 +525,13 @@ class RefreshTokenRegistrationEngine:
                 elif account_type == "chatgpt_password_totp":
                     password = str(self.email_info.get("password") or "")
                     totp_secret = str(self.email_info.get("totp_secret") or "")
-                    if not password or not totp_secret:
+                    if not password:
+                        raise MissingPasswordCredentialsError(
+                            "ChatGPT 密码 + MFA 登录记录缺少 ChatGPT 密码"
+                        )
+                    if not totp_secret:
                         raise MissingTotpCredentialsError(
-                            "ChatGPT 密码 + MFA 登录记录缺少密码或 MFA 秘钥"
+                            "ChatGPT 密码 + MFA 登录记录缺少 MFA 秘钥"
                         )
                     self.password = password
                     self.totp_secret = totp_secret

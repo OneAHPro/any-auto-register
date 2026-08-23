@@ -350,6 +350,171 @@ class ChatGPTAccountPersistenceTests(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0].password, "new-password")
 
+    def test_existing_web_login_does_not_erase_saved_nested_credentials(self):
+        test_engine = self._test_engine()
+        existing = AccountModel(
+            platform="chatgpt",
+            email="preserve@example.com",
+            password="saved-password",
+            token="old-access-token",
+        )
+        existing.set_extra(
+            {
+                "refresh_token": "saved-refresh-token",
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "preserve@example.com",
+                    "account_id": "preserve@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "saved-password",
+                        "totp_secret": "SAVED-TOTP",
+                        "mfa_recovery_code": "SAVED-RECOVERY",
+                        "pool_file": "saved-pool.json",
+                    },
+                },
+            }
+        )
+        with Session(test_engine) as session:
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            existing_id = int(existing.id)
+
+        incoming = Account(
+            platform="chatgpt",
+            email="preserve@example.com",
+            password="",
+            token="new-access-token",
+            extra={
+                "chatgpt_token_source": "existing_account_web_login",
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "preserve@example.com",
+                    "account_id": "preserve@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "",
+                        "pool_file": "saved-pool.json",
+                    },
+                },
+            },
+        )
+
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, created = db_module.save_account_with_creation_state(incoming)
+
+        self.assertFalse(created)
+        self.assertEqual(int(saved.id), existing_id)
+        self.assertEqual(saved.password, "saved-password")
+        context_extra = saved.get_extra()["mailbox_login_context"]["extra"]
+        self.assertEqual(context_extra["password"], "saved-password")
+        self.assertEqual(context_extra["totp_secret"], "SAVED-TOTP")
+        self.assertEqual(
+            context_extra["mfa_recovery_code"],
+            "SAVED-RECOVERY",
+        )
+
+    def test_existing_web_login_replaces_nested_credentials_when_nonempty(self):
+        test_engine = self._test_engine()
+        existing = AccountModel(
+            platform="chatgpt",
+            email="replace@example.com",
+            password="old-password",
+        )
+        existing.set_extra(
+            {
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "replace@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "old-password",
+                        "totp_secret": "OLD-TOTP",
+                        "mfa_recovery_code": "OLD-RECOVERY",
+                    },
+                }
+            }
+        )
+        with Session(test_engine) as session:
+            session.add(existing)
+            session.commit()
+
+        incoming = Account(
+            platform="chatgpt",
+            email="replace@example.com",
+            password="new-password",
+            extra={
+                "chatgpt_token_source": "existing_account_web_login",
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": "replace@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "new-password",
+                        "totp_secret": "NEW-TOTP",
+                        "mfa_recovery_code": "NEW-RECOVERY",
+                    },
+                },
+            },
+        )
+
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, _created = db_module.save_account_with_creation_state(incoming)
+
+        self.assertEqual(saved.password, "new-password")
+        context_extra = saved.get_extra()["mailbox_login_context"]["extra"]
+        self.assertEqual(context_extra["password"], "new-password")
+        self.assertEqual(context_extra["totp_secret"], "NEW-TOTP")
+        self.assertEqual(context_extra["mfa_recovery_code"], "NEW-RECOVERY")
+
+    def test_password_reset_completion_removes_stale_pending_password(self):
+        test_engine = self._test_engine()
+        existing = AccountModel(
+            platform="chatgpt",
+            email="reset-clean@example.com",
+            password="old-password",
+        )
+        existing.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "reset-clean@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_reset_url_mail",
+                        "password": "old-password",
+                        "new_password": "pending-password",
+                        "password_reset_required": True,
+                    },
+                }
+            }
+        )
+        with Session(test_engine) as session:
+            session.add(existing)
+            session.commit()
+
+        incoming = Account(
+            platform="chatgpt",
+            email="reset-clean@example.com",
+            password="committed-password",
+            extra={
+                "chatgpt_token_source": "existing_account_web_login",
+                "mailbox_login_context": {
+                    "email": "reset-clean@example.com",
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "committed-password",
+                        "password_reset_required": False,
+                    },
+                },
+            },
+        )
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, _created = db_module.save_account_with_creation_state(incoming)
+
+        context_extra = saved.get_extra()["mailbox_login_context"]["extra"]
+        self.assertFalse(context_extra["password_reset_required"])
+        self.assertNotIn("new_password", context_extra)
+
     def test_targeted_cleanup_preserves_a_row_changed_after_this_attempt_saved_it(self):
         test_engine = self._test_engine()
         account = AccountModel(

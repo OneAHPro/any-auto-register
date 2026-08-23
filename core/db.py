@@ -233,6 +233,23 @@ class ProxyModel(SQLModel, table=True):
     last_checked: Optional[datetime] = None
 
 
+def _merge_nonempty_mapping(existing: dict, incoming: dict) -> dict:
+    """Merge nested credential projections without erasing saved values."""
+
+    merged = dict(existing or {})
+    for key, value in dict(incoming or {}).items():
+        current = merged.get(key)
+        if isinstance(current, dict) and isinstance(value, dict):
+            merged[key] = _merge_nonempty_mapping(current, value)
+            if value.get("password_reset_required") is False:
+                merged[key].pop("new_password", None)
+        elif value in (None, "") and key in merged:
+            continue
+        else:
+            merged[key] = value
+    return merged
+
+
 def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
     """Save an account and atomically report whether this call inserted it."""
     with Session(engine) as session:
@@ -249,20 +266,21 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
         ).first()
         if existing:
             incoming_extra = dict(account.extra or {})
-            if (
-                account.platform == "chatgpt"
+            existing_web_login = bool(
+                str(account.platform or "").strip().lower() == "chatgpt"
                 and incoming_extra.get("chatgpt_token_source")
                 == "existing_account_web_login"
-            ):
-                merged_extra = existing.get_extra()
-                for key, value in incoming_extra.items():
-                    if value in (None, "") and key in merged_extra:
-                        continue
-                    merged_extra[key] = value
+            )
+            if existing_web_login:
+                merged_extra = _merge_nonempty_mapping(
+                    existing.get_extra(),
+                    incoming_extra,
+                )
                 if incoming_extra.get("phone_oauth_ready") is False:
                     merged_extra.pop("oauth_resume_context", None)
                 incoming_extra = merged_extra
-            existing.password = account.password
+            if not existing_web_login or str(account.password or ""):
+                existing.password = account.password
             existing.user_id = account.user_id or ""
             existing.region = account.region or ""
             existing.token = account.token or ""
