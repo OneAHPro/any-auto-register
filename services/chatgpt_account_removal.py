@@ -9,9 +9,12 @@ from typing import Any
 from sqlalchemy import delete, func
 from sqlmodel import Session
 
-from core.db import AccountModel
+from core.db import AccountModel, cleanup_chatgpt_account_dependents
 from platforms.chatgpt.codex2api_upload import delete_codex2api_credential
-from services.chatgpt_account_coordination import chatgpt_account_operation_lock
+from services.chatgpt_account_coordination import (
+    chatgpt_account_email_operation_lock,
+    chatgpt_account_operation_lock,
+)
 
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -170,6 +173,11 @@ def _delete_local_snapshot(database_engine, snapshot: AccountSnapshot) -> str:
         )
         deleted = session.exec(statement)
         if int(getattr(deleted, "rowcount", 0) or 0) == 1:
+            if snapshot.platform.lower() == "chatgpt":
+                cleanup_chatgpt_account_dependents(
+                    session,
+                    snapshot.account_id,
+                )
             session.commit()
             return "deleted"
         session.rollback()
@@ -362,14 +370,55 @@ def remove_account(
         "task_control": task_control,
         "attempt_id": attempt_id,
     }
-    if already_locked:
-        return _remove_account_locked(snapshot, **kwargs)
 
-    with chatgpt_account_operation_lock(
-        snapshot.account_id,
+    def remove_locked_fresh_snapshot():
+        try:
+            fresh_snapshot = _load_snapshot(target_engine, normalized_id)
+        except Exception as exc:
+            return _result(
+                normalized_id,
+                ok=False,
+                status="database_error",
+                local_deleted=False,
+                codex2api=_codex_state(
+                    enabled=False,
+                    status="not_attempted",
+                ),
+                error_code="database_error",
+                message=f"读取锁内账号异常（{type(exc).__name__}）",
+            )
+        if fresh_snapshot is None:
+            return _result(
+                normalized_id,
+                ok=True,
+                status="already_absent",
+                local_deleted=False,
+                codex2api=_codex_state(
+                    enabled=False,
+                    status="not_applicable",
+                ),
+                message="账号已不存在",
+            )
+        if fresh_snapshot != snapshot:
+            return _result(
+                normalized_id,
+                ok=False,
+                status="local_delete_conflict",
+                local_deleted=False,
+                codex2api=_codex_state(
+                    enabled=False,
+                    status="not_attempted",
+                ),
+                error_code="local_delete_conflict",
+                message="账号记录已变化，请刷新后重试",
+            )
+        return _remove_account_locked(fresh_snapshot, **kwargs)
+
+    with chatgpt_account_email_operation_lock(
+        snapshot.email,
         blocking=False,
-    ) as acquired:
-        if not acquired:
+    ) as email_acquired:
+        if not email_acquired:
             return _result(
                 snapshot.account_id,
                 ok=False,
@@ -379,4 +428,24 @@ def remove_account(
                 error_code="account_busy",
                 message="该账号正在执行认证维护，请稍后重试",
             )
-        return _remove_account_locked(snapshot, **kwargs)
+        if already_locked:
+            return remove_locked_fresh_snapshot()
+
+        with chatgpt_account_operation_lock(
+            snapshot.account_id,
+            blocking=False,
+        ) as acquired:
+            if not acquired:
+                return _result(
+                    snapshot.account_id,
+                    ok=False,
+                    status="busy",
+                    local_deleted=False,
+                    codex2api=_codex_state(
+                        enabled=False,
+                        status="not_attempted",
+                    ),
+                    error_code="account_busy",
+                    message="该账号正在执行认证维护，请稍后重试",
+                )
+            return remove_locked_fresh_snapshot()

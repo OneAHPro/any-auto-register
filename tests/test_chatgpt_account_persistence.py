@@ -7,7 +7,13 @@ from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.base_platform import Account
 from core import db as db_module
-from core.db import AccountModel, save_account
+from core.db import (
+    AccountModel,
+    ChatGPTAuthStateModel,
+    ChatGPTMfaOperationModel,
+    OutlookAccountModel,
+    save_account,
+)
 
 
 class ChatGPTAccountPersistenceTests(unittest.TestCase):
@@ -236,6 +242,113 @@ class ChatGPTAccountPersistenceTests(unittest.TestCase):
             self.assertIsNotNone(
                 session.get(AccountModel, identities["other@example.com"][0])
             )
+
+    def test_targeted_cleanup_removes_auth_artifacts_and_quarantines_binding(self):
+        test_engine = self._test_engine()
+        incomplete = AccountModel(
+            platform="chatgpt",
+            email="incomplete-with-auth@example.com",
+            password="password",
+            extra_json='{"refresh_token":""}',
+        )
+        with Session(test_engine) as session:
+            session.add(incomplete)
+            session.commit()
+            session.refresh(incomplete)
+            account_id = int(incomplete.id)
+            created_at = incomplete.created_at
+            extra_json = incomplete.extra_json
+            session.add(
+                ChatGPTAuthStateModel(
+                    account_id=account_id,
+                    primary_state="confirmed",
+                    mfa_state="active",
+                    active_mfa_generation="incomplete-generation",
+                )
+            )
+            session.add(
+                ChatGPTMfaOperationModel(
+                    operation_id="incomplete-operation",
+                    account_id=account_id,
+                    email=incomplete.email,
+                    generation="incomplete-generation",
+                    base_auth_version=1,
+                    status="committed",
+                    totp_secret="INCOMPLETE-TOTP",
+                )
+            )
+            session.add(
+                OutlookAccountModel(
+                    email=incomplete.email,
+                    password="mail-password",
+                    state="bound",
+                    enabled=False,
+                    bound_account_id=account_id,
+                )
+            )
+            session.commit()
+
+        self.assertTrue(
+            db_module.delete_incomplete_chatgpt_account(
+                account_id,
+                expected_email="incomplete-with-auth@example.com",
+                expected_created_at=created_at,
+                expected_extra_json=extra_json,
+                database_engine=test_engine,
+            )
+        )
+
+        with Session(test_engine) as session:
+            self.assertIsNone(session.get(AccountModel, account_id))
+            self.assertEqual(
+                session.exec(
+                    select(ChatGPTAuthStateModel).where(
+                        ChatGPTAuthStateModel.account_id == account_id
+                    )
+                ).all(),
+                [],
+            )
+            self.assertEqual(
+                session.exec(
+                    select(ChatGPTMfaOperationModel).where(
+                        ChatGPTMfaOperationModel.account_id == account_id
+                    )
+                ).all(),
+                [],
+            )
+            mailbox = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(mailbox.state, "quarantined")
+            self.assertFalse(mailbox.enabled)
+            self.assertEqual(mailbox.bound_account_id, 0)
+            self.assertEqual(mailbox.quarantine_reason, "account_deleted")
+
+    def test_save_reuses_chatgpt_identity_case_insensitively(self):
+        test_engine = self._test_engine()
+        with Session(test_engine) as session:
+            existing = AccountModel(
+                platform="chatgpt",
+                email="Demo@Example.com",
+                password="old-password",
+            )
+            session.add(existing)
+            session.commit()
+            session.refresh(existing)
+            existing_id = int(existing.id)
+
+        incoming = Account(
+            platform="CHATGPT",
+            email="demo@example.COM",
+            password="new-password",
+        )
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, created = db_module.save_account_with_creation_state(incoming)
+
+        self.assertFalse(created)
+        self.assertEqual(int(saved.id), existing_id)
+        with Session(test_engine) as session:
+            rows = session.exec(select(AccountModel)).all()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0].password, "new-password")
 
     def test_targeted_cleanup_preserves_a_row_changed_after_this_attempt_saved_it(self):
         test_engine = self._test_engine()

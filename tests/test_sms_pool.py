@@ -2,6 +2,7 @@ import unittest
 import tempfile
 import threading
 import json
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -651,6 +652,12 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
         persistence = mock.patch("api.tasks._persist_task_snapshot")
         persistence.start()
         self.addCleanup(persistence.stop)
+        identity_lock = mock.patch(
+            "api.tasks.validated_chatgpt_account_operation_lock",
+            side_effect=lambda *args, **kwargs: nullcontext(True),
+        )
+        identity_lock.start()
+        self.addCleanup(identity_lock.stop)
 
     @staticmethod
     def _pool_request(*, count=2):

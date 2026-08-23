@@ -415,6 +415,59 @@ def test_email_lookup_rejects_duplicate_local_accounts(database_engine):
             )
 
 
+def test_email_lookup_rejects_committed_mfa_from_reused_account_id(
+    database_engine,
+):
+    account_id = 7
+    with Session(database_engine) as session:
+        original = _create_chatgpt_account(
+            session,
+            account_id=account_id,
+            email="original@example.com",
+        )
+        state = ensure_chatgpt_auth_state(original.id, session=session)
+        operation = stage_mfa_operation(
+            original.id,
+            original.email,
+            "ORIGINAL-TOTP",
+            base_auth_version=state.auth_version,
+            session=session,
+        )
+        assert transition_mfa_operation(
+            operation.operation_id,
+            expected_state="staged",
+            new_state="activated_remote",
+            expected_generation=operation.generation,
+            session=session,
+        )
+        commit_auth_projection(
+            original.id,
+            expected_version=state.auth_version,
+            active_operation_id=operation.operation_id,
+            session=session,
+        )
+        session.commit()
+
+    with Session(database_engine) as session:
+        original = session.get(AccountModel, account_id)
+        session.delete(original)
+        session.commit()
+        _create_chatgpt_account(
+            session,
+            account_id=account_id,
+            email="replacement@example.com",
+        )
+        session.commit()
+
+    with Session(database_engine) as session:
+        candidate = load_login_mfa_candidate_by_email(
+            "replacement@example.com",
+            session=session,
+        )
+
+    assert candidate is None
+
+
 def test_identity_resolver_distinguishes_zero_one_and_duplicate_accounts(
     database_engine,
 ):

@@ -2724,6 +2724,13 @@ def _record_auth_maintenance_outcome(
 ) -> dict[str, Any]:
     """Update the durable circuit once per maintenance attempt."""
     normalized = dict(result or {})
+    if bool(normalized.get("account_removed")) or _text(
+        normalized.get("stage")
+    ) == "account_removed":
+        # Account removal already deleted the identity-scoped auth aggregate.
+        # Re-recording this terminal outcome would recreate an orphan state
+        # that could later attach to a reused SQLite integer primary key.
+        return normalized
     try:
         succeeded = bool(normalized.get("relogin_ok")) or (
             bool(normalized.get("refresh_ok"))

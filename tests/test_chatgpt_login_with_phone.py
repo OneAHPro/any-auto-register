@@ -1,6 +1,7 @@
 import threading
 import unittest
 import json
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -1106,6 +1107,10 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
                 side_effect=lambda _account_id, fallback: fallback,
             ),
             patch("api.tasks._refresh_saved_chatgpt_login", return_value=""),
+            patch(
+                "api.tasks.validated_chatgpt_account_operation_lock",
+                side_effect=lambda *args, **kwargs: nullcontext(True),
+            ),
             patch("api.tasks._auto_upload_integrations"),
             patch("api.tasks._save_task_log") as save_task_log,
             patch("api.tasks._persist_task_snapshot"),

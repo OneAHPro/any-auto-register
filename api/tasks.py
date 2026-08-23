@@ -1,9 +1,10 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, StrictBool, StrictInt
-from sqlalchemy import case, func, update
+from sqlalchemy import case, func, inspect, update
 from sqlmodel import Session, select
 from typing import Optional
+from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timezone
 from weakref import WeakKeyDictionary
@@ -29,6 +30,10 @@ from core.sms_pool import SmsPoolExhaustedError, mask_sms_code, sms_pool_service
 from core.chatgpt_task_gate import chatgpt_task_gate
 from core.chatgpt_login_context import promote_managed_mfa_login_context
 from platforms.chatgpt.log_sanitizer import sanitize_chatgpt_log_message
+from services.chatgpt_account_coordination import (
+    chatgpt_account_email_operation_lock,
+    validated_chatgpt_account_operation_lock,
+)
 import time, json, asyncio, threading, logging, re
 
 router = APIRouter(prefix="/tasks", tags=["tasks"])
@@ -3128,6 +3133,17 @@ def _upsert_chatgpt_attempt_binding(
     with _chatgpt_binding_db_lock:
         _ensure_chatgpt_attempt_binding_table()
         with Session(engine) as s:
+            connection = s.connection()
+            if getattr(getattr(connection, "dialect", None), "name", "") == "sqlite":
+                raw_connection = getattr(connection, "connection", None)
+                if (
+                    raw_connection is not None
+                    and not getattr(raw_connection, "in_transaction", True)
+                ):
+                    # Serialize the identity check with account deletion.  A
+                    # delete that wins first leaves the binding detached; a
+                    # delete that follows this commit clears it again.
+                    connection.exec_driver_sql("BEGIN IMMEDIATE")
             row = s.exec(
                 select(ChatGPTAttemptBindingModel)
                 .where(ChatGPTAttemptBindingModel.task_id == str(task_id))
@@ -3144,8 +3160,20 @@ def _upsert_chatgpt_attempt_binding(
                 row.leadbee_code = str(leadbee_code or "").strip()
             if str(email or "").strip():
                 row.email = str(email or "").strip()
-            if int(account_id or 0) > 0:
-                row.account_id = int(account_id)
+            requested_account_id = int(account_id or 0)
+            if requested_account_id > 0:
+                binding_email = str(email or row.email or "").strip().lower()
+                matching_id = None
+                if binding_email and inspect(s.connection()).has_table(
+                    AccountModel.__tablename__
+                ):
+                    matching_id = s.exec(
+                        select(AccountModel.id)
+                        .where(AccountModel.id == requested_account_id)
+                        .where(func.lower(AccountModel.platform) == "chatgpt")
+                        .where(func.lower(AccountModel.email) == binding_email)
+                    ).first()
+                row.account_id = requested_account_id if matching_id is not None else 0
             if str(stage or "").strip():
                 row.stage = str(stage or "").strip()
             if str(status or "").strip():
@@ -3195,11 +3223,20 @@ def _retryable_chatgpt_bindings(task_id: str) -> list[ChatGPTAttemptBindingModel
                 account = None
                 if int(row.account_id or 0) > 0:
                     account = s.get(AccountModel, int(row.account_id))
+                    if account is not None and (
+                        str(account.platform or "").strip().lower() != "chatgpt"
+                        or str(account.email or "").strip().lower()
+                        != str(row.email or "").strip().lower()
+                    ):
+                        account = None
                 if account is None and row.email:
                     account = s.exec(
                         select(AccountModel)
-                        .where(AccountModel.platform == "chatgpt")
-                        .where(AccountModel.email == row.email)
+                        .where(func.lower(AccountModel.platform) == "chatgpt")
+                        .where(
+                            func.lower(AccountModel.email)
+                            == str(row.email or "").strip().lower()
+                        )
                     ).first()
                 extra = account.get_extra() if account is not None else {}
                 if str(extra.get("refresh_token") or "").strip():
@@ -3278,6 +3315,31 @@ def _resolve_chatgpt_retry_account_id(
     if saved_id == bound_id and saved_email == requested_email:
         return bound_id
     return saved_id
+
+
+def _load_unique_chatgpt_account_identity(
+    email: str,
+    *,
+    database_engine=None,
+):
+    """Return the existing local identity for one email before a save."""
+
+    normalized_email = str(email or "").strip().lower()
+    if not normalized_email:
+        return None
+    target_engine = database_engine or engine
+    with Session(target_engine) as session:
+        if not inspect(session.connection()).has_table(AccountModel.__tablename__):
+            return None
+        matches = session.exec(
+            select(AccountModel)
+            .where(func.lower(AccountModel.platform) == "chatgpt")
+            .where(func.lower(AccountModel.email) == normalized_email)
+            .order_by(AccountModel.id)
+        ).all()
+        if len(matches) > 1:
+            raise RuntimeError("同一邮箱存在多个 ChatGPT 本地账号，已停止写入")
+        return matches[0] if matches else None
 
 
 def _auto_upload_integrations(task_id: str, account):
@@ -3822,11 +3884,17 @@ def _load_chatgpt_retry_mailbox_context(
             account = None
             if int(row.account_id or 0) > 0:
                 account = session.get(AccountModel, int(row.account_id))
+                if account is not None and (
+                    str(account.platform or "").strip().lower() != "chatgpt"
+                    or str(account.email or "").strip().lower()
+                    != normalized_email
+                ):
+                    account = None
             if account is None:
                 account = session.exec(
                     select(AccountModel)
-                    .where(AccountModel.platform == "chatgpt")
-                    .where(AccountModel.email == expected_email)
+                    .where(func.lower(AccountModel.platform) == "chatgpt")
+                    .where(func.lower(AccountModel.email) == normalized_email)
                 ).first()
             if account is not None:
                 saved_password = str(account.password or "")
@@ -4316,6 +4384,63 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             phone_diagnostic: dict = {}
             previous_phone_diagnostic: dict = {}
             api_order_auto_retry_count = 0
+            account_operation_stack = ExitStack()
+            locked_account_email = ""
+            account_email_fence_failed = False
+            locked_account_id = 0
+            locked_account_created_at = None
+
+            def _ensure_account_email_fence(email_value: str) -> bool:
+                nonlocal locked_account_email, account_email_fence_failed
+                normalized_email = str(email_value or "").strip().lower()
+                if account_email_fence_failed or not normalized_email:
+                    return False
+                if locked_account_email:
+                    return locked_account_email == normalized_email
+                acquired = account_operation_stack.enter_context(
+                    chatgpt_account_email_operation_lock(
+                        normalized_email,
+                        blocking=False,
+                    )
+                )
+                if not acquired:
+                    account_email_fence_failed = True
+                    return False
+                locked_account_email = normalized_email
+                return True
+
+            def _ensure_account_id_fence(identity) -> bool:
+                nonlocal locked_account_id, locked_account_created_at
+                try:
+                    identity_id = int(getattr(identity, "id", 0) or 0)
+                except (TypeError, ValueError):
+                    return False
+                identity_email = str(
+                    getattr(identity, "email", "") or ""
+                ).strip().lower()
+                identity_created_at = getattr(identity, "created_at", None)
+                if identity_id <= 0 or not identity_email or identity_created_at is None:
+                    return False
+                if locked_account_id:
+                    return bool(
+                        locked_account_id == identity_id
+                        and locked_account_email == identity_email
+                        and locked_account_created_at == identity_created_at
+                    )
+                acquired = account_operation_stack.enter_context(
+                    validated_chatgpt_account_operation_lock(
+                        identity_id,
+                        email=identity_email,
+                        created_at=identity_created_at,
+                        database_engine=engine,
+                        blocking=True,
+                    )
+                )
+                if not acquired:
+                    return False
+                locked_account_id = identity_id
+                locked_account_created_at = identity_created_at
+                return True
 
             def _sms_pool_binding_context(value=None):
                 context = dict(value) if isinstance(value, dict) else {}
@@ -4345,6 +4470,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 control.checkpoint()
                 attempt_id = control.start_attempt()
                 control.checkpoint(attempt_id=attempt_id)
+                if current_email and not _ensure_account_email_fence(
+                    current_email
+                ):
+                    raise RuntimeError(
+                        "该 ChatGPT 邮箱正在执行账号删除或保存，请稍后重试"
+                    )
                 if parent_binding_id and bound_email:
                     retry_mailbox_context = _load_chatgpt_retry_mailbox_context(
                         parent_binding_id,
@@ -4405,6 +4536,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     def _record_mailbox_binding(email_value, mailbox_account):
                         nonlocal current_email
                         current_email = str(email_value or current_email or "").strip()
+                        if not _ensure_account_email_fence(current_email):
+                            raise RuntimeError(
+                                "该 ChatGPT 邮箱正在执行账号删除或保存"
+                            )
                         account_extra = dict(
                             getattr(mailbox_account, "extra", None) or {}
                         )
@@ -4538,6 +4673,23 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "luckmail_base_url",
                                 merged_extra.get("luckmail_base_url"),
                             )
+                if req.platform == "chatgpt":
+                    if not _ensure_account_email_fence(
+                        str(getattr(account, "email", "") or "")
+                    ):
+                        raise RuntimeError(
+                            "该 ChatGPT 邮箱正在执行账号删除或保存，请稍后重试"
+                        )
+                    existing_identity = _load_unique_chatgpt_account_identity(
+                        str(getattr(account, "email", "") or ""),
+                        database_engine=engine,
+                    )
+                    if existing_identity is not None and not _ensure_account_id_fence(
+                        existing_identity
+                    ):
+                        raise RuntimeError(
+                            "ChatGPT 已有账号身份已变化，已停止覆盖保存"
+                        )
                 if _bind_phone_and_get_rt:
                     (
                         saved_account,
@@ -4549,6 +4701,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             saved_account_extra_snapshot = raw_saved_extra
                 else:
                     saved_account = save_account(account)
+                if req.platform == "chatgpt":
+                    if not _ensure_account_id_fence(saved_account):
+                        raise RuntimeError(
+                            "ChatGPT 账号保存后身份已变化，已停止后续认证写入"
+                        )
                 # The mailbox claim is intentionally bound only after the
                 # ChatGPT row has a stable local id.  This closes the window
                 # where a successful first login could leave the receiver
@@ -5631,7 +5788,14 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             )
                 release_capacity = getattr(capacity_lease, "release", None)
                 if callable(release_capacity):
-                    release_capacity()
+                    try:
+                        release_capacity()
+                    except Exception as exc:
+                        _log(
+                            task_id,
+                            "[WARN] LeadBee API 并发租约释放失败"
+                            f"（{type(exc).__name__}）",
+                        )
                 if sms_pool_item_id and not sms_pool_settlement_pending:
                     try:
                         sms_pool_service.finalize(
@@ -5652,6 +5816,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         "[WARN] LeadBee 服务端未确认卡密终态；"
                         "该卡保持隔离，不会重新分配或标记为已使用",
                     )
+                account_operation_stack.close()
                 control.finish_attempt(attempt_id)
 
         from concurrent.futures import CancelledError, ThreadPoolExecutor, as_completed

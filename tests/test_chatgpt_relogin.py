@@ -29,6 +29,7 @@ from services.chatgpt_relogin import (
     _build_email_service,
     _load_saved_account,
     _login_with_saved_credentials,
+    _record_auth_maintenance_outcome,
     _recover_url_login_credentials,
     is_saved_chatgpt_account_relogin_eligible,
     list_auto_maintenance_account_ids,
@@ -108,6 +109,28 @@ class ChatGPTReloginTests(unittest.TestCase):
             session.commit()
             session.refresh(account)
             return int(account.id)
+
+    def test_removed_account_does_not_recreate_orphan_auth_state(self):
+        result = {
+            "ok": False,
+            "relogin_ok": False,
+            "stage": "account_removed",
+            "account_removed": True,
+            "account_id": self.account_id,
+            "email": "demo@example.com",
+            "message": "account removed",
+        }
+
+        with mock.patch(
+            "services.chatgpt_relogin.record_chatgpt_auth_failure"
+        ) as record_failure:
+            normalized = _record_auth_maintenance_outcome(
+                self.account_id,
+                result,
+            )
+
+        self.assertEqual(normalized, result)
+        record_failure.assert_not_called()
 
     def test_password_only_account_without_mailbox_context_is_not_eligible(self):
         account_id = self._add_eligibility_account(

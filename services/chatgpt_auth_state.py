@@ -461,6 +461,18 @@ def _candidate_in_session(
     ).first()
     if operation is None or not str(operation.totp_secret or "").strip():
         return None
+    account = session.get(AccountModel, account_id)
+    if (
+        account is None
+        or str(account.platform or "").strip().lower() != "chatgpt"
+        or str(account.email or "").strip().lower()
+        != str(operation.email or "").strip().lower()
+    ):
+        # SQLite may reuse a deleted integer primary key.  A committed MFA
+        # generation belongs to both the local id and the original email; it
+        # must never become a credential for a later account that received the
+        # same numeric id.
+        return None
     recovery_state = _as_recovery_state(operation.recovery_code_state)
     return ChatGPTLoginMfaCandidate(
         operation_id=str(operation.operation_id),

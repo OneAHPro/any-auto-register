@@ -11,7 +11,7 @@ from sqlmodel import SQLModel, Session, create_engine, select
 
 from core import base_mailbox
 from core.base_mailbox import MailboxAccount, OutlookMailbox, create_mailbox
-from core.db import OutlookAccountModel
+from core.db import AccountModel, OutlookAccountModel
 
 
 class _FakeResponse:
@@ -129,6 +129,14 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
     def test_bound_mailbox_is_not_reallocated_and_stale_release_is_rejected(self):
         test_engine = self._lease_engine()
         with Session(test_engine) as session:
+            session.add(
+                AccountModel(
+                    id=77,
+                    platform="chatgpt",
+                    email="bound@example.com",
+                    password="chatgpt-password",
+                )
+            )
             session.add(
                 OutlookAccountModel(
                     email="bound@example.com",
@@ -318,6 +326,41 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         )
         self.assertEqual(request_kwargs["headers"]["x-lang"], "zh-CN")
         self.assertIn("Mozilla/5.0", request_kwargs["headers"]["User-Agent"])
+
+    def test_late_bind_rejects_deleted_chatgpt_account_identity(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="late-bind@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            account = AccountModel(
+                platform="chatgpt",
+                email="late-bind@example.com",
+                password="chatgpt-password",
+            )
+            session.add(account)
+            session.commit()
+            session.refresh(account)
+            account_id = int(account.id)
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email_by_address("late-bind@example.com")
+            with Session(test_engine) as session:
+                session.delete(session.get(AccountModel, account_id))
+                session.commit()
+            bound = mailbox.bind_account(claimed, account_id)
+
+        self.assertFalse(bound)
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "leased")
+            self.assertEqual(row.bound_account_id, 0)
 
     @mock.patch("requests.get")
     @mock.patch("requests.Session")

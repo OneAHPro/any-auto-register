@@ -238,8 +238,14 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
     with Session(engine) as session:
         existing = session.exec(
             select(AccountModel)
-            .where(AccountModel.platform == account.platform)
-            .where(AccountModel.email == account.email)
+            .where(
+                func.lower(AccountModel.platform)
+                == str(account.platform or "").strip().lower()
+            )
+            .where(
+                func.lower(AccountModel.email)
+                == str(account.email or "").strip().lower()
+            )
         ).first()
         if existing:
             incoming_extra = dict(account.extra or {})
@@ -427,6 +433,57 @@ def finalize_chatgpt_mfa_rotation(
             session.commit()
 
 
+def cleanup_chatgpt_account_dependents(
+    session: Session,
+    account_id: int,
+    *,
+    quarantine_reason: str = "account_deleted",
+) -> None:
+    """Remove identity-scoped auth rows after the owning account is deleted.
+
+    ``accounts.id`` is an SQLite integer primary key and may be reused after a
+    deletion.  Keeping canonical MFA rows or a bound mailbox attached to that
+    number would therefore transfer the deleted account's identity to a future
+    account.  Callers must invoke this only after their account delete CAS has
+    succeeded, in the same transaction.
+    """
+
+    normalized_id = int(account_id)
+    if normalized_id <= 0:
+        raise ValueError("ChatGPT account id must be positive")
+    now = _utcnow()
+    session.exec(
+        delete(ChatGPTMfaOperationModel).where(
+            ChatGPTMfaOperationModel.account_id == normalized_id
+        )
+    )
+    session.exec(
+        delete(ChatGPTAuthStateModel).where(
+            ChatGPTAuthStateModel.account_id == normalized_id
+        )
+    )
+    session.exec(
+        update(ChatGPTAttemptBindingModel)
+        .where(ChatGPTAttemptBindingModel.account_id == normalized_id)
+        .values(account_id=0, updated_at=now)
+    )
+    session.exec(
+        update(OutlookAccountModel)
+        .where(OutlookAccountModel.bound_account_id == normalized_id)
+        .values(
+            state="quarantined",
+            enabled=False,
+            lease_owner="",
+            lease_expires_at=None,
+            lease_version=OutlookAccountModel.lease_version + 1,
+            bound_account_id=0,
+            quarantine_reason=str(quarantine_reason or "account_deleted")[:120],
+            last_error="local ChatGPT account identity was deleted",
+            updated_at=now,
+        )
+    )
+
+
 def delete_incomplete_chatgpt_account(
     account_id: int,
     *,
@@ -466,6 +523,7 @@ def delete_incomplete_chatgpt_account(
         )
         deleted_count = int(getattr(result, "rowcount", 0) or 0)
         if deleted_count == 1:
+            cleanup_chatgpt_account_dependents(session, int(account_id))
             session.commit()
             return True
         session.rollback()
@@ -487,7 +545,10 @@ def purge_incomplete_chatgpt_accounts(*, database_engine=None) -> int:
             if not chatgpt_account_refresh_token(account)
         ]
         for account in incomplete:
+            account_id = int(account.id or 0)
             session.delete(account)
+            if account_id > 0:
+                cleanup_chatgpt_account_dependents(session, account_id)
         if incomplete:
             session.commit()
         return len(incomplete)

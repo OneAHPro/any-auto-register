@@ -463,6 +463,60 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
         self.assertEqual(rows[0].leadbee_code, "bei-sms-BOUND")
         self.assertEqual(rows[0].attempt_index, 3)
 
+    def test_late_binding_writer_does_not_restore_deleted_account_id(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+
+        with mock.patch("api.tasks.engine", test_engine):
+            row = _upsert_chatgpt_attempt_binding(
+                task_id="task-late-writer",
+                attempt_index=0,
+                email="deleted@example.com",
+                account_id=77,
+                leadbee_code="bei-sms-LATE",
+                status="failed",
+            )
+
+        self.assertEqual(row.account_id, 0)
+
+    def test_reused_account_id_does_not_resolve_other_email_binding(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        replacement = AccountModel(
+            id=77,
+            platform="chatgpt",
+            email="replacement@example.com",
+            password="password",
+        )
+        replacement.set_extra({"refresh_token": "replacement-rt"})
+        binding = ChatGPTAttemptBindingModel(
+            task_id="task-reused-id",
+            attempt_index=0,
+            email="deleted@example.com",
+            account_id=77,
+            leadbee_code="bei-sms-RETRY",
+            status="failed",
+        )
+        with Session(test_engine) as session:
+            session.add(replacement)
+            session.add(binding)
+            session.commit()
+
+        with mock.patch("api.tasks.engine", test_engine):
+            retryable = _retryable_chatgpt_bindings("task-reused-id")
+
+        self.assertEqual(len(retryable), 1)
+        self.assertEqual(retryable[0].email, "deleted@example.com")
+        self.assertEqual(retryable[0].status, "failed")
+
     def test_service_restart_returns_interrupted_bindings_to_failed_state(self):
         test_engine = create_engine(
             "sqlite://",

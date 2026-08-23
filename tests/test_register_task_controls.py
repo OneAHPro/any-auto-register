@@ -1,6 +1,8 @@
 import threading
 import unittest
 import uuid
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from unittest import mock
 from unittest.mock import patch
 
@@ -174,6 +176,12 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         config = patch("core.config_store.config_store.get_all", return_value={})
         config.start()
         self.addCleanup(config.stop)
+        identity_lock = patch(
+            "api.tasks.validated_chatgpt_account_operation_lock",
+            side_effect=lambda *args, **kwargs: nullcontext(True),
+        )
+        identity_lock.start()
+        self.addCleanup(identity_lock.stop)
         for target in (
             "core.proxy_pool.proxy_pool.report_success",
             "core.proxy_pool.proxy_pool.report_fail",
@@ -200,6 +208,12 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         payload.update(overrides)
         return RegisterTaskRequest(**payload)
 
+    @staticmethod
+    def _saved_account(account):
+        account.id = abs(hash(account.email)) % 1_000_000 + 1
+        account.created_at = datetime(2026, 8, 23, tzinfo=timezone.utc)
+        return account
+
     def _run_with_control(self, task_id: str, *, stop: bool = False, skip: bool = False):
         req = self._build_request()
         _create_task_record(task_id, req, "manual", None)
@@ -211,7 +225,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         with (
             patch("core.registry.get", return_value=_FakePlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
-            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("core.db.save_account", side_effect=self._saved_account),
             patch("api.tasks._save_task_log"),
         ):
             _run_register(task_id, req)
@@ -243,7 +257,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         with (
             patch("core.registry.get", return_value=_FakeChatGPTWorkspacePlatform),
             patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
-            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("core.db.save_account", side_effect=self._saved_account),
             patch("api.tasks._save_task_log"),
         ):
             _run_register(task_id, req)
@@ -262,7 +276,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         with (
             patch("core.registry.get", return_value=_YieldingChatGPTPlatform),
             patch("core.base_mailbox.create_mailbox", side_effect=lambda **_kwargs: _FakeMailbox()),
-            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("core.db.save_account", side_effect=self._saved_account),
             patch("api.tasks._save_task_log"),
         ):
             _run_register(task_id, req)
@@ -360,7 +374,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
                 "core.base_mailbox.create_mailbox",
                 side_effect=create_mailbox_for_provider,
             ),
-            patch("core.db.save_account", side_effect=lambda account: account),
+            patch("core.db.save_account", side_effect=self._saved_account),
             patch("api.tasks._save_task_log"),
         ):
             _run_register(task_id, req)
@@ -620,7 +634,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             return_value=_FakeMailbox(),
         ), mock.patch(
             "core.db.save_account",
-            side_effect=lambda account: account,
+            side_effect=self._saved_account,
         ), mock.patch(
             "api.tasks._save_task_log",
         ), mock.patch(

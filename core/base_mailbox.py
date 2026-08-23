@@ -6122,9 +6122,9 @@ class OutlookMailbox(BaseMailbox):
 
     def bind_account(self, account: MailboxAccount, account_id: int) -> bool:
         """Fence a lease to the ChatGPT account that consumed it."""
-        from sqlalchemy import update
-        from sqlmodel import Session
-        from core.db import OutlookAccountModel, engine
+        from sqlalchemy import func, update
+        from sqlmodel import Session, select
+        from core.db import AccountModel, OutlookAccountModel, engine
 
         try:
             local_account_id = int(account_id or 0)
@@ -6133,8 +6133,20 @@ class OutlookMailbox(BaseMailbox):
         row_id, owner, version, _bound_id = self._lease_identity(account)
         if row_id <= 0 or local_account_id <= 0:
             return False
+        mailbox_email = str(getattr(account, "email", "") or "").strip().lower()
+        if not mailbox_email:
+            return False
         with self._lock:
             with Session(engine) as session:
+                identity_query = (
+                    select(AccountModel.id)
+                    .where(AccountModel.id == local_account_id)
+                    .where(func.lower(AccountModel.platform) == "chatgpt")
+                    .where(func.lower(AccountModel.email) == mailbox_email)
+                )
+                if session.exec(identity_query).first() is None:
+                    return False
+                identity_exists = identity_query.exists()
                 row = session.get(OutlookAccountModel, row_id)
                 if row is None:
                     return False
@@ -6169,6 +6181,7 @@ class OutlookMailbox(BaseMailbox):
                         .where(OutlookAccountModel.state == "bound")
                         .where(OutlookAccountModel.bound_account_id == 0)
                         .where(OutlookAccountModel.lease_version == current_version)
+                        .where(identity_exists)
                         .values(
                             bound_account_id=local_account_id,
                             lease_version=current_version + 1,
@@ -6202,6 +6215,7 @@ class OutlookMailbox(BaseMailbox):
                     .where(OutlookAccountModel.state == "leased")
                     .where(OutlookAccountModel.lease_owner == owner)
                     .where(OutlookAccountModel.lease_version == version)
+                    .where(identity_exists)
                     .values(
                         state="bound",
                         enabled=False,
