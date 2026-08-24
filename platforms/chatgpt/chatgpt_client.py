@@ -669,6 +669,7 @@ class ChatGPTClient:
         otp_resend_wait_timeout=300,
         prepare_phone_oauth=True,
         _password_reset_depth=0,
+        _authorize_entry_retry_depth=0,
     ):
         """通过 ChatGPT Web 登录获取 AT，不发起 offline_access token exchange。"""
         from .oauth_client import OAuthClient
@@ -965,6 +966,35 @@ class ChatGPTClient:
                 )
                 if not next_state:
                     entry_error = str(helper.last_error or "").strip()
+                    if (
+                        not password_reset_required
+                        and helper._is_transient_oauth_entry_error(entry_error)
+                        and int(_authorize_entry_retry_depth or 0) < 5
+                    ):
+                        self._log(
+                            "Web OAuth authorize_continue 会话已失效，"
+                            "丢弃当前事务并从登录入口重新开始"
+                        )
+                        self._reset_session()
+                        return self.login_existing_account_and_get_session(
+                            email,
+                            skymail_client,
+                            password=password,
+                            totp_secret=totp_secret,
+                            mfa_recovery_code=mfa_recovery_code,
+                            on_mfa_totp_staged=on_mfa_totp_staged,
+                            on_mfa_totp_activated=on_mfa_totp_activated,
+                            on_mfa_recovery_code=on_mfa_recovery_code,
+                            password_reset_required=password_reset_required,
+                            on_password_reset=on_password_reset,
+                            otp_wait_timeout=otp_wait_timeout,
+                            otp_resend_wait_timeout=otp_resend_wait_timeout,
+                            prepare_phone_oauth=prepare_phone_oauth,
+                            _password_reset_depth=_password_reset_depth,
+                            _authorize_entry_retry_depth=(
+                                int(_authorize_entry_retry_depth or 0) + 1
+                            ),
+                        )
                     if (
                         password_reset_required
                         and int(_password_reset_depth or 0) < 1

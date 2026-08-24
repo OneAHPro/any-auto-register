@@ -643,6 +643,69 @@ class OAuthEntryRetryTests(unittest.TestCase):
         self.assertEqual(submit.call_count, 2)
         recreate.assert_called_once()
 
+    def test_login_rebuilds_pkce_transaction_after_continue_409(self):
+        client = OAuthClient({}, verbose=False)
+        callback_url = "http://localhost:1455/auth/callback?code=auth-code&state=second"
+        callback_state = FlowState(
+            page_type="oauth_callback",
+            continue_url=callback_url,
+            current_url=callback_url,
+        )
+
+        def submit_email(*args, **kwargs):
+            if submit_email.calls == 0:
+                submit_email.calls += 1
+                client.last_error = (
+                    '[stage=authorize_continue] 提交邮箱失败: 409 - '
+                    '{"error":{"message":"Your sign-in session is no longer valid."}}'
+                )
+                return None
+            submit_email.calls += 1
+            return callback_state
+
+        submit_email.calls = 0
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            side_effect=submit_email,
+        ) as submit, mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at", "refresh_token": "rt"},
+        ), mock.patch.object(
+            client,
+            "_recreate_session",
+        ), mock.patch.object(
+            client,
+            "_ensure_oauth_fingerprint",
+            return_value=("UA", '"Chromium";v="136"', "chrome136"),
+        ):
+            tokens = client.login_and_get_tokens(
+                "existing@example.com",
+                "",
+                "device-id",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                impersonate="chrome136",
+                prefer_passwordless_login=True,
+                allow_phone_verification=True,
+                login_source="interactive_phone_verification",
+            )
+
+        self.assertEqual(tokens["refresh_token"], "rt")
+        self.assertEqual(submit.call_count, 2)
+        first_params = submit.call_args_list[0].kwargs["authorize_params"]
+        second_params = submit.call_args_list[1].kwargs["authorize_params"]
+        self.assertNotEqual(first_params["state"], second_params["state"])
+        self.assertNotEqual(
+            first_params["code_challenge"], second_params["code_challenge"]
+        )
+
     def test_resumed_authenticated_session_skips_second_email_login(self):
         client = OAuthClient({}, verbose=False)
         callback_url = "http://localhost:1455/auth/callback?code=auth-code&state=demo"

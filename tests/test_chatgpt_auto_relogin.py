@@ -85,7 +85,7 @@ def test_public_config_defaults_are_exposed_without_database_writes(monkeypatch)
     assert response["codex2api_delete_on_account_remove_enabled"] == "0"
     assert response["chatgpt_auto_relogin_enabled"] == "0"
     assert response["chatgpt_auto_relogin_interval_minutes"] == "2"
-    assert response["chatgpt_auto_relogin_concurrency"] == "10"
+    assert response["chatgpt_auto_relogin_concurrency"] == "3"
     assert response["chatgpt_auto_relogin_alert_threshold"] == "20"
     assert response["chatgpt_auto_relogin_quota_alert_threshold_usd"] == "0.00"
     assert response["leadbee_api_enabled"] == "0"
@@ -250,7 +250,7 @@ def test_public_config_put_normalizes_enabled_to_zero_or_one(
             data={
                 "chatgpt_auto_relogin_enabled": submitted,
                 "chatgpt_auto_relogin_interval_minutes": 30,
-                "chatgpt_auto_relogin_concurrency": 10,
+                "chatgpt_auto_relogin_concurrency": 3,
             }
         )
     )
@@ -259,7 +259,7 @@ def test_public_config_put_normalizes_enabled_to_zero_or_one(
     assert store.values == {
         "chatgpt_auto_relogin_enabled": expected,
         "chatgpt_auto_relogin_interval_minutes": "30",
-        "chatgpt_auto_relogin_concurrency": "10",
+        "chatgpt_auto_relogin_concurrency": "3",
     }
     assert reconciles == [{"store": store}]
 
@@ -401,10 +401,10 @@ def test_service_normalizes_defaults_and_bounds_from_an_isolated_store():
 
     assert defaults.enabled is False
     assert defaults.interval_minutes == 2
-    assert defaults.concurrency == 10
+    assert defaults.concurrency == 3
     assert bounded.enabled is True
     assert bounded.interval_minutes == 2
-    assert bounded.concurrency == 10
+    assert bounded.concurrency == 3
     assert invalid == defaults
 
 
@@ -425,7 +425,7 @@ def test_settings_and_status_each_use_one_coherent_store_snapshot():
     later_snapshot = {
         "chatgpt_auto_relogin_enabled": "0",
         "chatgpt_auto_relogin_interval_minutes": "1440",
-        "chatgpt_auto_relogin_concurrency": "10",
+        "chatgpt_auto_relogin_concurrency": "3",
         "chatgpt_auto_relogin_status_state": "disabled",
         "chatgpt_auto_relogin_status_reason": "disabled_by_config",
         "chatgpt_auto_relogin_status_eligible_accounts": "99",
@@ -489,7 +489,7 @@ def test_internal_status_can_receive_scheduler_state_without_becoming_public_con
         "last_started_at": "2026-08-02T12:00:00Z",
         "next_run_at": "2026-08-02T12:30:00Z",
         "interval_minutes": 2,
-        "concurrency": 10,
+        "concurrency": 3,
     }
     assert set(service.INTERNAL_STATUS_CONFIG_KEYS).isdisjoint(CONFIG_KEYS)
 
@@ -515,7 +515,7 @@ def test_status_endpoint_has_a_coherent_disabled_response(monkeypatch):
         "last_started_at": None,
         "next_run_at": None,
         "interval_minutes": 2,
-        "concurrency": 10,
+        "concurrency": 3,
     }
 
 
@@ -814,7 +814,7 @@ def _enabled_store(**overrides) -> FakeConfigStore:
     values = {
         "chatgpt_auto_relogin_enabled": "1",
         "chatgpt_auto_relogin_interval_minutes": "30",
-        "chatgpt_auto_relogin_concurrency": "10",
+        "chatgpt_auto_relogin_concurrency": "3",
     }
     values.update(overrides)
     return FakeConfigStore(values)
@@ -847,7 +847,7 @@ def test_run_now_enqueues_immediately_and_tracks_the_automation_task():
         ),
     )
 
-    assert enqueues == [([1, 2, 3], 10)]
+    assert enqueues == [([1, 2, 3], 3)]
     assert result["accepted"] is True
     assert result["task_id"] == "task-now"
     assert result["reason"] == "enqueued"
@@ -998,7 +998,7 @@ def test_concurrent_run_now_calls_enqueue_only_one_task():
 
     assert not first.is_alive()
     assert not second.is_alive()
-    assert enqueues == [([1], 10)]
+    assert enqueues == [([1], 3)]
     assert sorted(result["accepted"] for result in results) == [False, True]
     assert {result["reason"] for result in results} == {"enqueued", "task_busy"}
 
@@ -1069,7 +1069,7 @@ def test_tick_waits_a_full_interval_then_enqueues_all_accounts_at_concurrency_te
     assert at_t0["state"] == "idle"
     assert at_t0["next_run_at"] == "2026-08-02T12:30:00Z"
     assert before_due["next_run_at"] == at_t0["next_run_at"]
-    assert enqueues == [([1, 2, 3], 10)]
+    assert enqueues == [([1, 2, 3], 3)]
     assert at_due["state"] == "running"
     assert at_due["reason"] == "task_running"
     assert at_due["active_task_id"] == "task-scheduled"
@@ -1315,7 +1315,7 @@ def test_terminal_active_schedules_full_interval_from_completion():
     assert reconciled["active_task_id"] is None
     assert reconciled["next_run_at"] == "2026-08-02T12:10:00Z"
     assert before_due["next_run_at"] == reconciled["next_run_at"]
-    assert enqueues == [([4, 5], 10)]
+    assert enqueues == [([4, 5], 3)]
     assert at_due["active_task_id"] == "task-next"
 
 
@@ -1342,7 +1342,7 @@ def test_overdue_terminal_task_enqueues_without_waiting_for_another_tick():
         },
     )
 
-    assert enqueues == [([4, 5], 10)]
+    assert enqueues == [([4, 5], 3)]
     assert status["state"] == "running"
     assert status["active_task_id"] == "task-next"
     assert status["next_run_at"] is None
@@ -1516,7 +1516,7 @@ def test_concurrent_due_ticks_enqueue_one_task_and_use_atomic_store_transitions(
     second.join(timeout=2)
 
     assert errors == []
-    assert enqueues == [([1, 2], 10)]
+    assert enqueues == [([1, 2], 3)]
     assert store.values["chatgpt_auto_relogin_status_active_task_id"] == "task-only"
     assert len(store.writes) == 2
 
@@ -1526,7 +1526,7 @@ def test_tick_reads_one_snapshot_and_writes_one_multi_key_transition():
     snapshot = {
         "chatgpt_auto_relogin_enabled": "1",
         "chatgpt_auto_relogin_interval_minutes": "30",
-        "chatgpt_auto_relogin_concurrency": "10",
+        "chatgpt_auto_relogin_concurrency": "3",
     }
     store = MutatingConfigStore(
         [snapshot, {**snapshot, "chatgpt_auto_relogin_enabled": "0"}]

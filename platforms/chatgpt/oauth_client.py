@@ -3937,21 +3937,6 @@ class OAuthClient:
                 "不重新访问 /oauth/authorize，不重新提交邮箱"
             )
         else:
-            code_verifier, code_challenge = generate_pkce()
-            oauth_state = secrets.token_urlsafe(32)
-            authorize_params = {
-                "response_type": "code",
-                "client_id": self.oauth_client_id,
-                "redirect_uri": self.oauth_redirect_uri,
-                "scope": "openid profile email offline_access",
-                "code_challenge": code_challenge,
-                "code_challenge_method": "S256",
-                "state": oauth_state,
-            }
-            authorize_url = f"{self.oauth_issuer}/oauth/authorize"
-
-            seed_oai_device_cookie(self.session, device_id)
-
             max_entry_attempts = 6
             entry_error = ""
             for entry_attempt in range(max_entry_attempts):
@@ -3968,6 +3953,24 @@ class OAuthClient:
                         None,
                         None,
                     )
+
+                # PKCE and OAuth state belong to one authorize transaction.  A
+                # session-invalid response invalidates the whole transaction,
+                # so every bounded retry must generate a new pair instead of
+                # resubmitting stale state with only a new cookie jar.
+                code_verifier, code_challenge = generate_pkce()
+                oauth_state = secrets.token_urlsafe(32)
+                authorize_params = {
+                    "response_type": "code",
+                    "client_id": self.oauth_client_id,
+                    "redirect_uri": self.oauth_redirect_uri,
+                    "scope": "openid profile email offline_access",
+                    "code_challenge": code_challenge,
+                    "code_challenge_method": "S256",
+                    "state": oauth_state,
+                }
+                authorize_url = f"{self.oauth_issuer}/oauth/authorize"
+                seed_oai_device_cookie(self.session, device_id)
 
                 if force_chatgpt_entry:
                     self._log("force_chatgpt_entry: 启动 ChatGPT 首页链路（不影响 OAuth PKCE）")

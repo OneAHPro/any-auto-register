@@ -1272,6 +1272,57 @@ class ExistingAccountLoginTests(unittest.TestCase):
         )
         self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
 
+    def test_post_rotation_phone_oauth_can_fall_back_to_fresh_mfa_login(self):
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+            allow_phone_verification=True,
+        )
+        current_client = mock.Mock()
+        fresh_client = mock.Mock()
+        prepared = types.SimpleNamespace(
+            session=object(),
+            device_id="fresh-device",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            flow_state=FlowState(page_type="add_phone"),
+        )
+        fresh_client.phone_oauth_resume_context = prepared
+        fresh_client.phone_oauth_browser_context = {"version": 1}
+        fresh_client.phone_oauth_prepare_diagnostic = {
+            "stage": "phone_oauth_prepare",
+            "attempt": 1,
+            "page_type": "add_phone",
+            "http_status": 200,
+            "recovery_status": "recovered",
+        }
+        fresh_client.phone_oauth_resume_error = ""
+        fresh_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {"access_token": "fresh-access-token"},
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=fresh_client)
+
+        result = engine._prepare_phone_oauth_with_fresh_login(
+            current_client,
+            "mfa-user@icloud.com",
+            PasswordTotpEmailService(),
+        )
+
+        self.assertIs(result, prepared)
+        self.assertIs(current_client.phone_oauth_resume_context, prepared)
+        fresh_client.login_existing_account_and_get_session.assert_called_once()
+        self.assertTrue(
+            fresh_client.login_existing_account_and_get_session.call_args.kwargs[
+                "prepare_phone_oauth"
+            ]
+        )
+
     def test_post_rotation_phone_oauth_first_attempt_success_has_no_backoff(self):
         engine = self._make_engine(
             login_stage="access_token",
@@ -1544,6 +1595,60 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(submit_email.call_args.kwargs["screen_hint"], "login")
         prepare_phone.assert_called_once()
         self.assertIn("首轮", client.phone_oauth_resume_error)
+
+    def test_web_login_restarts_from_home_after_authorize_continue_409(self):
+        client = ChatGPTClient(verbose=False)
+        client.visit_homepage = mock.Mock(return_value=True)
+        client.get_csrf_token = mock.Mock(return_value="csrf-token")
+        authorize_endpoint = (
+            "https://auth.openai.com/api/accounts/authorize?client_id=app-demo&state=demo"
+        )
+        client.signin = mock.Mock(return_value=authorize_endpoint)
+        client.authorize = mock.Mock(return_value=authorize_endpoint)
+        client.last_authorize_status = 200
+        client._get_cookie_value = mock.Mock(return_value="login-session")
+        client.fetch_chatgpt_session = mock.Mock(
+            return_value=(True, {"accessToken": "access-token"})
+        )
+        client.get_next_auth_session_token = mock.Mock(return_value="session-token")
+
+        next_state = FlowState(
+            page_type="add_phone",
+            current_url="https://auth.openai.com/add-phone",
+        )
+
+        def submit_email(helper, *_args, **_kwargs):
+            if submit_email.calls == 0:
+                submit_email.calls += 1
+                helper.last_error = (
+                    '[stage=authorize_continue] 提交邮箱失败: 409 - '
+                    'Your sign-in session is no longer valid'
+                )
+                return None
+            submit_email.calls += 1
+            return next_state
+
+        submit_email.calls = 0
+
+        with mock.patch.object(
+            OAuthClient,
+            "_submit_authorize_continue",
+            autospec=True,
+            side_effect=submit_email,
+        ) as submit_email_mock, mock.patch.object(
+            OAuthClient,
+            "prepare_phone_verification_transaction",
+            return_value=None,
+        ), mock.patch.object(client, "_reset_session") as reset_session:
+            ok, result = client.login_existing_account_and_get_session(
+                "existing@example.com",
+                mock.Mock(),
+            )
+
+        self.assertTrue(ok)
+        self.assertEqual(result["access_token"], "access-token")
+        self.assertEqual(submit_email_mock.call_count, 2)
+        reset_session.assert_called_once()
 
     def test_web_login_bootstraps_oauth_session_after_authorize_403(self):
         client = ChatGPTClient(verbose=False)

@@ -1129,6 +1129,63 @@ class RefreshTokenRegistrationEngine:
         chatgpt_client.phone_oauth_prepare_diagnostic = last_diagnostic
         return None
 
+    def _prepare_phone_oauth_with_fresh_login(
+        self,
+        chatgpt_client: ChatGPTClient,
+        email: str,
+        email_adapter: EmailServiceAdapter,
+    ):
+        """Fallback to one fresh credential login after session rebuild fails.
+
+        MFA rotation invalidates the browser transaction that was used to
+        perform the rotation.  If cloning that session cannot reach
+        ``add_phone``, a new login with the newly committed MFA is the only
+        valid source of a new PKCE transaction.  This method never starts a
+        phone provider; it only copies a validated context back to the
+        partial-login client.
+        """
+        fresh_client = self._build_chatgpt_client()
+        ok, session_result = fresh_client.login_existing_account_and_get_session(
+            email,
+            email_adapter,
+            password=self.password or "",
+            totp_secret=self.totp_secret or "",
+            mfa_recovery_code=str(
+                (self.email_info or {}).get("mfa_recovery_code") or ""
+            ),
+            password_reset_required=False,
+            otp_wait_timeout=600,
+            otp_resend_wait_timeout=300,
+            prepare_phone_oauth=True,
+        )
+        if not ok or not isinstance(session_result, dict):
+            self._log(
+                "MFA 轮换后全新凭据登录未建立手机 OAuth 事务，"
+                "保持手机验证待处理状态",
+                "warning",
+            )
+            return None
+        prepared = getattr(fresh_client, "phone_oauth_resume_context", None)
+        if not self._phone_oauth_context_is_ready(prepared):
+            self._log(
+                "MFA 轮换后全新凭据登录未返回可续接手机 OAuth 事务",
+                "warning",
+            )
+            return None
+        for attribute in (
+            "phone_oauth_resume_context",
+            "phone_oauth_resume_error",
+            "phone_oauth_browser_context",
+            "phone_oauth_prepare_diagnostic",
+        ):
+            setattr(
+                chatgpt_client,
+                attribute,
+                getattr(fresh_client, attribute, None),
+            )
+        self._log("MFA 轮换后已通过全新凭据登录重建手机 OAuth 事务")
+        return prepared
+
     def _reuse_register_browser_context(
         self,
         register_client: ChatGPTClient,
@@ -1682,19 +1739,31 @@ class RefreshTokenRegistrationEngine:
             self._log(
                 "MFA 轮换后已作废旧手机 OAuth 预建事务，正在使用当前会话重建"
             )
-            self._prepare_phone_oauth_after_mfa_rotation(
+            prepared_after_rotation = self._prepare_phone_oauth_after_mfa_rotation(
                 chatgpt_client,
                 result.email,
             )
+            if prepared_after_rotation is None:
+                self._prepare_phone_oauth_with_fresh_login(
+                    chatgpt_client,
+                    result.email,
+                    email_adapter,
+                )
             post_mfa_rebuild_attempted = True
         elif rotation is not None:
             # A mandatory enrollment mutates MFA even when an explicit
             # rotation was not planned; any pre-enrollment PKCE is stale.
             chatgpt_client.phone_oauth_resume_context = None
-            self._prepare_phone_oauth_after_mfa_rotation(
+            prepared_after_rotation = self._prepare_phone_oauth_after_mfa_rotation(
                 chatgpt_client,
                 result.email,
             )
+            if prepared_after_rotation is None:
+                self._prepare_phone_oauth_with_fresh_login(
+                    chatgpt_client,
+                    result.email,
+                    email_adapter,
+                )
             post_mfa_rebuild_attempted = True
 
         prepared_context = getattr(
