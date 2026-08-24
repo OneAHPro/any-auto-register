@@ -736,15 +736,15 @@ def recover_expired_outlook_leases(
                 .where(OutlookAccountModel.lease_version == version)
                 .where(OutlookAccountModel.lease_expires_at == row.lease_expires_at)
                 .values(
-                    state="available",
-                    enabled=True,
+                    state="failed",
+                    enabled=False,
                     lease_owner="",
                     lease_expires_at=None,
                     lease_version=version + 1,
                     bound_account_id=0,
                     bound_at=None,
-                    quarantine_reason="",
-                    last_error="",
+                    quarantine_reason="worker_interrupted",
+                    last_error="任务进程中断，邮箱租约已自动恢复为失败状态",
                     updated_at=_utcnow(),
                 )
             )

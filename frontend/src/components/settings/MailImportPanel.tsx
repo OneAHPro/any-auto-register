@@ -36,6 +36,9 @@ interface MailImportSnapshotItem {
   enabled?: boolean | null
   has_oauth?: boolean | null
   account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_google_password' | 'chatgpt_password_totp' | 'chatgpt_password_remote_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
+  pool_state?: string
+  last_error?: string
+  last_task_id?: string
 }
 
 interface UnifiedMailImportSnapshotItem extends MailImportSnapshotItem {
@@ -47,6 +50,8 @@ interface MailImportSnapshot {
   type: MailImportProviderType
   label: string
   count: number
+  available_count?: number | null
+  visible_count?: number | null
   items: MailImportSnapshotItem[]
   truncated: boolean
   filename: string
@@ -275,7 +280,15 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
     ))
   }, [snapshots])
   const importedCount = SUPPORTED_IMPORT_TYPES.reduce(
-    (total, providerType) => total + Math.max(0, Number(snapshots[providerType]?.count || 0)),
+    (total, providerType) => total + Math.max(
+      0,
+      Number(
+        snapshots[providerType]?.visible_count
+        ?? snapshots[providerType]?.count
+        ?? snapshots[providerType]?.items?.length
+        ?? 0,
+      ),
+    ),
     0,
   )
   const hasTruncatedSnapshot = SUPPORTED_IMPORT_TYPES.some(
@@ -348,6 +361,10 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
   useEffect(() => {
     if (!providers.length) return
     void loadSnapshots()
+    const timer = window.setInterval(() => {
+      void loadSnapshots()
+    }, 3000)
+    return () => window.clearInterval(timer)
   }, [providers.length, watchedPoolDir, watchedPoolFile])
 
   useEffect(() => {
@@ -678,7 +695,14 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
         key: 'status',
         width: 100,
         render: (_: unknown, item: UnifiedMailImportSnapshotItem) => {
-          const enabled = item.providerType === 'applemail' || item.enabled !== false
+          const state = String(item.pool_state || (item.enabled === false ? 'disabled' : 'available')).toLowerCase()
+          if (state === 'claimed' || state === 'leased') {
+            return <Tag color="processing">处理中</Tag>
+          }
+          if (state === 'failed' || state === 'quarantined') {
+            return <Tag color="error" title={item.last_error || ''}>登录失败</Tag>
+          }
+          const enabled = item.enabled !== false || state === 'available'
           return <Tag color={enabled ? 'green' : 'default'}>{enabled ? '可用' : '停用'}</Tag>
         },
       } as never,
@@ -703,6 +727,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             size="small"
             loading={deletingEmail === item.email}
             style={{ paddingInline: 0 }}
+            disabled={['claimed', 'leased'].includes(String(item.pool_state || '').toLowerCase())}
           >
             删除
           </Button>
@@ -885,8 +910,8 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
           <Tag color="blue">已导入: {importedCount} 个邮箱</Tag>
-          <Tag>微软邮箱 {snapshots.microsoft?.count || 0}</Tag>
-          <Tag color="purple">Google / MFA / AppleMail {snapshots.applemail?.count || 0}</Tag>
+          <Tag>微软邮箱 {snapshots.microsoft?.visible_count ?? snapshots.microsoft?.count ?? 0}</Tag>
+          <Tag color="purple">Google / MFA / AppleMail {snapshots.applemail?.visible_count ?? snapshots.applemail?.count ?? 0}</Tag>
           {snapshots.applemail?.filename ? (
             <Typography.Text type="secondary">AppleMail 文件: {snapshots.applemail.filename}</Typography.Text>
           ) : null}
@@ -911,6 +936,9 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
             rowSelection={{
               selectedRowKeys,
               onChange: setSelectedRowKeys,
+              getCheckboxProps: item => ({
+                disabled: ['claimed', 'leased'].includes(String(item.pool_state || '').toLowerCase()),
+              }),
             }}
             columns={columns}
             dataSource={tableData}

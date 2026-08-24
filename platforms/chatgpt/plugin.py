@@ -13,6 +13,11 @@ from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
     build_chatgpt_registration_mode_adapter,
 )
+from core.task_runtime import SkipCurrentAttemptRequested
+
+
+class ChatGPTFreePlanSkipped(SkipCurrentAttemptRequested):
+    error_code = "free_plan"
 
 
 @register
@@ -52,6 +57,8 @@ class ChatGPTPlatform(BasePlatform):
         login_only = str(
             extra_config.get("chatgpt_existing_account_login_only", "") or ""
         ).strip().lower() in {"1", "true", "yes", "on"}
+        if login_only:
+            extra_config.setdefault("chatgpt_subscription_gate_enabled", True)
         if not password:
             password = (
                 ""
@@ -747,21 +754,20 @@ class ChatGPTPlatform(BasePlatform):
         def _requeue_failed_login_mailbox(error="", error_code=""):
             if not login_only:
                 return
-            if _is_permanent_login_credential_error(error, error_code):
-                if str(error_code or "").strip() == "missing_password_credentials":
-                    log_fn(
-                        "ChatGPT 密码 + MFA 导入记录缺少密码；"
-                        "已从自动重试池隔离，请补齐密码后重新导入"
-                    )
-                else:
-                    log_fn(
-                        "当前 ChatGPT 账号仅支持 TOTP MFA，但导入记录缺少秘钥；"
-                        "已从自动重试池隔离，请补齐秘钥后重新导入"
-                    )
-                return
             mailbox_account = getattr(email_service, "_acct", None)
+            fail = getattr(self.mailbox, "fail_account", None)
             requeue = getattr(self.mailbox, "requeue_account", None)
-            if mailbox_account is not None and callable(requeue):
+            if mailbox_account is not None and callable(fail):
+                fail(
+                    mailbox_account,
+                    error=f"{error_code} {error}".strip(),
+                    task_id=str(extra_config.get("_chatgpt_task_id") or ""),
+                )
+            elif (
+                mailbox_account is not None
+                and callable(requeue)
+                and not _is_permanent_login_credential_error(error, error_code)
+            ):
                 detail = f"{error_code} {error}".lower()
                 uncertain = any(
                     marker in detail
@@ -796,6 +802,23 @@ class ChatGPTPlatform(BasePlatform):
             result_error_code = getattr(result, "error_code", "") if result else ""
             if not isinstance(result_error_code, str):
                 result_error_code = ""
+            if bool(getattr(result, "skipped", False)) and result_error_code == "free_plan":
+                mailbox_account = getattr(email_service, "_acct", None)
+                discard = getattr(self.mailbox, "discard_account", None)
+                discarded = bool(
+                    mailbox_account is not None
+                    and callable(discard)
+                    and discard(mailbox_account, reason="free_plan")
+                )
+                if not discarded:
+                    _requeue_failed_login_mailbox(
+                        "Free 套餐邮箱归档失败",
+                        "free_plan_discard_failed",
+                    )
+                    raise RuntimeError("Free 套餐邮箱归档失败，已保留为失败记录")
+                raise ChatGPTFreePlanSkipped(
+                    f"Free 套餐已跳过: {getattr(result, 'email', '')}"
+                )
             _requeue_failed_login_mailbox(result_error, result_error_code)
             raise RuntimeError(result_error)
 

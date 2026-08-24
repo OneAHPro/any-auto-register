@@ -18,6 +18,7 @@ from services.chatgpt_auth_state import (
     transition_mfa_operation,
 )
 from platforms.chatgpt.refresh_token_registration_engine import (
+    RegistrationResult,
     RefreshTokenRegistrationEngine,
 )
 from platforms.chatgpt.chatgpt_client import ChatGPTClient
@@ -241,6 +242,46 @@ class ExistingAccountLoginTests(unittest.TestCase):
         client.last_workspace_id = "workspace-1"
         client._get_cookie_value.return_value = "session-token"
         return client
+
+    def test_free_plan_skips_before_mfa_rotation(self):
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+            allow_phone_verification=True,
+        )
+        client = mock.Mock()
+        client.session = object()
+        client.device_id = "device-1"
+        client.ua = "UA"
+        client.sec_ch_ua = '"Chromium";v="136"'
+        client.accept_language = "en-US,en;q=0.9"
+        client.impersonate = "chrome136"
+        client.login_existing_account_and_get_session.return_value = (
+            True,
+            {"access_token": "free-access-token", "account_id": "account-1"},
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=client)
+        engine._rotate_mfa_after_login = mock.Mock()
+        engine.extra_config["chatgpt_subscription_gate_enabled"] = True
+        result = RegistrationResult(success=False, email="mfa-user@icloud.com")
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.probe_chatgpt_subscription",
+            return_value={"plan": "free", "http_status": 200},
+        ):
+            result = engine._login_existing_account_access_token(
+                result=result,
+                email_adapter=PasswordTotpEmailService(),
+                otp_wait_seconds=30,
+                otp_resend_wait_seconds=30,
+            )
+
+        self.assertFalse(result.success)
+        self.assertTrue(result.skipped)
+        self.assertEqual(result.error_code, "free_plan")
+        self.assertEqual(result.metadata["subscription_plan"], "free")
+        engine._rotate_mfa_after_login.assert_not_called()
 
     def test_login_only_skips_registration_and_saves_both_tokens(self):
         engine = self._make_engine()

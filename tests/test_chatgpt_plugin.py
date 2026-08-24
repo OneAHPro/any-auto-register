@@ -14,7 +14,7 @@ from core.base_platform import Account, RegisterConfig
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     RefreshTokenChatGPTRegistrationAdapter,
 )
-from platforms.chatgpt.plugin import ChatGPTPlatform
+from platforms.chatgpt.plugin import ChatGPTFreePlanSkipped, ChatGPTPlatform
 
 
 class _BlankMailbox:
@@ -94,6 +94,21 @@ class _RequeueMailbox(_TrackingMailbox):
 
     def requeue_account(self, account):
         self.requeued.append(account)
+
+
+class _LifecycleMailbox(_TrackingMailbox):
+    def __init__(self):
+        super().__init__()
+        self.failed = []
+        self.discarded = []
+
+    def fail_account(self, account, *, error="", task_id=""):
+        self.failed.append((account, error, task_id))
+        return True
+
+    def discard_account(self, account, *, reason=""):
+        self.discarded.append((account, reason))
+        return True
 
 
 class _SequentialLoginMailbox:
@@ -609,7 +624,7 @@ class ChatGPTPluginTests(unittest.TestCase):
 
         self.assertEqual(mailbox.requeued, [mailbox.account])
 
-    def test_failed_applemail_existing_login_is_returned_to_pool(self):
+    def test_failed_applemail_existing_login_remains_visible_as_failed(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
                 "retry@icloud.com----chatgpt-password----JBSWY3DPEHPK3PXP",
@@ -641,8 +656,46 @@ class ChatGPTPluginTests(unittest.TestCase):
                 pool_dir=tmp_dir,
                 pool_file="retry.json",
             )
-            self.assertEqual(snapshot["count"], 1)
+            self.assertEqual(snapshot["count"], 0)
+            self.assertEqual(snapshot["visible_count"], 1)
             self.assertEqual(snapshot["items"][0]["email"], "retry@icloud.com")
+            self.assertEqual(snapshot["items"][0]["pool_state"], "failed")
+
+    def test_free_plan_discards_mailbox_without_marking_failure(self):
+        mailbox = _LifecycleMailbox()
+        adapter = mock.Mock()
+
+        def run(context):
+            context.email_service.create_email()
+            return SimpleNamespace(
+                success=False,
+                skipped=True,
+                error_code="free_plan",
+                error_message="检测到 Free 套餐",
+                email=mailbox.account.email,
+            )
+
+        adapter.run.side_effect = run
+        platform = ChatGPTPlatform(
+            config=RegisterConfig(
+                extra={
+                    "chatgpt_registration_mode": "refresh_token",
+                    "chatgpt_existing_account_login_only": True,
+                    "_chatgpt_task_id": "task-free",
+                }
+            ),
+            mailbox=mailbox,
+        )
+
+        with mock.patch(
+            "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+            return_value=adapter,
+        ):
+            with self.assertRaises(ChatGPTFreePlanSkipped):
+                platform.register()
+
+        self.assertEqual(mailbox.discarded, [(mailbox.account, "free_plan")])
+        self.assertEqual(mailbox.failed, [])
 
     def test_totp_only_account_without_secret_is_not_requeued(self):
         mailbox = _RequeueMailbox()
@@ -893,6 +946,7 @@ class ChatGPTPluginTests(unittest.TestCase):
                     extra={
                         "chatgpt_registration_mode": "refresh_token",
                         "chatgpt_existing_account_login_only": True,
+                        "chatgpt_subscription_gate_enabled": False,
                     }
                 ),
                 mailbox=mailbox,

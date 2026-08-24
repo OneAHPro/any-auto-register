@@ -1,7 +1,11 @@
 import unittest
 from unittest import mock
 
-from platforms.chatgpt.status_probe import ProbeHTTPResult, probe_local_chatgpt_status
+from platforms.chatgpt.status_probe import (
+    ProbeHTTPResult,
+    probe_chatgpt_subscription,
+    probe_local_chatgpt_status,
+)
 
 
 class DummyAccount:
@@ -16,6 +20,23 @@ class DummyAccount:
 
 
 class ChatGPTStatusProbeTests(unittest.TestCase):
+    def test_subscription_gate_probe_normalizes_free_plan(self):
+        with mock.patch(
+            "platforms.chatgpt.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"plan_type":"chatgptfreeplan"}',
+                body_json={"plan_type": "chatgptfreeplan"},
+                error_code="",
+                message="ok",
+            ),
+        ):
+            result = probe_chatgpt_subscription("access-token")
+
+        self.assertEqual(result["plan"], "free")
+        self.assertEqual(result["http_status"], 200)
+
     def test_probe_marks_missing_access_token(self):
         account = DummyAccount()
 

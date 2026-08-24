@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 import requests
+import core.applemail_pool as applemail_pool
 
 from core.applemail_pool import (
     load_applemail_pool_records,
@@ -298,10 +299,12 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
 
             self.assertEqual(first.email, "user-0@icloud.com")
             self.assertEqual(after_claim["count"], 2)
-            self.assertNotIn(
+            self.assertIn(
                 first.email,
                 {item["email"] for item in after_claim["items"]},
             )
+            self.assertEqual(after_claim["available_count"], 2)
+            self.assertEqual(after_claim["visible_count"], 3)
 
             # A fresh mailbox instance simulates a process restart: it must read
             # the persisted claim instead of resetting an in-memory cursor.
@@ -315,7 +318,7 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 load_applemail_pool_snapshot(
                     pool_dir=tmp_dir,
                     pool_file="claim.json",
-                )["count"],
+                )["available_count"],
                 1,
             )
 
@@ -326,6 +329,36 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertEqual(len(all_records), 3)
             self.assertEqual(all_records[0]["pool_state"], "claimed")
             self.assertFalse(all_records[0]["enabled"])
+
+    def test_failed_mailbox_remains_visible_but_is_not_claimable(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                self._chatgpt_pool_content(2),
+                pool_dir=tmp_dir,
+                filename="failed.json",
+            )
+            mailbox = AppleMailMailbox(pool_dir=tmp_dir, pool_file="failed.json")
+            claimed = mailbox.get_email()
+            self.assertTrue(
+                applemail_pool.mark_applemail_record_failed(
+                    pool_dir=tmp_dir,
+                    pool_file="failed.json",
+                    claim_id=claimed.extra["_pool_claim_id"],
+                    error="[stage=mfa] incorrect_code",
+                    task_id="task-failed",
+                )
+            )
+            snapshot = load_applemail_pool_snapshot(
+                pool_dir=tmp_dir,
+                pool_file="failed.json",
+            )
+            failed = next(item for item in snapshot["items"] if item["email"] == claimed.email)
+            self.assertEqual(failed["pool_state"], "failed")
+            self.assertEqual(failed["last_error"], "[stage=mfa] incorrect_code")
+            self.assertEqual(snapshot["available_count"], 1)
+            self.assertEqual(snapshot["visible_count"], 2)
+            next_mailbox = AppleMailMailbox(pool_dir=tmp_dir, pool_file="failed.json")
+            self.assertEqual(next_mailbox.get_email().email, "user-1@icloud.com")
 
     def test_requeue_restores_only_the_claimed_mailbox_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
@@ -392,9 +425,13 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 pool_file="concurrent.json",
             )
             self.assertEqual(snapshot["count"], 7)
-            self.assertTrue(set(claimed).isdisjoint(
-                {item["email"] for item in snapshot["items"]}
-            ))
+            claimed_items = {
+                item["email"]
+                for item in snapshot["items"]
+                if item["pool_state"] == "claimed"
+            }
+            self.assertEqual(claimed_items, set(claimed))
+            self.assertEqual(snapshot["visible_count"], 10)
 
     def test_shared_claim_scope_skips_immediately_requeued_mailboxes_concurrently(self):
         from core.base_mailbox import MailboxClaimScope
@@ -587,9 +624,13 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 pool_file="exact.json",
             )
             self.assertEqual(snapshot["count"], 2)
-            self.assertNotIn(
-                "user-2@icloud.com",
-                {item["email"] for item in snapshot["items"]},
+            self.assertEqual(
+                next(
+                    item["pool_state"]
+                    for item in snapshot["items"]
+                    if item["email"] == "user-2@icloud.com"
+                ),
+                "claimed",
             )
 
     def test_empty_json_pool_remains_a_valid_persistent_pool(self):
@@ -653,7 +694,17 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
                 pool_file="states.json",
             )
             self.assertEqual(snapshot["count"], 1)
-            self.assertEqual(snapshot["items"][0]["email"], "available@icloud.com")
+            self.assertEqual(snapshot["visible_count"], 2)
+            self.assertEqual(
+                {
+                    item["email"]: item["pool_state"]
+                    for item in snapshot["items"]
+                },
+                {
+                    "claimed@icloud.com": "claimed",
+                    "available@icloud.com": "available",
+                },
+            )
 
             exact_mailbox = AppleMailMailbox(
                 pool_dir=tmp_dir,

@@ -22,6 +22,7 @@ _POOL_FILE_LOCK = threading.RLock()
 
 _POOL_STATE_AVAILABLE = "available"
 _POOL_STATE_CLAIMED = "claimed"
+_POOL_STATE_FAILED = "failed"
 _POOL_STATE_USED = "used"
 
 
@@ -118,6 +119,7 @@ def _copy_pool_metadata(
     if state in {
         _POOL_STATE_AVAILABLE,
         _POOL_STATE_CLAIMED,
+        _POOL_STATE_FAILED,
         _POOL_STATE_USED,
     }:
         record["pool_state"] = state
@@ -126,12 +128,18 @@ def _copy_pool_metadata(
     claim_id = str(entry.get("pool_claim_id") or "").strip()
     if claim_id and state == _POOL_STATE_CLAIMED:
         record["pool_claim_id"] = claim_id[:128]
+    for key in ("claimed_at", "failed_at", "last_task_id", "last_error"):
+        value = str(entry.get(key) or "").strip()
+        if value:
+            record[key] = value[:500 if key == "last_error" else 128]
     return record
 
 
 def _record_is_available(record: dict[str, Any]) -> bool:
     state = str(record.get("pool_state") or "").strip().lower()
     if state in {_POOL_STATE_CLAIMED, _POOL_STATE_USED}:
+        return False
+    if state == _POOL_STATE_FAILED:
         return False
     if state == _POOL_STATE_AVAILABLE:
         return True
@@ -683,6 +691,12 @@ def load_applemail_pool_snapshot(
 ) -> dict[str, Any]:
     path, records = load_applemail_pool_records(pool_file=pool_file, pool_dir=pool_dir)
     available_records = [record for record in records if _record_is_available(record)]
+    visible_records = [
+        record
+        for record in records
+        if str(record.get("pool_state") or "available").strip().lower()
+        in {_POOL_STATE_AVAILABLE, _POOL_STATE_CLAIMED, _POOL_STATE_FAILED}
+    ]
     limit = max(int(preview_limit or 0), 0)
     items = [
         {
@@ -693,18 +707,26 @@ def load_applemail_pool_snapshot(
                 str(record.get("account_type") or "").strip()
                 or "applemail_oauth"
             ),
+            "pool_state": str(record.get("pool_state") or "available").strip().lower(),
+            "last_error": str(record.get("last_error") or "")[:500],
+            "last_task_id": str(record.get("last_task_id") or "")[:128],
         }
-        for idx, record in enumerate(available_records[:limit], start=1)
+        for idx, record in enumerate(visible_records[:limit], start=1)
     ]
     return {
         "filename": path.name,
         "path": str(path),
+        # Keep the historical meaning of count (claimable rows) for callers
+        # that use it as task capacity. The UI renders items/visible_count so
+        # in-flight and failed rows stay visible without being re-claimed.
         "count": len(available_records),
+        "available_count": len(available_records),
+        "visible_count": len(visible_records),
         "items": items,
         "truncated": (
-            len(available_records) > limit
+            len(visible_records) > limit
             if limit > 0
-            else len(available_records) > 0
+            else len(visible_records) > 0
         ),
     }
 
@@ -810,6 +832,7 @@ def take_next_applemail_record(
         record["enabled"] = False
         record["pool_state"] = _POOL_STATE_CLAIMED
         record["pool_claim_id"] = uuid.uuid4().hex
+        record["claimed_at"] = datetime.now().isoformat()
         _atomic_write_pool_records(path, records)
         return path, dict(record)
 
@@ -863,8 +886,72 @@ def requeue_applemail_record(
         record["enabled"] = True
         record["pool_state"] = _POOL_STATE_AVAILABLE
         record.pop("pool_claim_id", None)
+        record.pop("claimed_at", None)
         _atomic_write_pool_records(path, records)
         return True
+
+
+def mark_applemail_record_failed(
+    *,
+    pool_file: str | None = None,
+    pool_dir: str | None = None,
+    claim_id: str = "",
+    email: str = "",
+    error: str = "",
+    task_id: str = "",
+) -> bool:
+    path = resolve_applemail_pool_path(pool_file=pool_file, pool_dir=pool_dir)
+    with _pool_transaction_lock(path):
+        records = parse_applemail_pool_content(
+            path.read_text(encoding="utf-8", errors="ignore"),
+            allow_empty=True,
+        )
+        record = _find_claimed_record(records, claim_id=claim_id, email=email)
+        if record is None:
+            return False
+        record["enabled"] = False
+        record["pool_state"] = _POOL_STATE_FAILED
+        record["failed_at"] = datetime.now().isoformat()
+        record["last_error"] = str(error or "")[:500]
+        record["last_task_id"] = str(task_id or "")[:128]
+        record.pop("pool_claim_id", None)
+        record.pop("claimed_at", None)
+        _atomic_write_pool_records(path, records)
+        return True
+
+
+def recover_applemail_claims_after_restart(
+    *,
+    pool_dir: str | None = None,
+) -> int:
+    base_dir = _normalize_pool_dir(pool_dir)
+    if not base_dir.exists():
+        return 0
+    recovered = 0
+    for pattern in ("*.json", "*.txt", "*.csv"):
+        for path in base_dir.glob(pattern):
+            if not path.is_file():
+                continue
+            with _pool_transaction_lock(path):
+                records = parse_applemail_pool_content(
+                    path.read_text(encoding="utf-8", errors="ignore"),
+                    allow_empty=True,
+                )
+                changed = False
+                for record in records:
+                    if str(record.get("pool_state") or "").strip().lower() != _POOL_STATE_CLAIMED:
+                        continue
+                    record["enabled"] = False
+                    record["pool_state"] = _POOL_STATE_FAILED
+                    record["failed_at"] = datetime.now().isoformat()
+                    record["last_error"] = "任务进程中断，邮箱领取已自动恢复"
+                    record.pop("pool_claim_id", None)
+                    record.pop("claimed_at", None)
+                    recovered += 1
+                    changed = True
+                if changed:
+                    _atomic_write_pool_records(path, records)
+    return recovered
 
 
 def mark_applemail_record_used(
@@ -888,6 +975,7 @@ def mark_applemail_record_used(
         record["enabled"] = False
         record["pool_state"] = _POOL_STATE_USED
         record.pop("pool_claim_id", None)
+        record.pop("claimed_at", None)
         _atomic_write_pool_records(path, records)
         return True
 
@@ -1019,8 +1107,14 @@ def delete_applemail_pool_records(
                 remaining.append(record)
                 continue
             deleted_email, _mailbox = pending.pop(match_index)
+            if str(record.get("pool_state") or "").strip().lower() == _POOL_STATE_CLAIMED:
+                remaining.append(record)
+                errors.append(f"邮箱正在登录处理中，暂不能删除: {deleted_email}")
+                continue
             deleted.append(deleted_email)
-        errors = [f"未找到要删除的小苹果邮箱: {email}" for email, _ in pending]
+        errors.extend(
+            f"未找到要删除的小苹果邮箱: {email}" for email, _ in pending
+        )
         if deleted:
             _atomic_write_pool_records(path, remaining)
         return path, deleted, errors
@@ -1074,15 +1168,27 @@ def save_applemail_pool_records(
                     continue
                 matched_existing_ids.add(id(existing))
                 state = str(existing.get("pool_state") or "").strip().lower()
-                if state in {_POOL_STATE_CLAIMED, _POOL_STATE_USED}:
+                if state in {
+                    _POOL_STATE_CLAIMED,
+                    _POOL_STATE_FAILED,
+                    _POOL_STATE_USED,
+                }:
                     record["pool_state"] = state
                     record["enabled"] = False
                     if state == _POOL_STATE_CLAIMED:
                         claim_id = str(existing.get("pool_claim_id") or "").strip()
                         if claim_id:
                             record["pool_claim_id"] = claim_id
+                        claimed_at = str(existing.get("claimed_at") or "").strip()
+                        if claimed_at:
+                            record["claimed_at"] = claimed_at
                     else:
                         record.pop("pool_claim_id", None)
+                    if state == _POOL_STATE_FAILED:
+                        for key in ("failed_at", "last_task_id", "last_error"):
+                            value = str(existing.get(key) or "").strip()
+                            if value:
+                                record[key] = value
                     if (
                         str(existing.get("account_type") or "").strip()
                         == "chatgpt_password_reset_url_mail"

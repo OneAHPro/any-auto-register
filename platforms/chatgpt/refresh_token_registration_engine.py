@@ -36,6 +36,7 @@ from .mfa_manager import ChatGPTMfaManager, MfaRotationError, MfaRotationResult
 from .oauth import OAuthManager
 from .oauth_client import OAuthClient
 from .oauth_resume_cache import oauth_resume_cache, serialize_oauth_resume_context
+from .status_probe import probe_chatgpt_subscription
 from .utils import (
     FlowState,
     generate_random_birthday,
@@ -72,6 +73,7 @@ class RegistrationResult:
     logs: list | None = None
     metadata: dict | None = None
     source: str = "register"
+    skipped: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -352,6 +354,45 @@ class RefreshTokenRegistrationEngine:
         if value in {"access_token", "access_token_only", "at", "at_only"}:
             return "access_token"
         return "refresh_token"
+
+    def _subscription_gate_enabled(self) -> bool:
+        value = self.extra_config.get("chatgpt_subscription_gate_enabled", False)
+        if isinstance(value, bool):
+            return value
+        return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+    def _apply_subscription_gate(
+        self,
+        result: RegistrationResult,
+        access_token: str,
+    ) -> bool:
+        if not self._subscription_gate_enabled():
+            return True
+        if bool((result.metadata or {}).get("subscription_gate_passed")):
+            return True
+        probe = probe_chatgpt_subscription(access_token, proxy=self.proxy_url)
+        plan = str(probe.get("plan") or "unknown").strip().lower() or "unknown"
+        result.metadata = dict(result.metadata or {})
+        result.metadata.update(
+            {
+                "subscription_plan": plan,
+                "subscription_http_status": int(probe.get("http_status") or 0),
+            }
+        )
+        if plan == "free":
+            result.skipped = True
+            result.error_code = "free_plan"
+            result.error_message = "检测到 Free 套餐，已停止 MFA、手机接码和外部同步"
+            self._log(result.error_message, "warning")
+            return False
+        if plan == "unknown":
+            result.error_code = "subscription_probe_failed"
+            result.error_message = "订阅套餐检测失败，已停止后续操作并保留邮箱重试"
+            self._log(result.error_message, "error")
+            return False
+        result.metadata["subscription_gate_passed"] = True
+        self._log(f"订阅套餐检测完成: {plan}")
+        return True
 
     def _should_upgrade_passwordless_login_for_mfa(self) -> bool:
         """Use the one-time mailbox session to establish a primary password.
@@ -1426,6 +1467,8 @@ class RefreshTokenRegistrationEngine:
             if not web_access_token:
                 result.error_message = "ChatGPT Web 会话未返回 Access Token"
                 return result
+            if not self._apply_subscription_gate(result, web_access_token):
+                return result
             enrollment_present, rotation = self._consume_mfa_enrollment(
                 result=result,
                 email_adapter=email_adapter,
@@ -1576,6 +1619,8 @@ class RefreshTokenRegistrationEngine:
                 "已有账号登录未同时获取 " + " 和 ".join(missing_tokens)
             )
             return result
+        if not self._apply_subscription_gate(result, access_token):
+            return result
 
         raw_oauth_enrollment = getattr(
             oauth_client,
@@ -1684,6 +1729,12 @@ class RefreshTokenRegistrationEngine:
         access_token = str(session_data.get("access_token") or "").strip()
         if not access_token:
             result.error_message = "已有账号邮箱登录未获取 Access Token"
+            return result
+
+        # The subscription check must happen before consuming a mandatory MFA
+        # enrollment, rotating MFA, preparing phone OAuth, or persisting/syncing
+        # the account. Free accounts exit here with no downstream side effects.
+        if not self._apply_subscription_gate(result, access_token):
             return result
 
         rotation = None

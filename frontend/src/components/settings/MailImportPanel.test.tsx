@@ -37,12 +37,15 @@ const providers = [
 
 function snapshot(
   type: 'microsoft' | 'applemail',
-  items: Array<{ email: string; account_type?: string }> = [],
+  items: Array<{ email: string; account_type?: string; pool_state?: string; last_error?: string }> = [],
 ) {
+  const availableCount = items.filter(item => !item.pool_state || item.pool_state === 'available').length
   return {
     type,
     label: type,
-    count: items.length,
+    count: availableCount,
+    available_count: availableCount,
+    visible_count: items.length,
     items: items.map((item, index) => ({
       index: index + 1,
       mailbox: 'INBOX',
@@ -256,6 +259,28 @@ describe('MailImportPanel automatic detection', () => {
     expect(await screen.findByText('统一兼容导入')).toBeTruthy()
     expect(await screen.findByText('one@outlook.com')).toBeTruthy()
     expect(await screen.findByText('two@gmail.com')).toBeTruthy()
+    expect(screen.getByText('已导入: 2 个邮箱')).toBeTruthy()
+  })
+
+  it('keeps processing and failed mailboxes visible with distinct states', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/mail-imports/providers') return { items: providers }
+      if (path.startsWith('/mail-imports/snapshot?type=microsoft')) {
+        return snapshot('microsoft', [
+          { email: 'working@outlook.com', pool_state: 'leased' },
+          { email: 'failed@outlook.com', pool_state: 'failed', last_error: 'invalid MFA' },
+        ])
+      }
+      if (path.startsWith('/mail-imports/snapshot?type=applemail')) return snapshot('applemail')
+      throw new Error(`unexpected request: ${path}`)
+    })
+
+    renderPanel()
+
+    expect(await screen.findByText('working@outlook.com')).toBeTruthy()
+    expect(await screen.findByText('failed@outlook.com')).toBeTruthy()
+    expect(screen.getByText('处理中')).toBeTruthy()
+    expect(screen.getByText('登录失败')).toBeTruthy()
     expect(screen.getByText('已导入: 2 个邮箱')).toBeTruthy()
   })
 })

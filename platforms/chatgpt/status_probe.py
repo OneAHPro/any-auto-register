@@ -190,6 +190,58 @@ def _probe_backend_me(access_token: str, proxy: Optional[str]) -> ProbeHTTPResul
     return _perform_get(CHATGPT_ME_URL, headers=headers, proxy=proxy)
 
 
+def probe_chatgpt_subscription(
+    access_token: str,
+    proxy: Optional[str] = None,
+) -> dict[str, Any]:
+    """Read only the subscription plan needed by the post-login gate."""
+    token = str(access_token or "").strip()
+    if not token:
+        return {
+            "plan": "unknown",
+            "http_status": 0,
+            "error_code": "missing_access_token",
+            "message": "账号缺少 access_token",
+        }
+    try:
+        response = _probe_backend_me(token, proxy=proxy)
+    except Exception as exc:
+        return {
+            "plan": "unknown",
+            "http_status": 0,
+            "error_code": type(exc).__name__,
+            "message": "订阅套餐检测请求异常",
+        }
+    plan_type = ""
+    workspace_plan_type = ""
+    if response.status_code == 200 and response.body_json:
+        body = response.body_json
+        plan_type = str(body.get("plan_type") or "").strip()
+        orgs = (
+            (body.get("orgs") or {}).get("data")
+            if isinstance(body.get("orgs"), dict)
+            else []
+        ) or []
+        if isinstance(orgs, list):
+            for org in orgs:
+                settings = org.get("settings") if isinstance(org, dict) else None
+                value = (
+                    str(settings.get("workspace_plan_type") or "").strip()
+                    if isinstance(settings, dict)
+                    else ""
+                )
+                if value:
+                    workspace_plan_type = value
+                    break
+    return {
+        "plan": _normalize_plan_type(plan_type, workspace_plan_type),
+        "http_status": int(response.status_code or 0),
+        "error_code": str(response.error_code or ""),
+        "message": str(response.message or "")[:500],
+        "workspace_plan_type": workspace_plan_type,
+    }
+
+
 def _probe_codex_usage(access_token: str, account_id: str, proxy: Optional[str]) -> ProbeHTTPResult:
     headers = {
         "Authorization": f"Bearer {access_token}",

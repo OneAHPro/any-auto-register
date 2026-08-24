@@ -898,6 +898,33 @@ class AppleMailMailbox(BaseMailbox):
             self._selected_record = selected
         return restored
 
+    def fail_account(
+        self,
+        account: MailboxAccount,
+        *,
+        error: str = "",
+        task_id: str = "",
+    ) -> bool:
+        from .applemail_pool import mark_applemail_record_failed
+
+        selected = dict(self._selected_record or {})
+        account_extra = dict(getattr(account, "extra", None) or {})
+        claim_id = str(account_extra.get("_pool_claim_id") or "").strip()
+        if not claim_id:
+            claim_id = str(selected.get("pool_claim_id") or "").strip()
+        return mark_applemail_record_failed(
+            pool_file=str(self._selected_pool_path or self.pool_file),
+            pool_dir=self.pool_dir,
+            claim_id=claim_id,
+            email=str(getattr(account, "email", "") or ""),
+            error=error,
+            task_id=task_id,
+        )
+
+    def discard_account(self, account: MailboxAccount, *, reason: str = "") -> bool:
+        del reason
+        return self.mark_account_used(account)
+
     def mark_account_used(self, account: MailboxAccount) -> bool:
         from .applemail_pool import mark_applemail_record_used
 
@@ -6373,7 +6400,13 @@ class OutlookMailbox(BaseMailbox):
                     self._active_lease_account = None
                 return True
 
-    def release_account(self, account: MailboxAccount, *, uncertain: bool = False) -> bool:
+    def release_account(
+        self,
+        account: MailboxAccount,
+        *,
+        uncertain: bool = False,
+        failed: bool = False,
+    ) -> bool:
         """Release an owned lease, or quarantine it when remote state is unclear."""
         from sqlalchemy import update
         from sqlmodel import Session
@@ -6383,8 +6416,12 @@ class OutlookMailbox(BaseMailbox):
         expected_created_at = self._lease_created_at(account)
         if row_id <= 0 or not owner:
             return False
-        state = "quarantined" if uncertain else "available"
-        reason = "remote_state_uncertain" if uncertain else "login_failed_before_commit"
+        state = "failed" if failed else ("quarantined" if uncertain else "available")
+        reason = (
+            "login_failed_before_commit"
+            if failed
+            else ("remote_state_uncertain" if uncertain else "")
+        )
         extra = self._lease_extra(account)
         last_error = str(extra.get("_outlook_last_error") or "")[:500]
         # A persisted retry context can intentionally contain only the lease
@@ -6434,7 +6471,7 @@ class OutlookMailbox(BaseMailbox):
                         lease_version=version + 1,
                         bound_account_id=0,
                         bound_at=None,
-                        quarantine_reason=reason if uncertain else "",
+                        quarantine_reason=reason,
                         last_error=last_error,
                         updated_at=self._utcnow(),
                     )
@@ -6446,6 +6483,69 @@ class OutlookMailbox(BaseMailbox):
         self._set_lease_projection(
             account,
             state=state,
+            lease_version=version + 1,
+        )
+        if self._active_lease_account is account:
+            self._active_lease_account = None
+        return True
+
+    def fail_account(
+        self,
+        account: MailboxAccount,
+        *,
+        error: str = "",
+        task_id: str = "",
+    ) -> bool:
+        extra = self._lease_extra(account)
+        extra["_outlook_last_error"] = str(error or "")[:500]
+        if task_id:
+            extra["_outlook_last_task_id"] = str(task_id)[:128]
+        return self.release_account(account, failed=True)
+
+    def discard_account(self, account: MailboxAccount, *, reason: str = "") -> bool:
+        """Archive an owned lease after a Free-plan gate or explicit discard."""
+        from sqlalchemy import update
+        from sqlmodel import Session
+        from core.db import OutlookAccountModel, engine
+
+        row_id, owner, version, _bound_id = self._lease_identity(account)
+        expected_created_at = self._lease_created_at(account)
+        if row_id <= 0 or not owner:
+            return False
+        with self._lock:
+            with Session(engine) as session:
+                query = (
+                    update(OutlookAccountModel)
+                    .where(OutlookAccountModel.id == row_id)
+                    .where(OutlookAccountModel.state == "leased")
+                    .where(OutlookAccountModel.lease_owner == owner)
+                    .where(OutlookAccountModel.lease_version == version)
+                )
+                if expected_created_at is not None:
+                    query = query.where(
+                        OutlookAccountModel.created_at == expected_created_at
+                    )
+                result = session.exec(
+                    query.values(
+                        state="discarded",
+                        enabled=False,
+                        lease_owner="",
+                        lease_expires_at=None,
+                        lease_version=version + 1,
+                        bound_account_id=0,
+                        bound_at=None,
+                        quarantine_reason=str(reason or "discarded")[:200],
+                        last_error="",
+                        updated_at=self._utcnow(),
+                    )
+                )
+                if int(getattr(result, "rowcount", 0) or 0) != 1:
+                    session.rollback()
+                    return False
+                session.commit()
+        self._set_lease_projection(
+            account,
+            state="discarded",
             lease_version=version + 1,
         )
         if self._active_lease_account is account:

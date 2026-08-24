@@ -62,6 +62,13 @@ def _print_runtime_info() -> None:
 async def lifespan(app: FastAPI):
     _print_runtime_info()
     init_db()
+    from core.applemail_pool import recover_applemail_claims_after_restart
+    from core.config_store import config_store
+    recovered_applemail = recover_applemail_claims_after_restart(
+        pool_dir=config_store.get("applemail_pool_dir", "mail")
+    )
+    if recovered_applemail:
+        print(f"[OK] 已恢复 {recovered_applemail} 个中断的小苹果邮箱任务")
     load_all()
     print("[OK] 数据库初始化完成")
     from core.registry import list_platforms

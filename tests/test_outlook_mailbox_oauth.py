@@ -179,8 +179,67 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         mailbox = OutlookMailbox()
         with mock.patch("core.db.engine", test_engine):
             self.assertEqual(mailbox.recover_expired_leases(), 1)
+            with self.assertRaises(RuntimeError):
+                mailbox.get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "failed")
+            self.assertIn("任务进程中断", row.last_error)
+
+    def test_failed_login_keeps_outlook_mailbox_visible_but_unclaimable(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="failed@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
             claimed = mailbox.get_email()
-        self.assertEqual(claimed.email, "expired@example.com")
+            self.assertTrue(
+                mailbox.fail_account(
+                    claimed,
+                    error="invalid MFA",
+                    task_id="task-failed",
+                )
+            )
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "failed")
+            self.assertFalse(row.enabled)
+            self.assertEqual(row.last_error, "invalid MFA")
+
+    def test_free_plan_discards_outlook_mailbox(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email="free@example.com",
+                    password="mail-password",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox",
+                )
+            )
+            session.commit()
+
+        mailbox = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = mailbox.get_email()
+            self.assertTrue(mailbox.discard_account(claimed, reason="free_plan"))
+            with self.assertRaises(RuntimeError):
+                OutlookMailbox().get_email()
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "discarded")
+            self.assertFalse(row.enabled)
 
     def test_uncertain_release_quarantines_mailbox(self):
         test_engine = self._lease_engine()

@@ -3,6 +3,7 @@ import unittest
 import uuid
 from contextlib import nullcontext
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import patch
 
@@ -12,6 +13,7 @@ from core import task_runtime
 from core.base_mailbox import BaseMailbox, MailboxAccount
 from core.base_platform import Account, BasePlatform
 from core.chatgpt_task_gate import ChatGPTTaskGate
+from platforms.chatgpt.plugin import ChatGPTFreePlanSkipped
 
 
 class _FakeMailbox(BaseMailbox):
@@ -83,6 +85,29 @@ class _FakeChatGPTWorkspacePlatform(BasePlatform):
             email=f"user{index}@example.com",
             password=password or "pw",
             extra={"workspace_id": f"ws-{index}"},
+        )
+
+    def check_valid(self, account: Account) -> bool:
+        return True
+
+
+class _FreeChatGPTPlatform(BasePlatform):
+    name = "chatgpt"
+    display_name = "ChatGPT"
+
+    def __init__(self, config=None, mailbox=None):
+        super().__init__(config)
+        self.mailbox = mailbox
+
+    def register(self, email: str = None, password: str = None) -> Account:
+        mailbox_account = self.mailbox.get_email()
+        callback = (self.config.extra or {}).get(
+            "_chatgpt_attempt_binding_callback"
+        )
+        if callable(callback):
+            callback(mailbox_account.email, mailbox_account)
+        raise ChatGPTFreePlanSkipped(
+            f"Free 套餐已跳过: {mailbox_account.email}"
         )
 
     def check_valid(self, account: Account) -> bool:
@@ -271,6 +296,52 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         self.assertEqual(snapshot["success"], 2)
         self.assertEqual(snapshot["registered"], 2)
         self.assertEqual(snapshot["total"], 2)
+
+    def test_free_plan_is_counted_cleaned_and_never_saved_or_synced(self):
+        task_id = "task-chatgpt-free-gate"
+        req = self._build_request(
+            platform="chatgpt",
+            extra={
+                "mail_provider": "fake",
+                "chatgpt_existing_account_login_only": True,
+                "chatgpt_existing_account_bind_phone_and_get_rt": False,
+            },
+        )
+        _create_task_record(task_id, req, "manual", None)
+        existing = SimpleNamespace(id=77, email="demo@example.com")
+
+        with (
+            patch("core.registry.get", return_value=_FreeChatGPTPlatform),
+            patch("core.base_mailbox.create_mailbox", return_value=_FakeMailbox()),
+            patch("core.db.save_account") as save_account,
+            patch(
+                "api.tasks._load_unique_chatgpt_account_identity",
+                return_value=existing,
+            ),
+            patch(
+                "services.chatgpt_account_removal.remove_account",
+                return_value={"ok": True, "status": "deleted"},
+            ) as remove_account,
+            patch("api.tasks._auto_upload_integrations") as external_sync,
+            patch("api.tasks._save_task_log"),
+        ):
+            _run_register(task_id, req)
+
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["status"], "done")
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(snapshot["skipped"], 1)
+        self.assertEqual(snapshot["meta"]["free_skipped_count"], 1)
+        self.assertIn("Free 套餐 1 个", "\n".join(snapshot["logs"]))
+        save_account.assert_not_called()
+        external_sync.assert_not_called()
+        remove_account.assert_called_once_with(
+            77,
+            database_engine=tasks_module.engine,
+            codex2api_delete_on_account_remove_enabled=False,
+            task_control=mock.ANY,
+            attempt_id=mock.ANY,
+        )
 
     def test_chatgpt_mailbox_wait_yields_active_concurrency_to_next_account(self):
         task_id = "task-chatgpt-mailbox-background-wait"

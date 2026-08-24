@@ -167,7 +167,13 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
             }
             try {
               const snapshot = await apiFetch(`/mail-imports/snapshot?${params.toString()}`)
-              return { type, count: Math.max(0, Number(snapshot?.count || 0)) }
+              return {
+                type,
+                count: Math.max(
+                  0,
+                  Number(snapshot?.available_count ?? snapshot?.count ?? 0),
+                ),
+              }
             } catch {
               return { type, count: 0 }
             }

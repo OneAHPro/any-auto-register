@@ -373,8 +373,14 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
                 pool_file="retry.json",
             )
             self.assertEqual(
-                [item["email"] for item in snapshot["items"]],
-                ["decoy@example.com"],
+                {
+                    item["email"]: item["pool_state"]
+                    for item in snapshot["items"]
+                },
+                {
+                    "decoy@example.com": "available",
+                    target_email: "claimed",
+                },
             )
 
             self.assertTrue(retry_mailbox.requeue_account(reclaimed))

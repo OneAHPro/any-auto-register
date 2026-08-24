@@ -68,6 +68,7 @@ MAX_PERSISTED_TASK_LOG_BYTES = 256 * 1024
 TASK_SNAPSHOT_PERSIST_INTERVAL_SECONDS = 1.0
 TASK_SUMMARY_META_KEYS = (
     "automation",
+    "free_skipped_count",
     "invalid_rt_count",
     "relogin_failed_count",
     "deleted_account_count",
@@ -557,7 +558,14 @@ def _chatgpt_mail_provider_available_count(provider: str) -> int:
             preview_limit=1,
         )
     )
-    return max(0, int(snapshot.count or 0))
+    return max(
+        0,
+        int(
+            getattr(snapshot, "available_count", None)
+            if getattr(snapshot, "available_count", None) is not None
+            else snapshot.count
+        ),
+    )
 
 
 def _chatgpt_mail_provider_reserved_count(provider: str) -> int:
@@ -4335,10 +4343,17 @@ def _bind_chatgpt_retry_mailbox(
     return _PersistedChatGPTRetryMailbox(mailbox, mailbox_account)
 
 
-def _requeue_chatgpt_login_mailbox(mailbox, account) -> bool:
-    """Return a consumed mailbox after a phone-stage failure for later retry."""
+def _requeue_chatgpt_login_mailbox(
+    mailbox,
+    account,
+    *,
+    error: str = "登录或接码流程失败",
+    task_id: str = "",
+) -> bool:
+    """Persist a failed mailbox row; fall back to a legacy requeue backend."""
     from core.base_mailbox import MailboxAccount
 
+    fail = getattr(mailbox, "fail_account", None)
     requeue = getattr(mailbox, "requeue_account", None)
     extra = (
         dict(getattr(account, "extra", None) or {})
@@ -4346,7 +4361,7 @@ def _requeue_chatgpt_login_mailbox(mailbox, account) -> bool:
         else {}
     )
     context = extra.get("mailbox_login_context")
-    if not callable(requeue) or not isinstance(context, dict):
+    if not isinstance(context, dict):
         return False
     email = str(context.get("email") or getattr(account, "email", "") or "").strip()
     account_extra = context.get("extra")
@@ -4357,6 +4372,19 @@ def _requeue_chatgpt_login_mailbox(mailbox, account) -> bool:
         account_id=str(context.get("account_id") or ""),
         extra=dict(account_extra),
     )
+    if callable(fail):
+        try:
+            return bool(
+                fail(
+                    mailbox_account,
+                    error=str(error or "")[:500],
+                    task_id=str(task_id or "")[:128],
+                )
+            )
+        except TypeError:
+            pass
+    if not callable(requeue):
+        return False
     try:
         return bool(requeue(mailbox_account, uncertain=True))
     except TypeError:
@@ -4442,6 +4470,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     _persist_task_snapshot(task_id)
     success = 0
     skipped = 0
+    free_skipped_count = 0
+    free_skipped_count_lock = threading.Lock()
     errors = []
     external_sync_threads: list[threading.Thread] = []
     external_sync_threads_lock = threading.Lock()
@@ -4566,6 +4596,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 if k not in _CHATGPT_LEADBEE_SECRET_KEYS and v is not None and v != ""
             }
         )
+        _base_extra["_chatgpt_task_id"] = task_id
+        _task_store.update_meta(task_id, free_skipped_count=0)
 
         # 批量预取代理（无固定代理时），减少每线程单独查 DB
         from core.proxy_pool import proxy_pool as _proxy_pool
@@ -4673,7 +4705,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             return row
 
         def _do_one(i: int):
-            nonlocal next_start_time
+            nonlocal next_start_time, free_skipped_count
             _proxy = None
             _mailbox = None
             account = None
@@ -4856,11 +4888,10 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 if attempt_mail_provider:
                     merged_extra["mail_provider"] = attempt_mail_provider
 
-                if _bind_phone_and_get_rt:
-
-                    def _record_mailbox_binding(email_value, mailbox_account):
-                        nonlocal current_email
-                        current_email = str(email_value or current_email or "").strip()
+                def _record_mailbox_binding(email_value, mailbox_account):
+                    nonlocal current_email
+                    current_email = str(email_value or current_email or "").strip()
+                    if _bind_phone_and_get_rt:
                         if not _ensure_account_email_fence(current_email):
                             raise RuntimeError(
                                 "该 ChatGPT 邮箱正在执行账号删除或保存"
@@ -4894,9 +4925,9 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             parent_binding_id=parent_binding_id,
                         )
 
-                    merged_extra["_chatgpt_attempt_binding_callback"] = (
-                        _record_mailbox_binding
-                    )
+                merged_extra["_chatgpt_attempt_binding_callback"] = (
+                    _record_mailbox_binding
+                )
 
                 _config = RegisterConfig(
                     executor_type=req.executor_type,
@@ -5149,7 +5180,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "access_token_saved": True,
                             },
                         )
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        _requeue_chatgpt_login_mailbox(
+                            _mailbox,
+                            account,
+                            error=failure,
+                            task_id=task_id,
+                        )
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -5839,7 +5875,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "保留账号与邮箱凭据，不回池、不删除，等待后续巡检确认",
                             )
                         else:
-                            _requeue_chatgpt_login_mailbox(_mailbox, account)
+                            _requeue_chatgpt_login_mailbox(
+                                _mailbox,
+                                account,
+                                error=failure,
+                                task_id=task_id,
+                            )
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -5880,7 +5921,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "exchange_code_consumed": exchange_code_consumed,
                             },
                         )
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        _requeue_chatgpt_login_mailbox(
+                            _mailbox,
+                            account,
+                            error=failure,
+                            task_id=task_id,
+                        )
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -5981,12 +6027,66 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                     _persist_task_snapshot(task_id)
                 return AttemptResult.success()
             except SkipCurrentAttemptRequested as e:
+                is_free_plan = str(getattr(e, "error_code", "") or "") == "free_plan"
+                if is_free_plan:
+                    # Release any pre-save email fence before removing a stale
+                    # local projection for this Free account.
+                    account_operation_stack.close()
+                    cleanup_error = ""
+                    try:
+                        existing_identity = _load_unique_chatgpt_account_identity(
+                            current_email,
+                            database_engine=engine,
+                        )
+                        if existing_identity is not None:
+                            from services.chatgpt_account_removal import remove_account
+
+                            removal = remove_account(
+                                int(existing_identity.id),
+                                database_engine=engine,
+                                codex2api_delete_on_account_remove_enabled=False,
+                                task_control=control,
+                                attempt_id=attempt_id,
+                            )
+                            if removal.get("ok") or removal.get("status") == "already_absent":
+                                _log(
+                                    task_id,
+                                    f"  [Free] 已移除本地账号投影: {current_email}",
+                                )
+                            else:
+                                raise RuntimeError(
+                                    removal.get("message") or "Free 账号本地清理失败"
+                                )
+                    except Exception as cleanup_exc:
+                        cleanup_error = str(cleanup_exc or type(cleanup_exc).__name__)
+                        _log(
+                            task_id,
+                            "[WARN] Free 账号本地投影清理失败: "
+                            f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                        )
+                    if cleanup_error:
+                        failure = f"Free 套餐已停止后续操作，但本地账号清理失败: {cleanup_error}"
+                        _save_task_log(
+                            req.platform,
+                            current_email,
+                            "failed",
+                            error=failure,
+                            detail={"subscription_plan": "free"},
+                        )
+                        return AttemptResult.failed(failure)
+                    with free_skipped_count_lock:
+                        free_skipped_count += 1
+                        _task_store.update_meta(
+                            task_id,
+                            free_skipped_count=free_skipped_count,
+                        )
                 _log(task_id, f"[SKIP] 已跳过当前账号: {e}")
                 _save_task_log(
                     req.platform,
                     current_email,
                     "skipped",
                     error=str(e),
+                    detail={"subscription_plan": "free"} if is_free_plan else None,
                 )
                 if _bind_phone_and_get_rt:
                     if (
@@ -5994,7 +6094,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         and account is not None
                         and not phone_background_ownership_pending
                     ):
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        _requeue_chatgpt_login_mailbox(
+                            _mailbox,
+                            account,
+                            error=str(e),
+                            task_id=task_id,
+                        )
                     _persist_binding(
                         task_id=task_id,
                         attempt_index=i,
@@ -6002,7 +6107,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         email=current_email,
                         account_id=current_account_id,
                         stage=current_stage,
-                        status="failed",
+                        status="skipped" if is_free_plan else "failed",
                         error=str(e),
                         parent_binding_id=parent_binding_id,
                     )
@@ -6015,7 +6120,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         and account is not None
                         and not phone_background_ownership_pending
                     ):
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        _requeue_chatgpt_login_mailbox(
+                            _mailbox,
+                            account,
+                            error=str(e),
+                            task_id=task_id,
+                        )
                     _persist_binding(
                         task_id=task_id,
                         attempt_index=i,
@@ -6044,7 +6154,12 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         and account is not None
                         and not phone_background_ownership_pending
                     ):
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
+                        _requeue_chatgpt_login_mailbox(
+                            _mailbox,
+                            account,
+                            error=str(e),
+                            task_id=task_id,
+                        )
                     _persist_binding(
                         task_id=task_id,
                         attempt_index=i,
@@ -6193,6 +6308,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
         )
     else:
         summary = f"完成: 成功 {success} 个, 跳过 {skipped} 个, 失败 {len(errors)} 个"
+    if free_skipped_count:
+        summary += f"（其中 Free 套餐 {free_skipped_count} 个，已停止后续操作并清理）"
     _log(task_id, summary)
     if final_status == "done":
         processed = req.count

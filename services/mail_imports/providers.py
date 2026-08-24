@@ -141,6 +141,9 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
                 email=str(item.get("email") or ""),
                 mailbox=str(item.get("mailbox") or "INBOX"),
                 account_type=str(item.get("account_type") or "applemail_oauth"),
+                pool_state=str(item.get("pool_state") or "available"),
+                last_error=str(item.get("last_error") or ""),
+                last_task_id=str(item.get("last_task_id") or ""),
             )
             for item in snapshot.get("items", [])
         ]
@@ -149,6 +152,12 @@ class AppleMailImportStrategy(BaseMailImportStrategy):
             type="applemail",
             label=self.descriptor.label,
             count=int(snapshot.get("count") or 0),
+            available_count=int(
+                snapshot.get("available_count", snapshot.get("count", 0)) or 0
+            ),
+            visible_count=int(
+                snapshot.get("visible_count", len(snapshot.get("items", []))) or 0
+            ),
             items=items,
             truncated=bool(snapshot.get("truncated")),
             filename=str(snapshot.get("filename") or ""),
@@ -395,12 +404,27 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
         with Session(engine) as session:
             accounts = session.exec(
                 select(OutlookAccountModel)
-                .where(OutlookAccountModel.enabled == True)
+                .where(
+                    (
+                        (OutlookAccountModel.state == "available")
+                        & (OutlookAccountModel.enabled == True)
+                    )
+                    | OutlookAccountModel.state.in_(
+                        ["leased", "failed", "quarantined"]
+                    )
+                )
                 .order_by(OutlookAccountModel.id)
             ).all()
 
         limit = max(int(request.preview_limit or 0), 0)
         preview = accounts[:limit] if limit else []
+        available_count = sum(
+            1
+            for account in accounts
+            if str(getattr(account, "state", "available") or "available")
+            == "available"
+            and bool(account.enabled)
+        )
         items = [
             MailImportSnapshotItem(
                 index=idx,
@@ -416,6 +440,10 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                     getattr(account, "account_type", ACCOUNT_TYPE_MICROSOFT_OAUTH)
                     or ACCOUNT_TYPE_MICROSOFT_OAUTH
                 ),
+                pool_state=str(
+                    getattr(account, "state", "available") or "available"
+                ),
+                last_error=str(getattr(account, "last_error", "") or "")[:500],
             )
             for idx, account in enumerate(preview, start=1)
         ]
@@ -423,7 +451,9 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
         return MailImportSnapshot(
             type="microsoft",
             label=self.descriptor.label,
-            count=len(accounts),
+            count=available_count,
+            available_count=available_count,
+            visible_count=len(accounts),
             items=items,
             truncated=len(accounts) > limit if limit > 0 else len(accounts) > 0,
         )
@@ -608,6 +638,8 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
             ).first()
             if not account:
                 raise RuntimeError(f"未找到要删除的微软邮箱: {email}")
+            if str(getattr(account, "state", "") or "") == "leased":
+                raise RuntimeError(f"邮箱正在登录处理中，暂不能删除: {email}")
 
             session.delete(account)
             session.commit()
@@ -641,6 +673,9 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
                 ).first()
                 if not account:
                     errors.append(f"未找到要删除的微软邮箱: {email}")
+                    continue
+                if str(getattr(account, "state", "") or "") == "leased":
+                    errors.append(f"邮箱正在登录处理中，暂不能删除: {email}")
                     continue
                 session.delete(account)
                 deleted.append(email)

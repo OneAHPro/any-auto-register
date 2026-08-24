@@ -42,6 +42,9 @@ class MailImportSnapshotItem(BaseModel):
     enabled: bool | None = None
     has_oauth: bool | None = None
     account_type: MailImportAccountType | None = None
+    pool_state: str = "available"
+    last_error: str = ""
+    last_task_id: str = ""
 
 
 class MailImportSnapshotRequest(BaseModel):
@@ -108,6 +111,8 @@ class MailImportSnapshot(BaseModel):
     type: MailImportProviderType
     label: str
     count: int
+    available_count: int | None = None
+    visible_count: int | None = None
     items: list[MailImportSnapshotItem] = Field(default_factory=list)
     truncated: bool = False
     filename: str = ""
