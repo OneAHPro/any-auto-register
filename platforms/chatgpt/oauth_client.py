@@ -4401,7 +4401,7 @@ class OAuthClient:
 
                     workspace_error = str(self.last_error or "").strip()
                     self._set_error(
-                        "passwordless 登录后仍停留在 add_phone，未获取到 workspace / callback；"
+                        "账号登录后仍停留在 add_phone，未获取到 workspace / callback；"
                         "为避免重复发送邮箱验证码，本次不重启登录"
                         + (f" ({workspace_error})" if workspace_error else "")
                     )

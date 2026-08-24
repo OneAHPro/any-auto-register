@@ -15,6 +15,7 @@ Production release `3b3709a` still reports `authorize_continue -> HTTP 409` with
 3. The post-MFA phone path first performs the existing bounded same-session rebuild. If that cannot produce a valid `add_phone`-compatible context, it performs one fresh credential login using the newly managed TOTP/recovery code and prepares phone OAuth in that new authenticated session. The fresh fallback never starts LeadBee and is accepted only after the resume-context validator passes.
 4. Automatic re-login defaults to three concurrent accounts. The setting remains configurable but is bounded to three for the automatic OAuth entry path, reducing simultaneous Sentinel and authorize requests while keeping account work parallel.
 5. The provider-start gate remains strict: no LeadBee/SMS reservation occurs without a version-2 resume context containing PKCE verifier, OAuth state, and flow state.
+6. Durable account backoff gates only full credential login. Every visible Refresh Token account remains in each remote Codex2API probe, so a recovered account clears its stale circuit while an invalid account is reported but not repeatedly logged in before `next_retry_at`.
 
 ## Invariants
 

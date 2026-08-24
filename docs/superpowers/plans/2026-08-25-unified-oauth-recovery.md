@@ -64,3 +64,16 @@ Run: `PYTHONPATH=. .venv/bin/pytest -q tests/test_chatgpt_phone_flow.py tests/te
 - [ ] **Step 2: Review the diff for secret leakage, provider ordering, stale-context reuse, and retry bounds.**
 - [ ] **Step 3: Commit and push `main`; create a production SQLite backup, install an immutable release, restart only as needed, and verify HTTP health.**
 - [ ] **Step 4: Check the 20-account manifest before and after deployment.** Record per-account status only as `login_ok`, `mfa_ok`, `phone_oauth_ready`, `refresh_token_ok`, `codex2api_ok`, or a redacted stage/error.
+
+### Task 6: Keep remote probes visible during credential backoff
+
+**Files:**
+- Modify: `services/chatgpt_relogin.py`
+- Modify: `api/tasks.py`
+- Modify: `tests/test_chatgpt_relogin.py`
+- Modify: `tests/test_chatgpt_relogin_task.py`
+
+- [ ] **Step 1: Add failing tests showing backoff accounts remain in the remote probe cohort but do not start full login.**
+- [ ] **Step 2: Move the retry gate from account enumeration to the remote-failure dispatch boundary.**
+- [ ] **Step 3: Clear stale local failure circuits when the remote probe reports a healthy account.**
+- [ ] **Step 4: Run focused and full suites before the final immutable release.**

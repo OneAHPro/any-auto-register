@@ -761,6 +761,39 @@ def _chatgpt_bind_phone_enabled(req: RegisterTaskRequest) -> bool:
     )
 
 
+def _chatgpt_automation_login_retry_allowed(
+    account_id: int,
+    expected_email: str,
+) -> bool:
+    """Apply durable backoff only to the same persisted account identity."""
+    from services.chatgpt_auth_state import chatgpt_auth_retry_allowed
+
+    try:
+        with Session(engine) as session:
+            account = session.get(AccountModel, int(account_id))
+            if account is None:
+                # Let the normal login path produce the authoritative missing-row
+                # result. Synthetic task fixtures may reuse unrelated integer ids.
+                return True
+            if account.platform != "chatgpt":
+                return True
+            normalized_expected = str(expected_email or "").strip().lower()
+            if (
+                normalized_expected
+                and str(account.email or "").strip().lower() != normalized_expected
+            ):
+                # The state row belongs to a different identity (for example after
+                # SQLite integer-id reuse). Ignore that unrelated circuit; the
+                # normal login identity guards still validate the task target.
+                return True
+            return chatgpt_auth_retry_allowed(int(account_id), session=session)
+    except Exception:
+        # Startup migrations and isolated task tests may not have the identity
+        # tables ready yet. Preserve the historical dispatch behavior; the
+        # credential operation itself still performs full identity validation.
+        return True
+
+
 def _chatgpt_phone_oauth_is_ready(candidate) -> bool:
     """Gate provider startup on a prepared transaction or legacy recovery."""
     candidate_extra = (
@@ -2038,6 +2071,7 @@ def _run_chatgpt_relogin_task_inner(
             confirm_codex2api_auth_failure,
             inspect_codex2api_account_health,
         )
+        from services.chatgpt_auth_state import clear_chatgpt_auth_failure
 
         remote_health = inspect_codex2api_account_health(
             account_ids,
@@ -2051,19 +2085,23 @@ def _run_chatgpt_relogin_task_inner(
             )
             return
         login_states = {"auth_failed", "remote_missing"}
-        probe_only_account_ids = [
+        login_candidate_account_ids = [
             account_id
             for account_id in account_ids
             if str(
                 (remote_health.get(account_id) or {}).get("state") or ""
             ).strip().lower()
-            not in login_states
+            in login_states
+            and _chatgpt_automation_login_retry_allowed(
+                account_id,
+                str((remote_health.get(account_id) or {}).get("email") or ""),
+            )
         ]
-        probe_only_account_id_set = set(probe_only_account_ids)
-        login_candidate_account_ids = [
+        login_candidate_account_id_set = set(login_candidate_account_ids)
+        probe_only_account_ids = [
             account_id
             for account_id in account_ids
-            if account_id not in probe_only_account_id_set
+            if account_id not in login_candidate_account_id_set
         ]
         account_ids = [
             *probe_only_account_ids,
@@ -2199,6 +2237,13 @@ def _run_chatgpt_relogin_task_inner(
                     ).strip().lower()
                 email = str(health.get("email") or "").strip()
                 if health_state == "healthy":
+                    try:
+                        clear_chatgpt_auth_failure(account_id)
+                    except Exception:
+                        # The remote probe result remains authoritative for the
+                        # current cycle.  A transient local DB lock can be
+                        # cleared by the next successful probe.
+                        pass
                     healthy_message = str(
                         health.get("message")
                         or "Codex2API 远端鉴权正常"
@@ -2215,7 +2260,10 @@ def _run_chatgpt_relogin_task_inner(
                         "remote_status": health.get("remote_status"),
                         "message": healthy_message,
                     }
-                elif health_state in {"auth_failed", "remote_missing"}:
+                elif (
+                    health_state in {"auth_failed", "remote_missing"}
+                    and account_id in login_candidate_account_id_set
+                ):
                     if health_state == "auth_failed":
                         _record_confirmed_auth_failure()
                     result = relogin_chatgpt_account(
@@ -2235,6 +2283,20 @@ def _run_chatgpt_relogin_task_inner(
                             "remote_auth_state": health_state,
                             "remote_status": health.get("remote_status"),
                         }
+                elif health_state in {"auth_failed", "remote_missing"}:
+                    result = {
+                        "ok": False,
+                        "relogin_ok": False,
+                        "stage": "auth_backoff",
+                        "mode": "remote_probe",
+                        "account_id": account_id,
+                        "email": email,
+                        "remote_status": health.get("remote_status"),
+                        "message": (
+                            str(health.get("message") or "远端鉴权失效")
+                            + "；账号仍在退避期，本轮未重复登录"
+                        ),
+                    }
                 else:
                     result = {
                         "ok": False,

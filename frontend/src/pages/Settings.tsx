@@ -1918,9 +1918,9 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       )
       data.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_concurrency,
-        10,
+        3,
         1,
-        10,
+        3,
       )
       data.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
         data.chatgpt_auto_relogin_alert_threshold,
@@ -2044,9 +2044,9 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       )
       values.chatgpt_auto_relogin_concurrency = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_concurrency,
-        10,
+        3,
         1,
-        10,
+        3,
       )
       values.chatgpt_auto_relogin_alert_threshold = normalizeBoundedInteger(
         values.chatgpt_auto_relogin_alert_threshold,

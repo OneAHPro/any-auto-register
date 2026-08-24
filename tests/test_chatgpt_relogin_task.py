@@ -592,6 +592,8 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         ) as refresh_first, mock.patch(
             "services.chatgpt_relogin.relogin_chatgpt_account"
         ) as full_login, mock.patch(
+            "services.chatgpt_auth_state.clear_chatgpt_auth_failure"
+        ) as clear_failure, mock.patch(
             "api.tasks._save_task_log"
         ) as save_task_log:
             _run_chatgpt_relogin_task(task_id, [17])
@@ -599,11 +601,52 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         inspect_remote.assert_called_once_with([17], quota_accounts=[])
         refresh_first.assert_not_called()
         full_login.assert_not_called()
+        clear_failure.assert_called_once_with(17)
         save_task_log.assert_not_called()
         snapshot = _task_store.snapshot(task_id)
         self.assertEqual(snapshot["success"], 1)
         self.assertTrue(
             any("无需重登" in line for line in snapshot["logs"])
+        )
+
+    def test_automatic_task_reports_remote_failure_but_defers_login_during_backoff(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [17],
+            source="schedule",
+            automation=True,
+        )
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+            return_value={
+                17: {
+                    "account_id": 17,
+                    "email": "backoff@example.com",
+                    "state": "auth_failed",
+                    "remote_status": "error",
+                    "message": "Codex2API 明确返回 Refresh Token 已失效",
+                }
+            },
+        ), mock.patch(
+            "services.chatgpt_codex2api_health.confirm_codex2api_auth_failure",
+            side_effect=lambda value: value,
+        ), mock.patch(
+            "api.tasks._chatgpt_automation_login_retry_allowed",
+            return_value=False,
+        ), mock.patch(
+            "services.chatgpt_relogin.relogin_chatgpt_account",
+        ) as full_login:
+            _run_chatgpt_relogin_task(task_id, [17])
+
+        full_login.assert_not_called()
+        snapshot = _task_store.snapshot(task_id)
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertIn("退避", snapshot["errors"][0])
+        self.assertTrue(
+            any("Refresh Token 已失效" in line for line in snapshot["logs"])
         )
 
     def test_automatic_task_records_all_probe_only_results_before_login(self):

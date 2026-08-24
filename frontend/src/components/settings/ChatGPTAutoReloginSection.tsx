@@ -171,9 +171,9 @@ export default function ChatGPTAutoReloginSection() {
       <Form.Item
         name="chatgpt_auto_relogin_concurrency"
         label="异常账号重登并发数"
-        initialValue={10}
+        initialValue={3}
       >
-        <InputNumber aria-label="异常账号重登并发数" min={1} max={10} precision={0} style={{ width: '100%' }} />
+        <InputNumber aria-label="异常账号重登并发数" min={1} max={3} precision={0} style={{ width: '100%' }} />
       </Form.Item>
 
       <Typography.Paragraph type="secondary">

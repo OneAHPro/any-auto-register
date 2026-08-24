@@ -479,7 +479,6 @@ def list_auto_maintenance_account_ids(
             if account.id is not None
             and _text(account.email)
             and account_is_visible_in_default_list(account)
-            and _auth_maintenance_retry_allowed(active_session, int(account.id))
         ]
 
     if session is not None:

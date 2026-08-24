@@ -3503,7 +3503,7 @@ class ChatGPTReloginTests(unittest.TestCase):
 
         self.assertIn(account_id, account_ids)
 
-    def test_auto_maintenance_skips_account_during_durable_backoff(self):
+    def test_auto_maintenance_still_probes_account_during_durable_backoff(self):
         account_id = self._add_eligibility_account(
             "cooldown@example.com",
             extra={"refresh_token": "rt-only-token"},
@@ -3523,7 +3523,7 @@ class ChatGPTReloginTests(unittest.TestCase):
             database_engine=self.engine,
         )
 
-        self.assertNotIn(account_id, account_ids)
+        self.assertIn(account_id, account_ids)
 
     def test_auto_maintenance_treats_missing_rt_as_full_login_candidate(self):
         account_id = self._add_eligibility_account(

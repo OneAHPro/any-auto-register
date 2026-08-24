@@ -193,7 +193,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
     })
     await waitFor(() => {
       expect((screen.getByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement).value).toBe('2')
-      expect((screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement).value).toBe('10')
+      expect((screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement).value).toBe('3')
       expect((screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement).value).toBe('20')
     })
   })
