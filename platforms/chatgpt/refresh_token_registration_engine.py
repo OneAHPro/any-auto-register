@@ -377,6 +377,8 @@ class RefreshTokenRegistrationEngine:
             {
                 "subscription_plan": plan,
                 "subscription_http_status": int(probe.get("http_status") or 0),
+                "subscription_plan_source": str(probe.get("plan_source") or ""),
+                "subscription_error_code": str(probe.get("error_code") or ""),
             }
         )
         if plan == "free":
@@ -388,6 +390,12 @@ class RefreshTokenRegistrationEngine:
         if plan == "unknown":
             result.error_code = "subscription_probe_failed"
             result.error_message = "订阅套餐检测失败，已停止后续操作并保留邮箱重试"
+            self._log(
+                "订阅套餐检测详情: "
+                f"http={probe.get('http_status', 0)} "
+                f"error_code={probe.get('error_code', '')}",
+                "error",
+            )
             self._log(result.error_message, "error")
             return False
         result.metadata["subscription_gate_passed"] = True

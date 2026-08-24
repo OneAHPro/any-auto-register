@@ -212,6 +212,12 @@ def probe_chatgpt_subscription(
             "error_code": type(exc).__name__,
             "message": "订阅套餐检测请求异常",
         }
+    token_auth = _extract_auth_info(_decode_jwt_payload(token))
+    token_plan_type = str(
+        token_auth.get("chatgpt_plan_type")
+        or token_auth.get("plan_type")
+        or ""
+    ).strip()
     plan_type = ""
     workspace_plan_type = ""
     if response.status_code == 200 and response.body_json:
@@ -233,12 +239,18 @@ def probe_chatgpt_subscription(
                 if value:
                     workspace_plan_type = value
                     break
+    plan = _normalize_plan_type(plan_type, workspace_plan_type)
+    plan_source = "backend_me" if plan != "unknown" else ""
+    if plan == "unknown" and response.status_code == 200 and token_plan_type:
+        plan = _normalize_plan_type(token_plan_type, "")
+        plan_source = "access_token_claim"
     return {
-        "plan": _normalize_plan_type(plan_type, workspace_plan_type),
+        "plan": plan,
         "http_status": int(response.status_code or 0),
         "error_code": str(response.error_code or ""),
         "message": str(response.message or "")[:500],
         "workspace_plan_type": workspace_plan_type,
+        "plan_source": plan_source,
     }
 
 

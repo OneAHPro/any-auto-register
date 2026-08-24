@@ -1,3 +1,5 @@
+import base64
+import json
 import unittest
 from unittest import mock
 
@@ -20,6 +22,33 @@ class DummyAccount:
 
 
 class ChatGPTStatusProbeTests(unittest.TestCase):
+    def test_subscription_probe_falls_back_to_access_token_plan_claim(self):
+        payload = base64.urlsafe_b64encode(
+            json.dumps(
+                {
+                    "https://api.openai.com/auth": {
+                        "chatgpt_plan_type": "plus",
+                    }
+                }
+            ).encode()
+        ).decode().rstrip("=")
+        token = f"header.{payload}.signature"
+        with mock.patch(
+            "platforms.chatgpt.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200,
+                headers={},
+                body_text='{"object":"user"}',
+                body_json={"object": "user"},
+                error_code="",
+                message="ok",
+            ),
+        ):
+            result = probe_chatgpt_subscription(token)
+
+        self.assertEqual(result["plan"], "plus")
+        self.assertEqual(result["plan_source"], "access_token_claim")
+
     def test_subscription_gate_probe_normalizes_free_plan(self):
         with mock.patch(
             "platforms.chatgpt.status_probe._probe_backend_me",
