@@ -933,10 +933,16 @@ def recover_applemail_claims_after_restart(
             if not path.is_file():
                 continue
             with _pool_transaction_lock(path):
-                records = parse_applemail_pool_content(
-                    path.read_text(encoding="utf-8", errors="ignore"),
-                    allow_empty=True,
-                )
+                try:
+                    records = parse_applemail_pool_content(
+                        path.read_text(encoding="utf-8", errors="ignore"),
+                        allow_empty=True,
+                    )
+                except (OSError, ValueError):
+                    # A historical/root-owned or unrelated JSON file must not
+                    # prevent the service from starting. Runtime allocation
+                    # will still report that configured file normally.
+                    continue
                 changed = False
                 for record in records:
                     if str(record.get("pool_state") or "").strip().lower() != _POOL_STATE_CLAIMED:

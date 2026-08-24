@@ -360,6 +360,22 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             next_mailbox = AppleMailMailbox(pool_dir=tmp_dir, pool_file="failed.json")
             self.assertEqual(next_mailbox.get_email().email, "user-1@icloud.com")
 
+    def test_restart_recovery_skips_unreadable_pool_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            pool_path = Path(tmp_dir) / "unreadable.json"
+            pool_path.write_text("[]", encoding="utf-8")
+
+            with mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=PermissionError("fixture unreadable"),
+            ):
+                recovered = applemail_pool.recover_applemail_claims_after_restart(
+                    pool_dir=tmp_dir,
+                )
+
+            self.assertEqual(recovered, 0)
+
     def test_requeue_restores_only_the_claimed_mailbox_once(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
