@@ -656,7 +656,7 @@ class ChatGPTPluginTests(unittest.TestCase):
                 pool_dir=tmp_dir,
                 pool_file="retry.json",
             )
-            self.assertEqual(snapshot["count"], 0)
+            self.assertEqual(snapshot["count"], 1)
             self.assertEqual(snapshot["visible_count"], 1)
             self.assertEqual(snapshot["items"][0]["email"], "retry@icloud.com")
             self.assertEqual(snapshot["items"][0]["pool_state"], "failed")

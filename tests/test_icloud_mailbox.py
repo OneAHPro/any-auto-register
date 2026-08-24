@@ -330,7 +330,7 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertEqual(all_records[0]["pool_state"], "claimed")
             self.assertFalse(all_records[0]["enabled"])
 
-    def test_failed_mailbox_remains_visible_but_is_not_claimable(self):
+    def test_failed_mailbox_remains_visible_and_is_claimable_by_later_task(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             save_applemail_pool_json(
                 self._chatgpt_pool_content(2),
@@ -355,10 +355,10 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             failed = next(item for item in snapshot["items"] if item["email"] == claimed.email)
             self.assertEqual(failed["pool_state"], "failed")
             self.assertEqual(failed["last_error"], "[stage=mfa] incorrect_code")
-            self.assertEqual(snapshot["available_count"], 1)
+            self.assertEqual(snapshot["available_count"], 2)
             self.assertEqual(snapshot["visible_count"], 2)
             next_mailbox = AppleMailMailbox(pool_dir=tmp_dir, pool_file="failed.json")
-            self.assertEqual(next_mailbox.get_email().email, "user-1@icloud.com")
+            self.assertEqual(next_mailbox.get_email().email, claimed.email)
 
     def test_restart_recovery_skips_unreadable_pool_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

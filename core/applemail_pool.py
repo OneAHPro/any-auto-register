@@ -140,7 +140,7 @@ def _record_is_available(record: dict[str, Any]) -> bool:
     if state in {_POOL_STATE_CLAIMED, _POOL_STATE_USED}:
         return False
     if state == _POOL_STATE_FAILED:
-        return False
+        return True
     if state == _POOL_STATE_AVAILABLE:
         return True
     return _normalize_enabled(record.get("enabled", True))
@@ -833,6 +833,9 @@ def take_next_applemail_record(
         record["pool_state"] = _POOL_STATE_CLAIMED
         record["pool_claim_id"] = uuid.uuid4().hex
         record["claimed_at"] = datetime.now().isoformat()
+        record.pop("failed_at", None)
+        record.pop("last_error", None)
+        record.pop("last_task_id", None)
         _atomic_write_pool_records(path, records)
         return path, dict(record)
 

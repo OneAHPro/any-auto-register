@@ -5896,6 +5896,7 @@ class OutlookMailbox(BaseMailbox):
         lease_seconds: int = 900,
     ):
         self._lock = threading.Lock()
+        self._claim_scope: MailboxClaimScope | None = None
         self._active_lease_account: MailboxAccount | None = None
         self._last_lease_renew_monotonic = 0.0
         self._lease_owner = str(lease_owner or "").strip()[:160]
@@ -6027,6 +6028,7 @@ class OutlookMailbox(BaseMailbox):
         target_email: str = "",
         lease_owner: str = "",
         lease_seconds: int | None = None,
+        exclude_emails=None,
     ) -> dict[str, Any]:
         """Claim one row with a cross-process SQLite CAS.
 
@@ -6044,18 +6046,28 @@ class OutlookMailbox(BaseMailbox):
         except (TypeError, ValueError):
             ttl = self._lease_seconds
         normalized_email = str(target_email or "").strip().lower()
+        normalized_excluded = {
+            str(value or "").strip().lower()
+            for value in (exclude_emails or ())
+            if str(value or "").strip()
+        }
         now = self._utcnow()
         expires = now + timedelta(seconds=ttl)
         with OutlookMailbox._pop_lock:
             with Session(engine) as session:
                 query = select(OutlookAccountModel).where(
-                    OutlookAccountModel.state == "available"
+                    OutlookAccountModel.state.in_(["available", "failed"])
                 )
                 # ``enabled`` is a compatibility projection still written by
                 # the import UI.  Keep it as a safety guard for rows created
                 # by older/import paths that set enabled=False without
                 # explicitly setting the new state column.
-                query = query.where(OutlookAccountModel.enabled == True)
+                query = query.where(
+                    or_(
+                        OutlookAccountModel.state == "failed",
+                        OutlookAccountModel.enabled == True,
+                    )
+                )
                 # Never hand out a row that already carries a local-account
                 # binding, even if an older writer left its state projection
                 # inconsistent.
@@ -6069,15 +6081,22 @@ class OutlookMailbox(BaseMailbox):
                     query = query.where(
                         func.lower(OutlookAccountModel.email) == normalized_email
                     )
+                if normalized_excluded:
+                    query = query.where(
+                        func.lower(OutlookAccountModel.email).notin_(
+                            normalized_excluded
+                        )
+                    )
                 candidates = session.exec(
                     query.order_by(OutlookAccountModel.id)
                 ).all()
                 for candidate in candidates:
                     old_version = int(candidate.lease_version or 0)
+                    candidate_state = str(candidate.state or "available")
                     result = session.exec(
                         update(OutlookAccountModel)
                         .where(OutlookAccountModel.id == candidate.id)
-                        .where(OutlookAccountModel.state == "available")
+                        .where(OutlookAccountModel.state == candidate_state)
                         .where(OutlookAccountModel.lease_version == old_version)
                         .values(
                             state="leased",
@@ -6107,6 +6126,7 @@ class OutlookMailbox(BaseMailbox):
         target_email: str = "",
         lease_owner: str = "",
         lease_seconds: int | None = None,
+        exclude_emails=None,
         **kwargs,
     ) -> MailboxAccount:
         """Lease a mailbox without deleting its credentials row."""
@@ -6123,6 +6143,7 @@ class OutlookMailbox(BaseMailbox):
             target_email=target_email,
             lease_owner=lease_owner,
             lease_seconds=lease_seconds,
+            exclude_emails=exclude_emails,
         )
         return self._mailbox_account_from_payload(payload)
 
@@ -6131,7 +6152,16 @@ class OutlookMailbox(BaseMailbox):
         return self._claim_account_payload(target_email=email)
 
     def get_email(self) -> MailboxAccount:
+        if self._claim_scope is not None:
+            return self._claim_scope.claim(
+                lambda exclude_emails: self.claim_account(
+                    exclude_emails=exclude_emails,
+                )
+            )
         return self.claim_account()
+
+    def bind_claim_scope(self, scope: MailboxClaimScope | None) -> None:
+        self._claim_scope = scope
 
     def get_email_by_address(self, email: str) -> MailboxAccount:
         """Claim the exact available mailbox used by a retry binding."""

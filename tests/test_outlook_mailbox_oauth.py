@@ -10,7 +10,12 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import SQLModel, Session, create_engine, select
 
 from core import base_mailbox
-from core.base_mailbox import MailboxAccount, OutlookMailbox, create_mailbox
+from core.base_mailbox import (
+    MailboxAccount,
+    MailboxClaimScope,
+    OutlookMailbox,
+    create_mailbox,
+)
 from core.db import AccountModel, OutlookAccountModel
 
 
@@ -179,14 +184,13 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         mailbox = OutlookMailbox()
         with mock.patch("core.db.engine", test_engine):
             self.assertEqual(mailbox.recover_expired_leases(), 1)
-            with self.assertRaises(RuntimeError):
-                mailbox.get_email()
+            claimed = mailbox.get_email()
+        self.assertEqual(claimed.email, "expired@example.com")
         with Session(test_engine) as session:
             row = session.exec(select(OutlookAccountModel)).one()
-            self.assertEqual(row.state, "failed")
-            self.assertIn("任务进程中断", row.last_error)
+            self.assertEqual(row.state, "leased")
 
-    def test_failed_login_keeps_outlook_mailbox_visible_but_unclaimable(self):
+    def test_failed_login_keeps_outlook_mailbox_claimable_by_later_task(self):
         test_engine = self._lease_engine()
         with Session(test_engine) as session:
             session.add(
@@ -209,13 +213,40 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
                     task_id="task-failed",
                 )
             )
-            with self.assertRaises(RuntimeError):
-                OutlookMailbox().get_email()
+            reclaimed = OutlookMailbox().get_email()
+            self.assertEqual(reclaimed.email, "failed@example.com")
         with Session(test_engine) as session:
             row = session.exec(select(OutlookAccountModel)).one()
-            self.assertEqual(row.state, "failed")
+            self.assertEqual(row.state, "leased")
             self.assertFalse(row.enabled)
-            self.assertEqual(row.last_error, "invalid MFA")
+            self.assertEqual(row.last_error, "")
+
+    def test_shared_claim_scope_does_not_retry_failed_outlook_row_in_same_task(self):
+        test_engine = self._lease_engine()
+        with Session(test_engine) as session:
+            for index in range(2):
+                session.add(
+                    OutlookAccountModel(
+                        email=f"scope-{index}@example.com",
+                        password="mail-password",
+                        account_type="mailapi_url",
+                        mailapi_url=f"https://mail.example.test/inbox/{index}",
+                    )
+                )
+            session.commit()
+
+        scope = MailboxClaimScope()
+        first_mailbox = OutlookMailbox()
+        second_mailbox = OutlookMailbox()
+        first_mailbox.bind_claim_scope(scope)
+        second_mailbox.bind_claim_scope(scope)
+        with mock.patch("core.db.engine", test_engine):
+            first = first_mailbox.get_email()
+            self.assertTrue(first_mailbox.fail_account(first, error="fixture"))
+            second = second_mailbox.get_email()
+
+        self.assertEqual(first.email, "scope-0@example.com")
+        self.assertEqual(second.email, "scope-1@example.com")
 
     def test_free_plan_discards_outlook_mailbox(self):
         test_engine = self._lease_engine()

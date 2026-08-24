@@ -421,9 +421,15 @@ class MicrosoftMailImportStrategy(BaseMailImportStrategy):
         available_count = sum(
             1
             for account in accounts
-            if str(getattr(account, "state", "available") or "available")
-            == "available"
-            and bool(account.enabled)
+            if (
+                str(getattr(account, "state", "available") or "available")
+                == "failed"
+                or (
+                    str(getattr(account, "state", "available") or "available")
+                    == "available"
+                    and bool(account.enabled)
+                )
+            )
         )
         items = [
             MailImportSnapshotItem(
