@@ -761,6 +761,37 @@ def _chatgpt_bind_phone_enabled(req: RegisterTaskRequest) -> bool:
     )
 
 
+def _chatgpt_phone_oauth_is_ready(candidate) -> bool:
+    """Gate provider startup on a prepared transaction or legacy recovery."""
+    candidate_extra = (
+        dict(candidate.extra)
+        if isinstance(getattr(candidate, "extra", None), dict)
+        else {}
+    )
+    resume = candidate_extra.get("oauth_resume_context")
+    browser = candidate_extra.get("oauth_browser_context")
+    post_mfa_attempted = (
+        candidate_extra.get("post_mfa_phone_oauth_rebuild_attempted") is True
+    )
+    resume_ready = bool(
+        isinstance(resume, dict)
+        and int(resume.get("version") or 0) == 2
+        and str(resume.get("code_verifier") or "").strip()
+        and str(resume.get("oauth_state") or "").strip()
+        and isinstance(resume.get("flow_state"), dict)
+    )
+    if bool(candidate_extra.get("phone_oauth_ready") is True and resume_ready):
+        return True
+    if post_mfa_attempted:
+        return False
+    return bool(
+        isinstance(browser, dict)
+        and int(browser.get("version") or 0) == 1
+        and isinstance(browser.get("cookies"), list)
+        and browser.get("cookies")
+    )
+
+
 def _redact_task_secret(message, secret: str) -> str:
     text = str(message or "").strip()
     normalized_secret = str(secret or "").strip()
@@ -4587,6 +4618,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
             saved_account = None
             saved_account_created_by_attempt = False
             saved_account_extra_snapshot: str | None = None
+            preserve_incomplete_account = False
             phone_flow_completed = False
             phone_background_ownership_pending = False
             retry_binding = _retry_bindings[i] if _retry_bindings else {}
@@ -4827,29 +4859,6 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         platform.mailbox._log_fn = platform._log_fn
                     return mailbox, platform
 
-                def _phone_oauth_is_ready(candidate) -> bool:
-                    candidate_extra = (
-                        dict(candidate.extra)
-                        if isinstance(getattr(candidate, "extra", None), dict)
-                        else {}
-                    )
-                    resume = candidate_extra.get("oauth_resume_context")
-                    browser = candidate_extra.get("oauth_browser_context")
-                    resume_ready = bool(
-                        isinstance(resume, dict)
-                        and int(resume.get("version") or 0) == 2
-                        and str(resume.get("code_verifier") or "").strip()
-                        and str(resume.get("oauth_state") or "").strip()
-                        and isinstance(resume.get("flow_state"), dict)
-                    )
-                    browser_ready = bool(
-                        isinstance(browser, dict)
-                        and int(browser.get("version") or 0) == 1
-                        and isinstance(browser.get("cookies"), list)
-                        and browser.get("cookies")
-                    )
-                    return bool(resume_ready or browser_ready)
-
                 _mailbox, _platform = _new_platform_session()
                 _log(task_id, f"开始{action_name}第 {i + 1}/{req.count} 个账号")
                 if _proxy:
@@ -5029,10 +5038,11 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         ),
                         parent_binding_id=parent_binding_id,
                     )
-                    if not _phone_oauth_is_ready(account):
+                    if not _chatgpt_phone_oauth_is_ready(account):
+                        preserve_incomplete_account = True
                         failure = (
                             "邮箱登录成功，Access Token 已保存，但手机授权事务未就绪；"
-                            "已认证浏览器快照也不可用，本次未启动 LeadBee"
+                            "已保留密码、MFA 与账号状态，本次未启动 LeadBee"
                         )
                         _log(task_id, f"[FAIL] {failure}: {account.email}")
                         _save_task_log(
@@ -5047,7 +5057,6 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                                 "exchange_code_consumed": False,
                             },
                         )
-                        _requeue_chatgpt_login_mailbox(_mailbox, account)
                         _persist_binding(
                             task_id=task_id,
                             attempt_index=i,
@@ -5987,6 +5996,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 if (
                     _bind_phone_and_get_rt
                     and saved_account_created_by_attempt
+                    and not preserve_incomplete_account
                     and not phone_flow_completed
                     and not phone_background_ownership_pending
                     and saved_account is not None

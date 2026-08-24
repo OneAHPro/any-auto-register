@@ -930,8 +930,9 @@ class AppleMailMailbox(BaseMailbox):
             selected["pool_state"] = "used"
             selected.pop("pool_claim_id", None)
             self._selected_record = selected
-            if isinstance(account.extra, dict):
-                account.extra["_pool_state"] = "used"
+            transient_extra = getattr(account, "extra", None)
+            if isinstance(transient_extra, dict):
+                transient_extra["_pool_state"] = "used"
         return marked
 
     def commit_password_reset(

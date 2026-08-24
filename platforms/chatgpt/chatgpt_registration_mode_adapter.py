@@ -136,6 +136,10 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
                 extra["oauth_browser_context"] = oauth_browser_context
             if "phone_oauth_ready" in metadata:
                 extra["phone_oauth_ready"] = bool(metadata.get("phone_oauth_ready"))
+            if "post_mfa_phone_oauth_rebuild_attempted" in metadata:
+                extra["post_mfa_phone_oauth_rebuild_attempted"] = bool(
+                    metadata.get("post_mfa_phone_oauth_rebuild_attempted")
+                )
             if "phone_oauth_prepare_error" in metadata:
                 extra["phone_oauth_prepare_error"] = str(
                     metadata.get("phone_oauth_prepare_error") or ""

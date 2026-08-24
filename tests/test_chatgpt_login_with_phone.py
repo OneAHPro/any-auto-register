@@ -63,6 +63,8 @@ class _ExistingAccountPlatform(BasePlatform):
     seen_extras = []
     phone_oauth_ready = True
     phone_oauth_ready_sequence = []
+    post_mfa_rebuild_attempted = False
+    oauth_resume_context_override = None
     phone_oauth_prepare_error = ""
     phone_oauth_browser_context_available = True
     register_emails = []
@@ -76,6 +78,8 @@ class _ExistingAccountPlatform(BasePlatform):
             cls.seen_extras = []
             cls.phone_oauth_ready = True
             cls.phone_oauth_ready_sequence = []
+            cls.post_mfa_rebuild_attempted = False
+            cls.oauth_resume_context_override = None
             cls.phone_oauth_prepare_error = ""
             cls.phone_oauth_browser_context_available = True
             cls.register_emails = []
@@ -115,8 +119,17 @@ class _ExistingAccountPlatform(BasePlatform):
                 "refresh_token": "",
                 "chatgpt_token_source": "existing_account_web_login",
                 "phone_oauth_ready": ready,
+                "post_mfa_phone_oauth_rebuild_attempted": bool(
+                    type(self).post_mfa_rebuild_attempted
+                ),
                 "phone_oauth_prepare_error": type(self).phone_oauth_prepare_error,
                 "oauth_resume_context": (
+                    dict(type(self).oauth_resume_context_override)
+                    if isinstance(
+                        type(self).oauth_resume_context_override,
+                        dict,
+                    )
+                    else
                     {
                         "version": 2,
                         "attempt": index,
@@ -142,7 +155,13 @@ class _ExistingAccountPlatform(BasePlatform):
                     "provider": "microsoft",
                     "email": account_email,
                     "account_id": str(index),
-                    "extra": {"account_type": "mailapi_url"},
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": password or "mail-password",
+                        "totp_secret": "JBSWY3DPEHPK3PXP",
+                        "mfa_recovery_code": "RECOVERY-CODE",
+                        "chatgpt_mfa_managed": True,
+                    },
                 },
             },
         )
@@ -1021,6 +1040,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
                 id=account_id,
                 platform=account.platform,
                 email=account.email,
+                password=account.password,
                 extra=extra,
                 extra_json=json.dumps(extra, ensure_ascii=False),
                 created_at=datetime(2026, 8, 3, tzinfo=timezone.utc),
@@ -1830,6 +1850,21 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         self.assertEqual(_LoginMailbox.marked_used, [])
         self.assertEqual(len(saved), 2)
         self.assertTrue(all(row.extra.get("access_token") for row in saved))
+        self.assertTrue(all(row.password for row in saved))
+        self.assertTrue(
+            all(
+                row.extra["mailbox_login_context"]["extra"].get("totp_secret")
+                for row in saved
+            )
+        )
+        self.assertTrue(
+            all(
+                row.extra["mailbox_login_context"]["extra"].get(
+                    "mfa_recovery_code"
+                )
+                for row in saved
+            )
+        )
         self.assertEqual(cleanup_incomplete.call_count, 2)
         self.assertEqual(
             {call.args[0] for call in cleanup_incomplete.call_args_list},
@@ -1882,10 +1917,21 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         self.assertEqual(len(snapshot["errors"]), 2)
         self.assertEqual(len(saved), 2)
         self.assertTrue(all(row.extra.get("access_token") for row in saved))
+        self.assertTrue(all(row.password for row in saved))
+        self.assertTrue(
+            all(
+                row.extra["mailbox_login_context"]["extra"].get("totp_secret")
+                and row.extra["mailbox_login_context"]["extra"].get(
+                    "mfa_recovery_code"
+                )
+                for row in saved
+            )
+        )
         complete.assert_not_called()
-        self.assertEqual(cleanup_incomplete.call_count, 2)
+        cleanup_incomplete.assert_not_called()
         joined_logs = "\n".join(snapshot["logs"])
         self.assertIn("手机授权事务未就绪", joined_logs)
+        self.assertIn("已保留密码、MFA 与账号状态", joined_logs)
         self.assertNotIn("开始自动接码", joined_logs)
         self.assertNotIn("card-secret", joined_logs)
         failed_calls = [
@@ -1899,7 +1945,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             self.assertTrue(call.kwargs["detail"]["access_token_saved"])
             self.assertFalse(call.kwargs["detail"]["exchange_code_consumed"])
 
-    def test_unprepared_phone_oauth_uses_browser_snapshot_without_fresh_login(self):
+    def test_legacy_browser_snapshot_can_recover_before_provider_start(self):
         _ExistingAccountPlatform.phone_oauth_ready = False
 
         snapshot, saved, complete, _save_task_log, cleanup_incomplete = self._run(
@@ -1924,7 +1970,67 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         complete.assert_called_once()
         cleanup_incomplete.assert_not_called()
         joined_logs = "\n".join(snapshot["logs"])
-        self.assertNotIn("重新建立一次 OAuth 登录会话", joined_logs)
+        self.assertNotIn("本次未启动 LeadBee", joined_logs)
+
+    def test_exhausted_post_mfa_rebuild_does_not_use_browser_snapshot(self):
+        _ExistingAccountPlatform.phone_oauth_ready = False
+        _ExistingAccountPlatform.post_mfa_rebuild_attempted = True
+
+        snapshot, saved, complete, _save_task_log, cleanup_incomplete = self._run(
+            "task-chatgpt-login-phone-post-mfa-exhausted",
+            count=1,
+            completion=lambda **_: self.fail(
+                "LeadBee must not start after post-MFA rebuild exhaustion"
+            ),
+        )
+
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(saved), 1)
+        complete.assert_not_called()
+        cleanup_incomplete.assert_not_called()
+        joined_logs = "\n".join(snapshot["logs"])
+        self.assertIn("手机授权事务未就绪", joined_logs)
+        self.assertIn("本次未启动 LeadBee", joined_logs)
+
+    def test_post_mfa_ready_flag_does_not_accept_malformed_v2_context(self):
+        _ExistingAccountPlatform.phone_oauth_ready = True
+        _ExistingAccountPlatform.post_mfa_rebuild_attempted = True
+        _ExistingAccountPlatform.oauth_resume_context_override = {
+            "version": 2,
+            "code_verifier": "",
+            "oauth_state": "state",
+            "flow_state": {"page_type": "add_phone"},
+        }
+
+        snapshot, _saved, complete, _save_task_log, cleanup = self._run(
+            "task-post-mfa-malformed-v2",
+            count=1,
+            completion=lambda **_: self.fail("malformed v2 must not start provider"),
+        )
+
+        self.assertEqual(snapshot["success"], 0)
+        complete.assert_not_called()
+        cleanup.assert_not_called()
+
+    def test_post_mfa_valid_v2_requires_explicit_ready_flag(self):
+        _ExistingAccountPlatform.phone_oauth_ready = False
+        _ExistingAccountPlatform.post_mfa_rebuild_attempted = True
+        _ExistingAccountPlatform.oauth_resume_context_override = {
+            "version": 2,
+            "code_verifier": "verifier",
+            "oauth_state": "state",
+            "flow_state": {"page_type": "add_phone"},
+        }
+
+        snapshot, _saved, complete, _save_task_log, cleanup = self._run(
+            "task-post-mfa-ready-false",
+            count=1,
+            completion=lambda **_: self.fail("ready=false must not start provider"),
+        )
+
+        self.assertEqual(snapshot["success"], 0)
+        complete.assert_not_called()
+        cleanup.assert_not_called()
 
 
 if __name__ == "__main__":

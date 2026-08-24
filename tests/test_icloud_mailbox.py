@@ -20,6 +20,7 @@ from core.applemail_pool import (
     take_next_applemail_record,
 )
 from core.base_mailbox import AppleMailMailbox, MailApiUrlOtpBackend
+from core.db import AccountModel
 from core.icloud_mail import ICloudMailClient, generate_totp
 
 
@@ -746,6 +747,42 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             _path, records = load_applemail_pool_records(
                 pool_dir=tmp_dir,
                 pool_file="reimport.json",
+            )
+            self.assertEqual(records[0]["pool_state"], "used")
+
+    def test_mark_used_accepts_persisted_account_without_extra_attribute(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                self._chatgpt_pool_content(1),
+                pool_dir=tmp_dir,
+                filename="persisted-account-used.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="persisted-account-used.json",
+            )
+            claimed = mailbox.get_email()
+            persisted = AccountModel(
+                platform="chatgpt",
+                email=claimed.email,
+                password="chatgpt-password",
+                status="registered",
+            )
+            persisted.set_extra(
+                {
+                    "refresh_token": "saved-refresh-token",
+                    "mailbox_login_context": {
+                        "provider": "applemail",
+                        "email": claimed.email,
+                        "extra": dict(claimed.extra),
+                    },
+                }
+            )
+
+            self.assertTrue(mailbox.mark_account_used(persisted))
+            _path, records = load_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="persisted-account-used.json",
             )
             self.assertEqual(records[0]["pool_state"], "used")
 

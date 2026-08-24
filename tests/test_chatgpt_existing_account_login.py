@@ -1048,6 +1048,377 @@ class ExistingAccountLoginTests(unittest.TestCase):
         cache.take.assert_called_once_with("existing@example.com")
         cache.remember.assert_not_called()
 
+    def test_post_rotation_phone_oauth_retries_in_authenticated_session(self):
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+            allow_phone_verification=True,
+        )
+        chatgpt_client = mock.Mock()
+        chatgpt_client.session = types.SimpleNamespace(rotation_applied=False)
+        chatgpt_client.device_id = "device-1"
+        chatgpt_client.ua = "UA"
+        chatgpt_client.sec_ch_ua = '"Chromium";v="136"'
+        chatgpt_client.accept_language = "en-US,en;q=0.9"
+        chatgpt_client.impersonate = "chrome136"
+        chatgpt_client.phone_oauth_resume_context = mock.Mock(
+            code_verifier="stale-verifier",
+            oauth_state="stale-state",
+            flow_state=FlowState(page_type="add_phone"),
+        )
+        chatgpt_client.phone_oauth_browser_context = {}
+        chatgpt_client.phone_oauth_prepare_diagnostic = {}
+        chatgpt_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "access-token",
+                "session_token": "session-token",
+                "account_id": "account-1",
+                "workspace_id": "workspace-1",
+            },
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=chatgpt_client)
+        def rotate_after_login(**_kwargs):
+            chatgpt_client.session.rotation_applied = True
+            return MfaRotationResult(
+                totp_secret="NEWSECRET",
+                recovery_code="RECOVERY",
+                replaced_existing=True,
+                mfa_enabled=True,
+                rotated_at="2026-08-24T13:50:00+00:00",
+            )
+        engine._rotate_mfa_after_login = mock.Mock(side_effect=rotate_after_login)
+        first_helper = mock.Mock()
+        first_helper.last_state = FlowState(page_type="log_in")
+        first_helper.last_http_status = 200
+        first_helper.last_error = "returned to login"
+        def first_prepare(**_kwargs):
+            self.assertIsNone(chatgpt_client.phone_oauth_resume_context)
+            self.assertTrue(chatgpt_client.session.rotation_applied)
+            return None
+
+        first_helper.prepare_phone_verification_transaction.side_effect = (
+            first_prepare
+        )
+        prepared_context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-1",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            authorize_url="https://auth.openai.com/oauth/authorize",
+            authorize_params={"state": "fresh-state"},
+            flow_state=FlowState(
+                page_type="add_phone",
+                current_url="https://auth.openai.com/add-phone",
+            ),
+            referer="https://auth.openai.com/add-phone",
+        )
+        second_helper = mock.Mock()
+        second_helper.last_state = prepared_context.flow_state
+        second_helper.last_http_status = 200
+        second_helper.last_error = ""
+        second_helper.prepare_phone_verification_transaction.return_value = (
+            prepared_context
+        )
+        engine._build_oauth_client = mock.Mock(
+            side_effect=[first_helper, second_helper]
+        )
+
+        def serialize_context(*_args, **kwargs):
+            if kwargs.get("code_verifier"):
+                return {
+                    "version": 2,
+                    "device_id": kwargs["device_id"],
+                    "cookies": [],
+                    "code_verifier": kwargs["code_verifier"],
+                    "oauth_state": kwargs["oauth_state"],
+                    "flow_state": {"page_type": "add_phone"},
+                }
+            return {
+                "version": 1,
+                "device_id": "device-1",
+                "cookies": [{"name": "login_session", "value": "cookie"}],
+            }
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine."
+            "serialize_oauth_resume_context",
+            side_effect=serialize_context,
+        ), mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.time.sleep"
+        ) as sleep:
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        login_kwargs = (
+            chatgpt_client.login_existing_account_and_get_session.call_args.kwargs
+        )
+        self.assertFalse(login_kwargs["prepare_phone_oauth"])
+        self.assertEqual(engine._build_oauth_client.call_count, 2)
+        for helper in (first_helper, second_helper):
+            helper.adopt_browser_context.assert_called_once_with(
+                chatgpt_client.session,
+                device_id="device-1",
+                user_agent="UA",
+                sec_ch_ua='"Chromium";v="136"',
+                accept_language="en-US,en;q=0.9",
+            )
+        sleep.assert_called_once_with(0.5)
+        self.assertTrue(result.metadata["phone_oauth_ready"])
+        self.assertTrue(
+            result.metadata["post_mfa_phone_oauth_rebuild_attempted"]
+        )
+        self.assertEqual(
+            result.metadata["oauth_resume_context"]["code_verifier"],
+            "fresh-verifier",
+        )
+        self.assertEqual(
+            result.metadata["phone_oauth_prepare_diagnostic"],
+            {
+                "stage": "phone_oauth_prepare",
+                "attempt": 2,
+                "page_type": "add_phone",
+                "http_status": 200,
+                "recovery_status": "recovered",
+            },
+        )
+
+    def test_post_rotation_phone_oauth_exhaustion_stays_partial(self):
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+            allow_phone_verification=True,
+        )
+        chatgpt_client = mock.Mock()
+        chatgpt_client.session = object()
+        chatgpt_client.device_id = "device-1"
+        chatgpt_client.ua = "UA"
+        chatgpt_client.sec_ch_ua = '"Chromium";v="136"'
+        chatgpt_client.accept_language = "en-US,en;q=0.9"
+        chatgpt_client.impersonate = "chrome136"
+        chatgpt_client.phone_oauth_resume_context = None
+        chatgpt_client.phone_oauth_browser_context = {}
+        chatgpt_client.phone_oauth_prepare_diagnostic = {}
+        chatgpt_client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "access-token",
+                "session_token": "session-token",
+                "account_id": "account-1",
+                "workspace_id": "workspace-1",
+            },
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=chatgpt_client)
+        engine._rotate_mfa_after_login = mock.Mock(
+            return_value=MfaRotationResult(
+                totp_secret="NEWSECRET",
+                recovery_code="RECOVERY",
+                replaced_existing=True,
+                mfa_enabled=True,
+                rotated_at="2026-08-24T13:50:00+00:00",
+            )
+        )
+        helpers = []
+        for page_type, http_status in (
+            ("log_in", 200),
+            ("unknown", 403),
+            ("login_password", 200),
+        ):
+            helper = mock.Mock()
+            helper.last_state = FlowState(page_type=page_type)
+            helper.last_http_status = http_status
+            helper.last_error = "not ready"
+            helper.prepare_phone_verification_transaction.return_value = None
+            helpers.append(helper)
+        engine._build_oauth_client = mock.Mock(side_effect=helpers)
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine."
+            "serialize_oauth_resume_context",
+            return_value={
+                "version": 1,
+                "device_id": "device-1",
+                "cookies": [{"name": "login_session", "value": "cookie"}],
+            },
+        ), mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.time.sleep"
+        ) as sleep:
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        self.assertEqual(engine._build_oauth_client.call_count, 3)
+        self.assertFalse(result.metadata["phone_oauth_ready"])
+        self.assertTrue(
+            result.metadata["post_mfa_phone_oauth_rebuild_attempted"]
+        )
+        self.assertEqual(result.metadata["oauth_resume_context"], {})
+        self.assertEqual(
+            result.metadata["phone_oauth_prepare_diagnostic"],
+            {
+                "stage": "phone_oauth_prepare",
+                "attempt": 3,
+                "page_type": "login_password",
+                "http_status": 200,
+                "recovery_status": "deferred",
+            },
+        )
+        self.assertEqual(sleep.call_args_list, [mock.call(0.5), mock.call(1.0)])
+
+    def test_post_rotation_phone_oauth_first_attempt_success_has_no_backoff(self):
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=PasswordTotpEmailService(),
+            rotate_mfa=True,
+            allow_phone_verification=True,
+        )
+        client = mock.Mock()
+        client.session = object()
+        client.device_id = "device-1"
+        client.ua = "UA"
+        client.sec_ch_ua = '"Chromium";v="136"'
+        client.accept_language = "en-US,en;q=0.9"
+        client.impersonate = "chrome136"
+        context = types.SimpleNamespace(
+            session=object(),
+            device_id="device-1",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="fresh-verifier",
+            oauth_state="fresh-state",
+            authorize_url="https://auth.openai.com/oauth/authorize",
+            authorize_params={"state": "fresh-state"},
+            flow_state=FlowState(page_type="add_phone"),
+            referer="https://auth.openai.com/add-phone",
+        )
+        helper = mock.Mock()
+        helper.prepare_phone_verification_transaction.return_value = context
+        helper.last_http_status = 200
+        engine._build_oauth_client = mock.Mock(return_value=helper)
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.time.sleep"
+        ) as sleep:
+            prepared = engine._prepare_phone_oauth_after_mfa_rotation(
+                client,
+                "mfa-user@icloud.com",
+            )
+
+        self.assertIs(prepared, context)
+        engine._build_oauth_client.assert_called_once()
+        sleep.assert_not_called()
+        self.assertIs(client.phone_oauth_resume_context, context)
+        self.assertEqual(
+            client.phone_oauth_prepare_diagnostic["recovery_status"],
+            "recovered",
+        )
+
+    def test_mandatory_mfa_enrollment_rebuilds_phone_oauth_once(self):
+        email_service = PasswordTotpEmailService()
+        email_service.commit_mfa_rotation = mock.Mock(return_value=True)
+        engine = self._make_engine(
+            login_stage="access_token",
+            email_service=email_service,
+            rotate_mfa=False,
+            allow_phone_verification=True,
+        )
+        client = mock.Mock()
+        client.session = object()
+        client.device_id = "device-1"
+        client.ua = "UA"
+        client.sec_ch_ua = '"Chromium";v="136"'
+        client.accept_language = "en-US,en;q=0.9"
+        client.impersonate = "chrome136"
+        client.phone_oauth_resume_context = mock.Mock(
+            code_verifier="stale-verifier",
+            oauth_state="stale-state",
+            flow_state=FlowState(page_type="add_phone"),
+        )
+        client.phone_oauth_browser_context = {}
+        client.phone_oauth_prepare_diagnostic = {}
+        client.login_existing_account_and_get_session.return_value = (
+            True,
+            {
+                "access_token": "access-token",
+                "session_token": "session-token",
+                "account_id": "account-1",
+                "workspace_id": "workspace-1",
+                "mfa_enrollment": {
+                    "totp_secret": "MANDATORY-SECRET",
+                    "recovery_code": "MANDATORY-RECOVERY",
+                    "rotated_at": "2026-08-24T13:50:00+00:00",
+                },
+            },
+        )
+        engine._build_chatgpt_client = mock.Mock(return_value=client)
+        engine._rotate_mfa_after_login = mock.Mock()
+        prepared = types.SimpleNamespace(
+            session=object(),
+            device_id="device-1",
+            user_agent="UA",
+            sec_ch_ua='"Chromium";v="136"',
+            accept_language="en-US,en;q=0.9",
+            impersonate="chrome136",
+            code_verifier="mandatory-verifier",
+            oauth_state="mandatory-state",
+            authorize_url="https://auth.openai.com/oauth/authorize",
+            authorize_params={"state": "mandatory-state"},
+            flow_state=FlowState(page_type="add_phone"),
+            referer="https://auth.openai.com/add-phone",
+        )
+        helper = mock.Mock()
+
+        def prepare(**_kwargs):
+            self.assertIsNone(client.phone_oauth_resume_context)
+            return prepared
+
+        helper.prepare_phone_verification_transaction.side_effect = prepare
+        helper.last_http_status = 200
+        engine._build_oauth_client = mock.Mock(return_value=helper)
+
+        def serialize_context(*_args, **kwargs):
+            if kwargs.get("code_verifier"):
+                return {
+                    "version": 2,
+                    "device_id": kwargs["device_id"],
+                    "cookies": [],
+                    "code_verifier": kwargs["code_verifier"],
+                    "oauth_state": kwargs["oauth_state"],
+                    "flow_state": {"page_type": "add_phone"},
+                }
+            return {
+                "version": 1,
+                "device_id": "device-1",
+                "cookies": [{"name": "login_session", "value": "cookie"}],
+            }
+
+        with mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine."
+            "serialize_oauth_resume_context",
+            side_effect=serialize_context,
+        ):
+            result = engine.run()
+
+        self.assertTrue(result.success)
+        engine._rotate_mfa_after_login.assert_not_called()
+        email_service.commit_mfa_rotation.assert_called_once_with(
+            totp_secret="MANDATORY-SECRET",
+            recovery_code="MANDATORY-RECOVERY",
+            rotated_at="2026-08-24T13:50:00+00:00",
+        )
+        engine._build_oauth_client.assert_called_once()
+        self.assertTrue(result.metadata["phone_oauth_ready"])
+        self.assertTrue(
+            result.metadata["post_mfa_phone_oauth_rebuild_attempted"]
+        )
+
     def test_existing_account_chatgpt_client_logs_login_chain(self):
         engine = self._make_engine(login_stage="access_token")
         messages = []

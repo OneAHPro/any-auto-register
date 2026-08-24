@@ -984,6 +984,121 @@ class RefreshTokenRegistrationEngine:
         client._log = lambda msg: self._log(f"[登录链路] {msg}")
         return client
 
+    @staticmethod
+    def _phone_oauth_context_is_ready(context: Any) -> bool:
+        return bool(
+            context is not None
+            and str(getattr(context, "code_verifier", "") or "").strip()
+            and str(getattr(context, "oauth_state", "") or "").strip()
+            and isinstance(getattr(context, "flow_state", None), FlowState)
+        )
+
+    @staticmethod
+    def _safe_phone_oauth_page_type(value: Any) -> str:
+        raw = str(value or "").strip().lower()
+        return "".join(
+            character
+            for character in raw
+            if character.isalnum() or character in {"_", "-"}
+        )[:64] or "unknown"
+
+    def _prepare_phone_oauth_after_mfa_rotation(
+        self,
+        chatgpt_client: ChatGPTClient,
+        email: str,
+        *,
+        max_attempts: int = 3,
+    ):
+        """Build a fresh PKCE transaction from the live post-rotation session."""
+        session = getattr(chatgpt_client, "session", None)
+        device_id = str(getattr(chatgpt_client, "device_id", "") or "")
+        user_agent = str(getattr(chatgpt_client, "ua", "") or "")
+        sec_ch_ua = str(getattr(chatgpt_client, "sec_ch_ua", "") or "")
+        accept_language = str(
+            getattr(chatgpt_client, "accept_language", "") or ""
+        )
+        impersonate = str(
+            getattr(chatgpt_client, "impersonate", "") or ""
+        )
+        bounded_attempts = max(1, min(int(max_attempts or 3), 3))
+        last_diagnostic = {
+            "stage": "phone_oauth_prepare",
+            "attempt": 0,
+            "page_type": "unknown",
+            "http_status": 0,
+            "recovery_status": "deferred",
+        }
+        for attempt in range(1, bounded_attempts + 1):
+            if attempt > 1:
+                delay = 0.5 * (attempt - 1)
+                self._log(
+                    "MFA 轮换后的手机 OAuth 事务将在短暂退避后重试: "
+                    f"attempt={attempt}"
+                )
+                time.sleep(delay)
+            helper = self._build_oauth_client()
+            helper.adopt_browser_context(
+                session,
+                device_id=device_id,
+                user_agent=user_agent,
+                sec_ch_ua=sec_ch_ua,
+                accept_language=accept_language,
+            )
+            try:
+                prepared = helper.prepare_phone_verification_transaction(
+                    email=str(email or "").strip(),
+                    device_id=device_id,
+                    user_agent=user_agent,
+                    sec_ch_ua=sec_ch_ua,
+                    accept_language=accept_language,
+                    impersonate=impersonate,
+                )
+            except TaskInterruption:
+                raise
+            except Exception:
+                prepared = None
+            state = (
+                getattr(prepared, "flow_state", None)
+                if prepared is not None
+                else getattr(helper, "last_state", None)
+            )
+            ready = self._phone_oauth_context_is_ready(prepared)
+            last_diagnostic = {
+                "stage": "phone_oauth_prepare",
+                "attempt": attempt,
+                "page_type": self._safe_phone_oauth_page_type(
+                    getattr(state, "page_type", "")
+                ),
+                "http_status": max(
+                    0,
+                    int(getattr(helper, "last_http_status", 0) or 0),
+                ),
+                "recovery_status": "recovered" if ready else "deferred",
+            }
+            if ready:
+                chatgpt_client.phone_oauth_resume_context = prepared
+                chatgpt_client.phone_oauth_resume_error = ""
+                chatgpt_client.phone_oauth_prepare_diagnostic = last_diagnostic
+                self._log(
+                    "MFA 轮换后已在当前认证会话中重建手机 OAuth 事务: "
+                    f"attempt={attempt}, "
+                    f"page_type={last_diagnostic['page_type']}"
+                )
+                return prepared
+            self._log(
+                "MFA 轮换后的手机 OAuth 事务尚未就绪: "
+                f"attempt={attempt}, "
+                f"page_type={last_diagnostic['page_type']}, "
+                f"http_status={last_diagnostic['http_status']}",
+                "warning",
+            )
+        chatgpt_client.phone_oauth_resume_context = None
+        chatgpt_client.phone_oauth_resume_error = (
+            "MFA 轮换后未能建立可续接的手机 OAuth 事务"
+        )
+        chatgpt_client.phone_oauth_prepare_diagnostic = last_diagnostic
+        return None
+
     def _reuse_register_browser_context(
         self,
         register_client: ChatGPTClient,
@@ -1438,6 +1553,7 @@ class RefreshTokenRegistrationEngine:
     ) -> RegistrationResult:
         self._log("2. 登录已有 ChatGPT 账号并提取 Access Token...")
         chatgpt_client = self._build_chatgpt_client()
+        rotate_mfa_planned = self._existing_account_should_rotate_mfa()
         ok, session_result = chatgpt_client.login_existing_account_and_get_session(
             result.email,
             email_adapter,
@@ -1469,6 +1585,7 @@ class RefreshTokenRegistrationEngine:
             ),
             otp_wait_timeout=otp_wait_seconds,
             otp_resend_wait_timeout=otp_resend_wait_seconds,
+            prepare_phone_oauth=not rotate_mfa_planned,
         )
         if not ok:
             result.error_message = str(
@@ -1483,6 +1600,7 @@ class RefreshTokenRegistrationEngine:
             return result
 
         rotation = None
+        post_mfa_rebuild_attempted = False
         enrollment_present, rotation = self._consume_mfa_enrollment(
             result=result,
             email_adapter=email_adapter,
@@ -1490,7 +1608,7 @@ class RefreshTokenRegistrationEngine:
         )
         if enrollment_present and rotation is None:
             return result
-        if self._existing_account_should_rotate_mfa() and not enrollment_present:
+        if rotate_mfa_planned and not enrollment_present:
             rotation = self._rotate_mfa_after_login(
                 result=result,
                 email_adapter=email_adapter,
@@ -1529,11 +1647,25 @@ class RefreshTokenRegistrationEngine:
                 )
             chatgpt_client.phone_oauth_resume_context = None
             chatgpt_client.phone_oauth_resume_error = (
-                "MFA 轮换后将从最新认证浏览器快照建立手机验证事务"
+                "MFA 轮换后正在当前认证会话中重建手机验证事务"
             )
             self._log(
-                "MFA 轮换后已作废旧手机 OAuth 预建事务，将使用最新会话继续"
+                "MFA 轮换后已作废旧手机 OAuth 预建事务，正在使用当前会话重建"
             )
+            self._prepare_phone_oauth_after_mfa_rotation(
+                chatgpt_client,
+                result.email,
+            )
+            post_mfa_rebuild_attempted = True
+        elif rotation is not None:
+            # A mandatory enrollment mutates MFA even when an explicit
+            # rotation was not planned; any pre-enrollment PKCE is stale.
+            chatgpt_client.phone_oauth_resume_context = None
+            self._prepare_phone_oauth_after_mfa_rotation(
+                chatgpt_client,
+                result.email,
+            )
+            post_mfa_rebuild_attempted = True
 
         prepared_context = getattr(
             chatgpt_client, "phone_oauth_resume_context", None
@@ -1645,6 +1777,9 @@ class RefreshTokenRegistrationEngine:
             "workspace_id": result.workspace_id,
             "phone_verification_required": True,
             "phone_oauth_ready": prepared_ready,
+            "post_mfa_phone_oauth_rebuild_attempted": (
+                post_mfa_rebuild_attempted
+            ),
             "phone_oauth_prepare_error": str(
                 getattr(chatgpt_client, "phone_oauth_resume_error", "") or ""
             ).strip(),

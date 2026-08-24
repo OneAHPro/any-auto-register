@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 
+from api.tasks import _chatgpt_phone_oauth_is_ready
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     CHATGPT_REGISTRATION_MODE_ACCESS_TOKEN_ONLY,
     CHATGPT_REGISTRATION_MODE_REFRESH_TOKEN,
@@ -136,6 +137,85 @@ class ChatGPTRegistrationModeAdapterTests(unittest.TestCase):
             "OAuth bootstrap failed",
         )
         self.assertNotIn("oauth_resume_context", account.extra)
+
+    def test_build_account_preserves_post_mfa_rebuild_marker_and_ready_v2(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "existing@example.com",
+                "password": "password",
+                "account_id": "acct-existing",
+                "access_token": "at-existing",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-existing",
+                "workspace_id": "ws-existing",
+                "source": "existing_account_web_login",
+                "metadata": {
+                    "phone_verification_required": True,
+                    "phone_oauth_ready": True,
+                    "post_mfa_phone_oauth_rebuild_attempted": True,
+                    "oauth_resume_context": {
+                        "version": 2,
+                        "code_verifier": "verifier",
+                        "oauth_state": "state",
+                        "flow_state": {"page_type": "add_phone"},
+                    },
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertTrue(account.extra["phone_oauth_ready"])
+        self.assertTrue(
+            account.extra["post_mfa_phone_oauth_rebuild_attempted"]
+        )
+        self.assertEqual(account.extra["oauth_resume_context"]["version"], 2)
+        self.assertTrue(_chatgpt_phone_oauth_is_ready(account))
+
+    def test_exhausted_post_mfa_metadata_blocks_legacy_browser_fallback(self):
+        adapter = build_chatgpt_registration_mode_adapter(
+            {"chatgpt_registration_mode": "refresh_token"}
+        )
+        result = type(
+            "Result",
+            (),
+            {
+                "email": "existing@example.com",
+                "password": "password",
+                "account_id": "acct-existing",
+                "access_token": "at-existing",
+                "refresh_token": "",
+                "id_token": "",
+                "session_token": "session-existing",
+                "workspace_id": "ws-existing",
+                "source": "existing_account_web_login",
+                "metadata": {
+                    "phone_verification_required": True,
+                    "phone_oauth_ready": False,
+                    "post_mfa_phone_oauth_rebuild_attempted": True,
+                    "oauth_resume_context": {},
+                    "oauth_browser_context": {
+                        "version": 1,
+                        "cookies": [
+                            {"name": "login_session", "value": "cookie"}
+                        ],
+                    },
+                },
+            },
+        )()
+
+        account = adapter.build_account(result, fallback_password="fallback")
+
+        self.assertTrue(
+            account.extra["post_mfa_phone_oauth_rebuild_attempted"]
+        )
+        self.assertFalse(_chatgpt_phone_oauth_is_ready(account))
 
     def test_access_token_only_adapter_passes_runtime_context_to_engine(self):
         created = {}
