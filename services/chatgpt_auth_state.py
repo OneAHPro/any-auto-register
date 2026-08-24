@@ -1053,6 +1053,162 @@ def clear_chatgpt_auth_failure(
         return _auth_snapshot(row)
 
 
+def _assert_rotation_journal_belongs_to_account(
+    account: AccountModel,
+    journal: ChatGPTMfaRotationJournalModel,
+    session: Session,
+) -> None:
+    account_email = str(account.email or "").strip().lower()
+    journal_email = str(journal.email or "").strip().lower()
+    if not account_email or not hmac.compare_digest(account_email, journal_email):
+        raise ChatGPTAuthIdentityConflict(
+            "ChatGPT MFA rotation journal identity does not match account"
+        )
+    resolved_account_id = resolve_chatgpt_auth_account_id(
+        account_email,
+        session=session,
+    )
+    if resolved_account_id != int(account.id or 0):
+        raise ChatGPTAuthIdentityConflict(
+            "ChatGPT MFA rotation journal account identity is not unique"
+        )
+
+def _commit_activated_rotation_journal(
+    account: AccountModel,
+    state: ChatGPTAuthState,
+    journal: ChatGPTMfaRotationJournalModel,
+    *,
+    password: str,
+    mailbox_context: Mapping[str, Any] | None,
+    session: Session,
+) -> ChatGPTAuthState:
+    """Project one remotely activated WAL record and consume it atomically."""
+
+    _assert_rotation_journal_belongs_to_account(account, journal, session)
+    if str(journal.status or "").strip().lower() != "activated":
+        raise ChatGPTMfaOperationConflict(
+            "ChatGPT MFA rotation journal is not remotely activated"
+        )
+    totp_secret = str(journal.totp_secret or "").strip()
+    recovery_code = str(journal.recovery_code or "").strip()
+    if not totp_secret:
+        raise ChatGPTMfaOperationConflict(
+            "ChatGPT MFA rotation journal has no TOTP credential"
+        )
+
+    current_operation = session.exec(
+        select(ChatGPTMfaOperationModel)
+        .where(ChatGPTMfaOperationModel.account_id == int(account.id))
+        .where(
+            ChatGPTMfaOperationModel.generation
+            == state.active_mfa_generation
+        )
+        .where(
+            ChatGPTMfaOperationModel.status
+            == ChatGPTMfaOperationStatus.COMMITTED.value
+        )
+    ).first()
+    if current_operation is not None and (
+        hmac.compare_digest(
+            str(current_operation.totp_secret or "").strip(),
+            totp_secret,
+        )
+        and hmac.compare_digest(
+            str(current_operation.recovery_code or "").strip(),
+            recovery_code,
+        )
+    ):
+        session.delete(journal)
+        session.flush()
+        return state
+
+    operation = stage_mfa_operation(
+        int(account.id),
+        str(account.email or ""),
+        totp_secret,
+        base_auth_version=state.auth_version,
+        session=session,
+    )
+    if not transition_mfa_operation(
+        operation.operation_id,
+        expected_state=ChatGPTMfaOperationStatus.STAGED,
+        new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
+        expected_generation=operation.generation,
+        recovery_code=recovery_code,
+        rotated_at=str(journal.rotated_at or "").strip(),
+        session=session,
+    ):
+        raise ChatGPTMfaOperationConflict(
+            "ChatGPT MFA proof changed before canonical promotion"
+        )
+    promoted = commit_auth_projection(
+        int(account.id),
+        expected_version=state.auth_version,
+        password=password,
+        mailbox_context=mailbox_context,
+        active_operation_id=operation.operation_id,
+        session=session,
+    )
+    session.delete(journal)
+    session.flush()
+    return promoted
+
+
+def reconcile_activated_chatgpt_mfa_rotation(
+    account_id: int,
+    *,
+    session: Session | None = None,
+) -> ChatGPTAuthState | None:
+    """Recover an activated MFA WAL record before any credential login.
+
+    The journal is written before the remote mutation and marked ``activated``
+    immediately after it.  It therefore remains the recovery authority when a
+    process exits before the normal Account projection can be promoted.
+    """
+
+    normalized_id = _normalize_account_id(account_id)
+    with _session_scope(session) as (active_session, owns_session):
+        account = active_session.get(AccountModel, normalized_id)
+        if account is None or str(account.platform or "").strip().lower() != "chatgpt":
+            raise ChatGPTAuthIdentityConflict("ChatGPT account identity is missing")
+        journal = active_session.exec(
+            select(ChatGPTMfaRotationJournalModel)
+            .where(
+                func.lower(ChatGPTMfaRotationJournalModel.email)
+                == str(account.email or "").strip().lower()
+            )
+            .where(ChatGPTMfaRotationJournalModel.status == "activated")
+        ).first()
+        if journal is None:
+            return None
+
+        extra = dict(account.get_extra() or {})
+        mailbox_context = extra.get("mailbox_login_context")
+        context = (
+            dict(mailbox_context)
+            if isinstance(mailbox_context, Mapping)
+            else {}
+        )
+        context_extra = dict(context.get("extra") or {})
+        password = str(account.password or context_extra.get("password") or "")
+        state = ensure_chatgpt_auth_state(
+            normalized_id,
+            primary_confirmed=bool(password),
+            session=active_session,
+        )
+        recovered = _commit_activated_rotation_journal(
+            account,
+            state,
+            journal,
+            password=password,
+            mailbox_context=context or None,
+            session=active_session,
+        )
+        if owns_session:
+            active_session.commit()
+        return recovered
+
+
 def promote_successful_chatgpt_account_auth(
     account_id: int,
     *,
@@ -1063,7 +1219,10 @@ def promote_successful_chatgpt_account_auth(
     This is the compatibility bridge for first-login flows that still build an
     ``AccountModel`` projection before a local account id exists.  It runs only
     after that authenticated result is saved, so imported/staged TOTP material
-    is never promoted merely because it is present in the mailbox pool.
+    is never promoted merely because it is present in the mailbox pool.  A
+    later MFA generation replaces an existing canonical factor only when its
+    activated write-ahead journal exactly matches the saved projection; that
+    journal is consumed in the same transaction as the canonical replacement.
     """
     normalized_id = _normalize_account_id(account_id)
     with _session_scope(session) as (active_session, owns_session):
@@ -1088,11 +1247,65 @@ def promote_successful_chatgpt_account_auth(
             primary_confirmed=bool(password),
             session=active_session,
         )
+        rotation_journal = active_session.exec(
+            select(ChatGPTMfaRotationJournalModel)
+            .where(
+                func.lower(ChatGPTMfaRotationJournalModel.email)
+                == str(account.email or "").strip().lower()
+            )
+        ).first()
+        confirmed_rotation = None
+        if rotation_journal is not None:
+            journal_secret = str(rotation_journal.totp_secret or "").strip()
+            journal_recovery = str(rotation_journal.recovery_code or "").strip()
+            journal_matches_projection = (
+                hmac.compare_digest(journal_secret, totp_secret)
+                and hmac.compare_digest(journal_recovery, recovery_code)
+            )
+            if (
+                str(rotation_journal.status or "").strip().lower() != "activated"
+                or not journal_matches_projection
+            ):
+                raise ChatGPTMfaOperationConflict(
+                    "ChatGPT MFA rotation journal is not eligible for promotion"
+                )
+            confirmed_rotation = rotation_journal
+
+        if confirmed_rotation is not None:
+            promoted = _commit_activated_rotation_journal(
+                account,
+                state,
+                confirmed_rotation,
+                password=password,
+                mailbox_context=context or None,
+                session=active_session,
+            )
+            if owns_session:
+                active_session.commit()
+            return promoted
+
         current_candidate = _candidate_in_session(normalized_id, active_session)
-        # Once a generation is canonical and committed, an older mailbox
-        # projection is only a compatibility view.  Never let that stale copy
-        # replace the active factor after a duplicate/imported login.
-        if not totp_secret or current_candidate is not None:
+        if not totp_secret:
+            if owns_session:
+                active_session.commit()
+            return state
+
+        if current_candidate is not None:
+            candidate_matches_projection = (
+                hmac.compare_digest(current_candidate.totp_secret, totp_secret)
+                and hmac.compare_digest(
+                    current_candidate.recovery_code,
+                    recovery_code,
+                )
+            )
+            if candidate_matches_projection:
+                if owns_session:
+                    active_session.commit()
+                return state
+            # A committed generation may only be replaced by the exact secret
+            # and recovery code recorded after remote activation.  Account.extra
+            # alone remains a compatibility projection and is not proof that a
+            # later MFA enrollment succeeded.
             if owns_session:
                 active_session.commit()
             return state
@@ -1110,6 +1323,7 @@ def promote_successful_chatgpt_account_auth(
             new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
             expected_generation=operation.generation,
             recovery_code=recovery_code,
+            rotated_at=str(context_extra.get("mfa_rotated_at") or "").strip(),
             session=active_session,
         ):
             raise ChatGPTMfaOperationConflict(

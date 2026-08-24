@@ -41,6 +41,7 @@ from services.chatgpt_auth_state import (
     clear_chatgpt_auth_failure,
     load_chatgpt_auth_state,
     load_login_mfa_candidate,
+    reconcile_activated_chatgpt_mfa_rotation,
     record_chatgpt_auth_failure,
 )
 from services.chatgpt_account_coordination import (
@@ -513,6 +514,13 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
         email = _text(account.email)
         if not email:
             raise RuntimeError("ChatGPT 账号邮箱未填写")
+        recovered_rotation = reconcile_activated_chatgpt_mfa_rotation(
+            normalized_id,
+            session=session,
+        )
+        if recovered_rotation is not None:
+            session.commit()
+            session.refresh(account)
         extra = dict(account.get_extra() or {})
         mailbox_context = extra.get("mailbox_login_context")
         context_changed = False
@@ -2624,17 +2632,6 @@ def _relogin_chatgpt_account_locked(
             expected_created_at=saved["created_at"],
         )
         _promote_successful_auth_identity(saved)
-        if rotate_mfa:
-            try:
-                from core.db import finalize_chatgpt_mfa_rotation
-
-                finalize_chatgpt_mfa_rotation(saved["email"])
-            except Exception as exc:
-                _emit_observer(
-                    log_fn,
-                    "MFA 已保存到账号，但写前记录清理失败，将在后续自动恢复"
-                    f"（{type(exc).__name__}）",
-                )
         _emit_observer(log_fn, "已获取并保存全新的 Access Token / Refresh Token")
     except ChatGPTAccountDeactivatedError:
         if saved is None:

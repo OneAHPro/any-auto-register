@@ -24,6 +24,7 @@ from core.base_platform import Account, AccountStatus, BasePlatform
 from core.sms_pool import SmsPoolExhaustedError
 from core.task_runtime import StopTaskRequested
 from platforms.chatgpt.leadbee_runtime import LeadBeeCapacityExhausted
+from services.chatgpt_auth_state import ChatGPTMfaOperationConflict
 
 
 class _LoginMailbox:
@@ -992,6 +993,7 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
         saved_account_ids=None,
         sms_mode="",
         capacity_error=False,
+        promotion_error=None,
     ):
         req = RegisterTaskRequest(
             platform="chatgpt",
@@ -1092,6 +1094,11 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
             patch(
                 "core.db.save_account_with_creation_state",
                 side_effect=save_account_with_creation_state,
+            ),
+            patch(
+                "services.chatgpt_auth_state."
+                "promote_successful_chatgpt_account_auth",
+                side_effect=promotion_error,
             ),
             patch(
                 "core.db.delete_incomplete_chatgpt_account",
@@ -1894,6 +1901,32 @@ class ExistingAccountLoginWithPhoneTaskTests(unittest.TestCase):
 
         self.assertEqual(snapshot["success"], 0)
         cleanup_incomplete.assert_not_called()
+
+    def test_mfa_canonical_promotion_conflict_stops_before_leadbee(self):
+        (
+            snapshot,
+            saved,
+            complete,
+            _save_task_log,
+            cleanup_incomplete,
+        ) = self._run(
+            "task-chatgpt-mfa-promotion-conflict",
+            count=1,
+            promotion_error=ChatGPTMfaOperationConflict(
+                "MFA canonical generation conflict"
+            ),
+            completion=lambda **_: self.fail(
+                "LeadBee must not start before canonical MFA promotion"
+            ),
+        )
+
+        self.assertEqual(snapshot["success"], 0)
+        self.assertEqual(len(snapshot["errors"]), 1)
+        self.assertEqual(len(saved), 1)
+        complete.assert_not_called()
+        cleanup_incomplete.assert_not_called()
+        self.assertEqual(_LoginMailbox.marked_used, [])
+        self.assertNotIn("开始自动接码", "\n".join(snapshot["logs"]))
 
     def test_unprepared_phone_oauth_saves_access_token_without_starting_leadbee(self):
         _ExistingAccountPlatform.phone_oauth_ready = False

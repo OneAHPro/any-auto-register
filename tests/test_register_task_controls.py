@@ -182,6 +182,11 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         )
         identity_lock.start()
         self.addCleanup(identity_lock.stop)
+        auth_promotion = patch(
+            "services.chatgpt_auth_state.promote_successful_chatgpt_account_auth"
+        )
+        auth_promotion.start()
+        self.addCleanup(auth_promotion.stop)
         for target in (
             "core.proxy_pool.proxy_pool.report_success",
             "core.proxy_pool.proxy_pool.report_fail",

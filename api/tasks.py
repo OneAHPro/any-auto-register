@@ -4952,18 +4952,31 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 # leased forever, while keeping the credential+MFA promotion
                 # canonical for all import formats (including
                 # ``email----mailbox-url`` records).
-                try:
-                    saved_id = int(getattr(saved_account, "id", 0) or 0)
-                    if saved_id > 0:
+                saved_id = int(getattr(saved_account, "id", 0) or 0)
+                if saved_id > 0:
+                    try:
                         promote_successful_chatgpt_account_auth(saved_id)
+                    except Exception:
+                        # Remote MFA may already have changed.  Keep the saved
+                        # account and its write-ahead journal intact, fail this
+                        # attempt, and never start the phone provider against
+                        # an uncommitted canonical credential generation.
+                        preserve_incomplete_account = True
+                        raise
+                try:
                     mark_claimed = getattr(_mailbox, "mark_account_used", None)
-                    if saved_id > 0 and callable(mark_claimed):
+                    if (
+                        saved_id > 0
+                        and not _bind_phone_and_get_rt
+                        and callable(mark_claimed)
+                    ):
                         marked = mark_claimed(saved_account)
                         if marked is False:
                             _log(
                                 task_id,
                                 "[WARN] 邮箱租约绑定未确认；保留当前租约，避免重复分配",
                             )
+                    if saved_id > 0:
                         context = (
                             (saved_account.get_extra() or {}).get(
                                 "mailbox_login_context"
@@ -4999,18 +5012,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 except Exception as exc:
                     _log(
                         task_id,
-                        "[WARN] 登录凭据已保存，但 MFA/邮箱租约绑定待后续恢复"
+                        "[WARN] 登录凭据与 MFA 已保存，但邮箱租约绑定待后续恢复"
                         f"（{type(exc).__name__}）",
-                    )
-                try:
-                    from core.db import finalize_chatgpt_mfa_rotation
-
-                    finalize_chatgpt_mfa_rotation(account.email)
-                except Exception as exc:
-                    _log(
-                        task_id,
-                        "[WARN] 账号已保存，但 MFA 写前记录清理失败；"
-                        f"下次登录将自动核对（{type(exc).__name__}）",
                     )
                 if _proxy:
                     _proxy_pool.report_success(_proxy)

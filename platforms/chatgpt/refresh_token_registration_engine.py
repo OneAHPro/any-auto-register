@@ -430,6 +430,7 @@ class RefreshTokenRegistrationEngine:
             self.email_info["email"] = email_value
             self.email = email_value
             if existing_account_login_only:
+                auth_engine = self.extra_config.get("_chatgpt_auth_engine")
                 local_account_id = (
                     self.extra_config.get("chatgpt_local_account_id")
                     or self.email_info.get("chatgpt_local_account_id")
@@ -438,7 +439,6 @@ class RefreshTokenRegistrationEngine:
                 # engine (tests and maintenance workers do this deliberately).
                 # Resolve the identity in that same database when supplied;
                 # otherwise retain the canonical Task1 resolver.
-                auth_engine = self.extra_config.get("_chatgpt_auth_engine")
                 if auth_engine is not None:
                     with Session(auth_engine) as auth_session:
                         resolved_account_id = resolve_chatgpt_auth_account_id(
@@ -505,6 +505,36 @@ class RefreshTokenRegistrationEngine:
                     self.email_info.pop("totp_url", None)
                     self._log(
                         "已加载账号确认生效的 MFA 凭据继续登录"
+                    )
+                activated_rotation = load_chatgpt_mfa_rotation(
+                    email_value,
+                    database_engine=auth_engine,
+                )
+                if (
+                    str(activated_rotation.get("status") or "").strip().lower()
+                    == "activated"
+                    and str(activated_rotation.get("totp_secret") or "").strip()
+                ):
+                    # The WAL is written before the remote mutation and marked
+                    # activated immediately after it.  It is therefore the only
+                    # durable source when the process exits before AccountModel
+                    # is first created, and must override an older pool snapshot.
+                    self.email_info["totp_secret"] = str(
+                        activated_rotation.get("totp_secret") or ""
+                    ).strip()
+                    self.email_info["mfa_recovery_code"] = str(
+                        activated_rotation.get("recovery_code") or ""
+                    ).strip()
+                    self.email_info["chatgpt_mfa_managed"] = True
+                    self.email_info["mfa_rotated_at"] = str(
+                        activated_rotation.get("rotated_at") or ""
+                    ).strip()
+                    self.email_info.pop("totp_url", None)
+                    self.email_info.pop("mfa_secret", None)
+                    self.email_info.pop("totp", None)
+                    self._log(
+                        "检测到上次进程中断前已激活的 MFA；"
+                        "已恢复该代凭据继续登录"
                     )
                 account_type = str(
                     self.email_info.get("account_type") or ""

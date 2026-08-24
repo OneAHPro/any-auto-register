@@ -18,12 +18,14 @@ from core.db import (
 from services.chatgpt_auth_state import (
     ChatGPTAuthIdentityConflict,
     ChatGPTAuthVersionConflict,
+    ChatGPTMfaOperationConflict,
     commit_auth_projection,
     clear_chatgpt_auth_failure,
     ensure_chatgpt_auth_state,
     load_login_mfa_candidate,
     load_login_mfa_candidate_by_email,
     quarantine_legacy_staged_journals,
+    reconcile_activated_chatgpt_mfa_rotation,
     promote_successful_chatgpt_account_auth,
     record_chatgpt_auth_failure,
     resolve_chatgpt_auth_account_id,
@@ -736,3 +738,449 @@ def test_successful_legacy_login_promotes_password_totp_to_canonical_state(
     assert candidate is not None
     assert candidate.totp_secret == "REMOTE-VERIFIED-TOTP"
     assert candidate.recovery_code == "REMOTE-RECOVERY"
+
+
+def test_confirmed_rotation_journal_replaces_existing_canonical_mfa_generation(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "OLD-REMOTE-TOTP",
+                        "mfa_recovery_code": "OLD-REMOTE-RECOVERY",
+                        "chatgpt_mfa_managed": True,
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+
+        first = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        first_candidate = load_login_mfa_candidate(7, session=session)
+        assert first_candidate is not None
+
+        account = session.get(AccountModel, 7)
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "provider": "microsoft",
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "NEW-REMOTE-TOTP",
+                        "mfa_recovery_code": "NEW-REMOTE-RECOVERY",
+                        "chatgpt_mfa_managed": True,
+                        "mfa_rotated_at": "2026-08-24T13:50:37+00:00",
+                    },
+                }
+            }
+        )
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="NEW-REMOTE-TOTP",
+                recovery_code="NEW-REMOTE-RECOVERY",
+                status="activated",
+                rotated_at="2026-08-24T13:50:37+00:00",
+            )
+        )
+        session.add(account)
+        session.commit()
+
+        promoted = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        candidate = load_login_mfa_candidate(7, session=session)
+        journal = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == "demo@example.com"
+            )
+        ).first()
+
+    assert promoted.auth_version == first.auth_version + 1
+    assert candidate is not None
+    assert candidate.generation != first_candidate.generation
+    assert candidate.totp_secret == "NEW-REMOTE-TOTP"
+    assert candidate.recovery_code == "NEW-REMOTE-RECOVERY"
+    assert journal is None
+
+
+def test_unconfirmed_rotation_journal_cannot_replace_existing_canonical_mfa(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "OLD-REMOTE-TOTP",
+                        "mfa_recovery_code": "OLD-REMOTE-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+        first = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        first_candidate = load_login_mfa_candidate(7, session=session)
+
+        account = session.get(AccountModel, 7)
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "UNCONFIRMED-TOTP",
+                        "mfa_recovery_code": "UNCONFIRMED-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="UNCONFIRMED-TOTP",
+                recovery_code="UNCONFIRMED-RECOVERY",
+                status="staged",
+            )
+        )
+        session.add(account)
+        session.commit()
+
+        with pytest.raises(ChatGPTMfaOperationConflict):
+            promote_successful_chatgpt_account_auth(7, session=session)
+        session.rollback()
+        candidate = load_login_mfa_candidate(7, session=session)
+        journal = session.exec(
+            select(ChatGPTMfaRotationJournalModel).where(
+                ChatGPTMfaRotationJournalModel.email == "demo@example.com"
+            )
+        ).one()
+
+    assert candidate is not None
+    assert first_candidate is not None
+    assert candidate.generation == first_candidate.generation
+    assert candidate.totp_secret == "OLD-REMOTE-TOTP"
+    assert candidate.recovery_code == "OLD-REMOTE-RECOVERY"
+    assert journal.status == "staged"
+
+
+def test_confirmed_rotation_promotion_and_journal_consumption_roll_back_together(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "OLD-REMOTE-TOTP",
+                        "mfa_recovery_code": "OLD-REMOTE-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+        promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+
+        account = session.get(AccountModel, 7)
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "NEW-REMOTE-TOTP",
+                        "mfa_recovery_code": "NEW-REMOTE-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="NEW-REMOTE-TOTP",
+                recovery_code="NEW-REMOTE-RECOVERY",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        promote_successful_chatgpt_account_auth(7, session=session)
+        in_transaction = load_login_mfa_candidate(7, session=session)
+        assert in_transaction is not None
+        assert in_transaction.totp_secret == "NEW-REMOTE-TOTP"
+        assert session.exec(
+            select(ChatGPTMfaRotationJournalModel)
+        ).first() is None
+        session.rollback()
+
+    with Session(database_engine) as session:
+        candidate = load_login_mfa_candidate(7, session=session)
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).one()
+
+    assert candidate is not None
+    assert candidate.totp_secret == "OLD-REMOTE-TOTP"
+    assert journal.status == "activated"
+    assert journal.totp_secret == "NEW-REMOTE-TOTP"
+
+
+def test_matching_confirmed_journal_is_consumed_idempotently(database_engine):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "REMOTE-TOTP",
+                        "mfa_recovery_code": "REMOTE-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+        first = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="REMOTE-TOTP",
+                recovery_code="REMOTE-RECOVERY",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        replayed = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).first()
+        candidate = load_login_mfa_candidate(7, session=session)
+
+    assert replayed.auth_version == first.auth_version
+    assert journal is None
+    assert candidate is not None
+    assert candidate.totp_secret == "REMOTE-TOTP"
+
+
+def test_replayed_journal_preserves_consumed_recovery_code_state(database_engine):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "REMOTE-TOTP",
+                        "mfa_recovery_code": "REMOTE-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+        first = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        active = session.exec(
+            select(ChatGPTMfaOperationModel).where(
+                ChatGPTMfaOperationModel.generation
+                == first.active_mfa_generation
+            )
+        ).one()
+        active.recovery_code_state = "consumed"
+        session.add(active)
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="REMOTE-TOTP",
+                recovery_code="REMOTE-RECOVERY",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        replayed = reconcile_activated_chatgpt_mfa_rotation(
+            7,
+            session=session,
+        )
+        session.commit()
+        operations = session.exec(
+            select(ChatGPTMfaOperationModel).where(
+                ChatGPTMfaOperationModel.account_id == 7
+            )
+        ).all()
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).first()
+
+    assert replayed is not None
+    assert replayed.auth_version == first.auth_version
+    assert len(operations) == 1
+    assert operations[0].recovery_code_state == "consumed"
+    assert journal is None
+
+
+def test_activated_rotation_journal_is_not_consumed_for_duplicate_account_identity(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        _create_chatgpt_account(session, account_id=7, email="duplicate@example.com")
+        _create_chatgpt_account(session, account_id=8, email="duplicate@example.com")
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="duplicate@example.com",
+                totp_secret="REMOTE-TOTP",
+                recovery_code="REMOTE-RECOVERY",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        with pytest.raises(ChatGPTAuthIdentityConflict):
+            reconcile_activated_chatgpt_mfa_rotation(7, session=session)
+        session.rollback()
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).one()
+        operations = session.exec(select(ChatGPTMfaOperationModel)).all()
+
+    assert journal.status == "activated"
+    assert operations == []
+
+
+def test_confirmed_rotation_with_empty_recovery_code_replaces_canonical_mfa(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        account = _create_chatgpt_account(session, password="PRIMARY-PASSWORD")
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "OLD-TOTP",
+                        "mfa_recovery_code": "OLD-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+        promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+
+        account = session.get(AccountModel, 7)
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "demo@example.com",
+                    "extra": {
+                        "password": "PRIMARY-PASSWORD",
+                        "totp_secret": "INHOUSE-TOTP",
+                        "mfa_recovery_code": "",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="INHOUSE-TOTP",
+                recovery_code="",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        candidate = load_login_mfa_candidate(7, session=session)
+
+    assert candidate is not None
+    assert candidate.totp_secret == "INHOUSE-TOTP"
+    assert candidate.recovery_code == ""
+
+
+def test_first_login_promotes_activated_journal_created_before_account_row(
+    database_engine,
+):
+    with Session(database_engine) as session:
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="first-login@example.com",
+                totp_secret="FIRST-LOGIN-TOTP",
+                recovery_code="FIRST-LOGIN-RECOVERY",
+                status="activated",
+            )
+        )
+        session.commit()
+        account = _create_chatgpt_account(
+            session,
+            account_id=7,
+            email="first-login@example.com",
+            password="FIRST-LOGIN-PASSWORD",
+        )
+        account.set_extra(
+            {
+                "mailbox_login_context": {
+                    "email": "first-login@example.com",
+                    "extra": {
+                        "password": "FIRST-LOGIN-PASSWORD",
+                        "totp_secret": "FIRST-LOGIN-TOTP",
+                        "mfa_recovery_code": "FIRST-LOGIN-RECOVERY",
+                    },
+                }
+            }
+        )
+        session.add(account)
+        session.commit()
+
+        promoted = promote_successful_chatgpt_account_auth(7, session=session)
+        session.commit()
+        candidate = load_login_mfa_candidate(7, session=session)
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).first()
+
+    assert promoted.mfa_state.value == "active"
+    assert candidate is not None
+    assert candidate.totp_secret == "FIRST-LOGIN-TOTP"
+    assert journal is None
+
+
+def test_activated_journal_without_totp_is_preserved_and_rejected(database_engine):
+    with Session(database_engine) as session:
+        _create_chatgpt_account(session)
+        session.add(
+            ChatGPTMfaRotationJournalModel(
+                email="demo@example.com",
+                totp_secret="",
+                recovery_code="RECOVERY-MUST-NOT-BE-CONSUMED",
+                status="activated",
+            )
+        )
+        session.commit()
+
+        with pytest.raises(ChatGPTMfaOperationConflict):
+            reconcile_activated_chatgpt_mfa_rotation(7, session=session)
+        session.rollback()
+        journal = session.exec(select(ChatGPTMfaRotationJournalModel)).one()
+
+    assert journal.status == "activated"
+    assert journal.recovery_code == "RECOVERY-MUST-NOT-BE-CONSUMED"

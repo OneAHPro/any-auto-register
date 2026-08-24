@@ -1,10 +1,12 @@
 import types
 import unittest
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
-from sqlmodel import SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.db import (
+    ChatGPTMfaRotationJournalModel,
     finalize_chatgpt_mfa_rotation,
     load_chatgpt_mfa_rotation,
     mark_chatgpt_mfa_rotation_activated,
@@ -340,6 +342,39 @@ class ChatGPTMfaManagerTests(unittest.TestCase):
 
 
 class ChatGPTMfaCredentialPersistenceTests(unittest.TestCase):
+    def test_restaging_existing_rotation_resets_its_identity_time_fence(self):
+        database_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(database_engine)
+        stage_chatgpt_mfa_rotation(
+            "demo@example.com",
+            "FIRST-SECRET",
+            database_engine=database_engine,
+        )
+        stale_created_at = datetime.now(timezone.utc) - timedelta(days=30)
+        with Session(database_engine) as session:
+            row = session.exec(select(ChatGPTMfaRotationJournalModel)).one()
+            row.created_at = stale_created_at
+            row.updated_at = stale_created_at
+            session.add(row)
+            session.commit()
+
+        stage_chatgpt_mfa_rotation(
+            "demo@example.com",
+            "SECOND-SECRET",
+            database_engine=database_engine,
+        )
+
+        with Session(database_engine) as session:
+            row = session.exec(select(ChatGPTMfaRotationJournalModel)).one()
+        normalized_created_at = row.created_at
+        if normalized_created_at.tzinfo is None:
+            normalized_created_at = normalized_created_at.replace(
+                tzinfo=timezone.utc
+            )
+        self.assertGreater(normalized_created_at, stale_created_at)
+        self.assertEqual(row.totp_secret, "SECOND-SECRET")
+        self.assertEqual(row.status, "staged")
+
     def test_rotation_journal_survives_activation_until_account_is_persisted(self):
         database_engine = create_engine("sqlite://")
         SQLModel.metadata.create_all(database_engine)

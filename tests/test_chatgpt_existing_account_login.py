@@ -6,6 +6,8 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from core.db import (
     AccountModel,
+    load_chatgpt_mfa_rotation,
+    mark_chatgpt_mfa_rotation_activated,
     stage_chatgpt_mfa_rotation,
     update_chatgpt_mfa_rotation_recovery_code,
 )
@@ -2307,6 +2309,43 @@ class ExistingAccountLoginTests(unittest.TestCase):
         emitted = "\n".join(engine.logs)
         self.assertNotIn("LEGACY-STAGED-TOTP", emitted)
         self.assertNotIn("LEGACY-STAGED-RECOVERY", emitted)
+
+    def test_activated_journal_recovers_mfa_before_local_account_exists(self):
+        database_engine = create_engine("sqlite://")
+        SQLModel.metadata.create_all(database_engine)
+        stage_chatgpt_mfa_rotation(
+            "mfa-user@icloud.com",
+            "RECOVERED-ACTIVATED-TOTP",
+            database_engine=database_engine,
+        )
+        mark_chatgpt_mfa_rotation_activated(
+            "mfa-user@icloud.com",
+            rotated_at="2026-08-24T13:50:37+00:00",
+            database_engine=database_engine,
+        )
+        update_chatgpt_mfa_rotation_recovery_code(
+            "mfa-user@icloud.com",
+            "RECOVERED-ACTIVATED-RECOVERY",
+            database_engine=database_engine,
+        )
+        engine = self._make_engine(email_service=PasswordTotpEmailService())
+        engine.extra_config["_chatgpt_auth_engine"] = database_engine
+
+        created = engine._create_email(existing_account_login_only=True)
+
+        self.assertTrue(created)
+        self.assertEqual(engine.totp_secret, "RECOVERED-ACTIVATED-TOTP")
+        self.assertEqual(
+            engine.email_info["mfa_recovery_code"],
+            "RECOVERED-ACTIVATED-RECOVERY",
+        )
+        self.assertEqual(
+            load_chatgpt_mfa_rotation(
+                "mfa-user@icloud.com",
+                database_engine=database_engine,
+            )["status"],
+            "activated",
+        )
 
     def test_explicit_local_account_id_must_match_login_email(self):
         database_engine = create_engine("sqlite://")

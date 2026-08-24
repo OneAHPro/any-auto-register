@@ -11,7 +11,12 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.base_mailbox import MailboxAccount, OutlookMailbox
-from core.db import AccountModel, ChatGPTAuthStateModel, OutlookAccountModel
+from core.db import (
+    AccountModel,
+    ChatGPTAuthStateModel,
+    ChatGPTMfaRotationJournalModel,
+    OutlookAccountModel,
+)
 from core.task_runtime import RegisterTaskControl, StopTaskRequested
 from platforms.chatgpt.oauth_client import OAuthClient
 from platforms.chatgpt.auth_outcomes import AuthFailureDomain, EmailBackendError
@@ -21,6 +26,7 @@ from services.chatgpt_auth_state import (
     ChatGPTMfaOperationStatus,
     commit_auth_projection,
     ensure_chatgpt_auth_state,
+    load_login_mfa_candidate,
     stage_mfa_operation,
     transition_mfa_operation,
 )
@@ -272,6 +278,90 @@ class ChatGPTReloginTests(unittest.TestCase):
             context_extra["mfa_recovery_code"],
             "CANONICAL-RECOVERY",
         )
+
+    def test_load_saved_account_recovers_activated_rotation_after_process_crash(self):
+        email = "crash-recovery@example.com"
+        account_id = self._add_eligibility_account(
+            email,
+            password="canonical-password",
+            extra={
+                "refresh_token": "saved-chatgpt-rt",
+                "mailbox_login_context": {
+                    "provider": "chatgpt_credentials",
+                    "email": email,
+                    "extra": {
+                        "account_type": "chatgpt_password_totp",
+                        "password": "canonical-password",
+                        "totp_secret": "OLD-CANONICAL-SECRET",
+                        "mfa_recovery_code": "OLD-CANONICAL-RECOVERY",
+                    },
+                },
+            },
+        )
+        with Session(self.engine) as session:
+            state = ensure_chatgpt_auth_state(
+                account_id,
+                primary_confirmed=True,
+                session=session,
+            )
+            operation = stage_mfa_operation(
+                account_id,
+                email,
+                "OLD-CANONICAL-SECRET",
+                base_auth_version=state.auth_version,
+                session=session,
+            )
+            self.assertTrue(
+                transition_mfa_operation(
+                    operation.operation_id,
+                    expected_state=ChatGPTMfaOperationStatus.STAGED,
+                    new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
+                    expected_generation=operation.generation,
+                    recovery_code="OLD-CANONICAL-RECOVERY",
+                    session=session,
+                )
+            )
+            commit_auth_projection(
+                account_id,
+                expected_version=state.auth_version,
+                active_operation_id=operation.operation_id,
+                session=session,
+            )
+            session.commit()
+
+            # Simulate a process exit after remote MFA activation and durable
+            # journal persistence, but before the account projection/promotion
+            # transaction could complete.
+            session.add(
+                ChatGPTMfaRotationJournalModel(
+                    email=email,
+                    totp_secret="NEW-ACTIVATED-SECRET",
+                    recovery_code="NEW-ACTIVATED-RECOVERY",
+                    status="activated",
+                    rotated_at="2026-08-24T13:50:37+00:00",
+                )
+            )
+            session.commit()
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+
+        context_extra = saved["mailbox_context"]["extra"]
+        self.assertEqual(context_extra["totp_secret"], "NEW-ACTIVATED-SECRET")
+        self.assertEqual(
+            context_extra["mfa_recovery_code"],
+            "NEW-ACTIVATED-RECOVERY",
+        )
+        with Session(self.engine) as session:
+            candidate = load_login_mfa_candidate(account_id, session=session)
+            journal = session.exec(
+                select(ChatGPTMfaRotationJournalModel).where(
+                    ChatGPTMfaRotationJournalModel.email == email
+                )
+            ).first()
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate.totp_secret, "NEW-ACTIVATED-SECRET")
+        self.assertIsNone(journal)
 
     def test_password_totp_context_is_eligible(self):
         account_id = self._add_eligibility_account(
@@ -2239,6 +2329,54 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertTrue(result["relogin_ok"])
         self.assertTrue(result["mfa_rotated"])
         self.assertEqual(result["stage"], "codex2api_sync")
+
+    def test_relogin_does_not_blindly_delete_unconsumed_mfa_rotation_journal(self):
+        with Session(self.engine) as session:
+            session.add(
+                ChatGPTMfaRotationJournalModel(
+                    email="demo@example.com",
+                    totp_secret="NEW-REMOTE-TOTP",
+                    recovery_code="NEW-REMOTE-RECOVERY",
+                    status="activated",
+                    rotated_at="2026-08-24T13:50:37+00:00",
+                )
+            )
+            session.commit()
+
+        tokens = self._fresh_tokens()
+        tokens["metadata"] = {
+            "mfa_rotation": {
+                "managed": True,
+                "rotated_at": "2026-08-24T13:50:37+00:00",
+            }
+        }
+        with mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ), mock.patch(
+            "services.chatgpt_relogin.reconcile_activated_chatgpt_mfa_rotation",
+            return_value=None,
+        ), mock.patch(
+            "services.chatgpt_relogin._promote_successful_auth_identity",
+            return_value=None,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ), mock.patch(
+            "core.db.finalize_chatgpt_mfa_rotation",
+        ) as finalizer, mock.patch("services.chatgpt_relogin.engine", self.engine):
+            result = relogin_chatgpt_account(self.account_id, rotate_mfa=True)
+
+        self.assertTrue(result["ok"])
+        finalizer.assert_not_called()
+        with Session(self.engine) as session:
+            journal = session.exec(
+                select(ChatGPTMfaRotationJournalModel).where(
+                    ChatGPTMfaRotationJournalModel.email == "demo@example.com"
+                )
+            ).one()
+        self.assertEqual(journal.status, "activated")
+        self.assertEqual(journal.totp_secret, "NEW-REMOTE-TOTP")
 
     def test_full_relogin_persists_password_changed_by_reset_flow(self):
         tokens = self._fresh_tokens()

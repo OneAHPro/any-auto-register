@@ -336,6 +336,7 @@ def stage_chatgpt_mfa_rotation(
     target_engine = database_engine or engine
     _ensure_chatgpt_mfa_rotation_journal(target_engine)
     with Session(target_engine) as session:
+        now = _utcnow()
         row = session.exec(
             select(ChatGPTMfaRotationJournalModel).where(
                 ChatGPTMfaRotationJournalModel.email == normalized_email
@@ -345,13 +346,19 @@ def stage_chatgpt_mfa_rotation(
             row = ChatGPTMfaRotationJournalModel(
                 email=normalized_email,
                 totp_secret=normalized_secret,
+                created_at=now,
+                updated_at=now,
             )
         else:
             row.totp_secret = normalized_secret
             row.recovery_code = ""
             row.status = "staged"
             row.rotated_at = ""
-            row.updated_at = _utcnow()
+            # The table is keyed by email, but every restage is a new WAL
+            # generation.  Reset its creation fence so a legitimate rotation
+            # after account recreation is not mistaken for a stale identity.
+            row.created_at = now
+            row.updated_at = now
         session.add(row)
         session.commit()
 

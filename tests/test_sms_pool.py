@@ -658,6 +658,11 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
         )
         identity_lock.start()
         self.addCleanup(identity_lock.stop)
+        auth_promotion = mock.patch(
+            "services.chatgpt_auth_state.promote_successful_chatgpt_account_auth"
+        )
+        auth_promotion.start()
+        self.addCleanup(auth_promotion.stop)
 
     @staticmethod
     def _pool_request(*, count=2):
