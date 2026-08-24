@@ -4453,14 +4453,19 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
     def _mailapi_history_item_code(cls, item: dict[str, Any]) -> str:
         import re
 
-        explicit = str(
-            item.get("verificationCode")
-            or item.get("verification_code")
-            or item.get("code")
-            or ""
-        ).strip()
-        if explicit:
-            return explicit
+        explicit_values = [
+            item.get("verificationCode"),
+            item.get("verification_code"),
+            item.get("code"),
+            item.get("otp"),
+        ]
+        codes = item.get("codes")
+        if isinstance(codes, list):
+            explicit_values.extend(codes[:10])
+        for value in explicit_values:
+            explicit = str(value or "").strip()
+            if re.fullmatch(r"\d{6}", explicit):
+                return explicit
 
         subject = " ".join(str(item.get("subject") or "").strip().split())
         if not re.search(
@@ -5393,6 +5398,82 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             )
         )
 
+    @classmethod
+    def _mailapi_javascript_page_api_url(
+        cls,
+        page_text: str,
+        source_url: str,
+        expected_email: str,
+    ) -> Optional[str]:
+        """Resolve the bounded same-origin JSON API used by an inbox shell."""
+        import re
+        import time
+        from urllib.parse import urlencode, urljoin, urlsplit, urlunsplit
+
+        raw = str(page_text or "")
+        source = urlsplit(str(source_url or ""))
+        if not source.path.startswith("/m/"):
+            return None
+        if not re.search(r"\bfetch\s*\(\s*api\b", raw):
+            return None
+        if not (
+            re.search(r"encodeURIComponent\s*\(\s*email\s*\)", raw)
+            and re.search(r"encodeURIComponent\s*\(\s*token\s*\)", raw)
+        ):
+            return None
+
+        def assigned_value(name: str) -> str:
+            match = re.search(
+                rf"\b(?:const|let|var)\s+{name}\s*=\s*"
+                rf"(?P<quote>['\"])(?P<value>.*?)(?P=quote)\s*;",
+                raw,
+                re.IGNORECASE | re.DOTALL,
+            )
+            return (
+                cls._decode_mailapi_script_string(match.group("value"))
+                if match
+                else ""
+            )
+
+        page_email = assigned_value("email").strip()
+        token = assigned_value("token").strip()
+        if (
+            not page_email
+            or page_email.lower() != str(expected_email or "").strip().lower()
+            or not token
+            or len(token) > 4096
+        ):
+            return None
+        endpoint_match = re.search(
+            r"(?P<quote>['\"])(?P<path>/api/messages)\?email=(?P=quote)",
+            raw,
+            re.IGNORECASE,
+        )
+        if endpoint_match is None:
+            return None
+        endpoint = urljoin(str(source_url or ""), endpoint_match.group("path"))
+        safe_endpoint = cls._mailapi_same_origin_url(endpoint, source_url)
+        if not safe_endpoint:
+            return None
+        parsed_endpoint = urlsplit(safe_endpoint)
+        query = urlencode(
+            {
+                "email": page_email,
+                "token": token,
+                "force": "1",
+                "t": str(int(time.time() * 1000)),
+            }
+        )
+        return urlunsplit(
+            (
+                parsed_endpoint.scheme,
+                parsed_endpoint.netloc,
+                parsed_endpoint.path,
+                query,
+                "",
+            )
+        )
+
     def _fetch_mailapi_text(self, account: MailboxAccount) -> str:
         from urllib.parse import urlsplit
 
@@ -5437,6 +5518,19 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
         ):
             return text
         source_url = str(getattr(response, "url", "") or url)
+        page_api_url = self._mailapi_javascript_page_api_url(
+            text,
+            source_url,
+            str(account.email or ""),
+        )
+        if page_api_url:
+            cookies = self._collect_mailapi_cookies(response)
+            api_response = self._request_mailapi(
+                page_api_url,
+                cookies=cookies,
+                timeout=5,
+            )
+            return str(api_response.text or "")
         naturalflower_api_url = self._naturalflower_mailbox_api_url(source_url)
         if naturalflower_api_url:
             cookies = self._collect_mailapi_cookies(response)
@@ -5896,6 +5990,7 @@ class OutlookMailbox(BaseMailbox):
             "lease_version": int(getattr(row, "lease_version", 0) or 0),
             "bound_account_id": int(getattr(row, "bound_account_id", 0) or 0),
             "bound_at": getattr(row, "bound_at", None),
+            "created_at": getattr(row, "created_at", None),
         }
 
     def _claim_account_payload(
@@ -6029,6 +6124,7 @@ class OutlookMailbox(BaseMailbox):
         lease_version = int(payload.get("lease_version") or 0)
         bound_account_id = int(payload.get("bound_account_id") or 0)
         lease_expires_at = payload.get("lease_expires_at")
+        created_at = payload.get("created_at")
         auth_mode = (
             "mailapi_url"
             if account_type == "mailapi_url"
@@ -6067,6 +6163,11 @@ class OutlookMailbox(BaseMailbox):
                     if isinstance(lease_expires_at, datetime)
                     else str(lease_expires_at or "")
                 ),
+                "_outlook_created_at": (
+                    created_at.isoformat()
+                    if isinstance(created_at, datetime)
+                    else str(created_at or "")
+                ),
             },
         )
         self._active_lease_account = account
@@ -6093,6 +6194,26 @@ class OutlookMailbox(BaseMailbox):
             bound_id = 0
         owner = str(extra.get("_outlook_lease_owner") or "").strip()
         return row_id, owner, version, bound_id
+
+    @classmethod
+    def _lease_created_at(cls, account: MailboxAccount) -> datetime | None:
+        extra = cls._lease_extra(account)
+        value = extra.get("_outlook_created_at")
+        if isinstance(value, datetime):
+            return value
+        text = str(value or "").strip()
+        if not text:
+            return None
+        try:
+            return datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _created_at_identity(value: Any) -> str:
+        if isinstance(value, datetime):
+            return value.isoformat()
+        return str(value or "").strip().replace("Z", "+00:00")
 
     @staticmethod
     def _set_lease_projection(
@@ -6131,6 +6252,9 @@ class OutlookMailbox(BaseMailbox):
         except (TypeError, ValueError):
             return False
         row_id, owner, version, _bound_id = self._lease_identity(account)
+        expected_created_at_identity = self._created_at_identity(
+            self._lease_extra(account).get("_outlook_created_at")
+        )
         if row_id <= 0 or local_account_id <= 0:
             return False
         mailbox_email = str(getattr(account, "email", "") or "").strip().lower()
@@ -6149,6 +6273,10 @@ class OutlookMailbox(BaseMailbox):
                 identity_exists = identity_query.exists()
                 row = session.get(OutlookAccountModel, row_id)
                 if row is None:
+                    return False
+                if expected_created_at_identity and self._created_at_identity(
+                    row.created_at
+                ) != expected_created_at_identity:
                     return False
                 current_version = int(row.lease_version or 0)
                 if (
@@ -6181,6 +6309,7 @@ class OutlookMailbox(BaseMailbox):
                         .where(OutlookAccountModel.state == "bound")
                         .where(OutlookAccountModel.bound_account_id == 0)
                         .where(OutlookAccountModel.lease_version == current_version)
+                        .where(OutlookAccountModel.created_at == row.created_at)
                         .where(identity_exists)
                         .values(
                             bound_account_id=local_account_id,
@@ -6215,6 +6344,7 @@ class OutlookMailbox(BaseMailbox):
                     .where(OutlookAccountModel.state == "leased")
                     .where(OutlookAccountModel.lease_owner == owner)
                     .where(OutlookAccountModel.lease_version == version)
+                    .where(OutlookAccountModel.created_at == row.created_at)
                     .where(identity_exists)
                     .values(
                         state="bound",
@@ -6249,6 +6379,7 @@ class OutlookMailbox(BaseMailbox):
         from core.db import OutlookAccountModel, engine
 
         row_id, owner, version, _bound_id = self._lease_identity(account)
+        expected_created_at = self._lease_created_at(account)
         if row_id <= 0 or not owner:
             return False
         state = "quarantined" if uncertain else "available"
@@ -6281,13 +6412,19 @@ class OutlookMailbox(BaseMailbox):
             )
         with self._lock:
             with Session(engine) as session:
-                result = session.exec(
+                query = (
                     update(OutlookAccountModel)
                     .where(OutlookAccountModel.id == row_id)
                     .where(OutlookAccountModel.state == "leased")
                     .where(OutlookAccountModel.lease_owner == owner)
                     .where(OutlookAccountModel.lease_version == version)
-                    .values(
+                )
+                if expected_created_at is not None:
+                    query = query.where(
+                        OutlookAccountModel.created_at == expected_created_at
+                    )
+                result = session.exec(
+                    query.values(
                         **credential_values,
                         state=state,
                         enabled=(state == "available"),
@@ -6325,6 +6462,7 @@ class OutlookMailbox(BaseMailbox):
         from core.db import OutlookAccountModel, engine
 
         row_id, owner, version, _bound_id = self._lease_identity(account)
+        expected_created_at = self._lease_created_at(account)
         if row_id <= 0 or not owner:
             return False
         try:
@@ -6335,14 +6473,20 @@ class OutlookMailbox(BaseMailbox):
         expires = now + timedelta(seconds=ttl)
         with self._lock:
             with Session(engine) as session:
-                result = session.exec(
+                query = (
                     update(OutlookAccountModel)
                     .where(OutlookAccountModel.id == row_id)
                     .where(OutlookAccountModel.state == "leased")
                     .where(OutlookAccountModel.lease_owner == owner)
                     .where(OutlookAccountModel.lease_version == version)
                     .where(OutlookAccountModel.lease_expires_at > now)
-                    .values(
+                )
+                if expected_created_at is not None:
+                    query = query.where(
+                        OutlookAccountModel.created_at == expected_created_at
+                    )
+                result = session.exec(
+                    query.values(
                         lease_expires_at=expires,
                         lease_version=version + 1,
                         updated_at=self._utcnow(),
@@ -6373,18 +6517,25 @@ class OutlookMailbox(BaseMailbox):
         from core.db import OutlookAccountModel, engine
 
         row_id, owner, version, _bound_id = self._lease_identity(account)
+        expected_created_at = self._lease_created_at(account)
         if row_id <= 0 or not owner:
             return False
         now = self._utcnow()
         with self._lock:
             with Session(engine) as session:
-                result = session.exec(
+                query = (
                     update(OutlookAccountModel)
                     .where(OutlookAccountModel.id == row_id)
                     .where(OutlookAccountModel.state == "leased")
                     .where(OutlookAccountModel.lease_owner == owner)
                     .where(OutlookAccountModel.lease_version == version)
-                    .values(
+                )
+                if expected_created_at is not None:
+                    query = query.where(
+                        OutlookAccountModel.created_at == expected_created_at
+                    )
+                result = session.exec(
+                    query.values(
                         state="bound",
                         enabled=False,
                         lease_owner="",
@@ -6479,6 +6630,7 @@ class OutlookMailbox(BaseMailbox):
         account_extra = dict(getattr(account, "extra", None) or {})
         mailapi_token = str(account_extra.get("mailapi_token") or "").strip()
         row_id, owner, version, bound_id = self._lease_identity(account)
+        expected_created_at = self._lease_created_at(account)
         if row_id <= 0:
             return False
         now = _utcnow()
@@ -6494,6 +6646,10 @@ class OutlookMailbox(BaseMailbox):
                 query = update(OutlookAccountModel).where(
                     OutlookAccountModel.id == row_id
                 ).where(OutlookAccountModel.lease_version == version)
+                if expected_created_at is not None:
+                    query = query.where(
+                        OutlookAccountModel.created_at == expected_created_at
+                    )
                 if owner:
                     query = query.where(OutlookAccountModel.state == "leased")
                     query = query.where(OutlookAccountModel.lease_owner == owner)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from core.base_mailbox import MailboxAccount, OutlookMailbox
 from core.db import AccountModel, ChatGPTAuthStateModel, OutlookAccountModel
@@ -1362,8 +1362,231 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertFalse(metadata_extra["password_reset_required"])
         self.assertEqual(
             metadata_extra["account_type"],
-            "chatgpt_password_reset_url_mail",
+            "chatgpt_password_totp",
         )
+
+    def test_context_only_mailapi_reset_persists_password_to_account(self):
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            account.password = ""
+            extra = account.get_extra()
+            extra["mailbox_login_context"] = {
+                "provider": "microsoft",
+                "email": account.email,
+                "account_id": account.email,
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": "https://mail.example.test/messages/token",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "mfa_recovery_code": "RECOVERY-CODE",
+                    "chatgpt_mfa_managed": True,
+                },
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox._generate_password_reset_password.return_value = (
+            "Reset-Password-2026!"
+        )
+        # These historical accounts no longer have an outlook_accounts row,
+        # so the mailbox backend cannot persist the new ChatGPT password.
+        mailbox.commit_password_reset.return_value = False
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(self.account_id)
+            with mock.patch(
+                "services.chatgpt_relogin.create_mailbox",
+                return_value=mailbox,
+            ):
+                service = _build_email_service(
+                    saved,
+                    {},
+                    log_fn=None,
+                    force_password_reset=True,
+                )
+            generated = service.create_email()["new_password"]
+            with Session(self.engine) as session:
+                account = session.get(AccountModel, self.account_id)
+                extra = account.get_extra()
+                extra["unrelated_probe"] = "preserved"
+                account.set_extra(extra)
+                account.updated_at = datetime(
+                    2030,
+                    1,
+                    2,
+                    3,
+                    4,
+                    5,
+                    tzinfo=timezone.utc,
+                )
+                session.add(account)
+                session.commit()
+            self.assertTrue(service.commit_password_reset(generated))
+            self.assertTrue(service.commit_password_reset(generated))
+
+        mailbox.commit_password_reset.assert_called_once()
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            self.assertEqual(account.password, generated)
+            account_extra = account.get_extra()
+            self.assertEqual(account_extra["unrelated_probe"], "preserved")
+            context_extra = account_extra["mailbox_login_context"]["extra"]
+            self.assertEqual(
+                context_extra["account_type"],
+                "chatgpt_password_totp",
+            )
+            self.assertEqual(context_extra["password"], generated)
+            self.assertFalse(context_extra["password_reset_required"])
+            self.assertEqual(
+                context_extra["mailapi_url"],
+                "https://mail.example.test/messages/token",
+            )
+            self.assertEqual(
+                context_extra["totp_secret"],
+                "JBSWY3DPEHPK3PXP",
+            )
+            self.assertEqual(
+                context_extra["mfa_recovery_code"],
+                "RECOVERY-CODE",
+            )
+            self.assertNotIn("new_password", context_extra)
+        with Session(self.engine) as session:
+            self.assertEqual(
+                len(session.exec(select(OutlookAccountModel)).all()),
+                0,
+            )
+
+    def test_canonical_mfa_without_password_bootstraps_through_mailapi(self):
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            account.password = ""
+            extra = account.get_extra()
+            extra["mailbox_login_context"] = {
+                "provider": "microsoft",
+                "email": account.email,
+                "account_id": account.email,
+                "extra": {
+                    "account_type": "mailapi_url",
+                    "mailapi_url": "https://mail.example.test/messages/token",
+                    "chatgpt_mfa_managed": True,
+                },
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.flush()
+            state = ensure_chatgpt_auth_state(
+                self.account_id,
+                primary_confirmed=True,
+                session=session,
+            )
+            operation = stage_mfa_operation(
+                self.account_id,
+                account.email,
+                "JBSWY3DPEHPK3PXP",
+                base_auth_version=state.auth_version,
+                session=session,
+            )
+            self.assertTrue(
+                transition_mfa_operation(
+                    operation.operation_id,
+                    expected_state=ChatGPTMfaOperationStatus.STAGED,
+                    new_state=ChatGPTMfaOperationStatus.ACTIVATED_REMOTE,
+                    expected_generation=operation.generation,
+                    recovery_code="RECOVERY-CODE",
+                    session=session,
+                )
+            )
+            commit_auth_projection(
+                self.account_id,
+                expected_version=state.auth_version,
+                active_operation_id=operation.operation_id,
+                session=session,
+            )
+            session.commit()
+
+        mailbox = mock.Mock()
+        mailbox.get_current_ids.return_value = set()
+        mailbox._generate_password_reset_password.return_value = (
+            "Reset-Password-2026!"
+        )
+        mailbox.commit_password_reset.return_value = False
+
+        class Adapter:
+            def run(self, context):
+                email_info = context.email_service.create_email()
+                generated = email_info["new_password"]
+                assert email_info["password_reset_required"] is True
+                assert context.email_service.commit_password_reset(generated)
+                return SimpleNamespace(
+                    success=True,
+                    error_message="",
+                    access_token="new-at",
+                    refresh_token="new-rt",
+                    id_token="new-id",
+                    session_token="new-session",
+                    workspace_id="workspace-1",
+                    account_id="new-user",
+                    source="existing_account_web_login",
+                    metadata={},
+                )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.config_store.get_all",
+            return_value={"default_executor": "headless"},
+        ), mock.patch(
+            "services.chatgpt_relogin.create_mailbox",
+            return_value=mailbox,
+        ), mock.patch(
+            "services.chatgpt_relogin.build_chatgpt_registration_mode_adapter",
+            return_value=Adapter(),
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ):
+            saved = _load_saved_account(self.account_id)
+            self.assertEqual(
+                saved["mailbox_context"]["extra"]["account_type"],
+                "chatgpt_password_totp",
+            )
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            self.assertEqual(account.password, "Reset-Password-2026!")
+            extra = account.get_extra()
+            context_extra = extra["mailbox_login_context"]["extra"]
+            self.assertEqual(
+                context_extra["account_type"],
+                "chatgpt_password_totp",
+            )
+            self.assertEqual(
+                context_extra["password"],
+                "Reset-Password-2026!",
+            )
+            self.assertEqual(
+                context_extra["totp_secret"],
+                "JBSWY3DPEHPK3PXP",
+            )
+            self.assertEqual(
+                context_extra["mfa_recovery_code"],
+                "RECOVERY-CODE",
+            )
+            self.assertEqual(
+                context_extra["mailapi_url"],
+                "https://mail.example.test/messages/token",
+            )
+            self.assertFalse(context_extra["password_reset_required"])
+            state = session.exec(
+                select(ChatGPTAuthStateModel).where(
+                    ChatGPTAuthStateModel.account_id == self.account_id
+                )
+            ).one()
+            self.assertEqual(state.primary_state, "confirmed")
+            self.assertEqual(state.mfa_state, "active")
 
     def test_saved_login_uses_mailbox_timeout_as_all_outer_otp_budgets(self):
         saved = {
@@ -1925,6 +2148,58 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["mfa_rotated"])
         self.assertTrue(login.call_args.kwargs["rotate_mfa"])
+
+    def test_successful_relogin_promotes_legacy_totp_to_canonical_auth_state(self):
+        password = "Generated-ChatGPT-Password"
+        context = {
+            "provider": "microsoft",
+            "email": "demo@example.com",
+            "account_id": "demo@example.com",
+            "extra": {
+                "account_type": "chatgpt_password_reset_url_mail",
+                "password": password,
+                "password_reset_required": False,
+                "mailapi_url": "https://mail.example.test/messages/token",
+                "totp_secret": "JBSWY3DPEHPK3PXP",
+                "mfa_recovery_code": "RECOVERY-CODE",
+                "chatgpt_mfa_managed": True,
+            },
+        }
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            account.password = ""
+            extra = account.get_extra()
+            extra["mailbox_login_context"] = {
+                **context,
+                "extra": {**context["extra"], "password": ""},
+            }
+            account.set_extra(extra)
+            session.add(account)
+            session.commit()
+
+        tokens = self._fresh_tokens()
+        tokens["password"] = password
+        tokens["metadata"] = {"mailbox_login_context": context}
+        with mock.patch(
+            "services.chatgpt_relogin._login_with_saved_credentials",
+            return_value=tokens,
+        ), mock.patch(
+            "services.chatgpt_relogin.sync_codex2api_account",
+            return_value={"name": "Codex2API", "ok": True, "msg": "ok"},
+        ), mock.patch("services.chatgpt_relogin.engine", self.engine):
+            result = relogin_chatgpt_account(self.account_id)
+
+        self.assertTrue(result["ok"])
+        with Session(self.engine) as session:
+            state = session.exec(
+                select(ChatGPTAuthStateModel).where(
+                    ChatGPTAuthStateModel.account_id == self.account_id
+                )
+            ).one()
+            self.assertEqual(state.primary_state, "confirmed")
+            self.assertEqual(state.mfa_state, "active")
+            self.assertTrue(state.active_mfa_generation)
+            self.assertEqual(state.circuit_state, "closed")
 
     def test_full_relogin_rejects_unconfirmed_mfa_rotation(self):
         sync = mock.Mock()
@@ -2600,6 +2875,8 @@ class ChatGPTReloginTests(unittest.TestCase):
         ), mock.patch(
             "services.chatgpt_relogin._persist_fresh_tokens",
             side_effect=persist,
+        ), mock.patch(
+            "services.chatgpt_relogin._promote_successful_auth_identity",
         ), mock.patch(
             "services.chatgpt_relogin.sync_codex2api_account",
             side_effect=sync,

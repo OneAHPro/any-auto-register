@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -26,10 +27,11 @@ from core.applemail_pool import (
     load_applemail_pool_snapshot,
     save_applemail_pool_json,
 )
-from core.base_mailbox import AppleMailMailbox
+from core.base_mailbox import AppleMailMailbox, OutlookMailbox
 from core.db import (
     AccountModel,
     ChatGPTAttemptBindingModel,
+    OutlookAccountModel,
     _recover_chatgpt_attempt_bindings,
 )
 
@@ -485,6 +487,382 @@ class ChatGPTRetryBindingTests(unittest.TestCase):
             )
             self.assertEqual(records[0]["pool_state"], "used")
             self.assertFalse(records[0]["enabled"])
+
+    def test_mailapi_retry_reclaims_and_binds_exact_outlook_row(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "retry-mailapi@example.com"
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox/token",
+                )
+            )
+            session.commit()
+
+        source = OutlookMailbox()
+        with mock.patch("core.db.engine", test_engine):
+            claimed = source.get_email_by_address(email)
+            context = {
+                "provider": "microsoft",
+                "email": email,
+                "account_id": claimed.account_id,
+                "extra": dict(claimed.extra),
+            }
+            self.assertTrue(source.requeue_account(claimed))
+            retry = _bind_chatgpt_retry_mailbox(
+                OutlookMailbox(),
+                context,
+                email,
+            )
+            reclaimed = retry.get_email()
+            self.assertNotEqual(
+                reclaimed.extra["_outlook_lease_version"],
+                context["extra"]["_outlook_lease_version"],
+            )
+            final_account = AccountModel(
+                platform="chatgpt",
+                email=email,
+                password="chatgpt-password",
+                status="registered",
+            )
+            final_account.set_extra({"refresh_token": "saved-refresh-token"})
+            with Session(test_engine) as session:
+                session.add(final_account)
+                session.commit()
+                session.refresh(final_account)
+                final_id = int(final_account.id)
+            self.assertTrue(retry.mark_account_used(final_account))
+
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "bound")
+            self.assertFalse(row.enabled)
+            self.assertEqual(row.bound_account_id, final_id)
+
+    def test_mailapi_retry_reuses_still_owned_outlook_lease(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "live-lease@example.com"
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox/token",
+                )
+            )
+            session.commit()
+
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            claimed = OutlookMailbox().get_email_by_address(email)
+            context = {
+                "provider": "microsoft",
+                "email": email,
+                "account_id": claimed.account_id,
+                "extra": dict(claimed.extra),
+            }
+            retry = _bind_chatgpt_retry_mailbox(
+                OutlookMailbox(),
+                context,
+                email,
+            )
+            reused = retry.get_email()
+            self.assertEqual(
+                reused.extra["_outlook_lease_owner"],
+                context["extra"]["_outlook_lease_owner"],
+            )
+            final_account = AccountModel(
+                platform="chatgpt",
+                email=email,
+                password="chatgpt-password",
+                status="registered",
+            )
+            final_account.set_extra(
+                {
+                    "refresh_token": "saved-refresh-token",
+                    "mailbox_login_context": context,
+                }
+            )
+            with Session(test_engine) as session:
+                session.add(final_account)
+                session.commit()
+                session.refresh(final_account)
+                final_id = int(final_account.id)
+            self.assertTrue(retry.mark_account_used(final_account))
+
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "bound")
+            self.assertEqual(row.bound_account_id, final_id)
+
+    def test_legacy_mailapi_retry_backfills_incarnation_after_release(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "legacy-released@example.com"
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox/token",
+                )
+            )
+            session.commit()
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            source = OutlookMailbox()
+            claimed = source.get_email_by_address(email)
+            context = {
+                "provider": "microsoft",
+                "email": email,
+                "account_id": claimed.account_id,
+                "extra": dict(claimed.extra),
+            }
+            context["extra"].pop("_outlook_created_at", None)
+            self.assertTrue(source.requeue_account(claimed))
+            retry = _bind_chatgpt_retry_mailbox(
+                OutlookMailbox(),
+                context,
+                email,
+            )
+            reclaimed = retry.get_email()
+
+        self.assertTrue(reclaimed.extra["_outlook_created_at"])
+        self.assertEqual(reclaimed.email, email)
+
+    def test_legacy_mailapi_retry_backfills_still_owned_lease(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "legacy-leased@example.com"
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox/token",
+                )
+            )
+            session.commit()
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            claimed = OutlookMailbox().get_email_by_address(email)
+            context = {
+                "provider": "microsoft",
+                "email": email,
+                "account_id": claimed.account_id,
+                "extra": dict(claimed.extra),
+            }
+            context["extra"].pop("_outlook_created_at", None)
+            retry = _bind_chatgpt_retry_mailbox(
+                OutlookMailbox(),
+                context,
+                email,
+            )
+            reused = retry.get_email()
+
+        self.assertTrue(reused.extra["_outlook_created_at"])
+        self.assertEqual(reused.email, email)
+
+    def test_mailapi_retry_reuses_row_bound_to_same_account(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "bound-retry@example.com"
+        with Session(test_engine) as session:
+            session.add(
+                OutlookAccountModel(
+                    email=email,
+                    password="",
+                    account_type="mailapi_url",
+                    mailapi_url="https://mail.example.test/inbox/token",
+                )
+            )
+            session.commit()
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            mailbox = OutlookMailbox()
+            claimed = mailbox.get_email_by_address(email)
+            account = AccountModel(
+                platform="chatgpt",
+                email=email,
+                password="chatgpt-password",
+                status="registered",
+            )
+            context = {
+                "provider": "microsoft",
+                "email": email,
+                "account_id": claimed.account_id,
+                "extra": dict(claimed.extra),
+            }
+            account.set_extra(
+                {
+                    "refresh_token": "saved-refresh-token",
+                    "mailbox_login_context": context,
+                }
+            )
+            with Session(test_engine) as session:
+                session.add(account)
+                session.commit()
+                session.refresh(account)
+                account_id = int(account.id)
+            context["extra"]["chatgpt_local_account_id"] = account_id
+            claimed.extra["chatgpt_local_account_id"] = account_id
+            self.assertTrue(mailbox.mark_account_used(claimed))
+            retry = _bind_chatgpt_retry_mailbox(
+                OutlookMailbox(),
+                context,
+                email,
+            )
+            reused = retry.get_email()
+            self.assertEqual(reused.email, email)
+            self.assertEqual(
+                reused.extra["mailapi_url"],
+                "https://mail.example.test/inbox/token",
+            )
+            self.assertTrue(retry.mark_account_used(account))
+
+        with Session(test_engine) as session:
+            row = session.exec(select(OutlookAccountModel)).one()
+            self.assertEqual(row.state, "bound")
+            self.assertEqual(row.bound_account_id, account_id)
+
+    def test_mailapi_retry_keeps_self_contained_context_after_pool_row_deleted(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "deleted-row@example.com"
+        context = {
+            "provider": "microsoft",
+            "email": email,
+            "account_id": "999",
+            "extra": {
+                "provider": "microsoft",
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://mail.example.test/inbox/token",
+                "_outlook_row_id": "999",
+                "_outlook_state": "leased",
+                "_outlook_lease_owner": "original-owner",
+                "_outlook_lease_version": 1,
+            },
+        }
+        retry = _bind_chatgpt_retry_mailbox(
+            OutlookMailbox(),
+            context,
+            email,
+        )
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            restored = retry.get_email()
+
+        self.assertEqual(restored.email, email)
+        self.assertEqual(
+            restored.extra["mailapi_url"],
+            "https://mail.example.test/inbox/token",
+        )
+
+    def test_mailapi_retry_does_not_swap_to_reimported_same_email_row(self):
+        test_engine = create_engine(
+            "sqlite://",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(test_engine)
+        email = "reimported@example.com"
+        with Session(test_engine) as session:
+            original = OutlookAccountModel(
+                email=email,
+                password="",
+                account_type="mailapi_url",
+                mailapi_url="https://old.example.test/inbox/token",
+            )
+            session.add(original)
+            session.commit()
+            session.refresh(original)
+            original_id = int(original.id)
+            original_created_at = original.created_at.isoformat()
+            session.delete(original)
+            session.commit()
+            replacement = OutlookAccountModel(
+                email=email,
+                password="",
+                account_type="mailapi_url",
+                mailapi_url="https://new.example.test/inbox/token",
+                created_at=datetime(2030, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
+            )
+            session.add(replacement)
+            session.commit()
+            session.refresh(replacement)
+            self.assertEqual(int(replacement.id), original_id)
+        context = {
+            "provider": "microsoft",
+            "email": email,
+            "account_id": str(original_id),
+            "extra": {
+                "provider": "microsoft",
+                "account_type": "mailapi_url",
+                "mailapi_url": "https://old.example.test/inbox/token",
+                "_outlook_row_id": str(original_id),
+                "_outlook_state": "leased",
+                "_outlook_lease_owner": "old-owner",
+                "_outlook_lease_version": 1,
+                "_outlook_created_at": original_created_at,
+            },
+        }
+        retry = _bind_chatgpt_retry_mailbox(
+            OutlookMailbox(),
+            context,
+            email,
+        )
+        with mock.patch("core.db.engine", test_engine), mock.patch(
+            "api.tasks.engine",
+            test_engine,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "身份已变化"):
+                retry.get_email()
+        with Session(test_engine) as session:
+            replacement = session.get(OutlookAccountModel, original_id)
+            self.assertEqual(replacement.state, "available")
+            self.assertTrue(replacement.enabled)
 
     def test_build_retry_request_preserves_email_card_order(self):
         bindings = [

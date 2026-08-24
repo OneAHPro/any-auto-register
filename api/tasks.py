@@ -14,6 +14,7 @@ import uuid
 from core.db import (
     AccountModel,
     ChatGPTAttemptBindingModel,
+    OutlookAccountModel,
     TaskLog,
     TaskRunModel,
     engine,
@@ -3873,6 +3874,7 @@ def _load_chatgpt_retry_mailbox_context(
     if normalized_id <= 0 or not normalized_email:
         return {}
 
+    local_account_id = 0
     with _chatgpt_binding_db_lock:
         _ensure_chatgpt_attempt_binding_table()
         with Session(engine) as session:
@@ -3897,6 +3899,7 @@ def _load_chatgpt_retry_mailbox_context(
                     .where(func.lower(AccountModel.email) == normalized_email)
                 ).first()
             if account is not None:
+                local_account_id = int(account.id or 0)
                 saved_password = str(account.password or "")
                 account_extra = account.get_extra()
                 candidate = account_extra.get("mailbox_login_context")
@@ -3922,6 +3925,8 @@ def _load_chatgpt_retry_mailbox_context(
     restored = deepcopy(context)
     restored["email"] = context_email
     restored["extra"] = deepcopy(context_extra)
+    if local_account_id > 0:
+        restored["extra"]["chatgpt_local_account_id"] = local_account_id
     return restored
 
 
@@ -3965,6 +3970,115 @@ class _PersistedChatGPTRetryMailbox:
             return
         setattr(self._delegate, name, value)
 
+    @staticmethod
+    def _outlook_pointer_is_still_owned(account) -> bool:
+        extra = dict(getattr(account, "extra", None) or {})
+        try:
+            row_id = int(extra.get("_outlook_row_id") or 0)
+            version = int(extra.get("_outlook_lease_version") or 0)
+            expected_account_id = int(
+                extra.get("chatgpt_local_account_id")
+                or extra.get("_outlook_bound_account_id")
+                or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        owner = str(extra.get("_outlook_lease_owner") or "").strip()
+        expected_created_at = str(
+            extra.get("_outlook_created_at") or ""
+        ).strip().replace("Z", "+00:00")
+        if row_id <= 0:
+            return False
+        with Session(engine) as session:
+            row = session.get(OutlookAccountModel, row_id)
+            # Explicit deletion of the import row must not destroy the retry
+            # binding's self-contained receive URL.  There is no competing
+            # durable owner in this case.
+            if row is None:
+                return True
+            row_email_matches = bool(
+                str(row.email or "").strip().lower()
+                == str(getattr(account, "email", "") or "").strip().lower()
+            )
+            row_created_at = (
+                row.created_at.isoformat()
+                if isinstance(row.created_at, datetime)
+                else str(row.created_at or "").strip().replace("Z", "+00:00")
+            )
+            if (
+                not row_email_matches
+                or not expected_created_at
+                or row_created_at != expected_created_at
+            ):
+                return False
+            state = str(row.state or "").strip().lower()
+            if state == "leased":
+                return bool(
+                    owner
+                    and str(row.lease_owner or "").strip() == owner
+                    and int(row.lease_version or 0) == version
+                )
+            return bool(
+                state == "bound"
+                and expected_account_id > 0
+                and int(row.bound_account_id or 0) == expected_account_id
+            )
+
+    @staticmethod
+    def _adopt_legacy_outlook_incarnation(account, row) -> bool:
+        """Attach pre-upgrade retry pointers only when continuity is proven."""
+        extra = dict(getattr(account, "extra", None) or {})
+        if str(extra.get("_outlook_created_at") or "").strip():
+            return True
+        try:
+            row_id = int(extra.get("_outlook_row_id") or 0)
+            version = int(extra.get("_outlook_lease_version") or 0)
+            expected_account_id = int(
+                extra.get("chatgpt_local_account_id")
+                or extra.get("_outlook_bound_account_id")
+                or 0
+            )
+        except (TypeError, ValueError):
+            return False
+        if (
+            row is None
+            or row_id <= 0
+            or int(row.id or 0) != row_id
+            or str(row.email or "").strip().lower()
+            != str(getattr(account, "email", "") or "").strip().lower()
+        ):
+            return False
+        state = str(row.state or "").strip().lower()
+        owner = str(extra.get("_outlook_lease_owner") or "").strip()
+        continuity = bool(
+            (
+                state == "leased"
+                and owner
+                and str(row.lease_owner or "").strip() == owner
+                and int(row.lease_version or 0) == version
+            )
+            or (
+                state == "bound"
+                and expected_account_id > 0
+                and int(row.bound_account_id or 0) == expected_account_id
+            )
+            or (
+                state == "available"
+                and int(row.lease_version or 0) == version + 1
+                and not str(row.lease_owner or "").strip()
+                and int(row.bound_account_id or 0) == 0
+            )
+        )
+        if not continuity:
+            return False
+        extra["_outlook_created_at"] = (
+            row.created_at.isoformat()
+            if isinstance(row.created_at, datetime)
+            else str(row.created_at or "")
+        )
+        account.extra = extra
+        return bool(extra["_outlook_created_at"])
+
     def _rehydrate_sanitized_credentials(self):
         account = self._account
         extra = dict(getattr(account, "extra", None) or {})
@@ -3981,22 +4095,72 @@ class _PersistedChatGPTRetryMailbox:
         # Before a local AccountModel exists, reclaim the exact original pool
         # row so a retry gets the full in-memory credential without copying it
         # into task metadata.
-        if (
-            account_type != "chatgpt_password_totp"
-            or has_totp
-            or not str(extra.get("pool_file") or "").strip()
-        ):
+        outlook_claim = bool(extra.get("_outlook_row_id"))
+        file_pool_claim = bool(
+            account_type == "chatgpt_password_totp"
+            and not has_totp
+            and str(extra.get("pool_file") or "").strip()
+        )
+        if not outlook_claim and not file_pool_claim:
             return account
+        if outlook_claim and not str(extra.get("_outlook_created_at") or "").strip():
+            try:
+                legacy_row_id = int(extra.get("_outlook_row_id") or 0)
+            except (TypeError, ValueError):
+                legacy_row_id = 0
+            with Session(engine) as session:
+                legacy_row = (
+                    session.get(OutlookAccountModel, legacy_row_id)
+                    if legacy_row_id > 0
+                    else None
+                )
+                self._adopt_legacy_outlook_incarnation(account, legacy_row)
+            extra = dict(getattr(account, "extra", None) or {})
         selector = getattr(self._delegate, "get_email_by_address", None)
         if not callable(selector):
             return account
         bound_email = str(getattr(account, "email", "") or "").strip()
-        reclaimed = selector(bound_email)
+        try:
+            reclaimed = selector(bound_email)
+        except Exception:
+            # A still-live lease can already belong to this retry context.
+            # Keep using the fenced projection instead of swapping identities.
+            if outlook_claim and self._outlook_pointer_is_still_owned(account):
+                return account
+            raise
         reclaimed_email = str(
             getattr(reclaimed, "email", "") or ""
         ).strip()
         if not reclaimed_email or reclaimed_email.lower() != bound_email.lower():
             raise RuntimeError("重试邮箱与原始邮箱池记录不一致")
+        if outlook_claim:
+            reclaimed_extra = dict(getattr(reclaimed, "extra", None) or {})
+            try:
+                expected_row_id = int(extra.get("_outlook_row_id") or 0)
+                reclaimed_row_id = int(
+                    reclaimed_extra.get("_outlook_row_id") or 0
+                )
+            except (TypeError, ValueError):
+                expected_row_id = 0
+                reclaimed_row_id = 0
+            expected_created_at = str(
+                extra.get("_outlook_created_at") or ""
+            ).strip().replace("Z", "+00:00")
+            reclaimed_created_at = str(
+                reclaimed_extra.get("_outlook_created_at") or ""
+            ).strip().replace("Z", "+00:00")
+            if (
+                expected_row_id <= 0
+                or reclaimed_row_id != expected_row_id
+                or not expected_created_at
+                or reclaimed_created_at != expected_created_at
+            ):
+                release = getattr(self._delegate, "requeue_account", None)
+                if callable(release):
+                    release(reclaimed)
+                if self._outlook_pointer_is_still_owned(account):
+                    return account
+                raise RuntimeError("重试邮箱池行身份已变化，已停止替换绑定")
         object.__setattr__(self, "_account", reclaimed)
         object.__setattr__(self, "_rehydrated_claim", True)
         return reclaimed
@@ -4035,6 +4199,14 @@ class _PersistedChatGPTRetryMailbox:
                 # Access Token may be persisted before phone verification. Keep
                 # this exact claim leased so a later failure can return it.
                 return True
+            try:
+                local_account_id = int(getattr(caller, "id", 0) or 0)
+            except (TypeError, ValueError):
+                local_account_id = 0
+            if local_account_id > 0:
+                mailbox_extra = dict(getattr(target, "extra", None) or {})
+                mailbox_extra["chatgpt_local_account_id"] = local_account_id
+                target.extra = mailbox_extra
         delegate = getattr(self._delegate, "mark_account_used", None)
         marked = bool(delegate(target)) if callable(delegate) else False
         if marked:

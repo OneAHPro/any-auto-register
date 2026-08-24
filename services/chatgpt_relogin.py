@@ -171,6 +171,11 @@ def _mailbox_context_from_outlook(
             "_outlook_bound_account_id": int(
                 getattr(imported, "bound_account_id", 0) or 0
             ),
+            "_outlook_created_at": (
+                imported.created_at.isoformat()
+                if isinstance(imported.created_at, datetime)
+                else str(imported.created_at or "")
+            ),
         },
     }
 
@@ -971,6 +976,125 @@ class _GoogleFederatedEmailService:
         return True
 
 
+def _persist_password_reset_to_account(
+    *,
+    account_id: int,
+    expected_email: str,
+    expected_created_at: datetime | None,
+    expected_password: str,
+    password: str,
+    mailbox_context: Mapping[str, Any],
+) -> bool:
+    """Durably save a remotely-reset password on the ChatGPT account.
+
+    Historical MailAPI imports can outlive their ``outlook_accounts`` row.
+    In that case the mailbox backend has nowhere to write the password, but
+    the ChatGPT account still has a durable identity and login context.  Use
+    that identity as the fallback persistence target with an optimistic CAS.
+    """
+    normalized_password = str(password or "")
+    if len(normalized_password) < 12 or expected_created_at is None:
+        return False
+    try:
+        normalized_id = int(account_id)
+    except (TypeError, ValueError):
+        return False
+
+    incoming_context = (
+        dict(mailbox_context)
+        if isinstance(mailbox_context, Mapping)
+        else {}
+    )
+    for _attempt in range(3):
+        with Session(engine) as session:
+            account = session.get(AccountModel, normalized_id)
+            if account is None or _text(account.platform).lower() != "chatgpt":
+                return False
+            if _text(account.email).lower() != _text(expected_email).lower():
+                return False
+            if account.created_at != expected_created_at:
+                return False
+
+            current_password = str(account.password or "")
+            if current_password not in {
+                str(expected_password or ""),
+                normalized_password,
+            }:
+                return False
+            current_extra = dict(account.get_extra() or {})
+            current_context = current_extra.get("mailbox_login_context")
+            current_context = (
+                dict(current_context)
+                if isinstance(current_context, Mapping)
+                else {}
+            )
+            current_context_extra = dict(current_context.get("extra") or {})
+            if (
+                str(account.password or "") == normalized_password
+                and str(current_context_extra.get("password") or "")
+                == normalized_password
+                and current_context_extra.get("password_reset_required")
+                is not True
+            ):
+                return True
+
+            merged_context = {**incoming_context, **current_context}
+            incoming_context_extra = dict(incoming_context.get("extra") or {})
+            # The latest durable context wins for every unrelated field.  The
+            # password-reset callback owns only password/reset/new_password.
+            merged_context_extra = {
+                **incoming_context_extra,
+                **current_context_extra,
+            }
+            merged_context_extra.update(
+                {
+                    "password": normalized_password,
+                    "password_reset_required": False,
+                }
+            )
+            merged_context_extra.pop("new_password", None)
+            has_totp = bool(
+                _text(
+                    merged_context_extra.get("totp_secret")
+                    or merged_context_extra.get("mfa_secret")
+                    or merged_context_extra.get("totp")
+                )
+            )
+            merged_context_extra["account_type"] = (
+                "chatgpt_password_totp"
+                if has_totp
+                else "chatgpt_password_url_otp"
+            )
+            merged_context["email"] = account.email
+            merged_context["extra"] = merged_context_extra
+            current_extra["mailbox_login_context"] = merged_context
+            snapshot = AccountModel(**account.model_dump())
+            snapshot.set_extra(current_extra)
+
+            result = session.exec(
+                update(AccountModel)
+                .where(AccountModel.id == normalized_id)
+                .where(AccountModel.platform == "chatgpt")
+                .where(
+                    func.lower(AccountModel.email)
+                    == _text(expected_email).lower()
+                )
+                .where(AccountModel.created_at == expected_created_at)
+                .where(AccountModel.password == current_password)
+                .where(AccountModel.extra_json == account.extra_json)
+                .values(
+                    password=normalized_password,
+                    updated_at=datetime.now(timezone.utc),
+                    extra_json=snapshot.extra_json,
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) == 1:
+                session.commit()
+                return True
+            session.rollback()
+    return False
+
+
 class _PersistedEmailService:
     def __init__(
         self,
@@ -982,6 +1106,10 @@ class _PersistedEmailService:
         log_fn: LogFn | None,
         otp_timeout_seconds: int = 300,
         defer_mailbox_claim: bool = False,
+        persisted_account_id: int | None = None,
+        persisted_account_email: str = "",
+        persisted_account_created_at: datetime | None = None,
+        persisted_account_password: str = "",
     ) -> None:
         self.service_type = type("ServiceType", (), {"value": provider})()
         self._mailbox = mailbox
@@ -998,6 +1126,17 @@ class _PersistedEmailService:
         )
         self._foreground_remaining_seconds = 20.0
         self._defer_mailbox_claim = bool(defer_mailbox_claim)
+        try:
+            self._persisted_account_id = (
+                int(persisted_account_id)
+                if persisted_account_id is not None
+                else None
+            )
+        except (TypeError, ValueError):
+            self._persisted_account_id = None
+        self._persisted_account_email = _text(persisted_account_email)
+        self._persisted_account_created_at = persisted_account_created_at
+        self._persisted_account_password = str(persisted_account_password or "")
 
     def _ensure_mailbox_claimed(self) -> None:
         """Claim a file-pool receiver only when an email factor is requested."""
@@ -1178,27 +1317,79 @@ class _PersistedEmailService:
         password = str(new_password or "")
         if len(password) < 12:
             raise ValueError("新密码至少需要 12 个字符")
+        account_extra = dict(self._account.extra or {})
+        if (
+            self._persisted_account_id is not None
+            and str(account_extra.get("password") or "") == password
+            and account_extra.get("password_reset_required") is not True
+        ):
+            return _persist_password_reset_to_account(
+                account_id=self._persisted_account_id,
+                expected_email=self._persisted_account_email
+                or self._account.email,
+                expected_created_at=self._persisted_account_created_at,
+                expected_password=self._persisted_account_password,
+                password=password,
+                mailbox_context=self._mailbox_context,
+            )
         commit = getattr(self._mailbox, "commit_password_reset", None)
-        if not callable(commit):
+        mailbox_committed = False
+        if callable(commit):
+            try:
+                mailbox_committed = commit(self._account, password) is not False
+            except Exception as exc:
+                if self._persisted_account_id is None:
+                    raise
+                _emit_observer(
+                    self._log_fn,
+                    f"邮箱池密码保存失败，将尝试保存到 ChatGPT 账号（{type(exc).__name__}）"
+                )
+        if self._persisted_account_id is None and not callable(commit):
             raise RuntimeError("当前邮箱后端不支持保存重置后的密码")
-        committed = commit(self._account, password)
-        if committed is False:
-            return False
         if not isinstance(self._account.extra, dict):
             self._account.extra = {}
         self._account.extra["password"] = password
         self._account.extra["password_reset_required"] = False
         self._account.extra.pop("new_password", None)
+        managed_totp = _text(
+            self._account.extra.get("totp_secret")
+            or self._account.extra.get("mfa_secret")
+            or self._account.extra.get("totp")
+        )
+        normalized_account_type = (
+            "chatgpt_password_totp"
+            if managed_totp
+            else "chatgpt_password_url_otp"
+        )
+        self._account.extra["account_type"] = normalized_account_type
         context_extra = dict(self._mailbox_context.get("extra") or {})
         context_extra.update(
             {
+                "account_type": normalized_account_type,
                 "password": password,
                 "password_reset_required": False,
             }
         )
         context_extra.pop("new_password", None)
         self._mailbox_context["extra"] = context_extra
-        return True
+        if self._persisted_account_id is not None:
+            if not _persist_password_reset_to_account(
+                account_id=self._persisted_account_id,
+                expected_email=self._persisted_account_email
+                or self._account.email,
+                expected_created_at=self._persisted_account_created_at,
+                expected_password=self._persisted_account_password,
+                password=password,
+                mailbox_context=self._mailbox_context,
+            ):
+                return False
+            if not mailbox_committed:
+                _emit_observer(
+                    self._log_fn,
+                    "邮箱池无可更新记录，已将新密码保存到绑定的 ChatGPT 账号",
+                )
+            return True
+        return mailbox_committed
 
     def commit_mfa_rotation(
         self,
@@ -1507,25 +1698,42 @@ def _build_email_service(
             f"账号 {saved['email']} 缺少邮箱登录凭据，请重新导入后再重登"
         )
     context_extra = dict(mailbox_context.get("extra") or {})
+    persisted_account_kwargs = {
+        "persisted_account_id": saved.get("id"),
+        "persisted_account_email": saved.get("email", ""),
+        "persisted_account_created_at": saved.get("created_at"),
+        "persisted_account_password": saved.get("password", ""),
+    }
     if not force_password_reset:
         mailbox_context = promote_managed_mfa_login_context(
             mailbox_context,
             saved_password=str(saved.get("password") or ""),
         )
         context_extra = dict(mailbox_context.get("extra") or {})
-    if _text(context_extra.get("account_type")).lower() == "mailapi_url":
+    current_account_type = _text(context_extra.get("account_type")).lower()
+    has_mail_api_url = bool(
+        _text(
+            context_extra.get("mail_api_url")
+            or context_extra.get("mailapi_url")
+        )
+    )
+    if force_password_reset and has_mail_api_url:
+        context_extra.update(
+            {
+                "account_type": "chatgpt_password_reset_url_mail",
+                "password": "",
+                "password_reset_required": True,
+            }
+        )
+        mailbox_context = {
+            **mailbox_context,
+            "extra": context_extra,
+        }
+    elif current_account_type == "mailapi_url":
         saved_password = str(
             context_extra.get("password") or saved.get("password") or ""
         )
-        if force_password_reset:
-            context_extra.update(
-                {
-                    "account_type": "chatgpt_password_reset_url_mail",
-                    "password": "",
-                    "password_reset_required": True,
-                }
-            )
-        elif saved_password:
+        if saved_password:
             context_extra.update(
                 {
                     "account_type": "chatgpt_password_url_otp",
@@ -1603,6 +1811,7 @@ def _build_email_service(
             provider="chatgpt_credentials",
             log_fn=log_fn,
             otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+            **persisted_account_kwargs,
         )
     if account_type in {
         "chatgpt_password_url_otp",
@@ -1691,6 +1900,7 @@ def _build_email_service(
             provider="chatgpt_credentials",
             log_fn=log_fn,
             otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+            **persisted_account_kwargs,
         )
     if provider == "chatgpt_credentials" or account_type == "chatgpt_password_totp":
         credentials = _recover_password_totp_credentials(
@@ -1749,6 +1959,7 @@ def _build_email_service(
                 log_fn=log_fn,
                 otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
                 defer_mailbox_claim=bool(credentials.get("pool_file")),
+                **persisted_account_kwargs,
             )
         return _PasswordTotpEmailService(credentials, mailbox_context)
 
@@ -1779,6 +1990,7 @@ def _build_email_service(
         provider=provider,
         log_fn=log_fn,
         otp_timeout_seconds=_resolve_mailbox_otp_timeout(config),
+        **persisted_account_kwargs,
     )
 
 
@@ -1789,9 +2001,23 @@ def _saved_account_supports_password_reset(saved: Mapping[str, Any]) -> bool:
     context_extra = mailbox_context.get("extra")
     if not isinstance(context_extra, Mapping):
         return False
-    return (
-        _text(context_extra.get("account_type")).lower()
-        == "chatgpt_password_reset_url_mail"
+    has_inline_mail_api = bool(
+        _text(
+            context_extra.get("mail_api_url")
+            or context_extra.get("mailapi_url")
+        )
+    )
+    account_type = _text(context_extra.get("account_type")).lower()
+    if account_type == "chatgpt_password_reset_url_mail":
+        return bool(has_inline_mail_api or _text(context_extra.get("pool_file")))
+    return bool(
+        has_inline_mail_api
+        and account_type
+        in {
+            "mailapi_url",
+            "chatgpt_password_url_otp",
+            "chatgpt_password_totp",
+        }
     )
 
 
@@ -1805,7 +2031,13 @@ def _saved_account_requires_password_bootstrap(
     if not isinstance(context_extra, Mapping):
         return False
     return bool(
-        _text(context_extra.get("account_type")).lower() == "mailapi_url"
+        _text(context_extra.get("account_type")).lower()
+        in {
+            "mailapi_url",
+            "chatgpt_password_url_otp",
+            "chatgpt_password_reset_url_mail",
+            "chatgpt_password_totp",
+        }
         and _text(
             context_extra.get("mail_api_url")
             or context_extra.get("mailapi_url")
@@ -2155,6 +2387,31 @@ def _persist_fresh_tokens(
         return snapshot
 
 
+def _promote_successful_auth_identity(saved: Mapping[str, Any]) -> None:
+    """Promote canonical auth only while the original account identity exists."""
+    from services.chatgpt_auth_state import (
+        promote_successful_chatgpt_account_auth,
+    )
+
+    with Session(engine) as auth_session:
+        auth_account = auth_session.get(AccountModel, int(saved["id"]))
+        if (
+            auth_account is None
+            or _text(auth_account.platform).lower() != "chatgpt"
+            or _text(auth_account.email).lower()
+            != _text(saved["email"]).lower()
+            or auth_account.created_at != saved["created_at"]
+        ):
+            raise RuntimeError(
+                "本地账号身份已发生变化，已停止提升规范认证状态"
+            )
+        promote_successful_chatgpt_account_auth(
+            int(saved["id"]),
+            session=auth_session,
+        )
+        auth_session.commit()
+
+
 def _remove_local_account_after_terminal_login_failure(
     account_id: int,
     *,
@@ -2366,6 +2623,7 @@ def _relogin_chatgpt_account_locked(
             expected_email=saved["email"],
             expected_created_at=saved["created_at"],
         )
+        _promote_successful_auth_identity(saved)
         if rotate_mfa:
             try:
                 from core.db import finalize_chatgpt_mfa_rotation

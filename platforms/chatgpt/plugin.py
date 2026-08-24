@@ -640,6 +640,7 @@ class ChatGPTPlatform(BasePlatform):
                             "_outlook_state",
                             "_outlook_bound_account_id",
                             "_outlook_lease_expires_at",
+                            "_outlook_created_at",
                         ):
                             if lease_key in account_extra:
                                 credential_snapshot[lease_key] = account_extra[
