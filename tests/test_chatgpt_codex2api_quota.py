@@ -97,7 +97,7 @@ def test_merge_quota_rows_fills_only_missing_summary_fields_from_same_probe():
                 "remote_id": 1,
                 "email": "one@example.com",
                 "remote_status": "active",
-                "usage_percent_5h": 45,
+                "usage_percent_5h": 50,
                 "billed_5h": 5,
                 "usage_percent_7d": 40,
                 "billed_7d": 10,
@@ -169,6 +169,17 @@ def test_merge_quota_rows_rejects_stale_timestamped_fallback_costs():
                 "quota_7d_updated_at": "old",
             }
         ],
+    )
+
+    assert merged[0]["billed_7d"] is None
+
+
+def test_merge_quota_rows_requires_matching_usage_without_timestamps():
+    from services.chatgpt_codex2api_quota import merge_quota_rows
+
+    merged = merge_quota_rows(
+        [{"remote_id": 1, "usage_percent_7d": 50, "billed_7d": None}],
+        [{"remote_id": 1, "usage_percent_7d": 40, "billed_7d": 10}],
     )
 
     assert merged[0]["billed_7d"] is None

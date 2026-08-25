@@ -152,6 +152,16 @@ def merge_quota_rows(
                     and fallback_timestamp
                     and final_timestamp != fallback_timestamp
                 )
+                if not final_timestamp and not fallback_timestamp:
+                    percent_key = (
+                        "usage_percent_5h"
+                        if field.endswith("_5h")
+                        else "usage_percent_7d"
+                    )
+                    same_snapshot = (
+                        merged.get(percent_key) is not None
+                        and merged.get(percent_key) == fallback.get(percent_key)
+                    )
                 if (
                     same_snapshot
                     and merged.get(field) is None

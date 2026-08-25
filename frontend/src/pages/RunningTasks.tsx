@@ -218,17 +218,20 @@ export default function RunningTasks() {
       && task.meta?.quota_alert_reason !== 'quota_query_failed'
     const currentWindowFresh = task.meta?.quota_current_fresh !== false
     const totalWindowFresh = task.meta?.quota_total_fresh !== false
+    const rawTotalRemainingQuota = formatRemainingQuota(
+      task.meta?.estimated_total_remaining_usd
+      ?? task.meta?.estimated_remaining_usd,
+    )
+    const hasCompleteTotalSnapshot = task.meta?.quota_total_fresh === true
+      && rawTotalRemainingQuota !== null
     const currentRemainingQuota = quotaDataAvailable && currentWindowFresh
       ? formatRemainingQuota(
         task.meta?.estimated_current_remaining_usd
         ?? task.meta?.estimated_remaining_usd,
       )
       : null
-    const totalRemainingQuota = quotaDataAvailable
-      ? formatRemainingQuota(
-        task.meta?.estimated_total_remaining_usd
-        ?? task.meta?.estimated_remaining_usd,
-      )
+    const totalRemainingQuota = quotaDataAvailable || hasCompleteTotalSnapshot
+      ? rawTotalRemainingQuota
       : null
 
     const duration = isActive(task)

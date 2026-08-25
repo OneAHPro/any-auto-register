@@ -185,6 +185,26 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.queryByText('$0.00')).toBeNull()
   })
 
+  it('shows a complete total from historical metadata when current quota was pending', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        quota_data_available: false,
+        quota_alert_reason: 'quota_query_failed',
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        estimated_current_remaining_usd: '3400.00',
+        estimated_total_remaining_usd: '13000.00',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('当前窗口额度刷新中')).toBeTruthy()
+    expect(screen.getByText('$13000.00')).toBeTruthy()
+    expect(screen.queryByText('本次探针额度未生成')).toBeNull()
+  })
+
   it('shows total quota while the current window is still refreshing', async () => {
     configureApi(automaticSummary({
       meta: {
