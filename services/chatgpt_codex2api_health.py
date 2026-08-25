@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from decimal import Decimal, InvalidOperation
 import time
 from typing import Iterable, Mapping
 
@@ -177,15 +178,38 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _prefer_detail_billed(summary: object, detail: object) -> object:
+    """Use a positive window detail when the summary is a placeholder zero."""
+
+    if detail is None:
+        return summary
+    if summary is None:
+        return detail
+    try:
+        summary_value = Decimal(str(summary).strip())
+        detail_value = Decimal(str(detail).strip())
+    except (InvalidOperation, TypeError, ValueError):
+        return summary
+    if summary_value == 0 and detail_value > 0:
+        return detail
+    return summary
+
+
 def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
     usage_5h_detail = row.get("usage_5h_detail")
     usage_7d_detail = row.get("usage_7d_detail")
     billed_5h = row.get("billed_5h")
     billed_7d = row.get("billed_7d")
-    if billed_5h is None and isinstance(usage_5h_detail, dict):
-        billed_5h = usage_5h_detail.get("account_billed")
-    if billed_7d is None and isinstance(usage_7d_detail, dict):
-        billed_7d = usage_7d_detail.get("account_billed")
+    if isinstance(usage_5h_detail, dict):
+        billed_5h = _prefer_detail_billed(
+            billed_5h,
+            usage_5h_detail.get("account_billed"),
+        )
+    if isinstance(usage_7d_detail, dict):
+        billed_7d = _prefer_detail_billed(
+            billed_7d,
+            usage_7d_detail.get("account_billed"),
+        )
     result = {
         "remote_id": _remote_id(row),
         "email": _remote_email(row),

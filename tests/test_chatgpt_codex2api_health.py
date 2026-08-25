@@ -122,6 +122,37 @@ def test_fetch_quota_accounts_recovers_billed_amounts_from_window_details():
     assert rows[0]["billed_7d"] == 20
 
 
+def test_fetch_quota_accounts_prefers_positive_detail_over_zero_summary():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 101,
+                        "email": "one@example.com",
+                        "status": "active",
+                        "plan_type": "team",
+                        "usage_percent_5h": 0,
+                        "billed_5h": 0,
+                        "usage_percent_7d": 0,
+                        "billed_7d": 0,
+                        "usage_5h_detail": {"account_billed": 0},
+                        "usage_7d_detail": {"account_billed": 94.22},
+                    }
+                ]
+            }
+        ),
+    ):
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    assert rows[0]["billed_5h"] == 0
+    assert rows[0]["billed_7d"] == 94.22
+
+
 def test_fetch_quota_accounts_keeps_rows_while_quota_fields_are_refreshing():
     from services import chatgpt_codex2api_health as health
 
