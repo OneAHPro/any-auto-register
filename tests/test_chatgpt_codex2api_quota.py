@@ -166,3 +166,38 @@ def test_incomplete_window_does_not_reuse_previous_quota_value():
     assert report.total_remaining_usd == Decimal("120.00")
     assert not report.current_data_complete
     assert report.total_data_complete
+
+
+def test_api_accounts_do_not_make_subscription_quota_incomplete():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "api@example.com",
+            "plan_type": "api",
+            "remote_status": "active",
+        },
+        {
+            "email": "plus@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+        {
+            "email": "unlimited@example.com",
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "remote_status": "active",
+            "usage_percent_7d": 50,
+            "billed_7d": 30,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("40.00")
+    assert report.total_remaining_usd == Decimal("50.00")
+    assert report.current_data_complete
+    assert report.total_data_complete

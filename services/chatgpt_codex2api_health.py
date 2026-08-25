@@ -204,6 +204,16 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
         result["billed_5h"] = billed_5h
     if billed_7d is not None:
         result["billed_7d"] = billed_7d
+    if (
+        "plan_type" in row
+        or row.get("reset_5h_at")
+        or row.get("codex_5h_usage_updated_at")
+    ):
+        result["has_5h_window"] = bool(
+            row.get("usage_percent_5h") is not None
+            or row.get("reset_5h_at")
+            or row.get("codex_5h_usage_updated_at")
+        )
     return result
 
 

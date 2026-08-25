@@ -133,17 +133,25 @@ def summarize_available_quota(
         ).strip().lower()
         if status not in NORMAL_REMOTE_STATUSES:
             continue
-        healthy_count += 1
         email = str(row.get("email") or row.get("name") or "").strip()
         plan_type = str(row.get("plan_type") or "").strip().lower()
+        if plan_type == "api":
+            continue
+        healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
         short_estimate = estimate_window_quota(row, "5h")
         # Accounts with a valid 5-hour window use it for the "current" amount.
         # Accounts without that window (for example Pro) use their weekly
         # estimate so they remain represented instead of contributing zero.
+        has_5h_window = row.get("has_5h_window")
+        if has_5h_window is None:
+            has_5h_window = bool(
+                row.get("usage_percent_5h") is not None
+                or plan_type not in {"", "pro"}
+            )
         if short_estimate.state in {"available", "exhausted"}:
             current_estimate = short_estimate
-        elif plan_type == "pro" or not plan_type:
+        elif not has_5h_window:
             current_estimate = estimate
         else:
             current_estimate = QuotaEstimate(state="invalid")
