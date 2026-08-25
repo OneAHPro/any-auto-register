@@ -533,7 +533,7 @@ def send_quota_threshold_alert(
     threshold_usd = _quota_alert_threshold(
         snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
     )
-    if not quota_report.current_fresh:
+    if not quota_report.current_fresh or not quota_report.total_fresh:
         return {
             "sent": False,
             "reason": "quota_data_stale",
