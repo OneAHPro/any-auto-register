@@ -1653,6 +1653,51 @@ class OAuthClientPasswordlessTests(unittest.TestCase):
             "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
         )
 
+    def test_login_and_get_tokens_resolves_workspace_page_before_generic_navigation(self):
+        client = self._make_client()
+        workspace_state = FlowState(
+            page_type="workspace",
+            method="GET",
+            continue_url="https://auth.openai.com/workspace",
+            current_url="https://auth.openai.com/workspace",
+        )
+
+        with mock.patch.object(
+            client,
+            "_bootstrap_oauth_session",
+            return_value="https://auth.openai.com/log-in",
+        ), mock.patch.object(
+            client,
+            "_submit_authorize_continue",
+            return_value=workspace_state,
+        ), mock.patch.object(
+            client,
+            "_state_supports_workspace_resolution",
+            return_value=True,
+        ), mock.patch.object(
+            client,
+            "_state_requires_navigation",
+            return_value=True,
+        ), mock.patch.object(
+            client,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", None),
+        ) as submit_workspace, mock.patch.object(
+            client,
+            "_exchange_code_for_tokens",
+            return_value={"access_token": "at"},
+        ):
+            tokens = client.login_and_get_tokens(
+                "user@example.com",
+                "Secret123!",
+                "device-fixed",
+                prefer_passwordless_login=False,
+                allow_phone_verification=False,
+            )
+
+        self.assertEqual(tokens["access_token"], "at")
+        submit_workspace.assert_called_once()
+
     def test_login_and_get_tokens_does_not_restart_when_add_phone_has_no_workspace(self):
         client = self._make_client()
         add_phone_state = FlowState(

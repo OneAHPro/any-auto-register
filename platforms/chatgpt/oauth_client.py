@@ -3536,7 +3536,11 @@ class OAuthClient:
                 state = next_state
                 continue
 
-            if self._state_requires_navigation(state):
+            # Workspace/organization pages are navigable GET states too, but
+            # they require an explicit selection before generic follow logic.
+            # Handle them below instead of following /workspace and falling
+            # through to the unsupported-state error.
+            if self._state_requires_navigation(state) and not self._state_supports_workspace_resolution(state):
                 code, next_state = self._follow_flow_state(
                     state,
                     referer=referer,
@@ -4422,7 +4426,7 @@ class OAuthClient:
                     state = next_state
                     continue
 
-            if self._state_requires_navigation(state):
+            if self._state_requires_navigation(state) and not self._state_supports_workspace_resolution(state):
                 code, next_state = self._follow_flow_state(
                     state,
                     referer=referer,
