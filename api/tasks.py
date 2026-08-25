@@ -2630,11 +2630,10 @@ def _run_chatgpt_relogin_task_inner(
                 fetch_codex2api_quota_accounts,
             )
 
-            final_quota_accounts = None
+            quota_report = None
             for quota_attempt in range(3):
                 try:
                     final_quota_accounts = fetch_codex2api_quota_accounts()
-                    break
                 except Exception:
                     if quota_attempt >= 2:
                         raise
@@ -2644,14 +2643,30 @@ def _run_chatgpt_relogin_task_inner(
                             "Codex2API 额度字段仍在刷新，正在自动重试读取",
                         )
                     time.sleep(1.0)
-            if final_quota_accounts is None:
+                    continue
+                candidate_report = summarize_available_quota(
+                    final_quota_accounts
+                )
+                if (
+                    candidate_report.available
+                    and candidate_report.current_data_complete
+                    and candidate_report.total_data_complete
+                ):
+                    quota_report = candidate_report
+                    quota_query_succeeded = True
+                    break
+                quota_report = candidate_report
+                if quota_attempt >= 2:
+                    quota_query_error_type = "QuotaDataIncomplete"
+                    break
+                if quota_attempt == 0:
+                    _log(
+                        task_id,
+                        "Codex2API 额度字段仍在刷新，正在自动重试读取",
+                    )
+                time.sleep(1.0)
+            if quota_report is None:
                 raise RuntimeError("Codex2API 额度读取未返回结果")
-            quota_report = summarize_available_quota(final_quota_accounts)
-            quota_query_succeeded = bool(
-                quota_report.available
-                and quota_report.current_data_complete
-                and quota_report.total_data_complete
-            )
         except Exception as exc:
             quota_query_error_type = type(exc).__name__
             quota_report = summarize_available_quota(remote_quota_accounts)

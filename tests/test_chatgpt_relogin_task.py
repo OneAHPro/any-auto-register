@@ -1370,6 +1370,58 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertTrue(meta["quota_data_available"])
         self.assertEqual(meta["estimated_remaining_usd"], "10.00")
 
+    def test_final_quota_query_retries_successful_but_incomplete_snapshot(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [245],
+            source="schedule",
+            automation=True,
+        )
+        pending_rows = [
+            {
+                "email": "ready@example.com",
+                "plan_type": "plus",
+                "has_5h_window": True,
+                "remote_status": "active",
+            }
+        ]
+        final_rows = [
+            {
+                "email": "ready@example.com",
+                "plan_type": "plus",
+                "has_5h_window": True,
+                "remote_status": "active",
+                "usage_percent_5h": 50,
+                "billed_5h": 5,
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            }
+        ]
+        self.final_quota_reader.side_effect = [pending_rows, final_rows]
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                245: {
+                    "account_id": 245,
+                    "email": "ready@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            },
+        ), mock.patch("api.tasks.time.sleep") as sleep:
+            _run_chatgpt_relogin_task(task_id, [245])
+
+        self.assertEqual(self.final_quota_reader.call_count, 2)
+        sleep.assert_called_once()
+        meta = _task_store.snapshot(task_id)["meta"]
+        self.assertTrue(meta["quota_data_available"])
+        self.assertEqual(meta["estimated_current_remaining_usd"], "5.00")
+        self.assertEqual(meta["estimated_total_remaining_usd"], "10.00")
+
     def test_quota_alert_exception_does_not_change_terminal_task_outcome(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
