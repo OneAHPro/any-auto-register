@@ -84,6 +84,22 @@ def _remote_id(value: object) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _has_finite_quota_signal(row: Mapping[str, object]) -> bool:
+    """Return whether at least one window has enough data to estimate a cap."""
+
+    for suffix in ("5h", "7d"):
+        percent = _decimal(row.get(f"usage_percent_{suffix}"))
+        billed = _decimal(row.get(f"billed_{suffix}"))
+        if (
+            percent is not None
+            and billed is not None
+            and billed >= 0
+            and percent > 0
+        ):
+            return True
+    return False
+
+
 def estimate_account_quota(row: Mapping[str, object]) -> QuotaEstimate:
     """Classify one account and estimate its remaining 7d USD quota."""
 
@@ -137,6 +153,8 @@ def summarize_available_quota(
         email = str(row.get("email") or row.get("name") or "").strip()
         plan_type = str(row.get("plan_type") or "").strip().lower()
         if plan_type == "api":
+            continue
+        if not _has_finite_quota_signal(row):
             continue
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")

@@ -213,6 +213,40 @@ def test_usage_percent_without_billed_cost_is_incomplete():
     assert not report.available
 
 
+def test_zero_percent_windows_without_finite_denominator_do_not_block_valid_rows():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "unbounded-team@example.com",
+            "plan_type": "team",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 0,
+            "billed_5h": 0,
+            "usage_percent_7d": 0,
+            "billed_7d": 94.22,
+        },
+        {
+            "email": "plus@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("10.00")
+    assert report.total_remaining_usd == Decimal("20.00")
+    assert report.account_count == 1
+    assert report.current_data_complete
+    assert report.total_data_complete
+    assert report.available
+
+
 def test_api_accounts_do_not_make_subscription_quota_incomplete():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 
