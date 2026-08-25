@@ -13,6 +13,7 @@ import requests
 import core.applemail_pool as applemail_pool
 
 from core.applemail_pool import (
+    delete_applemail_pool_records,
     load_applemail_pool_records,
     load_applemail_pool_snapshot,
     parse_applemail_pool_content,
@@ -359,6 +360,29 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             self.assertEqual(snapshot["visible_count"], 2)
             next_mailbox = AppleMailMailbox(pool_dir=tmp_dir, pool_file="failed.json")
             self.assertEqual(next_mailbox.get_email().email, claimed.email)
+
+    def test_delete_batch_reports_claimed_mailbox_without_server_error(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                self._chatgpt_pool_content(1),
+                pool_dir=tmp_dir,
+                filename="delete-claimed.json",
+            )
+            claimed = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="delete-claimed.json",
+            ).get_email()
+
+            path, deleted, errors = delete_applemail_pool_records(
+                pool_dir=tmp_dir,
+                pool_file="delete-claimed.json",
+                items=[{"email": claimed.email, "mailbox": "INBOX"}],
+            )
+
+            self.assertEqual(path.name, "delete-claimed.json")
+            self.assertEqual(deleted, [])
+            self.assertEqual(len(errors), 1)
+            self.assertIn("处理中", errors[0])
 
     def test_restart_recovery_skips_unreadable_pool_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:

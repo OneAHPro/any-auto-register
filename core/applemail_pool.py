@@ -1103,6 +1103,7 @@ def delete_applemail_pool_records(
             allow_empty=True,
         )
         deleted: list[str] = []
+        errors: list[str] = []
         remaining: list[dict[str, Any]] = []
         for record in records:
             record_email = str(record.get("email") or "").strip().lower()
