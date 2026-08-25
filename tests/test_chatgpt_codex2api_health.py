@@ -93,7 +93,7 @@ def test_fetch_quota_accounts_preserves_independent_5h_and_weekly_fields():
     assert rows[0]["billed_7d"] == 20
 
 
-def test_fetch_quota_accounts_recovers_billed_amounts_from_window_details():
+def test_fetch_quota_accounts_does_not_use_rolling_detail_for_missing_summary():
     from services import chatgpt_codex2api_health as health
 
     with mock.patch.object(
@@ -118,11 +118,11 @@ def test_fetch_quota_accounts_recovers_billed_amounts_from_window_details():
     ):
         rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
 
-    assert rows[0]["billed_5h"] == 10
-    assert rows[0]["billed_7d"] == 20
+    assert "billed_5h" not in rows[0]
+    assert rows[0]["billed_7d"] is None
 
 
-def test_fetch_quota_accounts_prefers_positive_detail_over_zero_summary():
+def test_fetch_quota_accounts_keeps_zero_summary_over_rolling_detail():
     from services import chatgpt_codex2api_health as health
 
     with mock.patch.object(
@@ -150,10 +150,10 @@ def test_fetch_quota_accounts_prefers_positive_detail_over_zero_summary():
         rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
 
     assert rows[0]["billed_5h"] == 0
-    assert rows[0]["billed_7d"] == 94.22
+    assert rows[0]["billed_7d"] == 0
 
 
-def test_fetch_quota_accounts_uses_window_detail_when_summary_is_misaligned():
+def test_fetch_quota_accounts_keeps_positive_summary_over_rolling_detail():
     from services import chatgpt_codex2api_health as health
 
     with mock.patch.object(
@@ -181,7 +181,36 @@ def test_fetch_quota_accounts_uses_window_detail_when_summary_is_misaligned():
         rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
 
     assert rows[0]["billed_5h"] == 10
-    assert rows[0]["billed_7d"] == 200
+    assert rows[0]["billed_7d"] == 10
+
+
+def test_fetch_quota_accounts_keeps_reset_aligned_summary_over_rolling_detail():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 6049,
+                        "email": "pro@example.com",
+                        "status": "active",
+                        "plan_type": "pro",
+                        "usage_percent_7d": 1,
+                        "billed_7d": 12.7424096,
+                        "usage_7d_detail": {
+                            "account_billed": 3624.34587308,
+                        },
+                    }
+                ]
+            }
+        ),
+    ):
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    assert rows[0]["billed_7d"] == 12.7424096
 
 
 def test_fetch_quota_accounts_keeps_rows_while_quota_fields_are_refreshing():

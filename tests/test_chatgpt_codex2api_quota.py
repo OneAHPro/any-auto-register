@@ -47,6 +47,32 @@ def test_estimate_account_quota_calculates_remaining_usd():
     assert estimate.remaining_usd == Decimal("38.32")
 
 
+def test_pro_low_usage_uses_reset_aligned_cost_without_exploding_estimate():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "pro@example.com",
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "remote_status": "active",
+            "usage_percent_7d": 1,
+            "billed_7d": 12.7424096,
+        },
+        {
+            "email": "pro-two@example.com",
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "remote_status": "active",
+            "usage_percent_7d": 1,
+            "billed_7d": 11.5290068,
+        },
+    ])
+
+    assert report.total_remaining_usd == Decimal("2402.87")
+    assert report.total_remaining_usd < Decimal("10000")
+
+
 def test_estimate_account_quota_rejects_missing_zero_or_invalid_values():
     from services.chatgpt_codex2api_quota import estimate_account_quota
 

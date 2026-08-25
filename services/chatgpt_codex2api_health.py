@@ -177,35 +177,13 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _prefer_detail_billed(summary: object, detail: object) -> object:
-    """Use the window detail because summary costs can belong to another window."""
-
-    if detail is None:
-        return summary
-    return detail
-
-
 def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
-    usage_5h_detail = row.get("usage_5h_detail")
-    usage_7d_detail = row.get("usage_7d_detail")
-    billed_5h = row.get("billed_5h")
-    billed_7d = row.get("billed_7d")
-    if isinstance(usage_5h_detail, dict):
-        billed_5h = _prefer_detail_billed(
-            billed_5h,
-            usage_5h_detail.get("account_billed"),
-        )
-    if isinstance(usage_7d_detail, dict):
-        billed_7d = _prefer_detail_billed(
-            billed_7d,
-            usage_7d_detail.get("account_billed"),
-        )
     result = {
         "remote_id": _remote_id(row),
         "email": _remote_email(row),
         "remote_status": _text(row.get("status")).lower(),
         "usage_percent_7d": row.get("usage_percent_7d"),
-        "billed_7d": billed_7d,
+        "billed_7d": row.get("billed_7d"),
     }
     for key in (
         "plan_type",
@@ -214,10 +192,9 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
     ):
         if key in row and row.get(key) is not None:
             result[key] = row.get(key)
-    if billed_5h is not None:
-        result["billed_5h"] = billed_5h
-    if billed_7d is not None:
-        result["billed_7d"] = billed_7d
+    # `billed_*` are reset-aligned quota-window costs from the API summary.
+    # The `usage_*_detail.account_billed` values are rolling gateway costs and
+    # must never be substituted into the quota estimator.
     if (
         "plan_type" in row
         or row.get("reset_5h_at")
