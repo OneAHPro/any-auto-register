@@ -93,6 +93,35 @@ def test_fetch_quota_accounts_preserves_independent_5h_and_weekly_fields():
     assert rows[0]["billed_7d"] == 20
 
 
+def test_fetch_quota_accounts_recovers_billed_amounts_from_window_details():
+    from services import chatgpt_codex2api_health as health
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 101,
+                        "email": "one@example.com",
+                        "status": "active",
+                        "plan_type": "plus",
+                        "usage_percent_5h": 20,
+                        "usage_percent_7d": 40,
+                        "usage_5h_detail": {"account_billed": 10},
+                        "usage_7d_detail": {"account_billed": 20},
+                    }
+                ]
+            }
+        ),
+    ):
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    assert rows[0]["billed_5h"] == 10
+    assert rows[0]["billed_7d"] == 20
+
+
 def test_fetch_quota_accounts_keeps_rows_while_quota_fields_are_refreshing():
     from services import chatgpt_codex2api_health as health
 
