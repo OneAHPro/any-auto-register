@@ -1232,6 +1232,32 @@ class ChatGPTClient:
             if helper._state_is_about_you(state):
                 return False, "该邮箱尚未完成 ChatGPT 账号注册"
 
+            if helper._state_supports_workspace_resolution(state):
+                self._log("Web 登录进入 workspace/org 选择，先完成当前账号选择")
+                consent_entry = (
+                    state.continue_url
+                    or state.current_url
+                    or f"{helper.oauth_issuer}/sign-in-with-chatgpt/codex/consent"
+                )
+                code, next_state = helper._oauth_submit_workspace_and_org(
+                    consent_entry,
+                    self.device_id,
+                    self.ua,
+                    self.impersonate,
+                )
+                if code:
+                    self._log("workspace/org 选择已完成，继续读取 ChatGPT Session")
+                    self.last_registration_state = state
+                    break
+                if next_state:
+                    referer = state.current_url or state.continue_url or referer
+                    state = next_state
+                    self.last_registration_state = state
+                    continue
+                return False, helper.last_error or (
+                    f"workspace/org 选择失败: {describe_flow_state(state)}"
+                )
+
             if self._state_requires_navigation(state):
                 success, next_state = self._follow_flow_state(
                     state,
