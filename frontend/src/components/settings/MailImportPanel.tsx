@@ -214,12 +214,13 @@ function buildResultMessage(result: MailImportResult) {
 
 export default function MailImportPanel({ form }: MailImportPanelProps) {
   const { message } = App.useApp()
-  const currentMailProvider = String(Form.useWatch('mail_provider', form) || '') as MailImportFormProviderType
-  const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
-  const watchedPoolDir = String(Form.useWatch('applemail_pool_dir', form) || 'mail')
-  const watchedPoolFile = String(Form.useWatch('applemail_pool_file', form) || '')
-  const watchedLuckmailEmailType = String(Form.useWatch('luckmail_email_type', form) || '')
-  const watchedLuckmailDomain = String(Form.useWatch('luckmail_domain', form) || '')
+  const watchOptions = { form, preserve: true }
+  const currentMailProvider = String(Form.useWatch('mail_provider', watchOptions) || '') as MailImportFormProviderType
+  const currentMailImportSource = String(Form.useWatch('mail_import_source', watchOptions) || 'microsoft')
+  const watchedPoolDir = String(Form.useWatch('applemail_pool_dir', watchOptions) || 'mail')
+  const watchedPoolFile = String(Form.useWatch('applemail_pool_file', watchOptions) || '')
+  const watchedLuckmailEmailType = String(Form.useWatch('luckmail_email_type', watchOptions) || '')
+  const watchedLuckmailDomain = String(Form.useWatch('luckmail_domain', watchOptions) || '')
 
   const [providers, setProviders] = useState<MailImportDisplayProvider[]>([])
   const [selectedType, setSelectedType] = useState<MailImportSelectionType>('outlook')

@@ -60,12 +60,19 @@ function snapshot(
   }
 }
 
-function renderPanel() {
+function renderPanel(initialValues: Record<string, unknown> = {}) {
   function Harness() {
     const [form] = Form.useForm()
     return (
       <App>
-        <Form form={form} initialValues={{ mail_provider: 'mail_import', mail_import_source: 'microsoft' }}>
+        <Form
+          form={form}
+          initialValues={{
+            mail_provider: 'mail_import',
+            mail_import_source: 'microsoft',
+            ...initialValues,
+          }}
+        >
           <MailImportPanel form={form} />
         </Form>
       </App>
@@ -260,6 +267,23 @@ describe('MailImportPanel automatic detection', () => {
     expect(await screen.findByText('one@outlook.com')).toBeTruthy()
     expect(await screen.findByText('two@gmail.com')).toBeTruthy()
     expect(screen.getByText('已导入: 2 个邮箱')).toBeTruthy()
+  })
+
+  it('loads the configured AppleMail file even when its form fields are not rendered', async () => {
+    renderPanel({
+      applemail_pool_dir: '/shared/data/mail',
+      applemail_pool_file: 'active-pool.json',
+    })
+
+    await waitFor(() => {
+      const request = vi.mocked(apiFetch).mock.calls.find(([path]) => (
+        String(path).startsWith('/mail-imports/snapshot?type=applemail')
+      ))
+      expect(request).toBeTruthy()
+      const url = new URL(String(request?.[0]), 'https://fixture.local')
+      expect(url.searchParams.get('pool_dir')).toBe('/shared/data/mail')
+      expect(url.searchParams.get('pool_file')).toBe('active-pool.json')
+    })
   })
 
   it('keeps processing and failed mailboxes visible with distinct states', async () => {
