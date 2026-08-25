@@ -1246,9 +1246,22 @@ class ChatGPTClient:
                     self.impersonate,
                 )
                 if code:
-                    self._log("workspace/org 选择已完成，继续读取 ChatGPT Session")
-                    self.last_registration_state = state
-                    break
+                    self._log(
+                        "workspace/org 选择已完成，先访问 authorization callback "
+                        "再读取 ChatGPT Session"
+                    )
+                    callback_state = next_state
+                    if callback_state is None:
+                        return False, "workspace 选择后缺少 authorization callback"
+                    success, landed_state = self._follow_flow_state(
+                        callback_state,
+                        referer=state.current_url or state.continue_url or referer,
+                    )
+                    if not success:
+                        return False, f"workspace authorization callback 失败: {landed_state}"
+                    self.last_registration_state = landed_state
+                    state = landed_state
+                    continue
                 if next_state:
                     referer = state.current_url or state.continue_url or referer
                     state = next_state

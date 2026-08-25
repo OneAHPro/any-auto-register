@@ -4701,11 +4701,11 @@ class OAuthClient:
 
                     # 如果有 continue_url，跟随它
                     if continue_url:
-                        code, _ = self._oauth_follow_for_code(
+                        code, callback_url = self._oauth_follow_for_code(
                             continue_url, consent_url, user_agent, impersonate
                         )
                         if code:
-                            return code, self._state_from_url(continue_url)
+                            return code, self._state_from_url(callback_url)
                     return None, workspace_state
 
                 except Exception as e:

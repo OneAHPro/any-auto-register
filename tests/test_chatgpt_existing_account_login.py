@@ -1951,6 +1951,59 @@ class ExistingAccountLoginTests(unittest.TestCase):
         self.assertEqual(result["access_token"], "access-token")
         submit_workspace.assert_called_once()
 
+    def test_web_login_follows_workspace_authorization_callback_before_session(self):
+        client = ChatGPTClient(verbose=False)
+        client.visit_homepage = mock.Mock(return_value=True)
+        client.get_csrf_token = mock.Mock(return_value="csrf-token")
+        client.signin = mock.Mock(return_value="https://auth.openai.com/mfa-challenge")
+        client.authorize = mock.Mock(return_value="https://auth.openai.com/mfa-challenge")
+        client.last_authorize_status = 200
+        client._get_cookie_value = mock.Mock(return_value="login-session")
+        workspace_state = FlowState(
+            page_type="workspace",
+            method="GET",
+            continue_url="https://auth.openai.com/workspace",
+            current_url="https://auth.openai.com/workspace",
+        )
+        callback_state = FlowState(
+            page_type="external_url",
+            method="GET",
+            continue_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+            current_url="https://chatgpt.com/api/auth/callback/openai?code=demo",
+        )
+        landed_state = FlowState(
+            page_type="chatgpt_home",
+            current_url="https://chatgpt.com/",
+            method="GET",
+        )
+        client._follow_flow_state = mock.Mock(return_value=(True, landed_state))
+        client.fetch_chatgpt_session = mock.Mock(
+            return_value=(True, {"accessToken": "access-token"})
+        )
+
+        with mock.patch.object(
+            OAuthClient,
+            "_submit_mfa_challenge",
+            return_value=workspace_state,
+        ), mock.patch.object(
+            OAuthClient,
+            "_oauth_submit_workspace_and_org",
+            return_value=("auth-code", callback_state),
+        ) as submit_workspace:
+            ok, result = client.login_existing_account_and_get_session(
+                "existing@example.com",
+                mock.Mock(),
+                totp_secret="JBSWY3DPEHPK3PXP",
+            )
+
+        self.assertTrue(ok, result)
+        self.assertEqual(result["access_token"], "access-token")
+        submit_workspace.assert_called_once()
+        client._follow_flow_state.assert_called_once_with(
+            callback_state,
+            referer="https://auth.openai.com/workspace",
+        )
+
     def test_web_login_clones_phone_oauth_after_first_email_otp(self):
         client = ChatGPTClient(verbose=False)
         client.visit_homepage = mock.Mock(return_value=True)
