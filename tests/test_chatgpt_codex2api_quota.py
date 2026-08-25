@@ -148,9 +148,8 @@ def test_summarize_mixes_plus_current_5h_with_pro_weekly_quota():
     assert report.total_data_complete
 
 
-def test_resolve_quota_amounts_uses_previous_value_for_incomplete_window():
+def test_incomplete_window_does_not_reuse_previous_quota_value():
     from services.chatgpt_codex2api_quota import (
-        resolve_quota_amounts,
         summarize_available_quota,
     )
 
@@ -163,16 +162,7 @@ def test_resolve_quota_amounts_uses_previous_value_for_incomplete_window():
             "billed_7d": 120,
         }]
     )
-    resolved = resolve_quota_amounts(
-        report,
-        {
-            "estimated_current_remaining_usd": "1980.89",
-            "estimated_total_remaining_usd": "8525.53",
-        },
-    )
-
-    assert resolved.current_remaining_usd == Decimal("1980.89")
-    assert resolved.total_remaining_usd == Decimal("120.00")
-    assert not resolved.current_fresh
-    assert resolved.total_fresh
-    assert resolved.available
+    assert report.current_remaining_usd == Decimal("0.00")
+    assert report.total_remaining_usd == Decimal("120.00")
+    assert not report.current_data_complete
+    assert report.total_data_complete

@@ -2662,49 +2662,6 @@ def _run_chatgpt_relogin_task_inner(
                 total_fresh=False,
             )
 
-        from services.chatgpt_codex2api_quota import resolve_quota_amounts
-        previous_meta = _task_store.snapshot(task_id).get("meta") or {}
-        if not quota_report.current_data_complete or not quota_report.total_data_complete or not quota_report.current_fresh or not quota_report.total_fresh:
-            previous_snapshots = [
-                item
-                for item in _task_store.list_snapshots()
-                if item.get("id") != task_id
-                and item.get("status") == "done"
-                and (item.get("meta") or {}).get("automation")
-                and (item.get("meta") or {}).get("quota_data_available")
-            ]
-            previous_snapshots.sort(
-                key=lambda item: str(item.get("updated_at") or ""),
-                reverse=True,
-            )
-            if previous_snapshots:
-                previous_meta = previous_snapshots[0].get("meta") or {}
-            if not previous_meta.get("estimated_current_remaining_usd"):
-                try:
-                    with Session(engine) as quota_session:
-                        previous_rows = quota_session.exec(
-                            select(TaskRunModel)
-                            .where(TaskRunModel.platform == "chatgpt")
-                            .where(TaskRunModel.source == "schedule")
-                            .where(TaskRunModel.status == "done")
-                            .where(TaskRunModel.id != task_id)
-                            .order_by(TaskRunModel.updated_at.desc())
-                            .limit(20)
-                        ).all()
-                    for previous_row in previous_rows:
-                        candidate = json.loads(previous_row.meta_json or "{}")
-                        if (
-                            candidate.get("automation")
-                            and candidate.get("quota_data_available")
-                            and candidate.get("estimated_current_remaining_usd")
-                            and candidate.get("estimated_total_remaining_usd")
-                        ):
-                            previous_meta = candidate
-                            break
-                except Exception:
-                    pass
-        quota_report = resolve_quota_amounts(quota_report, previous_meta)
-
         _task_store.update_meta(
             task_id,
             codex2api_account_count=quota_report.remote_account_count,
@@ -2718,7 +2675,12 @@ def _run_chatgpt_relogin_task_inner(
             estimated_total_remaining_usd=(
                 f"{quota_report.total_remaining_usd:.2f}"
             ),
-            quota_data_available=bool(quota_report.available),
+            quota_data_available=bool(
+                quota_query_succeeded
+                and quota_report.available
+                and quota_report.current_data_complete
+                and quota_report.total_data_complete
+            ),
             quota_current_fresh=quota_report.current_fresh,
             quota_total_fresh=quota_report.total_fresh,
         )

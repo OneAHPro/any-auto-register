@@ -1313,7 +1313,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         report = self.alert_sender.call_args.kwargs["quota_report"]
         self.assertEqual(report.remote_account_count, 1)
         self.assertEqual(report.account_count, 1)
-        self.assertEqual(str(report.estimated_remaining_usd), "0.00")
+        self.assertEqual(str(report.estimated_remaining_usd), "60.53")
         bark_report = self.bark_alert_sender.call_args.kwargs["quota_report"]
         self.assertIs(report, bark_report)
         self.quota_alert_sender.assert_not_called()
@@ -1325,7 +1325,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             snapshot["meta"]["quota_query_error_type"],
             "RuntimeError",
         )
-        self.assertTrue(snapshot["meta"]["quota_data_available"])
+        self.assertFalse(snapshot["meta"]["quota_data_available"])
         self.assertNotIn("secret detail", "\n".join(snapshot["logs"]))
 
     def test_final_quota_query_retries_until_remote_data_is_ready(self):
