@@ -73,6 +73,107 @@ def test_pro_low_usage_uses_reset_aligned_cost_without_exploding_estimate():
     assert report.total_remaining_usd < Decimal("10000")
 
 
+def test_merge_quota_rows_fills_only_missing_summary_fields_from_same_probe():
+    from services.chatgpt_codex2api_quota import (
+        merge_quota_rows,
+        summarize_available_quota,
+    )
+
+    merged = merge_quota_rows(
+        [
+            {
+                "remote_id": 1,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_5h": 50,
+                "billed_5h": None,
+                "usage_percent_7d": 40,
+                "billed_7d": None,
+                "has_5h_window": True,
+            }
+        ],
+        [
+            {
+                "remote_id": 1,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_5h": 45,
+                "billed_5h": 5,
+                "usage_percent_7d": 40,
+                "billed_7d": 10,
+                "has_5h_window": True,
+            }
+        ],
+    )
+
+    assert merged == [
+        {
+            "remote_id": 1,
+            "email": "one@example.com",
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 5,
+            "usage_percent_7d": 40,
+            "billed_7d": 10,
+            "has_5h_window": True,
+            "_quota_fallback_5h": True,
+            "_quota_fallback_7d": True,
+        }
+    ]
+    report = summarize_available_quota(merged)
+    assert not report.current_fresh
+    assert not report.total_fresh
+
+
+def test_merge_quota_rows_does_not_reintroduce_accounts_missing_from_final_response():
+    from services.chatgpt_codex2api_quota import merge_quota_rows
+
+    merged = merge_quota_rows(
+        [{"remote_id": 1, "email": "one@example.com"}],
+        [
+            {
+                "remote_id": 1,
+                "email": "one@example.com",
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            },
+            {
+                "remote_id": 2,
+                "email": "two@example.com",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+            },
+        ],
+    )
+
+    assert {row["remote_id"] for row in merged} == {1}
+
+
+def test_merge_quota_rows_rejects_stale_timestamped_fallback_costs():
+    from services.chatgpt_codex2api_quota import merge_quota_rows
+
+    merged = merge_quota_rows(
+        [
+            {
+                "remote_id": 1,
+                "usage_percent_7d": 50,
+                "billed_7d": None,
+                "quota_7d_updated_at": "new",
+            }
+        ],
+        [
+            {
+                "remote_id": 1,
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+                "quota_7d_updated_at": "old",
+            }
+        ],
+    )
+
+    assert merged[0]["billed_7d"] is None
+
+
 def test_estimate_account_quota_rejects_missing_zero_or_invalid_values():
     from services.chatgpt_codex2api_quota import estimate_account_quota
 
@@ -129,6 +230,54 @@ def test_summarize_available_quota_filters_non_normal_accounts():
     ]
     assert report.accounts[0].remaining_usd == Decimal("60.53")
     assert report.accounts[1].remaining_usd == Decimal("38.32")
+
+
+def test_summarize_treats_ready_remote_status_as_healthy():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "ready@example.com",
+            "remote_status": "ready",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        }
+    ])
+
+    assert report.account_count == 1
+    assert report.available
+    assert report.current_data_complete
+    assert report.total_data_complete
+
+
+def test_summarize_treats_quota_limited_statuses_as_valid_snapshots():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    statuses = (
+        "rate_limited_5h",
+        "rate_limited_7d",
+        "usage_exhausted",
+        "usage_limited",
+        "quota_paused",
+    )
+    report = summarize_available_quota([
+        {
+            "email": f"{status}@example.com",
+            "remote_status": status,
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "usage_percent_7d": 100,
+            "billed_7d": 50,
+        }
+        for status in statuses
+    ])
+
+    assert report.remote_account_count == len(statuses)
+    assert report.total_data_complete
+    assert report.available
+    assert report.total_remaining_usd == Decimal("0.00")
 
 
 def test_summarize_mixes_plus_current_5h_with_pro_weekly_quota():
@@ -192,6 +341,37 @@ def test_incomplete_window_does_not_reuse_previous_quota_value():
     assert report.total_remaining_usd == Decimal("120.00")
     assert not report.current_data_complete
     assert report.total_data_complete
+
+
+def test_complete_total_remains_available_when_current_window_is_partial():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "ready@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+        {
+            "email": "pending@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_7d": 50,
+            "billed_7d": 40,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("10.00")
+    assert report.total_remaining_usd == Decimal("60.00")
+    assert not report.current_data_complete
+    assert report.total_data_complete
+    assert report.available
 
 
 def test_exhausted_current_window_is_valid_zero_not_missing_data():

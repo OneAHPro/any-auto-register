@@ -22,6 +22,12 @@ BASE_CONFIG = {
 }
 
 
+def test_ready_remote_status_is_treated_as_healthy_for_auth_decisions():
+    from services import chatgpt_codex2api_health as health
+
+    assert "ready" in health.HEALTHY_STATUSES
+
+
 def test_fetch_quota_accounts_reads_latest_rows_without_triggering_probe():
     from services import chatgpt_codex2api_health as health
 

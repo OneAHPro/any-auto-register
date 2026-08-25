@@ -9,8 +9,23 @@ from typing import Iterable, Literal, Mapping
 
 CENT = Decimal("0.01")
 HUNDRED = Decimal("100")
-NORMAL_REMOTE_STATUSES = {"active", "rate_limited"}
+NORMAL_REMOTE_STATUSES = {
+    "active",
+    "ready",
+    "rate_limited",
+    "rate_limited_5h",
+    "rate_limited_7d",
+    "usage_exhausted",
+    "usage_limited",
+    "quota_paused",
+}
 VALID_ESTIMATE_STATES = {"available", "exhausted"}
+SUMMARY_QUOTA_FIELDS = (
+    "usage_percent_5h",
+    "billed_5h",
+    "usage_percent_7d",
+    "billed_7d",
+)
 
 
 @dataclass(frozen=True)
@@ -84,6 +99,76 @@ def _remote_id(value: object) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _quota_row_identities(row: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
+    identities: list[tuple[str, str]] = []
+    remote_id = _remote_id(row.get("remote_id") or row.get("id"))
+    if remote_id is not None:
+        identities.append(("id", str(remote_id)))
+    email = str(row.get("email") or row.get("name") or "").strip().lower()
+    if email:
+        identities.append(("email", email))
+    return tuple(identities)
+
+
+def merge_quota_rows(
+    rows: Iterable[Mapping[str, object]],
+    fallback_rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Fill transiently missing summary fields from the same probe snapshot.
+
+    The fallback is deliberately limited to reset-aligned summary fields.  It
+    never imports rolling ``usage_*_detail.account_billed`` values or replaces
+    a value returned by the newest response.
+    """
+
+    fallback_list = [dict(row) for row in fallback_rows if isinstance(row, Mapping)]
+    fallback_by_identity: dict[tuple[str, str], dict[str, object]] = {}
+    for row in fallback_list:
+        if not isinstance(row, Mapping):
+            continue
+        for identity in _quota_row_identities(row):
+            fallback_by_identity.setdefault(identity, dict(row))
+    merged_rows: list[dict[str, object]] = []
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        merged = dict(row)
+        identities = _quota_row_identities(row)
+        fallback = next(
+            (fallback_by_identity.get(identity) for identity in identities),
+            None,
+        )
+        if fallback is not None:
+            for field in SUMMARY_QUOTA_FIELDS:
+                timestamp_key = (
+                    "quota_5h_updated_at"
+                    if field.endswith("_5h")
+                    else "quota_7d_updated_at"
+                )
+                final_timestamp = merged.get(timestamp_key)
+                fallback_timestamp = fallback.get(timestamp_key)
+                same_snapshot = not (
+                    final_timestamp
+                    and fallback_timestamp
+                    and final_timestamp != fallback_timestamp
+                )
+                if (
+                    same_snapshot
+                    and merged.get(field) is None
+                    and fallback.get(field) is not None
+                ):
+                    merged[field] = fallback[field]
+                    merged[
+                        "_quota_fallback_5h"
+                        if field.endswith("_5h")
+                        else "_quota_fallback_7d"
+                    ] = True
+            if "has_5h_window" not in merged and "has_5h_window" in fallback:
+                merged["has_5h_window"] = True
+        merged_rows.append(merged)
+    return merged_rows
+
+
 def _has_5h_window(row: Mapping[str, object], plan_type: str) -> bool:
     value = row.get("has_5h_window")
     if value is not None:
@@ -151,6 +236,8 @@ def summarize_available_quota(
     current_count = 0
     total_count = 0
     healthy_count = 0
+    current_used_fallback = False
+    total_used_fallback = False
     for row in rows:
         remote_account_count += 1
         status = str(
@@ -164,6 +251,12 @@ def summarize_available_quota(
             continue
         if _is_non_finite_row(row, plan_type):
             continue
+        current_used_fallback = current_used_fallback or bool(
+            row.get("_quota_fallback_5h")
+        )
+        total_used_fallback = total_used_fallback or bool(
+            row.get("_quota_fallback_7d")
+        )
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
         short_estimate = estimate_window_quota(row, "5h")
@@ -239,11 +332,18 @@ def summarize_available_quota(
         total_data_count=total_count,
         current_data_complete=(healthy_count > 0 and current_count == healthy_count),
         total_data_complete=(healthy_count > 0 and total_count == healthy_count),
-        current_fresh=(healthy_count > 0 and current_count == healthy_count),
-        total_fresh=(healthy_count > 0 and total_count == healthy_count),
-        available=bool(
+        current_fresh=(
             healthy_count > 0
             and current_count == healthy_count
+            and not current_used_fallback
+        ),
+        total_fresh=(
+            healthy_count > 0
+            and total_count == healthy_count
+            and not total_used_fallback
+        ),
+        available=bool(
+            healthy_count > 0
             and total_count == healthy_count
         ),
     )
@@ -267,5 +367,6 @@ __all__ = [
     "QuotaEstimate",
     "estimate_account_quota",
     "estimate_window_quota",
+    "merge_quota_rows",
     "summarize_available_quota",
 ]

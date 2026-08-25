@@ -2620,6 +2620,7 @@ def _run_chatgpt_relogin_task_inner(
 
     if automation and final_status == "done":
         from services.chatgpt_codex2api_quota import (
+            merge_quota_rows,
             summarize_available_quota,
         )
 
@@ -2645,11 +2646,13 @@ def _run_chatgpt_relogin_task_inner(
                     time.sleep(1.0)
                     continue
                 candidate_report = summarize_available_quota(
-                    final_quota_accounts
+                    merge_quota_rows(
+                        final_quota_accounts,
+                        remote_quota_accounts,
+                    )
                 )
                 if (
                     candidate_report.available
-                    and candidate_report.current_data_complete
                     and candidate_report.total_data_complete
                 ):
                     quota_report = candidate_report
@@ -2693,13 +2696,12 @@ def _run_chatgpt_relogin_task_inner(
             quota_data_available=bool(
                 quota_query_succeeded
                 and quota_report.available
-                and quota_report.current_data_complete
                 and quota_report.total_data_complete
             ),
             quota_current_fresh=quota_report.current_fresh,
             quota_total_fresh=quota_report.total_fresh,
         )
-        if not quota_query_succeeded or not quota_report.current_fresh or not quota_report.total_fresh:
+        if not quota_query_succeeded:
             _task_store.update_meta(
                 task_id,
                 quota_alert_sent=False,
@@ -2713,6 +2715,31 @@ def _run_chatgpt_relogin_task_inner(
                 task_id,
                 "[ALERT] Codex2API 最新额度读取失败"
                 f"（{quota_query_error_type}），本轮跳过剩余额度告警",
+            )
+        elif not quota_report.total_fresh:
+            _task_store.update_meta(
+                task_id,
+                quota_alert_sent=False,
+                quota_alert_reason="quota_total_window_pending",
+                bark_quota_alert_sent=False,
+                bark_quota_alert_reason="quota_total_window_pending",
+            )
+            _log(
+                task_id,
+                "Codex2API 总计窗口额度仍在刷新，暂不触发额度阈值告警",
+            )
+        elif not quota_report.current_fresh:
+            _task_store.update_meta(
+                task_id,
+                quota_alert_sent=False,
+                quota_alert_reason="quota_current_window_pending",
+                bark_quota_alert_sent=False,
+                bark_quota_alert_reason="quota_current_window_pending",
+            )
+            _log(
+                task_id,
+                "Codex2API 当前窗口额度仍在刷新，已保留本轮总计额度；"
+                "暂不触发当前额度阈值告警",
             )
 
         try:
@@ -2834,7 +2861,7 @@ def _run_chatgpt_relogin_task_inner(
                 f"[ALERT] 重登失败 Bark 强提醒发送失败（{error_type}）",
             )
 
-        if quota_query_succeeded:
+        if quota_query_succeeded and quota_report.current_fresh and quota_report.total_fresh:
             try:
                 from services.chatgpt_auto_relogin_alerts import (
                     send_quota_threshold_alert,

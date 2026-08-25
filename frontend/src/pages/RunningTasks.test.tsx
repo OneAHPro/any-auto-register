@@ -185,6 +185,45 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.queryByText('$0.00')).toBeNull()
   })
 
+  it('shows total quota while the current window is still refreshing', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        estimated_current_remaining_usd: '10.00',
+        estimated_total_remaining_usd: '60.00',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('当前窗口额度刷新中')).toBeTruthy()
+    expect(screen.getByText('$60.00')).toBeTruthy()
+    expect(screen.queryByText('$10.00')).toBeNull()
+    expect(screen.queryByText('本次探针额度未生成')).toBeNull()
+  })
+
+  it('labels a fallback total as refreshing instead of hiding it', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: false,
+        estimated_current_remaining_usd: '10.00',
+        estimated_total_remaining_usd: '60.00',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('总计额度刷新中（暂用探针快照）')).toBeTruthy()
+    expect(screen.getByText('$60.00')).toBeTruthy()
+    expect(screen.queryByText('本次探针额度未生成')).toBeNull()
+  })
+
   it('hides task IDs without adding probe quota copy to manual tasks', async () => {
     configureApi(automaticSummary({
       id: 'task-manual-history',

@@ -46,6 +46,8 @@ interface TaskSnapshot {
     estimated_current_remaining_usd?: string | number
     estimated_total_remaining_usd?: string | number
     quota_data_available?: boolean
+    quota_current_fresh?: boolean
+    quota_total_fresh?: boolean
     alert_sent?: boolean
     alert_reason?: string
     quota_alert_reason?: string
@@ -214,7 +216,9 @@ export default function RunningTasks() {
     const deletedAccountCount = Math.max(0, Number(task.meta?.deleted_account_count) || 0)
     const quotaDataAvailable = task.meta?.quota_data_available !== false
       && task.meta?.quota_alert_reason !== 'quota_query_failed'
-    const currentRemainingQuota = quotaDataAvailable
+    const currentWindowFresh = task.meta?.quota_current_fresh !== false
+    const totalWindowFresh = task.meta?.quota_total_fresh !== false
+    const currentRemainingQuota = quotaDataAvailable && currentWindowFresh
       ? formatRemainingQuota(
         task.meta?.estimated_current_remaining_usd
         ?? task.meta?.estimated_remaining_usd,
@@ -248,16 +252,24 @@ export default function RunningTasks() {
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     本次探针额度统计中
                   </Text>
-                ) : task.status === 'done' && currentRemainingQuota && totalRemainingQuota ? (
+                ) : task.status === 'done' && totalRemainingQuota ? (
                   <div className="running-task-card__quota">
+                    {currentRemainingQuota ? (
+                      <>
+                        <Text type="secondary" style={{ fontSize: 11 }}>
+                          当前剩余可用额度
+                        </Text>
+                        <Text strong style={{ fontSize: 13, color: '#10b981' }}>
+                          {currentRemainingQuota}
+                        </Text>
+                      </>
+                    ) : (
+                      <Text type="secondary" style={{ fontSize: 11 }}>
+                        当前窗口额度刷新中
+                      </Text>
+                    )}
                     <Text type="secondary" style={{ fontSize: 11 }}>
-                      当前剩余可用额度
-                    </Text>
-                    <Text strong style={{ fontSize: 13, color: '#10b981' }}>
-                      {currentRemainingQuota}
-                    </Text>
-                    <Text type="secondary" style={{ fontSize: 11 }}>
-                      总计剩余可用额度
+                      {totalWindowFresh ? '总计剩余可用额度' : '总计额度刷新中（暂用探针快照）'}
                     </Text>
                     <Text strong style={{ fontSize: 13, color: '#10b981' }}>
                       {totalRemainingQuota}

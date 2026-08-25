@@ -19,7 +19,7 @@ AUTH_FAILED_STATUSES = {
     "token_invalidated",
     "unauthorized",
 }
-HEALTHY_STATUSES = {"active", "rate_limited"}
+HEALTHY_STATUSES = {"active", "ready", "rate_limited"}
 DEFERRED_STATUSES = {"error"}
 
 
@@ -185,6 +185,12 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
         "usage_percent_7d": row.get("usage_percent_7d"),
         "billed_7d": row.get("billed_7d"),
     }
+    for output_key, source_key in (
+        ("quota_5h_updated_at", "codex_5h_usage_updated_at"),
+        ("quota_7d_updated_at", "codex_usage_updated_at"),
+    ):
+        if row.get(source_key):
+            result[output_key] = row.get(source_key)
     for key in (
         "plan_type",
         "usage_percent_5h",
