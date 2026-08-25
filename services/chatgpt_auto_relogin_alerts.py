@@ -533,6 +533,13 @@ def send_quota_threshold_alert(
     threshold_usd = _quota_alert_threshold(
         snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
     )
+    if not quota_report.current_fresh:
+        return {
+            "sent": False,
+            "reason": "quota_data_stale",
+            "threshold_usd": f"{threshold_usd:.2f}",
+            "estimated_remaining_usd": f"{quota_report.current_remaining_usd:.2f}",
+        }
     estimated_remaining_usd = quota_report.current_remaining_usd.quantize(
         USD_CENT,
         rounding=ROUND_HALF_UP,

@@ -79,6 +79,8 @@ TASK_SUMMARY_META_KEYS = (
     "estimated_remaining_usd",
     "estimated_current_remaining_usd",
     "estimated_total_remaining_usd",
+    "quota_current_fresh",
+    "quota_total_fresh",
     "quota_data_available",
     "alert_sent",
     "alert_reason",
@@ -2645,10 +2647,63 @@ def _run_chatgpt_relogin_task_inner(
             if final_quota_accounts is None:
                 raise RuntimeError("Codex2API 额度读取未返回结果")
             quota_report = summarize_available_quota(final_quota_accounts)
-            quota_query_succeeded = True
+            quota_query_succeeded = bool(
+                quota_report.available
+                and quota_report.current_data_complete
+                and quota_report.total_data_complete
+            )
         except Exception as exc:
             quota_query_error_type = type(exc).__name__
             quota_report = summarize_available_quota(remote_quota_accounts)
+            from dataclasses import replace as replace_dataclass
+            quota_report = replace_dataclass(
+                quota_report,
+                current_fresh=False,
+                total_fresh=False,
+            )
+
+        from services.chatgpt_codex2api_quota import resolve_quota_amounts
+        previous_meta = _task_store.snapshot(task_id).get("meta") or {}
+        if not quota_report.current_data_complete or not quota_report.total_data_complete or not quota_report.current_fresh or not quota_report.total_fresh:
+            previous_snapshots = [
+                item
+                for item in _task_store.list_snapshots()
+                if item.get("id") != task_id
+                and item.get("status") == "done"
+                and (item.get("meta") or {}).get("automation")
+                and (item.get("meta") or {}).get("quota_data_available")
+            ]
+            previous_snapshots.sort(
+                key=lambda item: str(item.get("updated_at") or ""),
+                reverse=True,
+            )
+            if previous_snapshots:
+                previous_meta = previous_snapshots[0].get("meta") or {}
+            if not previous_meta.get("estimated_current_remaining_usd"):
+                try:
+                    with Session(engine) as quota_session:
+                        previous_rows = quota_session.exec(
+                            select(TaskRunModel)
+                            .where(TaskRunModel.platform == "chatgpt")
+                            .where(TaskRunModel.source == "schedule")
+                            .where(TaskRunModel.status == "done")
+                            .where(TaskRunModel.id != task_id)
+                            .order_by(TaskRunModel.updated_at.desc())
+                            .limit(20)
+                        ).all()
+                    for previous_row in previous_rows:
+                        candidate = json.loads(previous_row.meta_json or "{}")
+                        if (
+                            candidate.get("automation")
+                            and candidate.get("quota_data_available")
+                            and candidate.get("estimated_current_remaining_usd")
+                            and candidate.get("estimated_total_remaining_usd")
+                        ):
+                            previous_meta = candidate
+                            break
+                except Exception:
+                    pass
+        quota_report = resolve_quota_amounts(quota_report, previous_meta)
 
         _task_store.update_meta(
             task_id,
@@ -2663,9 +2718,11 @@ def _run_chatgpt_relogin_task_inner(
             estimated_total_remaining_usd=(
                 f"{quota_report.total_remaining_usd:.2f}"
             ),
-            quota_data_available=quota_query_succeeded,
+            quota_data_available=bool(quota_report.available),
+            quota_current_fresh=quota_report.current_fresh,
+            quota_total_fresh=quota_report.total_fresh,
         )
-        if not quota_query_succeeded:
+        if not quota_query_succeeded or not quota_report.current_fresh or not quota_report.total_fresh:
             _task_store.update_meta(
                 task_id,
                 quota_alert_sent=False,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Iterable, Literal, Mapping
 
@@ -39,6 +39,14 @@ class AvailableQuotaReport:
     remote_account_count: int = 0
     current_remaining_usd: Decimal | None = None
     total_remaining_usd: Decimal | None = None
+    eligible_account_count: int = 0
+    current_data_count: int = 0
+    total_data_count: int = 0
+    current_data_complete: bool = False
+    total_data_complete: bool = False
+    current_fresh: bool = True
+    total_fresh: bool = True
+    available: bool = True
 
     def __post_init__(self):
         if self.current_remaining_usd is None:
@@ -53,6 +61,55 @@ class AvailableQuotaReport:
                 "total_remaining_usd",
                 self.estimated_remaining_usd,
             )
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    parsed = _decimal(value)
+    return parsed.quantize(CENT, rounding=ROUND_HALF_UP) if parsed is not None else None
+
+
+def resolve_quota_amounts(
+    report: AvailableQuotaReport,
+    previous_meta: Mapping[str, object] | None = None,
+) -> AvailableQuotaReport:
+    """Keep display values stable when a remote window is temporarily incomplete."""
+    previous = previous_meta or {}
+    current_previous = _decimal_or_none(previous.get("estimated_current_remaining_usd"))
+    total_previous = _decimal_or_none(previous.get("estimated_total_remaining_usd"))
+    current = report.current_remaining_usd
+    total = report.total_remaining_usd
+    if total == Decimal("0.00") and report.accounts:
+        derived_total = sum(
+            (item.remaining_usd for item in report.accounts),
+            start=Decimal("0.00"),
+        ).quantize(CENT, rounding=ROUND_HALF_UP)
+        if derived_total > 0:
+            total = derived_total
+    current_fresh = bool(report.current_fresh and report.current_data_complete)
+    total_fresh = bool(report.total_fresh and report.total_data_complete)
+    if not current_fresh and current_previous is not None:
+        current = current_previous
+    if not total_fresh and total_previous is not None:
+        total = total_previous
+    available = bool(
+        current is not None
+        and total is not None
+        and (
+            current_fresh
+            or total_fresh
+            or current_previous is not None
+            or total_previous is not None
+        )
+    )
+    return replace(
+        report,
+        current_remaining_usd=current,
+        total_remaining_usd=total,
+        estimated_remaining_usd=total,
+        current_fresh=current_fresh,
+        total_fresh=total_fresh,
+        available=available,
+    )
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -114,6 +171,9 @@ def summarize_available_quota(
     remote_account_count = 0
     current_total = Decimal("0.00")
     total_total = Decimal("0.00")
+    eligible_count = 0
+    current_count = 0
+    total_count = 0
     for row in rows:
         remote_account_count += 1
         status = str(
@@ -136,6 +196,11 @@ def summarize_available_quota(
             current_estimate = QuotaEstimate(state="invalid")
         if estimate.state != "available" and current_estimate.state != "available":
             continue
+        eligible_count += 1
+        if current_estimate.state == "available":
+            current_count += 1
+        if estimate.state == "available" or estimate.usage_percent is not None:
+            total_count += 1
         if current_estimate.state == "available" and current_estimate.remaining_usd is not None:
             current_total += current_estimate.remaining_usd
         if estimate.state == "available" and estimate.remaining_usd is not None:
@@ -179,6 +244,11 @@ def summarize_available_quota(
         accounts=tuple(accounts),
         current_remaining_usd=current_total,
         total_remaining_usd=total_total,
+        eligible_account_count=eligible_count,
+        current_data_count=current_count,
+        total_data_count=total_count,
+        current_data_complete=(eligible_count == current_count),
+        total_data_complete=(eligible_count == total_count),
     )
 
 
