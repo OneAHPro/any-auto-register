@@ -247,6 +247,35 @@ def test_zero_percent_windows_without_finite_denominator_do_not_block_valid_rows
     assert report.available
 
 
+def test_missing_quota_fields_still_block_the_complete_snapshot():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "pending@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+        },
+        {
+            "email": "ready@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("10.00")
+    assert report.total_remaining_usd == Decimal("20.00")
+    assert not report.current_data_complete
+    assert not report.total_data_complete
+    assert not report.available
+
+
 def test_api_accounts_do_not_make_subscription_quota_incomplete():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 

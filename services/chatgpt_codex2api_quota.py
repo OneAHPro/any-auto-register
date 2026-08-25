@@ -84,20 +84,28 @@ def _remote_id(value: object) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _has_finite_quota_signal(row: Mapping[str, object]) -> bool:
-    """Return whether at least one window has enough data to estimate a cap."""
+def _has_5h_window(row: Mapping[str, object], plan_type: str) -> bool:
+    value = row.get("has_5h_window")
+    if value is not None:
+        return bool(value)
+    return bool(
+        row.get("usage_percent_5h") is not None
+        or plan_type not in {"", "pro"}
+    )
 
-    for suffix in ("5h", "7d"):
+
+def _is_non_finite_row(row: Mapping[str, object], plan_type: str) -> bool:
+    """Recognize explicit 0% windows as unlimited/non-finite, not missing."""
+
+    suffixes = ["7d"]
+    if _has_5h_window(row, plan_type):
+        suffixes.insert(0, "5h")
+    for suffix in suffixes:
         percent = _decimal(row.get(f"usage_percent_{suffix}"))
         billed = _decimal(row.get(f"billed_{suffix}"))
-        if (
-            percent is not None
-            and billed is not None
-            and billed >= 0
-            and percent > 0
-        ):
-            return True
-    return False
+        if percent is None or billed is None or billed < 0 or percent != 0:
+            return False
+    return True
 
 
 def estimate_account_quota(row: Mapping[str, object]) -> QuotaEstimate:
@@ -154,7 +162,7 @@ def summarize_available_quota(
         plan_type = str(row.get("plan_type") or "").strip().lower()
         if plan_type == "api":
             continue
-        if not _has_finite_quota_signal(row):
+        if _is_non_finite_row(row, plan_type):
             continue
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
@@ -162,12 +170,7 @@ def summarize_available_quota(
         # Accounts with a valid 5-hour window use it for the "current" amount.
         # Accounts without that window (for example Pro) use their weekly
         # estimate so they remain represented instead of contributing zero.
-        has_5h_window = row.get("has_5h_window")
-        if has_5h_window is None:
-            has_5h_window = bool(
-                row.get("usage_percent_5h") is not None
-                or plan_type not in {"", "pro"}
-            )
+        has_5h_window = _has_5h_window(row, plan_type)
         if short_estimate.state in {"available", "exhausted"}:
             current_estimate = short_estimate
         elif not has_5h_window:
