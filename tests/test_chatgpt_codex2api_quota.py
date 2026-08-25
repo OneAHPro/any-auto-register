@@ -103,3 +103,41 @@ def test_summarize_available_quota_filters_non_normal_accounts():
     ]
     assert report.accounts[0].remaining_usd == Decimal("60.53")
     assert report.accounts[1].remaining_usd == Decimal("38.32")
+
+
+def test_summarize_mixes_plus_current_5h_with_pro_weekly_quota():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota(
+        [
+            {
+                "email": "plus@example.com",
+                "plan_type": "plus",
+                "remote_status": "active",
+                "usage_percent_5h": 50,
+                "billed_5h": 10,
+                "usage_percent_7d": 25,
+                "billed_7d": 20,
+            },
+            {
+                "email": "pro@example.com",
+                "plan_type": "pro",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 50,
+            },
+            {
+                "email": "plus-pending@example.com",
+                "plan_type": "plus",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            },
+        ]
+    )
+
+    # Plus current = 5h (10), Pro current = weekly (50), while total is
+    # always the weekly sum (60 + 50 + 10).
+    assert report.current_remaining_usd == Decimal("60.00")
+    assert report.total_remaining_usd == Decimal("120.00")
+    assert report.estimated_remaining_usd == Decimal("120.00")

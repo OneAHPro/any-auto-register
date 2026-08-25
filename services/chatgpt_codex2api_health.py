@@ -178,13 +178,21 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
 
 
 def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
-    return {
+    result = {
         "remote_id": _remote_id(row),
         "email": _remote_email(row),
         "remote_status": _text(row.get("status")).lower(),
         "usage_percent_7d": row.get("usage_percent_7d"),
         "billed_7d": row.get("billed_7d"),
     }
+    for key in (
+        "plan_type",
+        "usage_percent_5h",
+        "billed_5h",
+    ):
+        if key in row and row.get(key) is not None:
+            result[key] = row.get(key)
+    return result
 
 
 def fetch_codex2api_quota_accounts(
@@ -207,18 +215,6 @@ def fetch_codex2api_quota_accounts(
     rows = payload.get("accounts") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
-    oauth_rows = [
-        row
-        for row in rows
-        if isinstance(row, dict)
-        and _text(row.get("account_type")).lower() == "oauth"
-        and _text(row.get("status")).lower() in HEALTHY_STATUSES
-    ]
-    if oauth_rows and any(
-        row.get("usage_percent_7d") is None or row.get("billed_7d") is None
-        for row in oauth_rows
-    ):
-        raise Codex2APIHealthError("Codex2API 额度数据未就绪")
     return [
         _quota_record(row)
         for row in rows

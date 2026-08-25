@@ -55,6 +55,8 @@ function automaticSummary(overrides: Record<string, unknown> = {}) {
       relogin_failed_count: 5,
       deleted_account_count: 3,
       estimated_remaining_usd: '98.85',
+      estimated_current_remaining_usd: '98.85',
+      estimated_total_remaining_usd: '120.00',
       alert_sent: true,
       alert_reason: 'sent',
     },
@@ -105,8 +107,10 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.getByText('鉴权失效 6')).toBeTruthy()
     expect(screen.getByText('重登失败 5')).toBeTruthy()
     expect(screen.getByText('邮件已提醒')).toBeTruthy()
-    expect(screen.getByText('剩余可用额度')).toBeTruthy()
     expect(screen.getByText('$98.85')).toBeTruthy()
+    expect(screen.getByText('当前剩余可用额度')).toBeTruthy()
+    expect(screen.getByText('总计剩余可用额度')).toBeTruthy()
+    expect(screen.getByText('$120.00')).toBeTruthy()
     expect(screen.queryByText('本次探针剩余可用额度')).toBeNull()
     expect(screen.queryByText('task-auto-history')).toBeNull()
   })

@@ -27,6 +27,8 @@ class AvailableQuotaAccount:
     usage_percent: Decimal
     billed_usd: Decimal
     remaining_usd: Decimal
+    current_remaining_usd: Decimal | None = None
+    plan_type: str = ""
 
 
 @dataclass(frozen=True)
@@ -35,6 +37,16 @@ class AvailableQuotaReport:
     estimated_remaining_usd: Decimal
     accounts: tuple[AvailableQuotaAccount, ...]
     remote_account_count: int = 0
+    current_remaining_usd: Decimal = Decimal("0.00")
+    total_remaining_usd: Decimal | None = None
+
+    def __post_init__(self):
+        if self.total_remaining_usd is None:
+            object.__setattr__(
+                self,
+                "total_remaining_usd",
+                self.estimated_remaining_usd,
+            )
 
 
 def _decimal(value: object) -> Decimal | None:
@@ -60,8 +72,12 @@ def _remote_id(value: object) -> int | None:
 def estimate_account_quota(row: Mapping[str, object]) -> QuotaEstimate:
     """Classify one account and estimate its remaining 7d USD quota."""
 
-    percent = _decimal(row.get("usage_percent_7d"))
-    billed = _decimal(row.get("billed_7d"))
+    return estimate_window_quota(row, "7d")
+
+
+def _estimate_quota_values(percent_value: object, billed_value: object) -> QuotaEstimate:
+    percent = _decimal(percent_value)
+    billed = _decimal(billed_value)
     if percent is None or billed is None or billed < 0 or percent <= 0:
         return QuotaEstimate(state="invalid")
     if percent >= HUNDRED:
@@ -90,6 +106,8 @@ def summarize_available_quota(
 
     accounts: list[AvailableQuotaAccount] = []
     remote_account_count = 0
+    current_total = Decimal("0.00")
+    total_total = Decimal("0.00")
     for row in rows:
         remote_account_count += 1
         status = str(
@@ -106,6 +124,20 @@ def summarize_available_quota(
         ):
             continue
         email = str(row.get("email") or row.get("name") or "").strip()
+        plan_type = str(row.get("plan_type") or "").strip().lower()
+        short_estimate = estimate_window_quota(row, "5h")
+        # Accounts with a valid 5-hour window use it for the "current" amount.
+        # Accounts without that window (for example Pro) use their weekly
+        # estimate so they remain represented instead of contributing zero.
+        if short_estimate.state in {"available", "exhausted"}:
+            current_estimate = short_estimate
+        elif plan_type == "pro":
+            current_estimate = estimate
+        else:
+            current_estimate = QuotaEstimate(state="invalid")
+        if current_estimate.state == "available" and current_estimate.remaining_usd is not None:
+            current_total += current_estimate.remaining_usd
+        total_total += estimate.remaining_usd
         accounts.append(
             AvailableQuotaAccount(
                 email=email,
@@ -113,19 +145,35 @@ def summarize_available_quota(
                 usage_percent=estimate.usage_percent,
                 billed_usd=estimate.billed_usd,
                 remaining_usd=estimate.remaining_usd,
+                current_remaining_usd=(
+                    current_estimate.remaining_usd
+                    if current_estimate.state == "available"
+                    else None
+                ),
+                plan_type=str(row.get("plan_type") or "").strip().lower(),
             )
         )
 
     accounts.sort(key=lambda item: (item.email.lower(), item.remote_id or 0))
-    total = sum(
-        (item.remaining_usd for item in accounts),
-        start=Decimal("0.00"),
-    ).quantize(CENT, rounding=ROUND_HALF_UP)
     return AvailableQuotaReport(
         remote_account_count=remote_account_count,
         account_count=len(accounts),
-        estimated_remaining_usd=total,
+        estimated_remaining_usd=total_total,
         accounts=tuple(accounts),
+        current_remaining_usd=current_total,
+        total_remaining_usd=total_total,
+    )
+
+
+def estimate_window_quota(
+    row: Mapping[str, object],
+    window: Literal["5h", "7d"],
+) -> QuotaEstimate:
+    """Estimate one independent quota window from the remote row."""
+    suffix = "5h" if window == "5h" else "7d"
+    return _estimate_quota_values(
+        row.get(f"usage_percent_{suffix}"),
+        row.get(f"billed_{suffix}"),
     )
 
 
@@ -134,5 +182,6 @@ __all__ = [
     "AvailableQuotaReport",
     "QuotaEstimate",
     "estimate_account_quota",
+    "estimate_window_quota",
     "summarize_available_quota",
 ]

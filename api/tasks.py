@@ -77,6 +77,8 @@ TASK_SUMMARY_META_KEYS = (
     "codex2api_account_count",
     "available_quota_account_count",
     "estimated_remaining_usd",
+    "estimated_current_remaining_usd",
+    "estimated_total_remaining_usd",
     "quota_data_available",
     "alert_sent",
     "alert_reason",
@@ -1805,6 +1807,8 @@ def _create_chatgpt_relogin_task_record(
                 "codex2api_account_count": 0,
                 "available_quota_account_count": 0,
                 "estimated_remaining_usd": "0.00",
+                "estimated_current_remaining_usd": "0.00",
+                "estimated_total_remaining_usd": "0.00",
                 "quota_data_available": False,
                 "codex2api_delete_on_account_remove_enabled": (
                     delete_linked_credential
@@ -2652,6 +2656,12 @@ def _run_chatgpt_relogin_task_inner(
             available_quota_account_count=quota_report.account_count,
             estimated_remaining_usd=(
                 f"{quota_report.estimated_remaining_usd:.2f}"
+            ),
+            estimated_current_remaining_usd=(
+                f"{quota_report.current_remaining_usd:.2f}"
+            ),
+            estimated_total_remaining_usd=(
+                f"{quota_report.total_remaining_usd:.2f}"
             ),
             quota_data_available=quota_query_succeeded,
         )

@@ -43,6 +43,8 @@ interface TaskSnapshot {
     relogin_failed_count?: number
     deleted_account_count?: number
     estimated_remaining_usd?: string | number
+    estimated_current_remaining_usd?: string | number
+    estimated_total_remaining_usd?: string | number
     quota_data_available?: boolean
     alert_sent?: boolean
     alert_reason?: string
@@ -212,8 +214,17 @@ export default function RunningTasks() {
     const deletedAccountCount = Math.max(0, Number(task.meta?.deleted_account_count) || 0)
     const quotaDataAvailable = task.meta?.quota_data_available !== false
       && task.meta?.quota_alert_reason !== 'quota_query_failed'
-    const remainingQuota = quotaDataAvailable
-      ? formatRemainingQuota(task.meta?.estimated_remaining_usd)
+    const currentRemainingQuota = quotaDataAvailable
+      ? formatRemainingQuota(
+        task.meta?.estimated_current_remaining_usd
+        ?? task.meta?.estimated_remaining_usd,
+      )
+      : null
+    const totalRemainingQuota = quotaDataAvailable
+      ? formatRemainingQuota(
+        task.meta?.estimated_total_remaining_usd
+        ?? task.meta?.estimated_remaining_usd,
+      )
       : null
 
     const duration = isActive(task)
@@ -237,13 +248,19 @@ export default function RunningTasks() {
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     本次探针额度统计中
                   </Text>
-                ) : task.status === 'done' && remainingQuota ? (
+                ) : task.status === 'done' && currentRemainingQuota && totalRemainingQuota ? (
                   <div className="running-task-card__quota">
                     <Text type="secondary" style={{ fontSize: 11 }}>
-                      剩余可用额度
+                      当前剩余可用额度
                     </Text>
                     <Text strong style={{ fontSize: 13, color: '#10b981' }}>
-                      {remainingQuota}
+                      {currentRemainingQuota}
+                    </Text>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      总计剩余可用额度
+                    </Text>
+                    <Text strong style={{ fontSize: 13, color: '#10b981' }}>
+                      {totalRemainingQuota}
                     </Text>
                   </div>
                 ) : (
