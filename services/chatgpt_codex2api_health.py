@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from decimal import Decimal, InvalidOperation
 import time
 from typing import Iterable, Mapping
 
@@ -179,20 +178,11 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
 
 
 def _prefer_detail_billed(summary: object, detail: object) -> object:
-    """Use a positive window detail when the summary is a placeholder zero."""
+    """Use the window detail because summary costs can belong to another window."""
 
     if detail is None:
         return summary
-    if summary is None:
-        return detail
-    try:
-        summary_value = Decimal(str(summary).strip())
-        detail_value = Decimal(str(detail).strip())
-    except (InvalidOperation, TypeError, ValueError):
-        return summary
-    if summary_value == 0 and detail_value > 0:
-        return detail
-    return summary
+    return detail
 
 
 def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
