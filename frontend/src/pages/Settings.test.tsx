@@ -106,7 +106,7 @@ describe('Settings ChatGPT automatic relogin config', () => {
     const interval = await screen.findByRole('spinbutton', { name: 'Codex2API 鉴权巡检间隔（分钟）' }) as HTMLInputElement
     const concurrency = screen.getByRole('spinbutton', { name: '异常账号重登并发数' }) as HTMLInputElement
     const threshold = screen.getByRole('spinbutton', { name: '重登失败告警阈值（账号数）' }) as HTMLInputElement
-    const quotaThreshold = screen.getByRole('spinbutton', { name: 'Codex2API 剩余额度告警阈值（美元）' }) as HTMLInputElement
+    const quotaThreshold = screen.getByRole('spinbutton', { name: 'Codex2API 当前剩余可用额度告警阈值（美元）' }) as HTMLInputElement
     const barkEndpoint = screen.getByLabelText('Bark 推送地址') as HTMLInputElement
     await waitFor(() => expect(interval.value).toBe('45'))
     expect(interval.value).toBe('45')

@@ -1279,6 +1279,49 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
 
             self.assertEqual(current_ids, set())
 
+    def test_mailapi_history_uses_message_recipient_when_top_email_is_missing(self):
+        mail_url = (
+            "https://mail.example.test/mail-api/v1/messages"
+            "?email=demo%40example.com&access_token=fixture"
+        )
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            save_applemail_pool_json(
+                json.dumps({
+                    "email": "demo@example.com",
+                    "password": "chatgpt-password",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                    "account_type": "chatgpt_password_totp",
+                    "mail_api_url": mail_url,
+                }),
+                pool_dir=tmp_dir,
+                filename="mailapi-recipient.json",
+            )
+            mailbox = AppleMailMailbox(
+                pool_dir=tmp_dir,
+                pool_file="mailapi-recipient.json",
+            )
+            account = mailbox.get_email()
+            response = mock.Mock(
+                status_code=200,
+                text=json.dumps({
+                    "latest_only": True,
+                    "messages": [{
+                        "date": "2026-08-25T14:50:06Z",
+                        "subject": "Your ChatGPT verification code",
+                        "code": "222222",
+                        "to": "demo@example.com",
+                    }],
+                }),
+                url=mail_url,
+                history=[],
+                cookies=None,
+            )
+
+            with mock.patch("requests.get", return_value=response):
+                current_ids = mailbox.get_current_ids(account)
+
+            self.assertTrue(current_ids)
+
     def test_remote_totp_accepts_exact_plaintext_code_without_rewriting_url(self):
         mail_url = (
             "https://mail.example.test/messages/MAIL_SECRET/"

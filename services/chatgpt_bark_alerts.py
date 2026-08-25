@@ -232,7 +232,7 @@ def send_bark_relogin_alert(
         f"其中封禁或删除：{deleted_count}\n"
         f"额度已用完的重登失败：{exhausted_count}\n"
         f"正常可用账号：{quota_report.account_count}\n"
-        f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
+        f"当前剩余可用额度：${quota_report.current_remaining_usd:.2f}\n"
         f"任务 ID：{_text(task_id)}"
     )
     result = _send_bark(
@@ -259,7 +259,7 @@ def send_bark_quota_threshold_alert(
     threshold_usd = _quota_alert_threshold(
         snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
     )
-    remaining_usd = quota_report.estimated_remaining_usd.quantize(
+    remaining_usd = quota_report.current_remaining_usd.quantize(
         USD_CENT,
         rounding=ROUND_HALF_UP,
     )
@@ -287,7 +287,7 @@ def send_bark_quota_threshold_alert(
         return {"sent": False, "reason": endpoint_error, **base_result}
 
     body = (
-        f"当前估算剩余额度：${remaining_usd:.2f}\n"
+        f"当前剩余可用额度：${remaining_usd:.2f}\n"
         f"告警阈值：${threshold_usd:.2f}\n"
         f"正常可用账号：{quota_report.account_count}\n"
         f"账号总数：{quota_report.remote_account_count}\n"
@@ -295,9 +295,9 @@ def send_bark_quota_threshold_alert(
     )
     result = _send_bark(
         endpoint=endpoint,
-        title=_business_alert_title(
-            quota_report,
-            "Codex 剩余额度不足告警",
+        title=(
+            f"${quota_report.current_remaining_usd:.2f}｜"
+            f"正常可用账号 {quota_report.account_count} 个｜Codex 剩余额度不足告警"
         ),
         body=body,
     )

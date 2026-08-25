@@ -153,7 +153,7 @@ def test_available_failure_alert_contains_remaining_usd(monkeypatch):
     assert "额度已用完的重登失败：3" in plain
     assert "正常可用账号：2" in plain
     assert "账号总数：2" in plain
-    assert "当前估算剩余额度：$98.85" in plain
+    assert "当前剩余可用额度：$98.85" in plain
     assert message["Subject"] == (
         "$98.85｜正常可用账号 2 个｜Codex 重登失败账号告警"
     )
@@ -209,7 +209,7 @@ def test_quota_threshold_alert_sends_below_threshold_every_call(monkeypatch):
     plain = message.get_body(preferencelist=("plain",)).get_content()
     html = message.get_body(preferencelist=("html",)).get_content()
     assert "额度告警阈值" not in plain
-    assert "当前估算剩余额度：$98.85" in plain
+    assert "当前剩余可用额度：$98.85" in plain
     assert "账号总数：2" in plain
     assert "Codex 剩余额度不足告警" in html
     assert "账号概览" in html
@@ -564,3 +564,32 @@ def test_alert_message_has_escaped_html_and_fixed_metrics_order(monkeypatch):
     assert "@media only screen and (max-width: 600px)" in html
     assert "smtp-test-credential" not in plain
     assert "smtp-test-credential" not in html
+
+
+def test_quota_threshold_uses_current_remaining_amount_not_weekly_total(monkeypatch):
+    from decimal import Decimal
+    from services import chatgpt_auto_relogin_alerts as alerts
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    report = AvailableQuotaReport(
+        account_count=2,
+        estimated_remaining_usd=Decimal("500.00"),
+        current_remaining_usd=Decimal("80.00"),
+        accounts=(),
+    )
+    monkeypatch.setattr(alerts.smtplib, "SMTP", pytest.fail)
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", pytest.fail)
+
+    result = alerts.send_quota_threshold_alert(
+        task_id="task-current-threshold",
+        quota_report=report,
+        quota_eligible_failure_count=0,
+        quota_exhausted_failure_count=0,
+        relogin_failed_count=0,
+        config={
+            "chatgpt_auto_relogin_quota_alert_threshold_usd": "100.00",
+        },
+    )
+
+    assert result["reason"] == "smtp_not_configured"
+    assert result["estimated_remaining_usd"] == "80.00"

@@ -221,7 +221,7 @@ def _build_message(
         f"额度已用完的重登失败：{quota_exhausted_failure_count}\n"
         f"正常可用账号：{quota_report.account_count}\n"
         f"账号总数：{quota_report.remote_account_count}\n"
-        f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
+        f"当前剩余可用额度：${quota_report.current_remaining_usd:.2f}\n"
         f"告警阈值：{threshold}\n"
         f"完成时间：{occurred_at}\n\n"
         "已删除或停用账号属于重登失败账号的子集。"
@@ -274,17 +274,17 @@ def _build_quota_threshold_message(
     deleted_account_count: int,
 ) -> EmailMessage:
     message = EmailMessage()
-    message["Subject"] = _business_alert_subject(
-        quota_report,
-        "Codex 剩余额度不足告警",
+    message["Subject"] = (
+        f"${quota_report.current_remaining_usd:.2f}｜"
+        f"正常可用账号 {quota_report.account_count} 个｜Codex 剩余额度不足告警"
     )
     message["From"] = sender
     message["To"] = ", ".join(recipients)
     occurred_at = _format_beijing_time()
     message.set_content(
-        "Codex 当前正常可用账号的估算剩余额度低于告警阈值。\n\n"
+        "Codex 当前剩余可用额度低于告警阈值。\n\n"
         f"任务 ID：{task_id}\n"
-        f"当前估算剩余额度：${quota_report.estimated_remaining_usd:.2f}\n"
+        f"当前剩余可用额度：${quota_report.current_remaining_usd:.2f}\n"
         f"正常可用账号：{quota_report.account_count}\n"
         f"账号总数：{quota_report.remote_account_count}\n"
         f"仍有额度的重登失败：{quota_eligible_failure_count}\n"
@@ -292,19 +292,19 @@ def _build_quota_threshold_message(
         f"重登失败：{relogin_failed_count}\n"
         f"其中已删除或停用账号：{deleted_account_count}\n"
         f"完成时间：{occurred_at}\n\n"
-        "剩余额度为按正常账号的 7 天用量百分比和已用成本计算的美元估算值。\n"
+        "当前剩余可用额度按账号当前适用的额度窗口估算。\n"
         "自动化流程每次检测到低于阈值时都会发送本告警。\n"
     )
     message.add_alternative(
         _build_alert_html(
             title="Codex 剩余额度不足告警",
-            lead="当前正常可用账号的估算剩余额度已低于告警阈值。",
+            lead="当前剩余可用额度已低于告警阈值。",
             badge="额度不足",
             badge_color="#b83b30",
             badge_border="#ffd0ca",
             badge_background="#fff2f0",
-            amount_label="当前估算剩余额度",
-            amount_usd=quota_report.estimated_remaining_usd,
+            amount_label="当前剩余可用额度",
+            amount_usd=quota_report.current_remaining_usd,
             section_label="账号概览",
             metrics=(
                 ("正常可用账号", quota_report.account_count),
@@ -313,14 +313,14 @@ def _build_quota_threshold_message(
             ),
             notice_title="持续告警规则",
             notice_body=(
-                "自动化流程每轮检测一次；只要剩余额度仍低于你设置的阈值，"
+                "自动化流程每轮检测一次；只要当前剩余可用额度仍低于你设置的阈值，"
                 "就会继续发送本邮件。"
             ),
             notice_color="#252e38",
             task_id=task_id,
             occurred_at=occurred_at,
             footer_note=(
-                "剩余额度按正常账号的 7 天用量百分比与已用成本估算，金额单位为美元。"
+                "当前剩余可用额度按账号当前适用的额度窗口估算，金额单位为美元。"
             ),
         ),
         subtype="html",
@@ -533,7 +533,7 @@ def send_quota_threshold_alert(
     threshold_usd = _quota_alert_threshold(
         snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
     )
-    estimated_remaining_usd = quota_report.estimated_remaining_usd.quantize(
+    estimated_remaining_usd = quota_report.current_remaining_usd.quantize(
         USD_CENT,
         rounding=ROUND_HALF_UP,
     )

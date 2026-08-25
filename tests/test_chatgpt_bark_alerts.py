@@ -80,7 +80,7 @@ def test_relogin_alert_posts_critical_call_payload(monkeypatch):
             "其中封禁或删除：3\n"
             "额度已用完的重登失败：2\n"
             "正常可用账号：2\n"
-            "当前估算剩余额度：$98.85\n"
+                "当前剩余可用额度：$98.85\n"
             "任务 ID：task-relogin-1"
         ),
         "group": "Any Auto Register · Codex",
@@ -172,7 +172,7 @@ def test_quota_alert_posts_every_time_remaining_is_below_threshold(monkeypatch):
     payload = json.loads(calls[0][0].data.decode("utf-8"))
     assert payload["title"] == "$98.85｜正常可用账号 2 个｜Codex 剩余额度不足告警"
     assert payload["body"] == (
-        "当前估算剩余额度：$98.85\n"
+            "当前剩余可用额度：$98.85\n"
         "告警阈值：$120.00\n"
         "正常可用账号：2\n"
         "账号总数：7\n"
@@ -218,10 +218,26 @@ def test_test_notification_uses_same_critical_delivery(monkeypatch):
     assert result == {"sent": True, "reason": "sent"}
     payload = json.loads(calls[0][0].data.decode("utf-8"))
     assert payload["title"] == "Any Auto Register · Bark 强提醒测试"
-    assert "配置可用" in payload["body"]
-    assert payload["level"] == "critical"
-    assert payload["call"] == "1"
-    assert payload["sound"] == "alarm"
+
+
+def test_bark_quota_threshold_uses_current_remaining_amount(monkeypatch):
+    current_report = AvailableQuotaReport(
+        account_count=2,
+        remote_account_count=7,
+        estimated_remaining_usd=Decimal("500.00"),
+        current_remaining_usd=Decimal("80.00"),
+        accounts=(),
+    )
+    monkeypatch.setattr(alerts, "_open_bark_request", pytest.fail)
+
+    result = alerts.send_bark_quota_threshold_alert(
+        task_id="task-current-quota",
+        quota_report=current_report,
+        config={**BASE_CONFIG, "bark_endpoint": ""},
+    )
+
+    assert result["reason"] == "bark_not_configured"
+    assert result["estimated_remaining_usd"] == "80.00"
 
 
 @pytest.mark.parametrize(

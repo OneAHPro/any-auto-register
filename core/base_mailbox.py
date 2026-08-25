@@ -4562,6 +4562,33 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             decoded_parts.append(str(content or ""))
         return " ".join(decoded_parts).strip() or raw
 
+    @staticmethod
+    def _mailapi_recipient_emails(value: Any) -> list[str]:
+        """Extract normalized recipient addresses from common MailAPI shapes."""
+        import re
+
+        values = value if isinstance(value, (list, tuple)) else [value]
+        emails: list[str] = []
+        for item in values:
+            if isinstance(item, dict):
+                nested = (
+                    item.get("email")
+                    or item.get("address")
+                    or item.get("value")
+                    or ""
+                )
+            else:
+                nested = item
+            for email in re.findall(
+                r"[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}",
+                str(nested or ""),
+                re.IGNORECASE,
+            ):
+                normalized = email.strip().lower()
+                if normalized and normalized not in emails:
+                    emails.append(normalized)
+        return emails
+
     @classmethod
     def _parse_mailapi_message(
         cls,
@@ -4734,6 +4761,13 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                     received_at,
                 ) = max(candidates, key=lambda candidate: candidate[:2])
                 subject = str(newest.get("subject") or "").strip()
+                response_emails = cls._mailapi_recipient_emails(
+                    newest.get("to")
+                    or newest.get("recipient")
+                    or newest.get("recipients")
+                    or newest.get("address")
+                    or newest.get("email")
+                )
                 identity = "|".join(
                     (
                         response_email,
@@ -4758,6 +4792,7 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
                     ).hexdigest(),
                     "status": payload.get("ok", payload.get("status")),
                     "response_email": response_email,
+                    "response_emails": response_emails,
                     "mailapi_history": True,
                 }
             return {
@@ -5673,7 +5708,16 @@ class MailApiUrlOtpBackend(OutlookMailboxBackend):
             return True
         response_email = str(message.get("response_email") or "").strip().lower()
         account_email = str(account.email or "").strip().lower()
-        return bool(response_email and account_email and response_email == account_email)
+        if not account_email:
+            return False
+        if response_email:
+            return response_email == account_email
+        response_emails = {
+            str(value or "").strip().lower()
+            for value in (message.get("response_emails") or [])
+            if str(value or "").strip()
+        }
+        return account_email in response_emails
 
     def get_current_ids(
         self,

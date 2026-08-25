@@ -2851,12 +2851,12 @@ def _run_chatgpt_relogin_task_inner(
             elif quota_alert_reason == "quota_not_below_threshold":
                 _log(
                     task_id,
-                    "剩余额度告警未触发：当前估算剩余额度未低于配置阈值",
+                    "剩余额度告警未触发：当前剩余可用额度未低于配置阈值",
                 )
             elif quota_alert_reason == "smtp_not_configured":
                 _log(
                     task_id,
-                    "[ALERT] 当前估算剩余额度已低于阈值，"
+                    "[ALERT] 当前剩余可用额度已低于阈值，"
                     "但 SMTP 配置不完整",
                 )
             else:
@@ -2923,14 +2923,14 @@ def _run_chatgpt_relogin_task_inner(
             elif bark_quota_alert_reason == "quota_not_below_threshold":
                 _log(
                     task_id,
-                    "剩余额度 Bark 强提醒未触发：当前估算剩余额度未低于配置阈值",
+                    "剩余额度 Bark 强提醒未触发：当前剩余可用额度未低于配置阈值",
                 )
             elif bark_quota_alert_reason == "bark_disabled":
                 _log(task_id, "Bark 强提醒未启用")
             elif bark_quota_alert_reason == "bark_not_configured":
                 _log(
                     task_id,
-                    "[ALERT] 当前估算剩余额度已低于阈值，"
+                    "[ALERT] 当前剩余可用额度已低于阈值，"
                     "但 Bark 推送地址未配置",
                 )
             elif bark_quota_alert_reason == "invalid_bark_endpoint":

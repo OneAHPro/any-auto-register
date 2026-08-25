@@ -191,12 +191,12 @@ export default function ChatGPTAutoReloginSection() {
       </Form.Item>
       <Form.Item
         name="chatgpt_auto_relogin_quota_alert_threshold_usd"
-        label="Codex2API 剩余额度告警阈值（美元）"
+        label="Codex2API 当前剩余可用额度告警阈值（美元）"
         initialValue={0}
-        extra="设置为 0 时关闭额度不足告警；每轮自动鉴权结束后，额度低于此值都会通过已启用的通知渠道发送提醒。"
+        extra="设置为 0 时关闭额度不足告警；每轮自动鉴权结束后，当前剩余可用额度低于此值都会通过已启用的通知渠道发送提醒。"
       >
         <InputNumber
-          aria-label="Codex2API 剩余额度告警阈值（美元）"
+          aria-label="Codex2API 当前剩余可用额度告警阈值（美元）"
           min={0}
           max={10000000}
           precision={2}

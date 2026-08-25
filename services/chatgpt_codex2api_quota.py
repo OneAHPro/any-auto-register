@@ -37,10 +37,16 @@ class AvailableQuotaReport:
     estimated_remaining_usd: Decimal
     accounts: tuple[AvailableQuotaAccount, ...]
     remote_account_count: int = 0
-    current_remaining_usd: Decimal = Decimal("0.00")
+    current_remaining_usd: Decimal | None = None
     total_remaining_usd: Decimal | None = None
 
     def __post_init__(self):
+        if self.current_remaining_usd is None:
+            object.__setattr__(
+                self,
+                "current_remaining_usd",
+                self.estimated_remaining_usd,
+            )
         if self.total_remaining_usd is None:
             object.__setattr__(
                 self,
@@ -115,36 +121,47 @@ def summarize_available_quota(
         ).strip().lower()
         if status not in NORMAL_REMOTE_STATUSES:
             continue
-        estimate = estimate_account_quota(row)
-        if (
-            estimate.state != "available"
-            or estimate.usage_percent is None
-            or estimate.billed_usd is None
-            or estimate.remaining_usd is None
-        ):
-            continue
         email = str(row.get("email") or row.get("name") or "").strip()
         plan_type = str(row.get("plan_type") or "").strip().lower()
+        estimate = estimate_window_quota(row, "7d")
         short_estimate = estimate_window_quota(row, "5h")
         # Accounts with a valid 5-hour window use it for the "current" amount.
         # Accounts without that window (for example Pro) use their weekly
         # estimate so they remain represented instead of contributing zero.
         if short_estimate.state in {"available", "exhausted"}:
             current_estimate = short_estimate
-        elif plan_type == "pro":
+        elif plan_type == "pro" or not plan_type:
             current_estimate = estimate
         else:
             current_estimate = QuotaEstimate(state="invalid")
+        if estimate.state != "available" and current_estimate.state != "available":
+            continue
         if current_estimate.state == "available" and current_estimate.remaining_usd is not None:
             current_total += current_estimate.remaining_usd
-        total_total += estimate.remaining_usd
+        if estimate.state == "available" and estimate.remaining_usd is not None:
+            total_total += estimate.remaining_usd
+        weekly_usage = (
+            estimate.usage_percent
+            if estimate.usage_percent is not None
+            else current_estimate.usage_percent
+        )
+        weekly_billed = (
+            estimate.billed_usd
+            if estimate.billed_usd is not None
+            else current_estimate.billed_usd
+        )
+        weekly_remaining = (
+            estimate.remaining_usd
+            if estimate.remaining_usd is not None
+            else Decimal("0.00")
+        )
         accounts.append(
             AvailableQuotaAccount(
                 email=email,
                 remote_id=_remote_id(row.get("remote_id") or row.get("id")),
-                usage_percent=estimate.usage_percent,
-                billed_usd=estimate.billed_usd,
-                remaining_usd=estimate.remaining_usd,
+                usage_percent=weekly_usage or Decimal("0"),
+                billed_usd=weekly_billed or Decimal("0"),
+                remaining_usd=weekly_remaining,
                 current_remaining_usd=(
                     current_estimate.remaining_usd
                     if current_estimate.state == "available"
