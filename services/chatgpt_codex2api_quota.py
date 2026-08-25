@@ -10,6 +10,7 @@ from typing import Iterable, Literal, Mapping
 CENT = Decimal("0.01")
 HUNDRED = Decimal("100")
 NORMAL_REMOTE_STATUSES = {"active", "rate_limited"}
+VALID_ESTIMATE_STATES = {"available", "exhausted"}
 
 
 @dataclass(frozen=True)
@@ -155,17 +156,24 @@ def summarize_available_quota(
             current_estimate = estimate
         else:
             current_estimate = QuotaEstimate(state="invalid")
+        current_valid = current_estimate.state in VALID_ESTIMATE_STATES
+        total_valid = estimate.state in VALID_ESTIMATE_STATES
+        if current_valid:
+            current_count += 1
+        if total_valid:
+            total_count += 1
+        if current_valid or total_valid:
+            eligible_count += 1
+        if current_valid and current_estimate.remaining_usd is not None:
+            current_total += current_estimate.remaining_usd
+        if total_valid and estimate.remaining_usd is not None:
+            total_total += estimate.remaining_usd
+        if not current_valid and not total_valid:
+            continue
+        # Keep the account list focused on accounts with a non-zero weekly
+        # balance, while exhausted rows still count as valid data above.
         if estimate.state != "available" and current_estimate.state != "available":
             continue
-        eligible_count += 1
-        if current_estimate.state == "available":
-            current_count += 1
-        if estimate.state == "available" or estimate.usage_percent is not None:
-            total_count += 1
-        if current_estimate.state == "available" and current_estimate.remaining_usd is not None:
-            current_total += current_estimate.remaining_usd
-        if estimate.state == "available" and estimate.remaining_usd is not None:
-            total_total += estimate.remaining_usd
         weekly_usage = (
             estimate.usage_percent
             if estimate.usage_percent is not None
@@ -212,7 +220,11 @@ def summarize_available_quota(
         total_data_complete=(healthy_count > 0 and total_count == healthy_count),
         current_fresh=(healthy_count > 0 and current_count == healthy_count),
         total_fresh=(healthy_count > 0 and total_count == healthy_count),
-        available=bool(healthy_count > 0 and (current_count or total_count)),
+        available=bool(
+            healthy_count > 0
+            and current_count == healthy_count
+            and total_count == healthy_count
+        ),
     )
 
 

@@ -168,6 +168,51 @@ def test_incomplete_window_does_not_reuse_previous_quota_value():
     assert report.total_data_complete
 
 
+def test_exhausted_current_window_is_valid_zero_not_missing_data():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "plus@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 100,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("0.00")
+    assert report.total_remaining_usd == Decimal("20.00")
+    assert report.current_data_count == 1
+    assert report.total_data_count == 1
+    assert report.current_data_complete
+    assert report.total_data_complete
+    assert report.available
+
+
+def test_usage_percent_without_billed_cost_is_incomplete():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "plus@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+        },
+    ])
+
+    assert report.current_data_complete
+    assert not report.total_data_complete
+    assert not report.available
+
+
 def test_api_accounts_do_not_make_subscription_quota_incomplete():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 
