@@ -225,6 +225,27 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.queryByText('本次探针额度未生成')).toBeNull()
   })
 
+  it('shows the saved current partial amount for historical pending metadata', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        quota_alert_reason: 'quota_current_window_pending',
+        estimated_current_remaining_usd: '1506.20',
+        estimated_total_remaining_usd: '3230.99',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('当前窗口可估算部分')).toBeTruthy()
+    expect(screen.getByText('$1506.20')).toBeTruthy()
+    expect(screen.getByText('$3230.99')).toBeTruthy()
+    expect(screen.queryByText('当前窗口额度刷新中')).toBeNull()
+  })
+
   it('shows a stable partial current quota for fresh zero-percent rows', async () => {
     configureApi(automaticSummary({
       meta: {

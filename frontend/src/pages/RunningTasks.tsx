@@ -232,8 +232,13 @@ export default function RunningTasks() {
     )
     const hasCompleteTotalSnapshot = task.meta?.quota_total_fresh === true
       && rawTotalRemainingQuota !== null
+    const hasHistoricalCurrentPartial = currentWindowStatus === ''
+      && task.meta?.quota_alert_reason === 'quota_current_window_pending'
+      && task.meta?.quota_total_fresh === true
+    const showCurrentPartial = currentWindowStatus === 'partial_unestimable'
+      || hasHistoricalCurrentPartial
     const currentRemainingQuota = quotaDataAvailable
-      && (currentWindowFresh || currentWindowStatus === 'partial_unestimable')
+      && (currentWindowFresh || showCurrentPartial)
       ? formatRemainingQuota(
         task.meta?.estimated_current_remaining_usd
         ?? task.meta?.estimated_remaining_usd,
@@ -269,8 +274,10 @@ export default function RunningTasks() {
                     {currentRemainingQuota ? (
                       <>
                         <Text type="secondary" style={{ fontSize: 11 }}>
-                          {currentWindowStatus === 'partial_unestimable'
-                            ? `当前窗口可估算部分（${currentDataCount}/${currentTotalCount}）`
+                          {showCurrentPartial
+                            ? currentDataCount > 0 && currentTotalCount > 0
+                              ? `当前窗口可估算部分（${currentDataCount}/${currentTotalCount}）`
+                              : '当前窗口可估算部分'
                             : '当前剩余可用额度'}
                         </Text>
                         <Text strong style={{ fontSize: 13, color: '#10b981' }}>
