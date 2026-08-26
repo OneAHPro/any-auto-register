@@ -48,6 +48,11 @@ interface TaskSnapshot {
     quota_data_available?: boolean
     quota_current_fresh?: boolean
     quota_total_fresh?: boolean
+    quota_current_status?: string
+    quota_current_data_count?: number
+    quota_current_total_count?: number
+    quota_current_unestimable_count?: number
+    quota_current_missing_count?: number
     alert_sent?: boolean
     alert_reason?: string
     quota_alert_reason?: string
@@ -218,13 +223,17 @@ export default function RunningTasks() {
       && task.meta?.quota_alert_reason !== 'quota_query_failed'
     const currentWindowFresh = task.meta?.quota_current_fresh !== false
     const totalWindowFresh = task.meta?.quota_total_fresh !== false
+    const currentWindowStatus = String(task.meta?.quota_current_status ?? '')
+    const currentDataCount = Math.max(0, Number(task.meta?.quota_current_data_count) || 0)
+    const currentTotalCount = Math.max(0, Number(task.meta?.quota_current_total_count) || 0)
     const rawTotalRemainingQuota = formatRemainingQuota(
       task.meta?.estimated_total_remaining_usd
       ?? task.meta?.estimated_remaining_usd,
     )
     const hasCompleteTotalSnapshot = task.meta?.quota_total_fresh === true
       && rawTotalRemainingQuota !== null
-    const currentRemainingQuota = quotaDataAvailable && currentWindowFresh
+    const currentRemainingQuota = quotaDataAvailable
+      && (currentWindowFresh || currentWindowStatus === 'partial_unestimable')
       ? formatRemainingQuota(
         task.meta?.estimated_current_remaining_usd
         ?? task.meta?.estimated_remaining_usd,
@@ -260,7 +269,9 @@ export default function RunningTasks() {
                     {currentRemainingQuota ? (
                       <>
                         <Text type="secondary" style={{ fontSize: 11 }}>
-                          当前剩余可用额度
+                          {currentWindowStatus === 'partial_unestimable'
+                            ? `当前窗口可估算部分（${currentDataCount}/${currentTotalCount}）`
+                            : '当前剩余可用额度'}
                         </Text>
                         <Text strong style={{ fontSize: 13, color: '#10b981' }}>
                           {currentRemainingQuota}

@@ -385,6 +385,90 @@ def test_complete_total_remains_available_when_current_window_is_partial():
     assert report.available
 
 
+def test_zero_percent_current_windows_are_reported_as_unestimable_not_pending():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "estimable@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 50,
+            "billed_5h": 10,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+        {
+            "email": "rounded-zero@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 0,
+            "billed_5h": 0.004,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+    ])
+
+    assert report.current_remaining_usd == Decimal("10.00")
+    assert report.current_data_count == 1
+    assert report.current_unestimable_count == 1
+    assert report.current_missing_count == 0
+    assert report.current_status == "partial_unestimable"
+    assert report.available
+
+
+def test_missing_current_window_remains_pending():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "pending@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        }
+    ])
+
+    assert report.current_unestimable_count == 0
+    assert report.current_missing_count == 1
+    assert report.current_status == "pending"
+
+
+def test_invalid_negative_current_window_values_remain_pending():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "negative-percent@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": -1,
+            "billed_5h": 2,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+        {
+            "email": "negative-billed@example.com",
+            "plan_type": "plus",
+            "has_5h_window": True,
+            "remote_status": "active",
+            "usage_percent_5h": 0,
+            "billed_5h": -1,
+            "usage_percent_7d": 50,
+            "billed_7d": 20,
+        },
+    ])
+
+    assert report.current_unestimable_count == 0
+    assert report.current_missing_count == 2
+    assert report.current_status == "pending"
+
+
 def test_exhausted_current_window_is_valid_zero_not_missing_data():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 

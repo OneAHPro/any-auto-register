@@ -57,6 +57,10 @@ class AvailableQuotaReport:
     total_remaining_usd: Decimal | None = None
     eligible_account_count: int = 0
     current_data_count: int = 0
+    current_data_total_count: int = 0
+    current_unestimable_count: int = 0
+    current_missing_count: int = 0
+    current_status: str = "unavailable"
     total_data_count: int = 0
     current_data_complete: bool = False
     total_data_complete: bool = False
@@ -248,6 +252,8 @@ def summarize_available_quota(
     healthy_count = 0
     current_used_fallback = False
     total_used_fallback = False
+    current_unestimable_count = 0
+    current_missing_count = 0
     for row in rows:
         remote_account_count += 1
         status = str(
@@ -280,6 +286,16 @@ def summarize_available_quota(
             current_estimate = estimate
         else:
             current_estimate = QuotaEstimate(state="invalid")
+            percent_5h = _decimal(row.get("usage_percent_5h"))
+            billed_5h = _decimal(row.get("billed_5h"))
+            if (
+                percent_5h == 0
+                and billed_5h is not None
+                and billed_5h >= 0
+            ):
+                current_unestimable_count += 1
+            else:
+                current_missing_count += 1
         current_valid = current_estimate.state in VALID_ESTIMATE_STATES
         total_valid = estimate.state in VALID_ESTIMATE_STATES
         if current_valid:
@@ -339,6 +355,20 @@ def summarize_available_quota(
         total_remaining_usd=total_total,
         eligible_account_count=eligible_count,
         current_data_count=current_count,
+        current_data_total_count=healthy_count,
+        current_unestimable_count=current_unestimable_count,
+        current_missing_count=current_missing_count,
+        current_status=(
+            "fallback"
+            if current_used_fallback
+            else "pending"
+            if current_missing_count
+            else "partial_unestimable"
+            if current_unestimable_count
+            else "complete"
+            if healthy_count > 0 and current_count == healthy_count
+            else "unavailable"
+        ),
         total_data_count=total_count,
         current_data_complete=(healthy_count > 0 and current_count == healthy_count),
         total_data_complete=(healthy_count > 0 and total_count == healthy_count),

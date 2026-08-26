@@ -225,6 +225,31 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.queryByText('本次探针额度未生成')).toBeNull()
   })
 
+  it('shows a stable partial current quota for fresh zero-percent rows', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        quota_current_status: 'partial_unestimable',
+        quota_current_data_count: 61,
+        quota_current_total_count: 65,
+        quota_current_unestimable_count: 4,
+        quota_current_missing_count: 0,
+        estimated_current_remaining_usd: '1515.63',
+        estimated_total_remaining_usd: '3352.40',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('当前窗口可估算部分（61/65）')).toBeTruthy()
+    expect(screen.getByText('$1515.63')).toBeTruthy()
+    expect(screen.getByText('$3352.40')).toBeTruthy()
+    expect(screen.queryByText('当前窗口额度刷新中')).toBeNull()
+  })
+
   it('labels a fallback total as refreshing instead of hiding it', async () => {
     configureApi(automaticSummary({
       meta: {

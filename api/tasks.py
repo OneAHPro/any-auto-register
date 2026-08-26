@@ -79,6 +79,11 @@ TASK_SUMMARY_META_KEYS = (
     "estimated_remaining_usd",
     "estimated_current_remaining_usd",
     "estimated_total_remaining_usd",
+    "quota_current_status",
+    "quota_current_data_count",
+    "quota_current_total_count",
+    "quota_current_unestimable_count",
+    "quota_current_missing_count",
     "quota_current_fresh",
     "quota_total_fresh",
     "quota_data_available",
@@ -1811,6 +1816,11 @@ def _create_chatgpt_relogin_task_record(
                 "estimated_remaining_usd": "0.00",
                 "estimated_current_remaining_usd": "0.00",
                 "estimated_total_remaining_usd": "0.00",
+                "quota_current_status": "pending",
+                "quota_current_data_count": 0,
+                "quota_current_total_count": 0,
+                "quota_current_unestimable_count": 0,
+                "quota_current_missing_count": 0,
                 "quota_data_available": False,
                 "codex2api_delete_on_account_remove_enabled": (
                     delete_linked_credential
@@ -2693,6 +2703,13 @@ def _run_chatgpt_relogin_task_inner(
             estimated_total_remaining_usd=(
                 f"{quota_report.total_remaining_usd:.2f}"
             ),
+            quota_current_status=quota_report.current_status,
+            quota_current_data_count=quota_report.current_data_count,
+            quota_current_total_count=quota_report.current_data_total_count,
+            quota_current_unestimable_count=(
+                quota_report.current_unestimable_count
+            ),
+            quota_current_missing_count=quota_report.current_missing_count,
             quota_data_available=bool(
                 quota_query_succeeded
                 and quota_report.available
@@ -2728,7 +2745,7 @@ def _run_chatgpt_relogin_task_inner(
                 task_id,
                 "Codex2API 总计窗口额度仍在刷新，暂不触发额度阈值告警",
             )
-        elif not quota_report.current_fresh:
+        elif quota_report.current_status == "pending":
             _task_store.update_meta(
                 task_id,
                 quota_alert_sent=False,
@@ -2740,6 +2757,32 @@ def _run_chatgpt_relogin_task_inner(
                 task_id,
                 "Codex2API 当前窗口额度仍在刷新，已保留本轮总计额度；"
                 "暂不触发当前额度阈值告警",
+            )
+        elif quota_report.current_status == "partial_unestimable":
+            _task_store.update_meta(
+                task_id,
+                quota_alert_sent=False,
+                quota_alert_reason="quota_current_partial_unestimable",
+                bark_quota_alert_sent=False,
+                bark_quota_alert_reason="quota_current_partial_unestimable",
+            )
+            _log(
+                task_id,
+                "Codex2API 当前窗口有账号返回 0% 用量，无法反推有限美元上限；"
+                f"已保存可估算部分 {quota_report.current_data_count}/"
+                f"{quota_report.current_data_total_count}，暂不触发额度阈值告警",
+            )
+        elif not quota_report.current_fresh:
+            _task_store.update_meta(
+                task_id,
+                quota_alert_sent=False,
+                quota_alert_reason="quota_current_snapshot_fallback",
+                bark_quota_alert_sent=False,
+                bark_quota_alert_reason="quota_current_snapshot_fallback",
+            )
+            _log(
+                task_id,
+                "Codex2API 当前窗口暂用同轮探针快照，暂不触发额度阈值告警",
             )
 
         try:
