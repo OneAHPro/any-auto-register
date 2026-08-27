@@ -203,6 +203,25 @@ class ChatGPTReloginTests(unittest.TestCase):
             },
         )
 
+    def test_managed_mfa_promotes_direct_chatgpt_password_context_to_totp(self):
+        account_id = self._add_eligibility_account(
+            "password@example.com",
+            password="saved-password",
+            extra={
+                "account_type": "chatgpt_password",
+                "totp_secret": "SAVED-TOTP",
+                "chatgpt_mfa_managed": True,
+            },
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+            service = _build_email_service(saved, {}, log_fn=None)
+
+        email = service.create_email()
+        self.assertEqual(email["account_type"], "chatgpt_password_totp")
+        self.assertEqual(email["totp_secret"], "SAVED-TOTP")
+
     def test_load_saved_account_recovers_yisen_mailapi_token(self):
         email = "relogin@yisen.uk"
         account_id = self._add_eligibility_account(

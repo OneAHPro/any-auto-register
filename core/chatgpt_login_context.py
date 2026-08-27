@@ -27,6 +27,7 @@ def promote_managed_mfa_login_context(
     ).strip()
     managed = extra.get("chatgpt_mfa_managed") is True
     promotable_type = account_type in {
+        "chatgpt_password",
         "mailapi_url",
         "chatgpt_password_url_otp",
         "chatgpt_password_reset_url_mail",
