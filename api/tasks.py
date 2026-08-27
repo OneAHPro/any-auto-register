@@ -66,6 +66,8 @@ CHATGPT_PHONE_FINALIZATION_WAIT_SECONDS = 45.0
 MAX_PERSISTED_TASK_LOG_ENTRIES = 500
 MAX_PERSISTED_TASK_LOG_BYTES = 256 * 1024
 TASK_SNAPSHOT_PERSIST_INTERVAL_SECONDS = 1.0
+QUOTA_QUERY_MAX_ATTEMPTS = 30
+QUOTA_QUERY_MAX_ERRORS = 3
 TASK_SUMMARY_META_KEYS = (
     "automation",
     "free_skipped_count",
@@ -2642,19 +2644,23 @@ def _run_chatgpt_relogin_task_inner(
             )
 
             quota_report = None
-            for quota_attempt in range(3):
+            quota_query_errors = 0
+            for quota_attempt in range(QUOTA_QUERY_MAX_ATTEMPTS):
                 try:
                     final_quota_accounts = fetch_codex2api_quota_accounts()
                 except Exception:
-                    if quota_attempt >= 2:
+                    quota_query_errors += 1
+                    if quota_query_errors >= QUOTA_QUERY_MAX_ERRORS:
                         raise
-                    if quota_attempt == 0:
+                    if quota_query_errors == 1:
                         _log(
                             task_id,
                             "Codex2API 额度字段仍在刷新，正在自动重试读取",
                         )
                     time.sleep(1.0)
                     continue
+                if not final_quota_accounts:
+                    raise RuntimeError("Codex2API 额度读取未返回账号")
                 candidate_report = summarize_available_quota(
                     merge_quota_rows(
                         final_quota_accounts,
@@ -2669,7 +2675,7 @@ def _run_chatgpt_relogin_task_inner(
                     quota_query_succeeded = True
                     break
                 quota_report = candidate_report
-                if quota_attempt >= 2:
+                if quota_attempt + 1 >= QUOTA_QUERY_MAX_ATTEMPTS:
                     quota_query_error_type = "QuotaDataIncomplete"
                     break
                 if quota_attempt == 0:

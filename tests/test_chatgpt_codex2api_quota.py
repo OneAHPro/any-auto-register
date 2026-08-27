@@ -243,6 +243,33 @@ def test_summarize_available_quota_filters_non_normal_accounts():
     assert report.accounts[1].remaining_usd == Decimal("38.32")
 
 
+def test_summarize_ignores_placeholder_rows_without_real_account_identity():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota(
+        [
+            {
+                "email": "",
+                "name": "at-import-1",
+                "remote_status": "active",
+            },
+            {
+                "email": "real@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+            },
+        ]
+    )
+
+    assert report.remote_account_count == 2
+    assert report.account_count == 1
+    assert report.current_data_total_count == 1
+    assert report.total_data_count == 1
+    assert report.total_data_complete
+    assert report.available
+
+
 def test_summarize_treats_ready_remote_status_as_healthy():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 
