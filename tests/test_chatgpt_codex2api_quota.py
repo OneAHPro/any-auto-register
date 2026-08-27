@@ -259,13 +259,19 @@ def test_summarize_ignores_placeholder_rows_without_real_account_identity():
                 "usage_percent_7d": 50,
                 "billed_7d": 20,
             },
+            {
+                "name": "managed-account",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            },
         ]
     )
 
-    assert report.remote_account_count == 2
-    assert report.account_count == 1
-    assert report.current_data_total_count == 1
-    assert report.total_data_count == 1
+    assert report.remote_account_count == 3
+    assert report.account_count == 2
+    assert report.current_data_total_count == 2
+    assert report.total_data_count == 2
     assert report.total_data_complete
     assert report.available
 

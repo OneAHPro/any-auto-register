@@ -2659,6 +2659,9 @@ def _run_chatgpt_relogin_task_inner(
                         )
                     time.sleep(1.0)
                     continue
+                # A successful response proves the endpoint is reachable;
+                # transport-error retries should only count consecutively.
+                quota_query_errors = 0
                 if not final_quota_accounts:
                     quota_query_errors += 1
                     if quota_query_errors >= QUOTA_QUERY_MAX_ERRORS:

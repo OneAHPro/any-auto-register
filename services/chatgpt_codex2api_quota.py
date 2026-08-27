@@ -261,13 +261,14 @@ def summarize_available_quota(
         ).strip().lower()
         if status not in NORMAL_REMOTE_STATUSES:
             continue
-        email = str(row.get("email") or row.get("name") or "").strip()
+        raw_email = str(row.get("email") or "").strip()
+        email = raw_email or str(row.get("name") or "").strip()
         # Codex2API can briefly expose token-import placeholders before the
         # account has been hydrated (for example ``at-import-1``).  They are
         # not real subscription accounts and have no quota window to report;
         # counting them as healthy makes an otherwise usable snapshot look
         # incomplete forever.
-        if "@" not in email:
+        if not raw_email and email.lower().startswith("at-import-"):
             continue
         plan_type = str(row.get("plan_type") or "").strip().lower()
         if plan_type == "api":

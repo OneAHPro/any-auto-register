@@ -1521,6 +1521,62 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         meta = _task_store.snapshot(task_id)["meta"]
         self.assertTrue(meta["quota_data_available"])
 
+    def test_final_quota_query_counts_only_consecutive_read_errors(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [250],
+            source="schedule",
+            automation=True,
+        )
+        pending_rows = [
+            {
+                "email": "ready@example.com",
+                "plan_type": "plus",
+                "has_5h_window": True,
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+            }
+        ]
+        final_rows = [
+            {
+                "email": "ready@example.com",
+                "plan_type": "plus",
+                "has_5h_window": True,
+                "remote_status": "active",
+                "usage_percent_5h": 50,
+                "billed_5h": 5,
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            }
+        ]
+        self.final_quota_reader.side_effect = [
+            RuntimeError("temporary read error"),
+            pending_rows,
+            RuntimeError("temporary read error"),
+            final_rows,
+        ]
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                250: {
+                    "account_id": 250,
+                    "email": "ready@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            },
+        ), mock.patch("api.tasks.time.sleep"):
+            _run_chatgpt_relogin_task(task_id, [250])
+
+        self.assertEqual(self.final_quota_reader.call_count, 4)
+        self.assertTrue(
+            _task_store.snapshot(task_id)["meta"]["quota_data_available"]
+        )
+
     def test_partial_current_window_still_exposes_complete_total_quota(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
