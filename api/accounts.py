@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
 from core.db import AccountModel, get_session
+from core.mail_import_delimiters import split_mail_import_fields
 from services.chatgpt_account_state import account_is_visible_in_default_list
 from services.chatgpt_account_removal import remove_account
 from typing import Optional
@@ -213,11 +214,11 @@ def import_accounts(
     """批量导入，每行格式: email password [extra]"""
     created = 0
     for line in body.lines:
-        parts = line.strip().split()
+        parts = split_mail_import_fields(str(line or "").strip())
         if len(parts) < 2:
             continue
         email, password = parts[0], parts[1]
-        extra = parts[2] if len(parts) > 2 else ""
+        extra = " ".join(parts[2:]) if len(parts) > 2 else ""
         if extra:
             try:
                 json.loads(extra)
