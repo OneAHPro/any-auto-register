@@ -2660,7 +2660,16 @@ def _run_chatgpt_relogin_task_inner(
                     time.sleep(1.0)
                     continue
                 if not final_quota_accounts:
-                    raise RuntimeError("Codex2API 额度读取未返回账号")
+                    quota_query_errors += 1
+                    if quota_query_errors >= QUOTA_QUERY_MAX_ERRORS:
+                        raise RuntimeError("Codex2API 额度读取未返回账号")
+                    if quota_query_errors == 1:
+                        _log(
+                            task_id,
+                            "Codex2API 额度账号清单为空，正在自动重试读取",
+                        )
+                    time.sleep(1.0)
+                    continue
                 candidate_report = summarize_available_quota(
                     merge_quota_rows(
                         final_quota_accounts,
