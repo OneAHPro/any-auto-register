@@ -912,6 +912,23 @@ class ICloudAppleMailPoolTests(unittest.TestCase):
             ],
         )
 
+    def test_parses_icloud_email_password_as_direct_chatgpt_password(self):
+        records = parse_applemail_pool_content(
+            "demo@icloud.com----chatgpt-password"
+        )
+
+        self.assertEqual(
+            records,
+            [
+                {
+                    "email": "demo@icloud.com",
+                    "password": "chatgpt-password",
+                    "account_type": "chatgpt_password",
+                    "mailbox": "INBOX",
+                }
+            ],
+        )
+
     def test_parses_supplier_email_password_remote_mfa_url(self):
         lookup_url = (
             "https://2fa.nloop.cc/api/mfa/lookup"

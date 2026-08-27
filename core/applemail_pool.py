@@ -306,6 +306,23 @@ def _normalize_google_federated_credential(
     }
 
 
+def _normalize_chatgpt_password_credential(
+    *,
+    email: str,
+    password: str,
+    mailbox: str = "INBOX",
+) -> dict[str, Any]:
+    normalized_password = str(password or "").strip()
+    if not normalized_password:
+        raise ValueError(f"{email} 缺少 ChatGPT 登录密码")
+    return {
+        "email": email,
+        "password": normalized_password,
+        "account_type": "chatgpt_password",
+        "mailbox": _normalize_mailbox(mailbox),
+    }
+
+
 def _normalize_record(entry: Any) -> dict[str, str]:
     if isinstance(entry, str):
         return _normalize_text_record(entry)
@@ -392,6 +409,12 @@ def _normalize_record(entry: Any) -> dict[str, str]:
             password=password,
             mailbox=mailbox,
         ), entry)
+    if account_type == "chatgpt_password":
+        return _copy_pool_metadata(_normalize_chatgpt_password_credential(
+            email=email,
+            password=password,
+            mailbox=mailbox,
+        ), entry)
     if password and mfa_secret and account_type == "icloud_web":
         return _copy_pool_metadata({
             "email": email,
@@ -441,6 +464,11 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
         raise ValueError("邮箱记录字段不足")
     if len(values) == 2:
         email, password = values
+        if _is_icloud_mail_address(email):
+            return _normalize_chatgpt_password_credential(
+                email=email,
+                password=password,
+            )
         return _normalize_google_federated_credential(
             email=email,
             password=password,

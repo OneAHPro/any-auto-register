@@ -151,6 +151,58 @@ class ChatGPTReloginTests(unittest.TestCase):
             )
         )
 
+    def test_load_saved_account_builds_direct_password_context_without_mailbox(self):
+        account_id = self._add_eligibility_account(
+            "password@example.com",
+            password="saved-password",
+            extra={"account_type": "chatgpt_password"},
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+
+        self.assertEqual(
+            saved["mailbox_context"],
+            {
+                "provider": "chatgpt_credentials",
+                "email": "password@example.com",
+                "account_id": str(account_id),
+                "extra": {
+                    "provider": "chatgpt_credentials",
+                    "account_type": "chatgpt_password",
+                    "password": "saved-password",
+                },
+            },
+        )
+
+    def test_build_email_service_preserves_direct_password_credentials(self):
+        account_id = self._add_eligibility_account(
+            "password@example.com",
+            password="saved-password",
+            extra={"account_type": "chatgpt_password"},
+        )
+
+        with mock.patch("services.chatgpt_relogin.engine", self.engine):
+            saved = _load_saved_account(account_id)
+            service = _build_email_service(
+                saved,
+                {},
+                log_fn=None,
+            )
+
+        self.assertEqual(
+            service.create_email(),
+            {
+                "email": "password@example.com",
+                "service_id": "password@example.com",
+                "token": "",
+                "account_type": "chatgpt_password",
+                "password": "saved-password",
+                "totp_secret": "",
+                "mfa_recovery_code": "",
+            },
+        )
+
     def test_load_saved_account_recovers_yisen_mailapi_token(self):
         email = "relogin@yisen.uk"
         account_id = self._add_eligibility_account(

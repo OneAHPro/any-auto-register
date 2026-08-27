@@ -256,7 +256,7 @@ describe('MailImportPanel automatic detection', () => {
         return snapshot('microsoft', [{ email: 'one@outlook.com' }])
       }
       if (path.startsWith('/mail-imports/snapshot?type=applemail')) {
-        return snapshot('applemail', [{ email: 'two@gmail.com', account_type: 'chatgpt_google_password' }])
+        return snapshot('applemail', [{ email: 'two@icloud.com', account_type: 'chatgpt_password' }])
       }
       throw new Error(`unexpected request: ${path}`)
     })
@@ -265,7 +265,8 @@ describe('MailImportPanel automatic detection', () => {
 
     expect(await screen.findByText('统一兼容导入')).toBeTruthy()
     expect(await screen.findByText('one@outlook.com')).toBeTruthy()
-    expect(await screen.findByText('two@gmail.com')).toBeTruthy()
+    expect(await screen.findByText('two@icloud.com')).toBeTruthy()
+    expect(await screen.findByText('ChatGPT 密码')).toBeTruthy()
     expect(screen.getByText('已导入: 2 个邮箱')).toBeTruthy()
   })
 

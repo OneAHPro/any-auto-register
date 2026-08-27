@@ -31,7 +31,7 @@ class AccountImportTests(unittest.TestCase):
             account = session.exec(select(AccountModel)).one()
             self.assertEqual(account.email, "user@example.com")
             self.assertEqual(account.password, "ChatGPT-password")
-            self.assertEqual(account.get_extra(), {})
+            self.assertEqual(account.get_extra(), {"account_type": "chatgpt_password"})
 
     def test_import_preserves_json_metadata_after_dash_split(self):
         metadata = {

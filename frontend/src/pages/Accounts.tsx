@@ -1060,12 +1060,18 @@ export default function Accounts() {
     if (!importText.trim()) return
     setImportLoading(true)
     try {
-      const lines = importText.trim().split('\n').filter(Boolean)
+      const lines = importText.trim().split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
       const res = await apiFetch('/accounts/import', {
         method: 'POST',
         body: JSON.stringify({ platform: currentPlatform, lines }),
       })
-      message.success(`导入成功 ${res.created} 个`)
+      const created = Math.max(Number(res.created) || 0, 0)
+      const skipped = Math.max(lines.length - created, 0)
+      message.success(
+        skipped > 0
+          ? `导入成功 ${created} 个，跳过 ${skipped} 行`
+          : `导入成功 ${created} 个`,
+      )
       setImportModalOpen(false)
       setImportText('')
       load()
@@ -2147,7 +2153,7 @@ export default function Accounts() {
         maskClosable={false}
       >
         <p style={{ marginBottom: 8, fontSize: 12, color: '#7a8ba3' }}>
-          每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email password [cashier_url]</code>
+          每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email----password [JSON元数据]</code>；也兼容空格分隔。
         </p>
         <Input.TextArea
           value={importText}

@@ -66,6 +66,15 @@ class MailImportAutoDetectionTests(unittest.TestCase):
         )
         self.assertNotIn(password, json.dumps(result.to_public_dict()))
 
+    def test_detects_icloud_email_password_as_direct_chatgpt_password(self):
+        result = detect_mail_import_content(
+            "worker@icloud.com----chatgpt-password"
+        )
+
+        self.assertTrue(result.can_import)
+        self.assertEqual(result.counts, {"microsoft": 0, "applemail": 1, "unresolved": 0})
+        self.assertEqual(result.rows[0].account_type, "chatgpt_password")
+
     def test_detects_microsoft_mailapi_url_without_exposing_url(self):
         secret_url = "https://mail.example.test/messages?token=super-secret"
 

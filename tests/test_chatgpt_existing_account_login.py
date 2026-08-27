@@ -103,6 +103,35 @@ class GoogleFederatedEmailService:
             },
         }
 
+
+class PasswordOnlyEmailService:
+    service_type = type("ServiceType", (), {"value": "chatgpt_credentials"})()
+
+    def create_email(self):
+        return {
+            "email": "mfa-user@icloud.com",
+            "service_id": "mfa-user@icloud.com",
+            "account_type": "chatgpt_password",
+            "password": "chatgpt-password",
+        }
+
+    def get_verification_code(self, **kwargs):
+        raise AssertionError("Password-only login must not read an unavailable mailbox")
+
+    def supports_email_verification(self):
+        return False
+
+    def get_mailbox_metadata(self):
+        return {
+            "provider": "chatgpt_credentials",
+            "email": "mfa-user@icloud.com",
+            "account_id": "mfa-user@icloud.com",
+            "extra": {
+                "account_type": "chatgpt_password",
+                "password": "chatgpt-password",
+            },
+        }
+
 class PasswordTotpWithMailEmailService(PasswordTotpEmailService):
     def __init__(self):
         self.committed_password = ""
@@ -521,6 +550,23 @@ class ExistingAccountLoginTests(unittest.TestCase):
         )
         self.assertFalse(call.kwargs["prefer_passwordless_login"])
         self.assertTrue(call.kwargs["force_password_login"])
+
+    def test_password_only_credentials_force_direct_chatgpt_password_login(self):
+        engine = self._make_engine(email_service=PasswordOnlyEmailService())
+        oauth_client = self._successful_oauth_client()
+        engine._build_oauth_client = mock.Mock(return_value=oauth_client)
+        engine._extract_account_info = mock.Mock(
+            return_value={"email": "mfa-user@icloud.com", "account_id": "account-1"}
+        )
+
+        result = engine.run()
+
+        self.assertTrue(result.success)
+        call = oauth_client.login_and_get_tokens.call_args
+        self.assertEqual(call.args[1], "chatgpt-password")
+        self.assertFalse(call.kwargs["prefer_passwordless_login"])
+        self.assertTrue(call.kwargs["force_password_login"])
+        self.assertEqual(call.kwargs["totp_secret"], "")
 
     def test_google_federated_credentials_force_password_login_without_totp(self):
         engine = self._make_engine(email_service=GoogleFederatedEmailService())

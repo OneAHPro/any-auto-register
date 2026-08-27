@@ -266,11 +266,16 @@ def _detect_text_row(line_number: int, line: str) -> AutoDetectedMailRow:
             raw_content=line,
         )
     if len(parts) == 2 and parts[1].strip():
+        fallback_account_type = (
+            "chatgpt_password"
+            if domain in APPLE_MAIL_DOMAINS
+            else "chatgpt_google_password"
+        )
         return _resolved_apple_row(
             line_number=line_number,
             email=email,
             raw_content=line,
-            fallback_account_type="chatgpt_google_password",
+            fallback_account_type=fallback_account_type,
         )
 
     if len(parts) == 3:

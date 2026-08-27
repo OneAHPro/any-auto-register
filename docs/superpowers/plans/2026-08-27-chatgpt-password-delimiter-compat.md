@@ -2,9 +2,9 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the account-management import accept `邮箱----密码` rows, preserve optional credential metadata, and prevent ChatGPT login jobs from running when the imported account has no usable MFA credential.
+**Goal:** Make both account-management and mailbox-pool imports accept `邮箱----密码` rows, preserve optional credential metadata, and route iCloud password-only rows explicitly without mislabeling them as Google federation.
 
-**Architecture:** Keep parsing at the account-import API boundary so all callers receive normalized `email`, `password`, and JSON metadata. Reuse the existing delimiter grammar used by the mail-import subsystem rather than adding a second parser. Add a preflight eligibility check to the ChatGPT relogin enqueue path, returning a per-account validation error before browser work when a password-only row cannot satisfy an MFA challenge.
+**Architecture:** Keep parsing at the account-import API boundary so all callers receive normalized `email`, `password`, and JSON metadata. Reuse the existing delimiter grammar used by the mail-import subsystem rather than adding a second parser. Add an explicit `chatgpt_password` pool account type for iCloud two-field rows, carrying the password through the existing ChatGPT login adapter; when the remote account requires TOTP and no factor is supplied, retain the existing precise missing-MFA result.
 
 **Tech Stack:** FastAPI, SQLModel, Python `unittest`/pytest, React + TypeScript + Vite.
 
@@ -93,78 +93,65 @@ git add api/accounts.py tests/test_accounts_import.py
 git commit -m "fix: accept dash-delimited account imports"
 ```
 
-### Task 2: Add ChatGPT MFA preflight for password-only imported rows
+### Task 2: Preserve iCloud password-only credentials through the ChatGPT login adapter
 
 **Files:**
-- Modify: `api/tasks.py:6452-6475`
 - Modify: `services/chatgpt_relogin.py:240-325`
-- Test: `tests/test_chatgpt_relogin_task.py`
+- Modify: `core/applemail_pool.py:292-470`
+- Modify: `core/base_mailbox.py:659-1060`
+- Modify: `platforms/chatgpt/plugin.py:155-620`
+- Modify: `platforms/chatgpt/refresh_token_registration_engine.py:580-690`
+- Modify: `services/mail_imports/auto_detection.py:260-280`
+- Modify: `services/mail_imports/providers.py:90-115`
+- Modify: `services/mail_imports/schemas.py:10-25`
+- Test: `tests/test_icloud_mailbox.py`, `tests/test_chatgpt_relogin.py`, `tests/test_chatgpt_existing_account_login.py`, `tests/test_chatgpt_plugin.py`
 
 - [ ] **Step 1: Write the failing tests**
 
 ```python
-def test_password_only_chatgpt_account_is_rejected_before_enqueue():
-    account = AccountModel(
-        platform="chatgpt",
-        email="user@example.com",
-        password="ChatGPT-password",
-        extra_json="{}",
-    )
-    session.add(account)
-    session.commit()
-
-    with pytest.raises(HTTPException) as exc:
-        create_chatgpt_relogin_task(
-            ChatGPTReloginTaskRequest(account_ids=[account.id]),
-            background_tasks=BackgroundTasks(),
-        )
-
-    assert exc.value.status_code == 400
-    assert "MFA" in str(exc.value.detail)
+def test_icloud_two_field_pool_row_is_classified_as_chatgpt_password():
+    records = parse_applemail_pool_content("user@icloud.com----ChatGPT-password")
+    assert records[0]["account_type"] == "chatgpt_password"
 
 
-def test_password_totp_chatgpt_account_remains_eligible():
-    account = AccountModel(
-        platform="chatgpt",
-        email="user@example.com",
-        password="ChatGPT-password",
-        extra_json=json.dumps(
-            {"account_type": "chatgpt_password_totp", "totp_secret": "BASE32_SECRET"}
-        ),
-    )
-    session.add(account)
-    session.commit()
-
-    with mock.patch("api.tasks.enqueue_chatgpt_relogin_task", return_value="task-1"):
-        result = create_chatgpt_relogin_task(
-            ChatGPTReloginTaskRequest(account_ids=[account.id]),
-            background_tasks=BackgroundTasks(),
-        )
-
-    assert result["task_id"] == "task-1"
+def test_saved_chatgpt_password_context_builds_without_mailbox_receiver():
+    saved = {
+        "email": "user@icloud.com",
+        "password": "ChatGPT-password",
+        "mailbox_context": {
+            "provider": "chatgpt_credentials",
+            "email": "user@icloud.com",
+            "extra": {
+                "account_type": "chatgpt_password",
+                "password": "ChatGPT-password",
+            },
+        },
+    }
+    service = _build_email_service(saved, {}, log_fn=None)
+    assert service.create_email()["account_type"] == "chatgpt_password"
 ```
 
 - [ ] **Step 2: Run the focused tests to verify they fail**
 
 Run: `pytest -q tests/test_chatgpt_relogin_task.py -k 'password_only or password_totp'`
 
-Expected: The password-only test fails because the endpoint currently enqueues the browser task; the TOTP test provides the expected compatibility baseline.
+Expected: The focused tests fail because two-field iCloud rows are currently labeled as Google federation and the saved-account adapter does not preserve a direct ChatGPT password type.
 
 - [ ] **Step 3: Implement the preflight check**
 
-Add a pure helper that reads the saved ChatGPT account's `extra_json` and considers the account eligible when it has a managed `totp_secret`/`mfa_secret`/`totp`, a remote `totp_url`, or an existing mailbox context that can provide MFA. Call it only for explicitly supplied `account_ids`; preserve `all_eligible` behavior, which already filters through `list_relogin_eligible_account_ids`. Raise HTTP 400 with the account email and a concise missing-MFA message before creating a task when any selected row is password-only.
+Classify two-field iCloud rows as `chatgpt_password`, add that account type to the mailbox strategy and snapshot schema, and carry it through `GenericEmailService`, `_load_saved_account`, `_build_email_service`, and the registration engine. Keep the existing missing-TOTP error when OpenAI returns an MFA challenge without a supplied factor; no factor is fabricated.
 
 - [ ] **Step 4: Run the focused tests to verify they pass**
 
-Run: `pytest -q tests/test_chatgpt_relogin_task.py -k 'password_only or password_totp'`
+Run: `PYTHONPATH=. ./.venv/bin/pytest -q tests/test_icloud_mailbox.py tests/test_chatgpt_relogin.py tests/test_chatgpt_existing_account_login.py tests/test_chatgpt_plugin.py -k 'chatgpt_password or direct_password'`
 
 Expected: PASS.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add api/tasks.py services/chatgpt_relogin.py tests/test_chatgpt_relogin_task.py
-git commit -m "fix: preflight missing ChatGPT MFA credentials"
+git add core/applemail_pool.py core/base_mailbox.py services/chatgpt_relogin.py platforms/chatgpt/plugin.py platforms/chatgpt/refresh_token_registration_engine.py services/mail_imports/providers.py services/mail_imports/schemas.py services/mail_imports/auto_detection.py tests/test_icloud_mailbox.py tests/test_chatgpt_relogin.py tests/test_chatgpt_existing_account_login.py tests/test_chatgpt_plugin.py
+git commit -m "fix: preserve iCloud password-only ChatGPT imports"
 ```
 
 ### Task 3: Update the account import UI and regression coverage
@@ -231,9 +218,9 @@ Run: `pnpm --dir frontend build`
 
 Expected: exit 0.
 
-- [ ] **Step 3: Request code review against the previous commit**
+- [ ] **Step 3: Request code review against the implementation commits**
 
-Review the complete diff from `git diff HEAD~3..HEAD` for parser compatibility, credential leakage, API behavior, and deployment safety. Fix every critical or important finding before proceeding.
+Review the complete implementation diff from the plan commit through `HEAD` for parser compatibility, credential leakage, API behavior, and deployment safety. Fix every critical or important finding before proceeding.
 
 - [ ] **Step 4: Push the branch and main, then stage a hashed release artifact**
 
@@ -246,4 +233,3 @@ Atomically switch the `current` symlink and frontend directory, restart `any-aut
 - [ ] **Step 6: Commit any final verification-only metadata and report evidence**
 
 Report commit SHA, release path, service state, endpoint status, test counts, and the preserved database backup path.
-

@@ -601,6 +601,21 @@ class RefreshTokenRegistrationEngine:
                         "已识别企业域名 Google 联邦登录凭据；"
                         "将从 OpenAI 邮箱入口自动跳转 Google 登录"
                     )
+                elif account_type == "chatgpt_password":
+                    password = str(self.email_info.get("password") or "")
+                    if not password:
+                        raise MissingPasswordCredentialsError(
+                            "ChatGPT 登录记录缺少 ChatGPT 密码"
+                        )
+                    self.password = password
+                    self.totp_secret = str(
+                        self.email_info.get("totp_secret") or ""
+                    ).strip()
+                    self.password_reset_required = False
+                    self._log(
+                        "已识别 ChatGPT 邮箱和密码登录凭据；"
+                        "认证要求 MFA 时需要同时提供 MFA 秘钥"
+                    )
                 elif account_type == "chatgpt_password_totp":
                     password = str(self.email_info.get("password") or "")
                     totp_secret = str(self.email_info.get("totp_secret") or "")

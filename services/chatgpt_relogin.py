@@ -261,7 +261,7 @@ def _mailbox_context_has_usable_credentials(
         mailbox_context,
         context_extra,
     )
-    if account_type == "chatgpt_google_password":
+    if account_type in {"chatgpt_password", "chatgpt_google_password"}:
         return bool(
             _text(context_extra.get("password") or saved.get("password"))
         )
@@ -526,6 +526,43 @@ def _load_saved_account(account_id: int) -> dict[str, Any]:
         if not isinstance(mailbox_context, dict) or not mailbox_context:
             mailbox_context = _mailbox_context_from_outlook(session, email)
             context_changed = bool(mailbox_context)
+        if not isinstance(mailbox_context, dict) or not mailbox_context:
+            account_type = _text(extra.get("account_type")).lower()
+            if account_type in {
+                "chatgpt_password",
+                "chatgpt_google_password",
+                "chatgpt_password_totp",
+                "chatgpt_password_remote_totp",
+                "chatgpt_password_url_otp",
+                "chatgpt_password_reset_url_mail",
+            }:
+                context_extra = {
+                    "provider": "chatgpt_credentials",
+                    "account_type": account_type,
+                }
+                for key in (
+                    "password",
+                    "totp_secret",
+                    "mfa_secret",
+                    "totp",
+                    "totp_url",
+                    "mfa_recovery_code",
+                    "mail_api_url",
+                    "mailapi_url",
+                    "password_reset_required",
+                    "new_password",
+                ):
+                    if key in extra and extra[key] not in (None, ""):
+                        context_extra[key] = extra[key]
+                context_extra["password"] = str(
+                    context_extra.get("password") or account.password or ""
+                )
+                mailbox_context = {
+                    "provider": "chatgpt_credentials",
+                    "email": email,
+                    "account_id": str(normalized_id),
+                    "extra": context_extra,
+                }
         else:
             imported_context = _mailbox_context_from_outlook(session, email)
             imported_extra = (
@@ -981,6 +1018,57 @@ class _GoogleFederatedEmailService:
         context_extra.pop("totp", None)
         self._mailbox_context["extra"] = context_extra
         return True
+
+
+class _ChatGPTPasswordEmailService(_GoogleFederatedEmailService):
+    """Self-contained direct ChatGPT password credentials.
+
+    These rows intentionally do not advertise Google federation or mailbox
+    OTP support.  If the account presents an MFA challenge, the OAuth layer
+    can report the missing TOTP credential without probing an unrelated inbox.
+    """
+
+    def create_email(self, config=None):
+        del config
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        return {
+            "email": self._email,
+            "service_id": self._email,
+            "token": "",
+            "account_type": "chatgpt_password",
+            "password": self._password,
+            "totp_secret": _text(
+                context_extra.get("totp_secret")
+                or context_extra.get("mfa_secret")
+                or context_extra.get("totp")
+            ),
+            "mfa_recovery_code": _text(
+                context_extra.get("mfa_recovery_code")
+            ),
+        }
+
+    def get_verification_code(self, **kwargs):
+        del kwargs
+        raise RuntimeError(
+            "当前账号使用 ChatGPT 密码重登，不读取邮箱验证码"
+        )
+
+    def commit_mfa_rotation(
+        self,
+        *,
+        totp_secret="",
+        recovery_code="",
+        rotated_at="",
+    ):
+        committed = super().commit_mfa_rotation(
+            totp_secret=totp_secret,
+            recovery_code=recovery_code,
+            rotated_at=rotated_at,
+        )
+        context_extra = dict(self._mailbox_context.get("extra") or {})
+        context_extra["account_type"] = "chatgpt_password_totp"
+        self._mailbox_context["extra"] = context_extra
+        return committed
 
 
 def _persist_password_reset_to_account(
@@ -1769,6 +1857,19 @@ def _build_email_service(
             password=password,
             mailbox_context=mailbox_context,
         )
+    if account_type == "chatgpt_password":
+        password = str(
+            context_extra.get("password") or saved.get("password") or ""
+        )
+        if not password:
+            raise RuntimeError(
+                f"账号 {saved['email']} 的 ChatGPT 登录凭据缺少密码"
+            )
+        return _ChatGPTPasswordEmailService(
+            email=_text(mailbox_context.get("email")) or saved["email"],
+            password=password,
+            mailbox_context=mailbox_context,
+        )
     if account_type == "chatgpt_password_remote_totp":
         password = _text(
             context_extra.get("password") or saved.get("password")
@@ -2281,6 +2382,7 @@ def _login_with_saved_credentials(
                 if isinstance(context_extra, dict) and _text(
                     context_extra.get("account_type")
                 ).lower() in {
+                    "chatgpt_password",
                     "chatgpt_google_password",
                     "chatgpt_password_totp",
                     "chatgpt_password_url_otp",

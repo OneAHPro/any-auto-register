@@ -215,6 +215,16 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(screen.getByRole('button', { name: /登录$/ })).toBeTruthy()
   })
 
+  it('documents dash-delimited email and password imports', async () => {
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    await user.click(screen.getByRole('button', { name: /导入$/ }))
+
+    expect(await screen.findByText(/email----password/)).toBeTruthy()
+  })
+
   it('shows the current automatic authentication cycle after the account count', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path.startsWith('/accounts?')) {

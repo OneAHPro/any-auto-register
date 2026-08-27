@@ -157,13 +157,16 @@ class ChatGPTPlatform(BasePlatform):
                         "service_id": self._acct.account_id,
                         "token": "",
                     }
-                    if (
-                        str(account_extra.get("account_type") or "").strip()
-                        == "chatgpt_google_password"
-                    ):
+                    account_type = str(
+                        account_extra.get("account_type") or ""
+                    ).strip()
+                    if account_type in {
+                        "chatgpt_password",
+                        "chatgpt_google_password",
+                    }:
                         result.update(
                             {
-                                "account_type": "chatgpt_google_password",
+                                "account_type": account_type,
                                 "password": str(
                                     account_extra.get("password") or ""
                                 ),
@@ -278,6 +281,7 @@ class ChatGPTPlatform(BasePlatform):
                     is_chatgpt_credentials = (
                         str(account_extra.get("account_type") or "").strip()
                         in {
+                            "chatgpt_password",
                             "chatgpt_google_password",
                             "chatgpt_password_totp",
                             "chatgpt_password_remote_totp",
@@ -484,6 +488,7 @@ class ChatGPTPlatform(BasePlatform):
                         ).strip()
                     )
                     if account_type in {
+                        "chatgpt_password",
                         "chatgpt_google_password",
                         "chatgpt_password_totp",
                         "chatgpt_password_remote_totp",
@@ -552,6 +557,7 @@ class ChatGPTPlatform(BasePlatform):
                     ).strip()
                     account_type = str(account_extra.get("account_type") or "").strip()
                     if account_type in {
+                        "chatgpt_password",
                         "chatgpt_google_password",
                         "chatgpt_password_totp",
                         "chatgpt_password_url_otp",
@@ -565,7 +571,10 @@ class ChatGPTPlatform(BasePlatform):
                                 account_extra.get("pool_file") or ""
                             ),
                         }
-                        if account_type == "chatgpt_google_password":
+                        if account_type in {
+                            "chatgpt_password",
+                            "chatgpt_google_password",
+                        }:
                             credential_snapshot["password"] = str(
                                 account_extra.get("password") or ""
                             )

@@ -35,7 +35,7 @@ interface MailImportSnapshotItem {
   mailbox: string
   enabled?: boolean | null
   has_oauth?: boolean | null
-  account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_google_password' | 'chatgpt_password_totp' | 'chatgpt_password_remote_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
+  account_type?: 'microsoft_oauth' | 'mailapi_url' | 'applemail_oauth' | 'icloud_web' | 'chatgpt_password' | 'chatgpt_google_password' | 'chatgpt_password_totp' | 'chatgpt_password_remote_totp' | 'chatgpt_password_url_otp' | 'chatgpt_password_reset_url_mail' | null
   pool_state?: string
   last_error?: string
   last_task_id?: string
@@ -651,6 +651,7 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
       mailapi_url: { label: 'MailAPI URL', color: 'purple' },
       applemail_oauth: { label: 'AppleMail OAuth', color: 'blue' },
       icloud_web: { label: 'iCloud Web', color: 'cyan' },
+      chatgpt_password: { label: 'ChatGPT 密码', color: 'orange' },
       chatgpt_google_password: { label: 'Google 联邦', color: 'geekblue' },
       chatgpt_password_totp: { label: '密码 + TOTP', color: 'green' },
       chatgpt_password_remote_totp: { label: '远程 TOTP', color: 'green' },

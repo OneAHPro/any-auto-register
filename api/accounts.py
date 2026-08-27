@@ -225,7 +225,11 @@ def import_accounts(
             except (json.JSONDecodeError, ValueError):
                 extra = "{}"
         else:
-            extra = "{}"
+            extra = (
+                '{"account_type":"chatgpt_password"}'
+                if body.platform.strip().lower() == "chatgpt"
+                else "{}"
+            )
         acc = AccountModel(platform=body.platform, email=email,
                            password=password, extra_json=extra)
         session.add(acc)

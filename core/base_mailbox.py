@@ -659,6 +659,7 @@ class AppleMailMailbox(BaseMailbox):
     def _is_chatgpt_password_totp_account(account: MailboxAccount) -> bool:
         extra = account.extra or {}
         return str(extra.get("account_type") or "").strip() in {
+            "chatgpt_password",
             "chatgpt_google_password",
             "chatgpt_password_totp",
             "chatgpt_password_remote_totp",
@@ -781,6 +782,7 @@ class AppleMailMailbox(BaseMailbox):
         account_type = str(record.get("account_type") or "").strip()
         direct_icloud = account_type == "icloud_web"
         chatgpt_credentials = account_type in {
+            "chatgpt_password",
             "chatgpt_google_password",
             "chatgpt_password_totp",
             "chatgpt_password_remote_totp",
