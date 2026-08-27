@@ -32,7 +32,7 @@ def test_import_accepts_four_dash_email_password_rows():
     account = session.exec(select(AccountModel)).one()
     assert account.email == "user@example.com"
     assert account.password == "ChatGPT-password"
-    assert account.get_extra() == {}
+    assert account.get_extra() == {"account_type": "chatgpt_password"}
 
 
 def test_import_preserves_json_metadata_after_dash_split():

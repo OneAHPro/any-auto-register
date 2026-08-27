@@ -109,6 +109,22 @@ class AccountListVisibilityTests(unittest.TestCase):
             ["visible-second@example.com"],
         )
 
+    def test_default_list_shows_imported_password_credentials_without_refresh_token(self):
+        with Session(self.engine) as session:
+            session.add(
+                self._account(
+                    "chatgpt",
+                    "password-only@example.com",
+                    '{"account_type":"chatgpt_password"}',
+                )
+            )
+            session.commit()
+
+            result = list_accounts(platform="chatgpt", page=1, page_size=20, session=session)
+
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["items"][0]["email"], "password-only@example.com")
+
 
 if __name__ == "__main__":
     unittest.main()

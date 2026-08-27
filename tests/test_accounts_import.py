@@ -31,7 +31,7 @@ class AccountImportTests(unittest.TestCase):
             account = session.exec(select(AccountModel)).one()
             self.assertEqual(account.email, "user@example.com")
             self.assertEqual(account.password, "ChatGPT-password")
-            self.assertEqual(account.get_extra(), {"account_type": "chatgpt_password"})
+            self.assertEqual(account.get_extra(), {"account_type": "chatgpt_google_password"})
 
     def test_import_preserves_json_metadata_after_dash_split(self):
         metadata = {
@@ -55,6 +55,23 @@ class AccountImportTests(unittest.TestCase):
             self.assertEqual(account.email, "user@example.com")
             self.assertEqual(account.password, "ChatGPT-password")
             self.assertEqual(account.get_extra(), metadata)
+
+    def test_import_marks_icloud_password_rows_as_direct_chatgpt_credentials(self):
+        with Session(self.engine) as session:
+            response = import_accounts(
+                ImportRequest(
+                    platform="chatgpt",
+                    lines=["user@icloud.com----ChatGPT-password"],
+                ),
+                session=session,
+            )
+
+            self.assertEqual(response, {"created": 1})
+            account = session.exec(select(AccountModel)).one()
+            self.assertEqual(
+                account.get_extra(),
+                {"account_type": "chatgpt_password"},
+            )
 
     def test_import_keeps_passwords_containing_spaces_when_dash_delimited(self):
         with Session(self.engine) as session:

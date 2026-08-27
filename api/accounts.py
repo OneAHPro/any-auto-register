@@ -10,6 +10,8 @@ from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
 
+_CHATGPT_DIRECT_PASSWORD_DOMAINS = {"icloud.com", "me.com", "mac.com"}
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -106,6 +108,7 @@ class AccountUpdate(BaseModel):
 class ImportRequest(BaseModel):
     platform: str
     lines: list[str]
+    account_type: Optional[str] = None
 
 
 class BatchDeleteRequest(BaseModel):
@@ -225,9 +228,17 @@ def import_accounts(
             except (json.JSONDecodeError, ValueError):
                 extra = "{}"
         else:
+            account_type = str(body.account_type or "").strip()
+            if not account_type and body.platform.strip().lower() == "chatgpt":
+                domain = str(email or "").strip().lower().rpartition("@")[2]
+                account_type = (
+                    "chatgpt_password"
+                    if domain in _CHATGPT_DIRECT_PASSWORD_DOMAINS
+                    else "chatgpt_google_password"
+                )
             extra = (
-                '{"account_type":"chatgpt_password"}'
-                if body.platform.strip().lower() == "chatgpt"
+                json.dumps({"account_type": account_type}, ensure_ascii=False)
+                if account_type
                 else "{}"
             )
         acc = AccountModel(platform=body.platform, email=email,

@@ -58,7 +58,32 @@ def account_is_visible_in_default_list(account: Any) -> bool:
     """Hide incomplete ChatGPT rows while preserving every other platform."""
     if _lower_text(getattr(account, "platform", "")) != "chatgpt":
         return True
-    return bool(chatgpt_account_refresh_token(account))
+    if chatgpt_account_refresh_token(account):
+        return True
+    try:
+        extra = getattr(account, "extra", None)
+        if not isinstance(extra, dict):
+            extra = json.loads(getattr(account, "extra_json", "{}") or "{}")
+        if not isinstance(extra, dict):
+            return False
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    account_type = _lower_text(extra.get("account_type"))
+    if account_type not in {
+        "chatgpt_password",
+        "chatgpt_google_password",
+        "chatgpt_password_totp",
+        "chatgpt_password_remote_totp",
+        "chatgpt_password_url_otp",
+        "chatgpt_password_reset_url_mail",
+        "mailapi_url",
+    }:
+        return False
+    return bool(
+        _lower_text(getattr(account, "password", ""))
+        or _lower_text(extra.get("password"))
+        or _lower_text(extra.get("new_password"))
+    )
 
 
 def is_account_deactivated_message(error_code: Any = "", message: Any = "") -> bool:
