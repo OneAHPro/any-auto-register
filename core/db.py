@@ -54,6 +54,9 @@ class AccountModel(SQLModel, table=True):
     trial_end_time: int = 0
     cashier_url: str = ""
     extra_json: str = "{}"   # JSON 存储平台自定义字段
+    # Stable control-plane identity.  Empty keeps rows created by older
+    # releases compatible until the startup reconciliation fills it.
+    identity_id: str = Field(default="", index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow)
 
@@ -231,6 +234,177 @@ class ProxyModel(SQLModel, table=True):
     fail_count: int = 0
     is_active: bool = True
     last_checked: Optional[datetime] = None
+
+
+class AccountIdentityModel(SQLModel, table=True):
+    """Stable identity that survives credential refreshes and pool moves."""
+
+    __tablename__ = "account_identities"
+
+    id: str = Field(primary_key=True)
+    platform: str = Field(index=True)
+    canonical_email: str = Field(index=True)
+    state: str = Field(default="active", index=True)
+    current_account_id: int = Field(default=0, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountIdentityAliasModel(SQLModel, table=True):
+    """Normalized identity aliases used for conservative deduplication."""
+
+    __tablename__ = "account_identity_aliases"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    alias_type: str = Field(index=True)
+    normalized_value: str = Field(index=True)
+    source: str = ""
+    first_seen_at: datetime = Field(default_factory=_utcnow)
+    last_seen_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class Codex2APITargetModel(SQLModel, table=True):
+    """One externally managed Codex2API instance."""
+
+    __tablename__ = "codex2api_targets"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    name: str = Field(index=True, sa_column_kwargs={"unique": True})
+    target_type: str = Field(default="public", index=True)
+    server_label: str = ""
+    base_url: str
+    admin_key_ref: str
+    default_pool_id: str = "PUBLIC_POOL"
+    enabled: bool = Field(default=True, index=True)
+    health_status: str = Field(default="unknown", index=True)
+    capability_json: str = "{}"
+    last_health_at: Optional[datetime] = None
+    last_sync_at: Optional[datetime] = None
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountTargetBindingModel(SQLModel, table=True):
+    """Mapping of one stable identity to one target's remote account."""
+
+    __tablename__ = "account_target_bindings"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    local_account_id: int = Field(index=True)
+    target_id: int = Field(index=True)
+    remote_account_id: int = Field(default=0, index=True)
+    remote_email: str = ""
+    sync_status: str = Field(default="unknown", index=True)
+    remote_status: str = ""
+    enabled: bool = True
+    credential_revision: str = ""
+    last_sync_at: Optional[datetime] = None
+    last_error: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountAssignmentModel(SQLModel, table=True):
+    """Current pool/target lease for a stable account identity."""
+
+    __tablename__ = "account_assignments"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    local_account_id: int = Field(index=True)
+    pool_id: str = Field(index=True)
+    target_id: int = Field(index=True)
+    state: str = Field(default="active", index=True)
+    lease_owner: str = ""
+    lease_reason: str = ""
+    lease_started_at: Optional[datetime] = None
+    lease_expires_at: Optional[datetime] = Field(default=None, index=True)
+    assignment_version: int = 1
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountQuotaSnapshotModel(SQLModel, table=True):
+    """Point-in-time quota evidence from one target."""
+
+    __tablename__ = "account_quota_snapshots"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    local_account_id: int = Field(index=True)
+    target_id: Optional[int] = Field(default=None, index=True)
+    window: str = Field(index=True)
+    usage_percent: Optional[float] = None
+    billed_usd: Optional[float] = None
+    remaining_usd: Optional[float] = None
+    reset_at: Optional[datetime] = None
+    source: str = "codex2api"
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    is_fresh: bool = True
+    raw_digest: str = ""
+    continuity_state: str = "normal"
+
+
+class AccountMigrationModel(SQLModel, table=True):
+    """Durable Saga record for a cross-target account migration."""
+
+    __tablename__ = "account_migrations"
+
+    id: str = Field(primary_key=True)
+    identity_id: str = Field(index=True)
+    local_account_id: int = Field(index=True)
+    source_target_id: int = Field(index=True)
+    destination_target_id: int = Field(index=True)
+    source_remote_id: int = 0
+    destination_remote_id: int = 0
+    state: str = Field(default="planned", index=True)
+    step: str = Field(default="planned", index=True)
+    expected_assignment_version: int = 0
+    expected_credential_revision: str = ""
+    idempotency_key: str = Field(index=True)
+    retry_count: int = 0
+    error_json: str = "{}"
+    plan_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+    completed_at: Optional[datetime] = None
+
+
+class SchedulerRunModel(SQLModel, table=True):
+    """One immutable capacity-planning run."""
+
+    __tablename__ = "scheduler_runs"
+
+    id: str = Field(primary_key=True)
+    mode: str = Field(default="dry_run", index=True)
+    status: str = Field(default="planned", index=True)
+    trigger: str = Field(default="manual", index=True)
+    plan_json: str = "{}"
+    executed_json: str = "{}"
+    error_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    completed_at: Optional[datetime] = None
+
+
+class SchedulerActionModel(SQLModel, table=True):
+    """An individual account action inside a scheduler run."""
+
+    __tablename__ = "scheduler_actions"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    run_id: str = Field(index=True)
+    identity_id: str = Field(index=True)
+    action: str = Field(index=True)
+    source_target_id: int = 0
+    destination_target_id: int = 0
+    reason: str = ""
+    status: str = Field(default="planned", index=True)
+    detail_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+    updated_at: datetime = Field(default_factory=_utcnow)
 
 
 def _merge_nonempty_mapping(existing: dict, incoming: dict) -> dict:
@@ -851,11 +1025,86 @@ def _recover_chatgpt_attempt_bindings() -> None:
         session.commit()
 
 
+def init_account_pool_schema(database_engine=None) -> None:
+    """Create account-pool tables and apply additive legacy migrations.
+
+    The project intentionally has no external migration dependency.  This
+    helper is safe to call from tests, startup, and a rolling deployment: it
+    only creates missing tables/columns and never rewrites credential data.
+    """
+
+    target_engine = database_engine or engine
+    SQLModel.metadata.create_all(target_engine)
+
+    if target_engine.url.get_backend_name() != "sqlite":
+        return
+
+    with target_engine.begin() as conn:
+        account_table = conn.exec_driver_sql(
+            "PRAGMA table_info('accounts')"
+        ).fetchall()
+        if account_table:
+            account_columns = {str(row[1]) for row in account_table}
+            if "identity_id" not in account_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN identity_id TEXT DEFAULT ''"
+                )
+            conn.exec_driver_sql(
+                "UPDATE accounts SET identity_id = '' WHERE identity_id IS NULL"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_accounts_identity_id "
+                "ON accounts (identity_id)"
+            )
+
+        # Field(index=True) covers fresh databases.  Explicit IF NOT EXISTS
+        # statements also repair installations created by older SQLModel
+        # versions whose metadata did not include every index.
+        index_specs = (
+            (
+                "ix_account_identity_alias_lookup",
+                "account_identity_aliases",
+                "alias_type, normalized_value",
+            ),
+            (
+                "ix_account_target_binding_identity_target",
+                "account_target_bindings",
+                "identity_id, target_id",
+            ),
+            (
+                "ix_account_assignment_identity_state",
+                "account_assignments",
+                "identity_id, state",
+            ),
+            (
+                "ix_account_quota_snapshot_identity_window_time",
+                "account_quota_snapshots",
+                "identity_id, window, captured_at",
+            ),
+            (
+                "ix_account_migration_identity_state",
+                "account_migrations",
+                "identity_id, state",
+            ),
+            (
+                "ix_scheduler_action_run_status",
+                "scheduler_actions",
+                "run_id, status",
+            ),
+        )
+        for index_name, table_name, columns in index_specs:
+            conn.exec_driver_sql(
+                f"CREATE INDEX IF NOT EXISTS {index_name} "
+                f"ON {table_name} ({columns})"
+            )
+
+
 def init_db():
     SQLModel.metadata.create_all(engine)
     _migrate_outlook_accounts_schema()
     recover_expired_outlook_leases()
     _migrate_chatgpt_auth_state_schema()
+    init_account_pool_schema(engine)
     _recover_chatgpt_attempt_bindings()
     from core.sms_pool import SmsPoolService
 
