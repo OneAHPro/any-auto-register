@@ -40,6 +40,14 @@ def test_pool_tables_and_account_identity_column_are_created():
             )
         }
     assert "identity_id" in columns
+    with engine.connect() as connection:
+        quota_columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info('account_quota_snapshots')"
+            )
+        }
+    assert "continuous_billed_usd" in quota_columns
 
 
 def test_schema_migration_is_idempotent():

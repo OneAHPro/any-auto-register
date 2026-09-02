@@ -339,6 +339,9 @@ class AccountQuotaSnapshotModel(SQLModel, table=True):
     window: str = Field(index=True)
     usage_percent: Optional[float] = None
     billed_usd: Optional[float] = None
+    # Control-plane cumulative value; differs from the target-local counter
+    # when a credential is imported into a fresh Codex2API instance.
+    continuous_billed_usd: Optional[float] = None
     remaining_usd: Optional[float] = None
     reset_at: Optional[datetime] = None
     source: str = "codex2api"
@@ -426,6 +429,27 @@ def _merge_nonempty_mapping(existing: dict, incoming: dict) -> dict:
 
 def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
     """Save an account and atomically report whether this call inserted it."""
+
+    def attach_stable_identity(saved: AccountModel) -> AccountModel:
+        """Best-effort identity projection kept outside the credential write."""
+
+        try:
+            from services.account_identity import ensure_identity_for_model
+
+            resolution = ensure_identity_for_model(engine, saved)
+            saved.identity_id = resolution.identity_id
+        except Exception as exc:
+            # Account login must remain usable during a rolling upgrade.  The
+            # startup reconciler retries this projection before migrations are
+            # allowed to run.
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "stable account identity projection deferred (%s)",
+                type(exc).__name__,
+            )
+        return saved
+
     with Session(engine) as session:
         existing = session.exec(
             select(AccountModel)
@@ -465,7 +489,7 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
             session.add(existing)
             session.commit()
             session.refresh(existing)
-            return existing, False
+            return attach_stable_identity(existing), False
         m = AccountModel(
             platform=account.platform,
             email=account.email,
@@ -480,7 +504,7 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
         session.add(m)
         session.commit()
         session.refresh(m)
-        return m, True
+        return attach_stable_identity(m), True
 
 
 def save_account(account) -> 'AccountModel':
@@ -1040,6 +1064,12 @@ def init_account_pool_schema(database_engine=None) -> None:
         return
 
     with target_engine.begin() as conn:
+        existing_tables = {
+            str(row[0])
+            for row in conn.exec_driver_sql(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
         account_table = conn.exec_driver_sql(
             "PRAGMA table_info('accounts')"
         ).fetchall()
@@ -1056,6 +1086,17 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "CREATE INDEX IF NOT EXISTS ix_accounts_identity_id "
                 "ON accounts (identity_id)"
             )
+
+        quota_table = conn.exec_driver_sql(
+            "PRAGMA table_info('account_quota_snapshots')"
+        ).fetchall()
+        if quota_table:
+            quota_columns = {str(row[1]) for row in quota_table}
+            if "continuous_billed_usd" not in quota_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_quota_snapshots "
+                    "ADD COLUMN continuous_billed_usd FLOAT"
+                )
 
         # Field(index=True) covers fresh databases.  Explicit IF NOT EXISTS
         # statements also repair installations created by older SQLModel
@@ -1093,6 +1134,8 @@ def init_account_pool_schema(database_engine=None) -> None:
             ),
         )
         for index_name, table_name, columns in index_specs:
+            if table_name not in existing_tables:
+                continue
             conn.exec_driver_sql(
                 f"CREATE INDEX IF NOT EXISTS {index_name} "
                 f"ON {table_name} ({columns})"
@@ -1106,6 +1149,11 @@ def init_db():
     _migrate_chatgpt_auth_state_schema()
     init_account_pool_schema(engine)
     _recover_chatgpt_attempt_bindings()
+    from services.account_identity import reconcile_existing_accounts
+    from services.codex2api_target_client import ensure_default_target
+
+    reconcile_existing_accounts(engine)
+    ensure_default_target(engine)
     from core.sms_pool import SmsPoolService
 
     sms_pool = SmsPoolService(engine)

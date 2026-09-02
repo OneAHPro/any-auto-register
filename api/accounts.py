@@ -2,7 +2,13 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlmodel import Session, select, func
 from pydantic import BaseModel
-from core.db import AccountModel, get_session
+from core.db import (
+    AccountAssignmentModel,
+    AccountModel,
+    AccountQuotaSnapshotModel,
+    AccountTargetBindingModel,
+    get_session,
+)
 from core.mail_import_delimiters import split_mail_import_fields
 from services.chatgpt_account_state import account_is_visible_in_default_list
 from services.chatgpt_account_removal import remove_account
@@ -82,11 +88,93 @@ def _sanitize_account_extra_for_api(raw_extra: str) -> str:
     return json.dumps(extra, ensure_ascii=False)
 
 
-def _account_for_response(account: AccountModel) -> dict:
+def _account_control_plane_summary(account: AccountModel, session: Session) -> dict:
+    """Return non-secret identity, assignment, binding and quota projections."""
+
+    identity_id = str(getattr(account, "identity_id", "") or "").strip()
+    summary: dict[str, object] = {
+        "identity_id": identity_id,
+        "assignment": None,
+        "binding": None,
+        "quota": {},
+    }
+    if not identity_id:
+        return summary
+
+    assignment = session.exec(
+        select(AccountAssignmentModel)
+        .where(AccountAssignmentModel.identity_id == identity_id)
+        .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
+        .order_by(AccountAssignmentModel.updated_at.desc())
+    ).first()
+    if assignment is not None:
+        summary["assignment"] = {
+            "pool_id": assignment.pool_id,
+            "target_id": int(assignment.target_id),
+            "state": assignment.state,
+            "lease_owner": assignment.lease_owner,
+            "lease_reason": assignment.lease_reason,
+            "lease_started_at": assignment.lease_started_at.isoformat()
+            if assignment.lease_started_at
+            else None,
+            "lease_expires_at": assignment.lease_expires_at.isoformat()
+            if assignment.lease_expires_at
+            else None,
+            "assignment_version": int(assignment.assignment_version or 0),
+        }
+        binding = session.exec(
+            select(AccountTargetBindingModel)
+            .where(AccountTargetBindingModel.identity_id == identity_id)
+            .where(AccountTargetBindingModel.target_id == assignment.target_id)
+        ).first()
+        if binding is not None:
+            summary["binding"] = {
+                "target_id": int(binding.target_id),
+                "remote_account_id": int(binding.remote_account_id or 0),
+                "sync_status": binding.sync_status,
+                "remote_status": binding.remote_status,
+                "enabled": bool(binding.enabled),
+                "last_sync_at": binding.last_sync_at.isoformat()
+                if binding.last_sync_at
+                else None,
+                "last_error": binding.last_error,
+            }
+
+    quota: dict[str, dict[str, object]] = {}
+    for window in ("5h", "7d", "monthly"):
+        snapshot = session.exec(
+            select(AccountQuotaSnapshotModel)
+            .where(AccountQuotaSnapshotModel.identity_id == identity_id)
+            .where(AccountQuotaSnapshotModel.window == window)
+            .order_by(AccountQuotaSnapshotModel.captured_at.desc())
+        ).first()
+        if snapshot is None:
+            continue
+        continuity_state = str(snapshot.continuity_state or "normal")
+        fresh = bool(snapshot.is_fresh)
+        quota[window] = {
+            "usage_percent": snapshot.usage_percent,
+            "billed_usd": snapshot.billed_usd,
+            "continuous_billed_usd": snapshot.continuous_billed_usd,
+            "remaining_usd": snapshot.remaining_usd,
+            "reset_at": snapshot.reset_at.isoformat() if snapshot.reset_at else None,
+            "captured_at": snapshot.captured_at.isoformat(),
+            "continuity_state": continuity_state,
+            "fresh": fresh,
+            "scheduler_eligible": fresh
+            and continuity_state not in {"unknown", "ambiguous", "stale"},
+        }
+    summary["quota"] = quota
+    return summary
+
+
+def _account_for_response(account: AccountModel, session: Session | None = None) -> dict:
     payload = account.model_dump()
     payload["extra_json"] = _sanitize_account_extra_for_api(
         str(payload.get("extra_json") or "{}")
     )
+    if session is not None:
+        payload.update(_account_control_plane_summary(account, session))
     return payload
 
 
@@ -148,7 +236,7 @@ def list_accounts(
     return {
         "total": total,
         "page": page,
-        "items": [_account_for_response(item) for item in items],
+        "items": [_account_for_response(item, session=session) for item in items],
     }
 
 
@@ -165,7 +253,7 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
     session.add(acc)
     session.commit()
     session.refresh(acc)
-    return _account_for_response(acc)
+    return _account_for_response(acc, session=session)
 
 
 @router.get("/stats")
@@ -337,7 +425,7 @@ def get_account(account_id: int, session: Session = Depends(get_session)):
     acc = session.get(AccountModel, account_id)
     if not acc:
         raise HTTPException(404, "账号不存在")
-    return _account_for_response(acc)
+    return _account_for_response(acc, session=session)
 
 
 @router.patch("/{account_id}")
@@ -356,7 +444,7 @@ def update_account(account_id: int, body: AccountUpdate,
     session.add(acc)
     session.commit()
     session.refresh(acc)
-    return _account_for_response(acc)
+    return _account_for_response(acc, session=session)
 
 
 @router.delete("/{account_id}")
