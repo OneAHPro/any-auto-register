@@ -1,0 +1,36 @@
+name: any-auto-register-codex2api-test
+
+services:
+  codex2api-a:
+    image: ghcr.io/james-6-23/codex2api:latest
+    environment:
+      CODEX_PORT: "8080"
+      ADMIN_SECRET: ${CODEX2API_TEST_ADMIN_SECRET:-test-admin-secret}
+      DATABASE_DRIVER: sqlite
+      DATABASE_PATH: /data/codex2api.db
+      CACHE_DRIVER: memory
+      CODEX_ALLOW_ANONYMOUS: "false"
+      LOG_DISABLED: "true"
+    ports:
+      - "127.0.0.1:18080:8080"
+    volumes:
+      - codex2api-test-a:/data
+
+  codex2api-b:
+    image: ghcr.io/james-6-23/codex2api:latest
+    environment:
+      CODEX_PORT: "8080"
+      ADMIN_SECRET: ${CODEX2API_TEST_ADMIN_SECRET:-test-admin-secret}
+      DATABASE_DRIVER: sqlite
+      DATABASE_PATH: /data/codex2api.db
+      CACHE_DRIVER: memory
+      CODEX_ALLOW_ANONYMOUS: "false"
+      LOG_DISABLED: "true"
+    ports:
+      - "127.0.0.1:18081:8080"
+    volumes:
+      - codex2api-test-b:/data
+
+volumes:
+  codex2api-test-a:
+  codex2api-test-b:
