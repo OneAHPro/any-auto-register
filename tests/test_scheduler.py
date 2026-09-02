@@ -277,9 +277,13 @@ def test_start_is_daemon_nonblocking_and_immediately_ticks_without_trial_or_cpa(
 ):
     scheduler = scheduler_module.Scheduler()
     ticked = threading.Event()
+    history_cleaned = threading.Event()
     auto_tick = mock.Mock(side_effect=lambda **_: ticked.set())
     history_cleanup = mock.Mock(
-        return_value={"task_runs": 0, "task_logs": 0}
+        side_effect=lambda: (
+            history_cleaned.set()
+            or {"task_runs": 0, "task_logs": 0}
+        )
     )
     trial = mock.Mock()
     cpa = mock.Mock()
@@ -307,6 +311,7 @@ def test_start_is_daemon_nonblocking_and_immediately_ticks_without_trial_or_cpa(
     scheduler.start()
     try:
         assert ticked.wait(timeout=1)
+        assert history_cleaned.wait(timeout=1)
         assert scheduler._thread is not None
         assert scheduler._thread.daemon is True
         auto_tick.assert_called_once()

@@ -23,6 +23,7 @@ from api.contribution import router as contribution_router
 from api.chatgpt import router as chatgpt_router
 from api.sms_pool import router as sms_pool_router
 from api.automations import router as automations_router
+from api.codex2api_control import router as codex2api_control_router
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
 
@@ -75,6 +76,8 @@ async def lifespan(app: FastAPI):
     print(f"[OK] 已加载平台: {[p['name'] for p in list_platforms()]}")
     from core.scheduler import scheduler
     scheduler.start()
+    from services.control_plane_runtime import wake_pending_migrations
+    wake_pending_migrations()
     from services.solver_manager import start_async
     start_async()
     yield
@@ -127,6 +130,7 @@ app.include_router(contribution_router, prefix="/api")
 app.include_router(chatgpt_router, prefix="/api")
 app.include_router(sms_pool_router, prefix="/api")
 app.include_router(automations_router, prefix="/api")
+app.include_router(codex2api_control_router, prefix="/api")
 
 
 @app.get("/api/solver/status")

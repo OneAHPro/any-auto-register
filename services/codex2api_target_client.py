@@ -12,6 +12,7 @@ import logging
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
+from urllib.parse import urlencode
 
 from curl_cffi import CurlMime
 from curl_cffi import requests as cffi_requests
@@ -703,6 +704,27 @@ class Codex2APITargetClient:
 
     def runtime_status(self) -> dict[str, Any]:
         return self._request("GET", "/api/admin/runtime-status")
+
+    def api_key_usage(
+        self,
+        *,
+        start: Any,
+        end: Any,
+    ) -> list[dict[str, Any]]:
+        query = urlencode(
+            {
+                "start": start.isoformat() if hasattr(start, "isoformat") else str(start),
+                "end": end.isoformat() if hasattr(end, "isoformat") else str(end),
+            }
+        )
+        payload = self._request("GET", f"/api/admin/usage/api-keys?{query}")
+        items = payload.get("items") if isinstance(payload, Mapping) else None
+        if not isinstance(items, list):
+            raise Codex2APITargetError(
+                "Codex2API API Key 用量格式无效",
+                endpoint="usage/api-keys",
+            )
+        return [dict(item) for item in items if isinstance(item, Mapping)]
 
     def import_refresh_token(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         return self._request("POST", "/api/admin/accounts", json_body=payload)

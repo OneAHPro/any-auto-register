@@ -409,6 +409,33 @@ def test_client_scrubs_credential_fields_from_success_payload(monkeypatch):
     assert rows[0]["allowed_api_key_ids"] == [1, 2]
 
 
+def test_client_reads_api_key_usage_with_explicit_range(monkeypatch):
+    from datetime import datetime, timezone
+    from services import codex2api_target_client as module
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse(
+            {"items": [{"api_key_id": 11, "requests": 2, "user_billed": 1.25}]}
+        )
+
+    monkeypatch.setattr(module.cffi_requests, "get", fake_get)
+    client = module.Codex2APITargetClient(
+        module.TargetConfig(id=1, name="node", base_url="https://node", admin_key="secret")
+    )
+
+    items = client.api_key_usage(
+        start=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        end=datetime(2026, 9, 3, 1, tzinfo=timezone.utc),
+    )
+
+    assert items[0]["api_key_id"] == 11
+    assert "/api/admin/usage/api-keys?" in calls[0]
+    assert "start=" in calls[0] and "end=" in calls[0]
+
+
 def test_account_test_treats_usage_limit_as_authenticated(monkeypatch):
     from services import codex2api_target_client as module
 

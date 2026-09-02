@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -14,8 +15,11 @@ from core.db import (
     AccountAssignmentEventModel,
     AccountAssignmentModel,
     AccountModel,
+    AccountPoolModel,
     AccountTargetBindingModel,
     Codex2APITargetModel,
+    CustomerUsageSampleModel,
+    PoolTargetPolicyModel,
     engine as default_engine,
 )
 from services.quota_ledger import merge_remote_rows
@@ -395,10 +399,112 @@ def collect_target_quota(
     )
 
 
+def collect_customer_usage(
+    database_engine=None,
+    *,
+    target_id: int,
+    client: Any | None = None,
+    now: datetime | None = None,
+) -> list[CustomerUsageSampleModel]:
+    """Collect one hourly API-key usage sample for pools on a target."""
+
+    target_engine = database_engine or default_engine
+    captured_at = _aware(now)
+    bucket_start = captured_at.replace(minute=0, second=0, microsecond=0)
+    with Session(target_engine) as session:
+        policies = session.exec(
+            select(PoolTargetPolicyModel)
+            .where(PoolTargetPolicyModel.target_id == int(target_id))
+            .where(PoolTargetPolicyModel.enabled == True)  # noqa: E712
+        ).all()
+        pools = {
+            str(row.id): row
+            for row in session.exec(
+                select(AccountPoolModel).where(
+                    AccountPoolModel.id.in_([str(policy.pool_id) for policy in policies])
+                )
+            ).all()
+        } if policies else {}
+    if not policies:
+        return []
+    resolved_client = _client_for(int(target_id), target_engine, client)
+    items = resolved_client.api_key_usage(start=bucket_start, end=captured_at)
+    samples: list[CustomerUsageSampleModel] = []
+    with Session(target_engine) as session:
+        for policy in policies:
+            pool = pools.get(str(policy.pool_id))
+            if pool is None or not str(pool.customer_id or "").strip():
+                continue
+            try:
+                configured_ids = {
+                    int(value)
+                    for value in json.loads(policy.remote_api_key_ids_json or "[]")
+                    if int(value) > 0
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                configured_ids = set()
+            selected = []
+            for item in items:
+                try:
+                    api_key_id = int(item.get("api_key_id") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if configured_ids and api_key_id not in configured_ids:
+                    continue
+                selected.append(item)
+            total = Decimal("0")
+            requests = 0
+            for item in selected:
+                try:
+                    billed = Decimal(str(item.get("user_billed") or 0))
+                except (InvalidOperation, TypeError, ValueError):
+                    continue
+                if billed.is_finite() and billed >= 0:
+                    total += billed
+                try:
+                    requests += max(int(item.get("requests") or 0), 0)
+                except (TypeError, ValueError):
+                    pass
+            billed_cents = int(
+                (total * 100).to_integral_value(rounding=ROUND_HALF_UP)
+            )
+            key_scope = min(configured_ids) if len(configured_ids) == 1 else 0
+            sample = session.exec(
+                select(CustomerUsageSampleModel).where(
+                    CustomerUsageSampleModel.customer_id == str(pool.customer_id),
+                    CustomerUsageSampleModel.target_id == int(target_id),
+                    CustomerUsageSampleModel.remote_api_key_id == key_scope,
+                    CustomerUsageSampleModel.bucket_start == bucket_start,
+                )
+            ).first()
+            if sample is None:
+                sample = CustomerUsageSampleModel(
+                    customer_id=str(pool.customer_id),
+                    pool_id=str(pool.id),
+                    target_id=int(target_id),
+                    remote_api_key_id=key_scope,
+                    bucket_start=bucket_start,
+                    bucket_end=captured_at,
+                    captured_at=captured_at,
+                )
+            sample.bucket_end = captured_at
+            sample.billed_cents = billed_cents
+            sample.request_count = requests
+            sample.captured_at = captured_at
+            session.add(sample)
+            session.flush()
+            samples.append(sample)
+        session.commit()
+        for sample in samples:
+            session.refresh(sample)
+        return samples
+
+
 __all__ = [
     "TargetHealthResult",
     "TargetQuotaResult",
     "collect_target_health",
     "collect_target_quota",
+    "collect_customer_usage",
     "reconcile_target_bindings",
 ]

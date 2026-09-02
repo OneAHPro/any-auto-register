@@ -26,8 +26,13 @@ def _enabled() -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
 
 
-def _submit_once(name: str, job: Callable[[], object]) -> bool:
-    if not _enabled():
+def _submit_once(
+    name: str,
+    job: Callable[[], object],
+    *,
+    require_scheduler_enabled: bool = True,
+) -> bool:
+    if require_scheduler_enabled and not _enabled():
         return False
     with _JOBS_LOCK:
         if name in _RUNNING_JOBS:
@@ -70,12 +75,25 @@ def run_all_target_health() -> list[object]:
 
 
 def run_all_target_quota() -> list[object]:
-    from services.control_plane_workers import collect_target_quota
+    from services.codex2api_target_client import get_target_client
+    from services.control_plane_workers import collect_customer_usage, collect_target_quota
 
     results = []
     for target_id in _enabled_target_ids():
         try:
-            results.append(collect_target_quota(engine, target_id=target_id))
+            client = get_target_client(target_id, engine)
+            results.append(
+                collect_target_quota(
+                    engine,
+                    target_id=target_id,
+                    client=client,
+                )
+            )
+            collect_customer_usage(
+                engine,
+                target_id=target_id,
+                client=client,
+            )
         except Exception:
             continue
     return results
@@ -85,6 +103,14 @@ def run_pool_planning() -> list[object]:
     from services.pool_scheduler import generate_scheduled_plans
 
     return generate_scheduled_plans(engine)
+
+
+def run_pending_migrations() -> list[object]:
+    """Resume durable migration Sagas after a process restart."""
+
+    from services.account_migration import resume_pending_migrations
+
+    return resume_pending_migrations(engine)
 
 
 def wake_target_health() -> bool:
@@ -99,10 +125,22 @@ def wake_pool_planning() -> bool:
     return _submit_once("pool_planning", run_pool_planning)
 
 
+def wake_pending_migrations() -> bool:
+    # Recovery is independent from automatic capacity planning. A manually
+    # confirmed migration must finish even while the scheduler is disabled.
+    return _submit_once(
+        "pending_migrations",
+        run_pending_migrations,
+        require_scheduler_enabled=False,
+    )
+
+
 __all__ = [
     "run_all_target_health",
     "run_all_target_quota",
+    "run_pending_migrations",
     "run_pool_planning",
+    "wake_pending_migrations",
     "wake_pool_planning",
     "wake_target_health",
     "wake_target_quota",

@@ -374,6 +374,8 @@ class PoolTargetPolicyModel(SQLModel, table=True):
     priority: int = 100
     min_accounts: int = 0
     max_accounts: int = 0
+    remote_api_key_ids_json: str = "[]"
+    bandwidth_mbps: int = 0
     enabled: bool = Field(default=True, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
@@ -1333,6 +1335,22 @@ def init_account_pool_schema(database_engine=None) -> None:
                     )
                 conn.exec_driver_sql(
                     f"UPDATE codex2api_targets SET {column} = 0 WHERE {column} IS NULL"
+                )
+
+        policy_table = conn.exec_driver_sql(
+            "PRAGMA table_info('pool_target_policies')"
+        ).fetchall()
+        if policy_table:
+            policy_columns = {str(row[1]) for row in policy_table}
+            if "remote_api_key_ids_json" not in policy_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE pool_target_policies "
+                    "ADD COLUMN remote_api_key_ids_json TEXT DEFAULT '[]'"
+                )
+            if "bandwidth_mbps" not in policy_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE pool_target_policies "
+                    "ADD COLUMN bandwidth_mbps INTEGER DEFAULT 0"
                 )
 
         # Field(index=True) covers fresh databases.  Explicit IF NOT EXISTS

@@ -68,6 +68,13 @@ class FakeClient:
             }
         ]
 
+    def api_key_usage(self, *, start, end):
+        self.calls.append("api-key-usage")
+        return [
+            {"api_key_id": 11, "requests": 20, "user_billed": 12.34},
+            {"api_key_id": 22, "requests": 99, "user_billed": 88.88},
+        ]
+
 
 def test_target_health_requires_two_successes_before_healthy():
     from services.control_plane_workers import collect_target_health
@@ -211,3 +218,42 @@ def test_default_target_reconciliation_bootstraps_binding_and_assignment():
     assert binding.remote_account_id == 77
     assert assignment.target_id == 1
     assert assignment.pool_id == "PUBLIC_POOL"
+
+
+def test_customer_usage_collection_filters_configured_api_keys():
+    from services.control_plane_workers import collect_customer_usage
+
+    engine = make_engine()
+    with Session(engine) as session:
+        session.add(
+            db.CustomerModel(id="customer-a", name="企业 A")
+        )
+        session.add(
+            db.AccountPoolModel(
+                id="ENTERPRISE_A_POOL",
+                name="企业 A 号池",
+                pool_type="enterprise",
+                customer_id="customer-a",
+            )
+        )
+        session.add(
+            db.PoolTargetPolicyModel(
+                pool_id="ENTERPRISE_A_POOL",
+                target_id=1,
+                priority=1,
+                remote_api_key_ids_json="[11]",
+            )
+        )
+        session.commit()
+
+    samples = collect_customer_usage(
+        engine,
+        target_id=1,
+        client=FakeClient(),
+        now=NOW,
+    )
+
+    assert len(samples) == 1
+    assert samples[0].customer_id == "customer-a"
+    assert samples[0].billed_cents == 1234
+    assert samples[0].request_count == 20
