@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import time
-from typing import Iterable, Mapping
+from typing import Any, Iterable, Mapping
 
 from curl_cffi import requests as cffi_requests
 from sqlmodel import Session, select
@@ -217,8 +217,26 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
 def fetch_codex2api_quota_accounts(
     *,
     config: Mapping[str, object] | None = None,
+    client: Any | None = None,
 ) -> list[dict[str, object]]:
     """Read the latest Codex2API account quota rows without probing."""
+
+    if client is not None:
+        try:
+            rows = client.list_accounts()
+        except Exception as exc:
+            if isinstance(exc, Codex2APIHealthError):
+                raise
+            raise Codex2APIHealthError(
+                f"读取 Codex2API 状态异常（{type(exc).__name__}）"
+            ) from None
+        if not isinstance(rows, list):
+            raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+        return [
+            _quota_record(row)
+            for row in rows
+            if isinstance(row, Mapping)
+        ]
 
     snapshot = dict(config) if config is not None else _get_config()
     base_url = _text(snapshot.get("codex2api_api_url")).rstrip("/")

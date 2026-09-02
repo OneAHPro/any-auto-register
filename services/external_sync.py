@@ -98,9 +98,68 @@ def sync_codex2api_account(
     *,
     force: bool = False,
     replace_existing: bool = False,
+    target: Any | None = None,
+    client: Any | None = None,
 ) -> dict[str, Any] | None:
     """只同步 Codex2API，并独立记录该目标的结果。"""
     from core.config_store import config_store
+
+    # New multi-target callers pass an explicit client.  Keeping this branch
+    # separate preserves the long-tested legacy upload path and its exact
+    # response semantics for existing login/relogin flows.
+    if client is not None or target is not None:
+        if client is None:
+            from services.codex2api_target_client import Codex2APITargetClient, TargetConfig
+
+            if isinstance(target, TargetConfig):
+                client = Codex2APITargetClient(target)
+            else:
+                raise ValueError("explicit Codex2API target requires a TargetConfig or client")
+        upload_account = _build_chatgpt_upload_account(account)
+        payload: dict[str, Any] = {
+            "name": _pick_text({"value": upload_account.email}, "value"),
+            "email": _pick_text({"value": upload_account.email}, "value"),
+        }
+        for key in (
+            "refresh_token",
+            "access_token",
+            "id_token",
+            "session_token",
+            "account_id",
+            "workspace_id",
+            "user_id",
+            "client_id",
+        ):
+            value = _pick_text({"value": getattr(upload_account, key, "")}, "value")
+            if value:
+                payload[key] = value
+        try:
+            if payload.get("refresh_token") and payload.get("access_token"):
+                response = client.import_full_json(payload)
+            elif payload.get("refresh_token"):
+                response = client.import_refresh_token(payload)
+            elif payload.get("access_token"):
+                response = client.import_access_token(payload)
+            else:
+                return {"name": "Codex2API", "ok": False, "msg": "账号缺少凭证"}
+            response = response if isinstance(response, dict) else {}
+            failed = int(response.get("failed") or 0)
+            successful = sum(
+                int(response.get(key) or 0)
+                for key in ("success", "updated", "duplicate")
+            )
+            if failed or successful <= 0:
+                message = str(
+                    response.get("message")
+                    or response.get("msg")
+                    or response.get("error")
+                    or "Codex2API 未确认账号已导入"
+                ).strip()[:200]
+                return {"name": "Codex2API", "ok": False, "msg": message}
+            return {"name": "Codex2API", "ok": True, "msg": "目标账号已导入"}
+        except Exception as exc:
+            logger.error("Codex2API target sync failed (%s)", type(exc).__name__)
+            return {"name": "Codex2API", "ok": False, "msg": "目标账号同步异常"}
 
     codex2api_enabled = _is_config_enabled(
         config_store.get("codex2api_enabled", "0"),
