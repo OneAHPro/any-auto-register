@@ -553,7 +553,9 @@ function parseStoredDomainList(value: unknown): string[] {
     if (Array.isArray(parsed)) {
       return normalizeDomainList(parsed)
     }
-  } catch {}
+  } catch {
+    // Fall back to the delimiter parser for legacy plain-text values.
+  }
 
   return normalizeDomainList(
     text
@@ -893,7 +895,6 @@ function IntegrationsPanel() {
   const [loading, setLoading] = useState(false)
   const [busy, setBusy] = useState('')
   const [updateMode, setUpdateMode] = useState<'tag' | 'branch'>('tag')
-  const saved = false
   const [resultModal, setResultModal] = useState({
     open: false,
     title: '',
@@ -982,36 +983,6 @@ function IntegrationsPanel() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      {false ? (
-        <div
-          style={{
-            position: 'fixed',
-            left: '50%',
-            bottom: 24,
-            transform: 'translateX(-50%)',
-            zIndex: 1000,
-            width: 'min(720px, calc(100vw - 32px))',
-            pointerEvents: 'none',
-          }}
-        >
-          <div
-            style={{
-              width: '100%',
-              padding: 0,
-              borderRadius: 0,
-              border: 'none',
-              background: 'transparent',
-              boxShadow: 'none',
-              backdropFilter: 'none',
-              pointerEvents: 'auto',
-            }}
-          >
-            <Button type="primary" icon={<SaveOutlined />} onClick={() => {}} loading={false} block size="large">
-              {saved ? '已保存 ✓' : '保存配置'}
-            </Button>
-          </div>
-        </div>
-      ) : null}
       <Modal
         open={resultModal.open}
         title={resultModal.title}
@@ -1621,7 +1592,9 @@ function SecurityPanel() {
     try {
       const s = await apiFetch('/auth/status')
       setStatus(s)
-    } catch {}
+    } catch {
+      // The security status is optional; the panel remains usable if it fails.
+    }
   }
 
   useEffect(() => { loadStatus() }, [])

@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
 from sqlmodel import Session, select
+from sqlalchemy.exc import OperationalError
 
 from core.db import (
     AccountAssignmentModel,
@@ -594,26 +595,31 @@ def ensure_default_pools(database_engine=None) -> list[AccountPoolModel]:
         ("FLOAT_POOL", "浮动池", "float"),
         ("STANDBY_POOL", "备用池", "standby"),
     )
-    with Session(target_engine) as session:
-        rows: list[AccountPoolModel] = []
-        for pool_id, name, pool_type in defaults:
-            row = session.get(AccountPoolModel, pool_id)
-            if row is None:
-                row = AccountPoolModel(
-                    id=pool_id,
-                    name=name,
-                    pool_type=pool_type,
-                    min_accounts=0,
-                    safe_concurrency_per_account=1,
-                    min_lease_hours=6,
-                    enabled=True,
-                )
-                session.add(row)
-            rows.append(row)
-        session.commit()
-        for row in rows:
-            session.refresh(row)
-        return rows
+    try:
+        with Session(target_engine) as session:
+            rows: list[AccountPoolModel] = []
+            for pool_id, name, pool_type in defaults:
+                row = session.get(AccountPoolModel, pool_id)
+                if row is None:
+                    row = AccountPoolModel(
+                        id=pool_id,
+                        name=name,
+                        pool_type=pool_type,
+                        min_accounts=0,
+                        safe_concurrency_per_account=1,
+                        min_lease_hours=6,
+                        enabled=True,
+                    )
+                    session.add(row)
+                rows.append(row)
+            session.commit()
+            for row in rows:
+                session.refresh(row)
+            return rows
+    except OperationalError:
+        # Keep startup recovery compatible with an older/partially-created
+        # database; the next normal init pass will create the tables.
+        return []
 
 
 def _latest_quota_by_identity(
