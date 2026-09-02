@@ -80,6 +80,11 @@ def seed_migratable_account(engine):
                     max_accounts=10,
                     safe_concurrency_per_account=3,
                 ),
+                db.AccountPoolModel(
+                    id="FLOAT_POOL",
+                    name="浮动池",
+                    pool_type="float",
+                ),
                 db.AccountIdentityModel(
                     id="identity-1",
                     platform="chatgpt",
@@ -322,6 +327,121 @@ def test_scheduler_plan_response_enriches_email_and_hides_credential_revision(mo
     action = response.json()["run"]["plan"]["actions"][0]
     assert action["email"] == "a@example.com"
     assert "credential_revision" not in response.text
+
+
+def test_scheduler_scale_down_reassigns_same_target_pool_without_remote_copy(monkeypatch):
+    client, engine, _module = build_client(monkeypatch)
+    account_id = seed_migratable_account(engine)
+    from services.pool_scheduler import AccountCandidate, PoolInput, create_dry_run
+
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            db.AccountQuotaSnapshotModel(
+                identity_id="identity-1",
+                local_account_id=account_id,
+                target_id=1,
+                window="7d",
+                billed_cents=100,
+                continuous_billed_cents=100,
+                remaining_cents=100000,
+                reset_at=now + timedelta(days=3),
+                captured_at=now,
+                is_fresh=True,
+                freshness_seconds=900,
+            )
+        )
+        session.commit()
+
+    run = create_dry_run(
+        engine,
+        PoolInput(
+            pool_id="PUBLIC_POOL",
+            forecast_7d_usd=0,
+            safe_7d_quota=1800,
+            current_accounts=1,
+            utilization=0.1,
+            low_utilization_cycles=2,
+            candidates=(
+                AccountCandidate(
+                    identity_id="identity-1",
+                    local_account_id=account_id,
+                    pool_type="PUBLIC_POOL",
+                    source_target_id=1,
+                    destination_target_id=1,
+                    assignment_version=1,
+                    lease_elapsed=True,
+                ),
+            ),
+        ),
+    )
+
+    response = client.post(
+        "/api/scheduler/apply",
+        json={"run_id": run.id, "confirm": True},
+    )
+
+    assert response.status_code == 202
+    with Session(engine) as session:
+        assignment = session.exec(
+            select(db.AccountAssignmentModel).where(
+                db.AccountAssignmentModel.identity_id == "identity-1"
+            )
+        ).one()
+    assert assignment.pool_id == "FLOAT_POOL"
+
+
+def test_scheduler_apply_rejects_plan_with_unavailable_capacity(monkeypatch):
+    client, engine, _module = build_client(monkeypatch)
+    account_id = seed_migratable_account(engine)
+    from services.pool_scheduler import AccountCandidate, PoolInput, create_dry_run
+
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            db.AccountQuotaSnapshotModel(
+                identity_id="identity-1",
+                local_account_id=account_id,
+                target_id=1,
+                window="7d",
+                billed_cents=100,
+                continuous_billed_cents=100,
+                remaining_cents=100000,
+                reset_at=now + timedelta(days=3),
+                captured_at=now,
+                is_fresh=True,
+                freshness_seconds=900,
+            )
+        )
+        session.commit()
+    run = create_dry_run(
+        engine,
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=5000,
+            safe_7d_quota=1800,
+            current_accounts=1,
+            candidates=(
+                AccountCandidate(
+                    identity_id="identity-1",
+                    local_account_id=account_id,
+                    source_target_id=1,
+                    destination_target_id=2,
+                    assignment_version=1,
+                    health="healthy",
+                    remaining_usd=900,
+                ),
+            ),
+        ),
+    )
+
+    response = client.post(
+        "/api/scheduler/apply",
+        json={"run_id": run.id, "confirm": True},
+    )
+
+    assert response.status_code == 409
+    assert "不可执行" in response.json()["detail"]
 
 
 def test_assignment_endpoint_queues_migration_operation(monkeypatch):

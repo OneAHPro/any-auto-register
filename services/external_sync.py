@@ -181,6 +181,41 @@ def _persist_explicit_target_binding(
         session.commit()
 
 
+def _assigned_codex2api_target(account: Any, database_engine: Any):
+    """Resolve the account's active target for legacy relogin call sites."""
+
+    from sqlmodel import Session, select
+
+    from core.db import AccountAssignmentModel, AccountModel, Codex2APITargetModel
+
+    if not isinstance(account, AccountModel) or account.id is None:
+        return None
+    from core.db import engine as default_engine
+
+    target_engine = database_engine or default_engine
+    try:
+        with Session(target_engine) as session:
+            assignment = session.exec(
+                select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.local_account_id == int(account.id),
+                    AccountAssignmentModel.identity_id == str(account.identity_id or ""),
+                    AccountAssignmentModel.state.in_(
+                        ["active", "draining", "standby"]
+                    ),
+                )
+            ).first()
+            if assignment is None:
+                return None
+            return session.get(
+                Codex2APITargetModel,
+                int(assignment.target_id),
+            )
+    except Exception:
+        # Preserve upgrades/imports created before the additive control-plane
+        # tables exist; those rows continue through the legacy adapter.
+        return None
+
+
 def sync_codex2api_account(
     account,
     *,
@@ -268,6 +303,45 @@ def sync_codex2api_account(
     )
     if not force and not codex2api_enabled:
         return None
+
+    from core.db import engine as default_engine
+
+    target_engine = database_engine or default_engine
+    assigned_target = _assigned_codex2api_target(account, target_engine)
+    if assigned_target is not None:
+        try:
+            from services.codex2api_target_client import get_target_client
+
+            assigned_client = get_target_client(
+                int(assigned_target.id),
+                target_engine,
+            )
+            return sync_codex2api_account(
+                account,
+                force=True,
+                replace_existing=replace_existing,
+                target=assigned_target,
+                client=assigned_client,
+                database_engine=target_engine,
+            )
+        except Exception as exc:
+            logger.error(
+                "Codex2API assigned-target sync failed (%s)",
+                type(exc).__name__,
+            )
+            try:
+                persist_codex2api_sync_result(
+                    account,
+                    False,
+                    "目标节点同步异常",
+                )
+            except Exception:
+                pass
+            return {
+                "name": "Codex2API",
+                "ok": False,
+                "msg": "目标节点同步异常",
+            }
 
     try:
         from platforms.chatgpt.codex2api_upload import upload_to_codex2api

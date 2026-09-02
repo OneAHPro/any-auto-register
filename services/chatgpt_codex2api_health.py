@@ -10,7 +10,7 @@ from typing import Any, Iterable, Mapping
 from curl_cffi import requests as cffi_requests
 from sqlmodel import Session, select
 
-from core.db import AccountModel, engine
+from core.db import AccountAssignmentModel, AccountModel, engine
 
 
 AUTH_FAILED_STATUSES = {
@@ -244,8 +244,34 @@ def fetch_codex2api_quota_accounts(
     *,
     config: Mapping[str, object] | None = None,
     client: Any | None = None,
+    database_engine=engine,
+    _skip_assignment_routing: bool = False,
 ) -> list[dict[str, object]]:
     """Read the latest Codex2API account quota rows without probing."""
+
+    if client is None and config is None and not _skip_assignment_routing:
+        try:
+            with Session(database_engine) as session:
+                assigned_ids = [
+                    int(row.local_account_id)
+                    for row in session.exec(
+                        select(AccountAssignmentModel).where(
+                            AccountAssignmentModel.state.in_(
+                                ["active", "draining", "standby"]
+                            )
+                        )
+                    ).all()
+                    if int(row.local_account_id or 0) > 0
+                ]
+        except Exception:
+            assigned_ids = []
+        if assigned_ids:
+            routed = _fetch_assigned_target_quota(
+                sorted(set(assigned_ids)),
+                database_engine=database_engine,
+            )
+            if routed is not None:
+                return routed
 
     if client is not None:
         try:
@@ -386,6 +412,257 @@ def _explicit_refresh_credential_failure(detail: str) -> bool:
     )
 
 
+def _assigned_target_groups(
+    account_ids: list[int],
+    *,
+    database_engine,
+) -> tuple[dict[int, list[int]], list[int]] | None:
+    """Return active target groups, or None when the legacy projection is absent."""
+
+    if not account_ids:
+        return None
+    try:
+        with Session(database_engine) as session:
+            rows = session.exec(
+                select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.local_account_id.in_(account_ids),
+                    AccountAssignmentModel.state.in_(
+                        ["active", "draining", "standby"]
+                    ),
+                )
+            ).all()
+    except Exception:
+        # Older test/upgrade databases may not have the additive tables yet;
+        # retain the legacy single-target health path in that case.
+        return None
+    if not rows:
+        return None
+    by_account = {
+        int(row.local_account_id): int(row.target_id)
+        for row in rows
+        if int(row.local_account_id or 0) > 0 and int(row.target_id or 0) > 0
+    }
+    if not by_account:
+        return None
+    groups: dict[int, list[int]] = defaultdict(list)
+    unassigned: list[int] = []
+    for account_id in account_ids:
+        target_id = by_account.get(int(account_id))
+        if target_id is None:
+            unassigned.append(int(account_id))
+        else:
+            groups[target_id].append(int(account_id))
+    return groups, unassigned
+
+
+def _fetch_assigned_target_quota(
+    account_ids: list[int],
+    *,
+    database_engine,
+) -> list[dict[str, object]] | None:
+    grouped = _assigned_target_groups(
+        account_ids,
+        database_engine=database_engine,
+    )
+    if grouped is None:
+        return None
+    target_groups, unassigned = grouped
+    rows: list[dict[str, object]] = []
+    if unassigned:
+        rows.extend(
+            fetch_codex2api_quota_accounts(
+                database_engine=database_engine,
+                _skip_assignment_routing=True,
+            )
+        )
+    for target_id, grouped_ids in target_groups.items():
+        try:
+            from services.codex2api_target_client import get_target_client
+
+            client = get_target_client(target_id, database_engine)
+            remote_rows = client.list_accounts()
+        except Exception:
+            continue
+        local_accounts = _load_local_accounts(
+            grouped_ids,
+            database_engine=database_engine,
+        )
+        local_emails = {
+            str(email).strip().lower()
+            for email in local_accounts.values()
+            if str(email).strip()
+        }
+        for raw_row in remote_rows if isinstance(remote_rows, list) else []:
+            if not isinstance(raw_row, Mapping):
+                continue
+            row = _quota_record(raw_row, include_reset_times=True)
+            email = str(row.get("email") or "").strip().lower()
+            if email in local_emails:
+                row["target_id"] = int(target_id)
+                rows.append(row)
+    return rows
+
+
+def _inspect_assigned_targets(
+    account_ids: list[int],
+    *,
+    database_engine,
+    probe_poll_attempts: int,
+    probe_poll_interval_seconds: float,
+    sleep_fn,
+    quota_accounts: list[dict[str, object]] | None,
+) -> dict[int, dict[str, object]] | None:
+    grouped = _assigned_target_groups(
+        account_ids,
+        database_engine=database_engine,
+    )
+    if grouped is None:
+        return None
+    target_groups, unassigned = grouped
+    result: dict[int, dict[str, object]] = {}
+    if unassigned:
+        # Explicitly unassigned legacy rows still use the original configured
+        # target; all assigned rows below use their persisted target instead.
+        result.update(
+            inspect_codex2api_account_health(
+                unassigned,
+                database_engine=database_engine,
+                probe_poll_attempts=probe_poll_attempts,
+                probe_poll_interval_seconds=probe_poll_interval_seconds,
+                sleep_fn=sleep_fn,
+                quota_accounts=quota_accounts,
+            )
+        )
+    for target_id, grouped_ids in target_groups.items():
+        local_accounts = _load_local_accounts(
+            grouped_ids,
+            database_engine=database_engine,
+        )
+        try:
+            from services.codex2api_target_client import get_target_client
+
+            target_client = get_target_client(target_id, database_engine)
+            target_quota: list[dict[str, object]] = []
+            group_result = inspect_codex2api_account_health(
+                grouped_ids,
+                local_accounts=local_accounts,
+                database_engine=database_engine,
+                probe_poll_attempts=probe_poll_attempts,
+                probe_poll_interval_seconds=probe_poll_interval_seconds,
+                sleep_fn=sleep_fn,
+                quota_accounts=target_quota,
+                client=target_client,
+            )
+        except Exception:
+            group_result = {
+                account_id: _record(
+                    account_id=account_id,
+                    email=str(local_accounts.get(account_id) or ""),
+                    state="deferred",
+                    message="Codex2API 目标暂时不可用，等待下一轮复查",
+                )
+                for account_id in grouped_ids
+            }
+            target_quota = []
+        for account_id, health in group_result.items():
+            result[int(account_id)] = {
+                **health,
+                "target_id": int(target_id),
+            }
+        if quota_accounts is not None:
+            quota_accounts.extend(
+                {**row, "target_id": int(target_id)}
+                for row in target_quota
+                if isinstance(row, dict)
+            )
+    return result
+
+
+def _confirm_with_target_client(
+    snapshot: dict[str, object],
+    client: Any,
+    *,
+    poll_attempts: int,
+    poll_interval_seconds: float,
+    sleep_fn,
+) -> dict[str, object]:
+    try:
+        remote_id = int(snapshot.get("remote_id") or 0)
+    except (TypeError, ValueError):
+        remote_id = 0
+    if remote_id <= 0:
+        return _confirmation_result(
+            snapshot,
+            state="deferred",
+            resolution="remote_refresh_unavailable",
+            remote_status=_text(snapshot.get("remote_status")),
+            message="Codex2API 账号 ID 无效，等待下一轮复查",
+        )
+    try:
+        client.refresh_account(remote_id)
+    except Exception:
+        return _confirmation_result(
+            snapshot,
+            state="deferred",
+            resolution="remote_refresh_unavailable",
+            remote_status=_text(snapshot.get("remote_status")),
+            message="Codex2API 自刷新请求异常，等待下一轮复查",
+        )
+    previous_updated_at = _text(snapshot.get("remote_updated_at"))
+    last_status = _text(snapshot.get("remote_status")).lower()
+    last_updated_at = previous_updated_at
+    attempts = min(max(int(poll_attempts or 1), 1), 10)
+    interval = max(float(poll_interval_seconds or 0), 0)
+    for attempt in range(attempts):
+        try:
+            rows = client.list_accounts()
+        except Exception:
+            rows = []
+        row = next(
+            (
+                item
+                for item in rows
+                if isinstance(item, Mapping) and _remote_id(item) == remote_id
+            ),
+            None,
+        )
+        if row is not None:
+            last_status = _text(row.get("status")).lower()
+            last_updated_at = _text(row.get("updated_at"))
+            if last_status in HEALTHY_STATUSES:
+                return _confirmation_result(
+                    snapshot,
+                    state="healthy",
+                    resolution="remote_refresh_recovered",
+                    remote_status=last_status,
+                    remote_updated_at=last_updated_at,
+                    message="Codex2API 已使用自身 RT 恢复鉴权，无需本地重登",
+                )
+            if (
+                last_status in AUTH_FAILED_STATUSES
+                and last_updated_at
+                and last_updated_at != previous_updated_at
+            ):
+                return _confirmation_result(
+                    snapshot,
+                    state="auth_failed",
+                    resolution="remote_refresh_confirmed_failure",
+                    remote_status=last_status,
+                    remote_updated_at=last_updated_at,
+                    message="Codex2API 使用自身 RT 刷新后仍鉴权失败，需要本地验证码重登",
+                )
+        if attempt + 1 < attempts and interval:
+            sleep_fn(interval)
+    return _confirmation_result(
+        snapshot,
+        state="deferred",
+        resolution="remote_refresh_pending",
+        remote_status=last_status,
+        remote_updated_at=last_updated_at,
+        message="Codex2API 自刷新结果尚未更新，等待下一轮复查",
+    )
+
+
 def confirm_codex2api_auth_failure(
     health: Mapping[str, object],
     *,
@@ -393,6 +670,8 @@ def confirm_codex2api_auth_failure(
     poll_attempts: int = 4,
     poll_interval_seconds: float = 1.0,
     sleep_fn=time.sleep,
+    client: Any | None = None,
+    database_engine=engine,
 ) -> dict[str, object]:
     """Ask Codex2API to refresh its own RT before requiring an OTP login."""
 
@@ -410,6 +689,32 @@ def confirm_codex2api_auth_failure(
                 "Codex2API 已明确返回 Refresh Token 失效，"
                 "需要本地验证码重登"
             ),
+        )
+    if client is None:
+        try:
+            target_id = int(snapshot.get("target_id") or 0)
+        except (TypeError, ValueError):
+            target_id = 0
+        if target_id > 0:
+            try:
+                from services.codex2api_target_client import get_target_client
+
+                client = get_target_client(target_id, database_engine)
+            except Exception:
+                return _confirmation_result(
+                    snapshot,
+                    state="deferred",
+                    resolution="remote_refresh_unavailable",
+                    remote_status=_text(snapshot.get("remote_status")),
+                    message="Codex2API 目标暂时不可用，等待下一轮复查",
+                )
+    if client is not None:
+        return _confirm_with_target_client(
+            snapshot,
+            client,
+            poll_attempts=poll_attempts,
+            poll_interval_seconds=poll_interval_seconds,
+            sleep_fn=sleep_fn,
         )
     try:
         remote_id = int(snapshot.get("remote_id") or 0)
@@ -543,6 +848,185 @@ def confirm_codex2api_auth_failure(
     )
 
 
+def _probe_target_client(
+    client: Any,
+    *,
+    probe_poll_attempts: int,
+    probe_poll_interval_seconds: float,
+    sleep_fn,
+) -> list[dict[str, object]]:
+    """Run the same wham-only probe through a target-aware client."""
+
+    try:
+        capability_payload = client.capabilities()
+        settings = (
+            capability_payload.get("settings", {})
+            if isinstance(capability_payload, dict)
+            else {}
+        )
+        if _to_bool(
+            settings.get("usage_probe_responses_fallback_enabled"),
+            default=False,
+        ):
+            raise Codex2APIHealthError(
+                "Codex2API 尚未关闭 Responses 探针回退，当前状态可能被旧连接掩盖"
+            )
+        probe = client.trigger_usage_probe()
+        if (
+            not isinstance(probe, dict)
+            or _text(probe.get("mode")).lower() != "wham_only"
+        ):
+            raise Codex2APIHealthError("Codex2API 未确认使用 wham_only 鉴权探针")
+        attempts = min(max(int(probe_poll_attempts or 1), 1), 300)
+        interval = max(float(probe_poll_interval_seconds or 0), 0)
+        for attempt in range(attempts):
+            runtime = client.runtime_status()
+            probes = runtime.get("probes") if isinstance(runtime, dict) else {}
+            running = isinstance(probes, dict) and _to_bool(
+                probes.get("usage_probe_running")
+            )
+            if not running:
+                break
+            if attempt + 1 < attempts and interval:
+                sleep_fn(interval)
+        else:
+            raise Codex2APIHealthError(
+                "Codex2API 鉴权探针执行超时，本轮等待下一次巡检"
+            )
+        rows = client.list_accounts()
+    except Codex2APIHealthError:
+        raise
+    except Exception as exc:
+        raise Codex2APIHealthError(
+            f"读取 Codex2API 状态异常（{type(exc).__name__}）"
+        ) from None
+    if not isinstance(rows, list):
+        raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _classify_remote_rows(
+    rows: list[dict[str, object]],
+    normalized_ids: list[int],
+    *,
+    local_accounts: Mapping[int, str] | None,
+    database_engine,
+) -> dict[int, dict[str, object]]:
+    """Classify rows after transport/probe details have been resolved."""
+
+    resolved_local_accounts = (
+        {
+            int(account_id): _text(email)
+            for account_id, email in local_accounts.items()
+            if int(account_id) in normalized_ids and _text(email)
+        }
+        if local_accounts is not None
+        else _load_local_accounts(
+            normalized_ids,
+            database_engine=database_engine,
+        )
+    )
+    remote_by_email: dict[str, list[dict[str, object]]] = defaultdict(list)
+    for raw_row in rows:
+        email = _remote_email(raw_row)
+        if email:
+            remote_by_email[email].append(raw_row)
+
+    result: dict[int, dict[str, object]] = {}
+    for account_id in normalized_ids:
+        email = _text(resolved_local_accounts.get(account_id))
+        if not email:
+            result[account_id] = _record(
+                account_id=account_id,
+                email="",
+                state="missing",
+                message="本地 ChatGPT 账号记录已不存在",
+            )
+            continue
+        matches = remote_by_email.get(email.lower(), [])
+        if not matches:
+            result[account_id] = _record(
+                account_id=account_id,
+                email=email,
+                state="remote_missing",
+                message="Codex2API 未找到同邮箱账号，将执行一次完整登录确认",
+            )
+            continue
+        if len(matches) > 1:
+            result[account_id] = _record(
+                account_id=account_id,
+                email=email,
+                state="ambiguous",
+                message="Codex2API 存在多个同邮箱账号，未触发自动重登",
+            )
+            continue
+        row = matches[0]
+        remote_status = _text(row.get("status")).lower()
+        explicit_error_auth_failure = (
+            remote_status == "error"
+            and _explicit_refresh_credential_failure(
+                _text(row.get("error_message"))
+            )
+        )
+        remote_id = _remote_id(row)
+        remote_updated_at = _text(row.get("updated_at"))
+        quota_fields = {
+            "usage_percent_7d": row.get("usage_percent_7d"),
+            "billed_7d": row.get("billed_7d"),
+        }
+        if remote_status in AUTH_FAILED_STATUSES or explicit_error_auth_failure:
+            record = _record(
+                account_id=account_id,
+                email=email,
+                state="auth_failed",
+                remote_id=remote_id,
+                remote_status=remote_status,
+                remote_updated_at=remote_updated_at,
+                probe_mode="wham_only",
+                **quota_fields,
+                message=(
+                    "Codex2API 明确返回 Refresh Token 已失效"
+                    if explicit_error_auth_failure
+                    else "Codex2API 本轮 wham 探针明确标记账号鉴权失效"
+                ),
+            )
+            if explicit_error_auth_failure:
+                record["auth_failure_source"] = "error_message"
+            result[account_id] = record
+        elif remote_status not in HEALTHY_STATUSES:
+            result[account_id] = _record(
+                account_id=account_id,
+                email=email,
+                state="deferred",
+                remote_id=remote_id,
+                remote_status=remote_status,
+                remote_updated_at=remote_updated_at,
+                **quota_fields,
+                message=(
+                    "Codex2API 账号状态为临时错误，等待下一轮复查"
+                    if remote_status in DEFERRED_STATUSES
+                    else (
+                        "Codex2API 账号状态暂不可识别"
+                        f"（{remote_status}），等待下一轮复查"
+                    )
+                    if remote_status
+                    else "Codex2API 未返回账号状态，等待下一轮复查"
+                ),
+            )
+        else:
+            result[account_id] = _record(
+                account_id=account_id,
+                email=email,
+                state="healthy",
+                remote_id=remote_id,
+                remote_status=remote_status,
+                remote_updated_at=remote_updated_at,
+                **quota_fields,
+                message=f"Codex2API 鉴权状态正常（{remote_status}）",
+            )
+    return result
+
+
 def inspect_codex2api_account_health(
     account_ids: Iterable[int],
     *,
@@ -553,10 +1037,40 @@ def inspect_codex2api_account_health(
     probe_poll_interval_seconds: float = 1.0,
     sleep_fn=time.sleep,
     quota_accounts: list[dict[str, object]] | None = None,
+    client: Any | None = None,
 ) -> dict[int, dict[str, object]]:
     """Return one conservative remote-auth decision for every local account."""
 
     normalized_ids = sorted({int(account_id) for account_id in account_ids})
+    if client is None and config is None:
+        routed = _inspect_assigned_targets(
+            normalized_ids,
+            database_engine=database_engine,
+            probe_poll_attempts=probe_poll_attempts,
+            probe_poll_interval_seconds=probe_poll_interval_seconds,
+            sleep_fn=sleep_fn,
+            quota_accounts=quota_accounts,
+        )
+        if routed is not None:
+            return routed
+    if client is not None:
+        rows = _probe_target_client(
+            client,
+            probe_poll_attempts=probe_poll_attempts,
+            probe_poll_interval_seconds=probe_poll_interval_seconds,
+            sleep_fn=sleep_fn,
+        )
+        if quota_accounts is not None:
+            quota_accounts.extend(
+                _quota_record(raw_row, include_reset_times=False)
+                for raw_row in rows
+            )
+        return _classify_remote_rows(
+            rows,
+            normalized_ids,
+            local_accounts=local_accounts,
+            database_engine=database_engine,
+        )
     snapshot = dict(config) if config is not None else _get_config()
     base_url = _text(snapshot.get("codex2api_api_url")).rstrip("/")
     admin_key = _text(snapshot.get("codex2api_admin_key"))

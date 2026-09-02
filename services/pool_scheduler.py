@@ -141,6 +141,8 @@ class PoolAction:
     assignment_version: int
     credential_revision: str
     reason: str
+    source_pool_id: str = ""
+    destination_pool_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -319,7 +321,8 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
 
     ranked = rank_candidates(pool.candidates)
     actions: list[PoolAction] = []
-    for candidate in ranked[:scale_up]:
+    scale_up_candidates = [candidate for candidate in ranked if not candidate.already_on_target]
+    for candidate in scale_up_candidates[:scale_up]:
         if (
             str(candidate.health).lower() not in {"healthy", "available"}
             or int(candidate.active_requests) > 0
@@ -336,14 +339,23 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
                 assignment_version=int(candidate.assignment_version),
                 credential_revision=str(candidate.credential_revision or ""),
                 reason="forecast_capacity_required",
+                source_pool_id=str(candidate.pool_type or ""),
+                destination_pool_id=str(pool.pool_id),
             )
         )
     if scale_down:
         removable = [
             candidate
             for candidate in reversed(ranked)
-            if candidate.lease_elapsed and int(candidate.active_requests) == 0
+            if str(candidate.pool_type or "").upper() == str(pool.pool_id).upper()
+            and candidate.lease_elapsed
+            and int(candidate.active_requests) == 0
         ]
+        scale_down_destination_pool = (
+            "STANDBY_POOL"
+            if str(pool.pool_id).upper() == "FLOAT_POOL"
+            else "FLOAT_POOL"
+        )
         for candidate in removable[:scale_down]:
             actions.append(
                 PoolAction(
@@ -355,8 +367,14 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
                     assignment_version=int(candidate.assignment_version),
                     credential_revision=str(candidate.credential_revision or ""),
                     reason="sustained_low_utilization",
+                    source_pool_id=str(pool.pool_id),
+                    destination_pool_id=scale_down_destination_pool,
                 )
             )
+    if len([action for action in actions if action.action == "scale_up"]) < scale_up:
+        blockers.append("capacity_unavailable")
+    if len([action for action in actions if action.action == "scale_down"]) < scale_down:
+        blockers.append("capacity_unavailable")
     current_costs, desired_costs = _plan_costs(
         pool,
         current_count=current,
@@ -368,9 +386,10 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
         desired_count=desired,
         scale_up_count=scale_up,
         scale_down_count=scale_down,
-        executable=True,
         requires_confirmation=bool(pool.confirmation_required and (scale_up or scale_down)),
+        blockers=tuple(blockers),
         actions=tuple(actions),
+        executable="capacity_unavailable" not in blockers,
         cost_estimated=bool(pool.cost_data_complete),
         cost_note="" if pool.cost_data_complete else "customer_usage_or_bandwidth_missing",
         current_costs=current_costs,
@@ -400,6 +419,8 @@ def _action_from_dict(value: Mapping[str, Any]) -> PoolAction:
         assignment_version=int(value.get("assignment_version") or 0),
         credential_revision=str(value.get("credential_revision") or ""),
         reason=str(value.get("reason") or ""),
+        source_pool_id=str(value.get("source_pool_id") or ""),
+        destination_pool_id=str(value.get("destination_pool_id") or ""),
     )
 
 
@@ -645,13 +666,20 @@ def _build_pool_candidates(
     destination_pool_id: str,
     now: datetime,
     min_lease_hours: int = 6,
+    source_pool_id: str | None = None,
 ) -> tuple[AccountCandidate, ...]:
-    assignments = session.exec(
-        select(AccountAssignmentModel)
-        .where(AccountAssignmentModel.state == "active")
-        .where(AccountAssignmentModel.pool_id != destination_pool_id)
-        .order_by(AccountAssignmentModel.updated_at)
-    ).all()
+    assignment_query = select(AccountAssignmentModel).where(
+        AccountAssignmentModel.state == "active"
+    )
+    if source_pool_id:
+        assignment_query = assignment_query.where(
+            AccountAssignmentModel.pool_id == str(source_pool_id)
+        )
+    else:
+        assignment_query = assignment_query.where(
+            AccountAssignmentModel.pool_id != destination_pool_id
+        )
+    assignments = session.exec(assignment_query.order_by(AccountAssignmentModel.updated_at)).all()
     identity_ids = {str(row.identity_id) for row in assignments}
     identities = {
         str(row.id): row
@@ -842,7 +870,16 @@ def generate_scheduled_plans(
             peak = max((int(row.peak_concurrency or 0) for row in pool_usage), default=0)
             policy = next((row for row in policies if row.pool_id == pool.id), None)
             customer = customers.get(str(pool.customer_id or ""))
-            destination_target_id = int(policy.target_id) if policy is not None else 0
+            pool_assignment_targets = [
+                int(row.target_id)
+                for row in assignments
+                if row.pool_id == pool.id and int(row.target_id or 0) > 0
+            ]
+            destination_target_id = (
+                int(policy.target_id)
+                if policy is not None
+                else min(pool_assignment_targets, default=1)
+            )
             target = targets.get(destination_target_id)
             try:
                 target_capabilities = json.loads(
@@ -854,18 +891,41 @@ def generate_scheduled_plans(
                 target is not None
                 and target.enabled
                 and target.health_status == "healthy"
-                and target_capabilities.get("migratable") is True
+                and (
+                    policy is None
+                    or target_capabilities.get("migratable") is True
+                )
             )
-            candidates = _build_pool_candidates(
-                session,
-                destination_target_id=destination_target_id,
-                destination_pool_id=str(pool.id),
-                now=generated_at,
-                min_lease_hours=max(
-                    int(pool.min_lease_hours or 0),
-                    configured_min_lease_hours,
-                ),
-            ) if destination_target_id else ()
+            min_lease_hours = max(
+                int(pool.min_lease_hours or 0),
+                configured_min_lease_hours,
+            )
+            candidates = list(
+                _build_pool_candidates(
+                    session,
+                    destination_target_id=destination_target_id,
+                    destination_pool_id=str(pool.id),
+                    now=generated_at,
+                    min_lease_hours=min_lease_hours,
+                )
+            )
+            # Include current-pool accounts for a possible scale-down. The
+            # planner keeps them out of scale-up actions when already on the
+            # destination target.
+            candidates.extend(
+                _build_pool_candidates(
+                    session,
+                    destination_target_id=destination_target_id,
+                    destination_pool_id=str(pool.id),
+                    source_pool_id=str(pool.id),
+                    now=generated_at,
+                    min_lease_hours=min_lease_hours,
+                )
+            )
+            deduped_candidates = {
+                candidate.identity_id: candidate for candidate in candidates
+            }
+            candidates = list(deduped_candidates.values())
             capacity = Decimal(max(current, 1)) * DEFAULT_SAFE_7D_QUOTA
             utilization = min(forecast / capacity, Decimal("1")) if capacity > 0 else Decimal("0")
             low_cycles = 0
@@ -879,7 +939,10 @@ def generate_scheduled_plans(
                     )
                 except (AttributeError, TypeError, ValueError):
                     continue
-                if previous_utilization < Decimal("0.60"):
+                if previous_utilization < max(
+                    min(scale_down_utilization, Decimal("1")),
+                    Decimal("0"),
+                ):
                     low_cycles += 1
                     if low_cycles >= 2:
                         break
@@ -935,7 +998,7 @@ def generate_scheduled_plans(
                     and policy is not None
                     and int(policy.bandwidth_mbps or 0) > 0
                 ),
-                candidates=candidates,
+                candidates=tuple(candidates),
             )
             plans.append((pool_input, str(pool.pool_type)))
 

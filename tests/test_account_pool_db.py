@@ -93,6 +93,39 @@ def test_schema_migration_adds_identity_column_to_legacy_accounts_table():
     assert "identity_id" in columns
 
 
+def test_schema_migration_adds_quota_amount_columns_before_backfill():
+    engine = make_engine()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE account_quota_snapshots ("
+            "id INTEGER PRIMARY KEY, identity_id TEXT, local_account_id INTEGER, "
+            "target_id INTEGER, window TEXT, billed_usd FLOAT, remaining_usd FLOAT, "
+            "captured_at DATETIME, reset_at DATETIME, usage_percent FLOAT"
+            ")"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_quota_snapshots "
+            "(id, identity_id, local_account_id, target_id, window, billed_usd, remaining_usd) "
+            "VALUES (1, 'identity-1', 1, 1, '7d', 12.34, 5.67)"
+        )
+
+    db.init_account_pool_schema(engine)
+
+    with engine.connect() as connection:
+        columns = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA table_info('account_quota_snapshots')"
+            )
+        }
+        values = connection.exec_driver_sql(
+            "SELECT billed_cents, remaining_cents, continuous_remaining_cents "
+            "FROM account_quota_snapshots WHERE id = 1"
+        ).one()
+    assert "continuous_remaining_usd" in columns
+    assert values == (1234, 567, None)
+
+
 def test_schema_migration_survives_duplicate_strong_aliases():
     engine = make_engine()
     db.init_account_pool_schema(engine)

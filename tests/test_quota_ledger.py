@@ -351,3 +351,42 @@ def test_monthly_snapshot_is_recorded_when_target_supplies_it():
 
     assert merged["monthly"].billed_usd == Decimal("300.00")
     assert merged["monthly"].fresh is True
+
+
+def test_latest_snapshot_can_be_scoped_to_current_target():
+    from services import quota_ledger
+
+    engine = make_engine()
+    quota_ledger.record_snapshot(
+        engine,
+        identity_id="id-1",
+        local_account_id=1,
+        target_id=2,
+        window="7d",
+        billed_usd=20,
+        usage_percent=2,
+        reset_at=RESET,
+        captured_at=datetime(2026, 9, 2, 10, tzinfo=timezone.utc),
+    )
+    quota_ledger.record_snapshot(
+        engine,
+        identity_id="id-1",
+        local_account_id=1,
+        target_id=1,
+        window="7d",
+        billed_usd=99,
+        usage_percent=9,
+        reset_at=RESET,
+        captured_at=datetime(2026, 9, 2, 11, tzinfo=timezone.utc),
+    )
+
+    scoped = quota_ledger.latest_snapshot(
+        engine,
+        identity_id="id-1",
+        window="7d",
+        target_id=2,
+    )
+
+    assert scoped is not None
+    assert scoped.target_id == 2
+    assert scoped.billed_usd == Decimal("20.00")

@@ -229,10 +229,20 @@ def _account_control_plane_summaries(
     ).all()
     snapshot_by_key: dict[tuple[str, str], AccountQuotaSnapshotModel] = {}
     for snapshot in snapshots:
-        snapshot_by_key.setdefault(
-            (str(snapshot.identity_id), str(snapshot.window)),
-            snapshot,
+        key = (str(snapshot.identity_id), str(snapshot.window))
+        current = snapshot_by_key.get(key)
+        assigned_target = assignment_by_identity.get(str(snapshot.identity_id))
+        preferred_target_id = (
+            int(assigned_target.target_id)
+            if assigned_target is not None
+            else None
         )
+        if current is None or (
+            preferred_target_id is not None
+            and int(snapshot.target_id or 0) == preferred_target_id
+            and int(current.target_id or 0) != preferred_target_id
+        ):
+            snapshot_by_key[key] = snapshot
 
     from services.quota_ledger import evaluate_snapshot
 

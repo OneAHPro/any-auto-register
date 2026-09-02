@@ -697,7 +697,212 @@ def test_auth_failure_confirmation_requires_a_fresh_remote_result():
 
     assert result["state"] == "deferred"
     assert result["resolution"] == "remote_refresh_pending"
-    sleep.assert_called_once_with(1)
+
+
+def test_assigned_accounts_are_probed_against_their_persisted_targets(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services import chatgpt_codex2api_health as health
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    clients = {}
+    with Session(engine) as session:
+        for account_id, target_id, email in (
+            (1, 11, "one@example.com"),
+            (2, 22, "two@example.com"),
+        ):
+            session.add(
+                db.AccountModel(
+                    id=account_id,
+                    platform="chatgpt",
+                    email=email,
+                    password="fixture",
+                    identity_id=f"identity-{account_id}",
+                )
+            )
+            session.add(
+                db.AccountAssignmentModel(
+                    identity_id=f"identity-{account_id}",
+                    local_account_id=account_id,
+                    pool_id="PUBLIC_POOL",
+                    target_id=target_id,
+                    state="active",
+                )
+            )
+        session.commit()
+
+    class AssignedClient:
+        def __init__(self, target_id, email, remote_id):
+            self.target_id = target_id
+            self.email = email
+            self.remote_id = remote_id
+            self.calls = []
+
+        def capabilities(self):
+            self.calls.append("capabilities")
+            return {"settings": {"usage_probe_responses_fallback_enabled": False}}
+
+        def trigger_usage_probe(self):
+            self.calls.append("probe")
+            return {"mode": "wham_only"}
+
+        def runtime_status(self):
+            self.calls.append("runtime")
+            return {"probes": {"usage_probe_running": False}}
+
+        def list_accounts(self):
+            self.calls.append("list")
+            return [{
+                "id": self.remote_id,
+                "email": self.email,
+                "status": "active",
+                "usage_percent_7d": 20,
+                "billed_7d": 10,
+            }]
+
+        def refresh_account(self, remote_id):
+            self.calls.append(("refresh", remote_id))
+            return {"ok": True}
+
+    clients[11] = AssignedClient(11, "one@example.com", 111)
+    clients[22] = AssignedClient(22, "two@example.com", 222)
+    monkeypatch.setattr(
+        "services.codex2api_target_client.get_target_client",
+        lambda target_id, database_engine: clients[int(target_id)],
+    )
+
+    quota = []
+    result = health.inspect_codex2api_account_health(
+        [1, 2],
+        database_engine=engine,
+        probe_poll_interval_seconds=0,
+        quota_accounts=quota,
+    )
+
+    assert result[1]["state"] == "healthy"
+    assert result[1]["target_id"] == 11
+    assert result[2]["target_id"] == 22
+    assert clients[11].calls.count("probe") == 1
+    assert clients[22].calls.count("probe") == 1
+    assert {row["target_id"] for row in quota} == {11, 22}
+
+
+def test_auth_failure_confirmation_uses_the_health_target_client(monkeypatch):
+    from services import chatgpt_codex2api_health as health
+
+    class Client:
+        def __init__(self):
+            self.calls = []
+
+        def refresh_account(self, remote_id):
+            self.calls.append(("refresh", remote_id))
+
+        def list_accounts(self):
+            self.calls.append("list")
+            return [{
+                "id": 222,
+                "email": "two@example.com",
+                "status": "active",
+                "updated_at": "2026-09-03T00:00:01+00:00",
+            }]
+
+    client = Client()
+    monkeypatch.setattr(
+        "services.codex2api_target_client.get_target_client",
+        lambda target_id, database_engine: client,
+    )
+    result = health.confirm_codex2api_auth_failure(
+        {
+            "account_id": 2,
+            "email": "two@example.com",
+            "state": "auth_failed",
+            "target_id": 22,
+            "remote_id": 222,
+            "remote_status": "unauthorized",
+            "remote_updated_at": "2026-09-03T00:00:00+00:00",
+        },
+        poll_attempts=1,
+        poll_interval_seconds=0,
+    )
+
+    assert result["state"] == "healthy"
+    assert client.calls == [("refresh", 222), "list"]
+
+
+def test_final_quota_reader_uses_assigned_targets_without_a_legacy_target_call(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services import chatgpt_codex2api_health as health
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    with Session(engine) as session:
+        for account_id, target_id, email in (
+            (1, 11, "one@example.com"),
+            (2, 22, "two@example.com"),
+        ):
+            session.add(
+                db.AccountModel(
+                    id=account_id,
+                    platform="chatgpt",
+                    email=email,
+                    password="fixture",
+                    identity_id=f"identity-{account_id}",
+                )
+            )
+            session.add(
+                db.AccountAssignmentModel(
+                    identity_id=f"identity-{account_id}",
+                    local_account_id=account_id,
+                    pool_id="PUBLIC_POOL",
+                    target_id=target_id,
+                    state="active",
+                )
+            )
+        session.commit()
+
+    class Client:
+        def __init__(self, email, remote_id):
+            self.email = email
+            self.remote_id = remote_id
+
+        def list_accounts(self):
+            return [{
+                "id": self.remote_id,
+                "email": self.email,
+                "status": "active",
+                "usage_percent_7d": 10,
+                "billed_7d": 2,
+            }]
+
+    clients = {
+        11: Client("one@example.com", 111),
+        22: Client("two@example.com", 222),
+    }
+    monkeypatch.setattr(
+        "services.codex2api_target_client.get_target_client",
+        lambda target_id, database_engine: clients[int(target_id)],
+    )
+
+    rows = health.fetch_codex2api_quota_accounts(database_engine=engine)
+
+    assert {(row["email"], row["target_id"]) for row in rows} == {
+        ("one@example.com", 11),
+        ("two@example.com", 22),
+    }
 
 
 def test_auth_failure_confirmation_accepts_updated_persistent_unauthorized():

@@ -202,8 +202,16 @@ def test_migration_disables_source_drains_uploads_verifies_and_enables_destinati
     with Session(engine) as session:
         assignments = session.exec(select(db.AccountAssignmentModel)).all()
         events = session.exec(select(db.AccountAssignmentEventModel)).all()
+        destination_binding = session.exec(
+            select(db.AccountTargetBindingModel).where(
+                db.AccountTargetBindingModel.target_id == 2
+            )
+        ).one()
     assert assignments[0].target_id == 2
     assert events[0].event_type == "migration_committed"
+    assert destination_binding.enabled is True
+    assert destination_binding.sync_status == "synced"
+    assert destination_binding.remote_status == "active"
 
 
 def test_upload_failure_restores_source_and_removes_destination():
@@ -227,6 +235,35 @@ def test_upload_failure_restores_source_and_removes_destination():
     assert result.state == "rolled_back"
     assert ("enable", 55, True) in targets[1].calls
     assert ("delete", 77) not in targets[2].calls
+
+
+def test_destination_verification_can_finish_before_first_quota_snapshot():
+    from services import account_migration
+
+    engine = make_engine()
+    account_id, identity_id = seed_account(engine)
+    migration_id = make_migration(engine, identity_id, account_id)
+    targets = {1: FakeTarget(55), 2: FakeTarget(77)}
+    targets[2].rows_override = [
+        {
+            "id": 77,
+            "email": "a@example.com",
+            "status": "active",
+            "enabled": True,
+            "workspace_id": "ws-1",
+        }
+    ]
+
+    result = account_migration.run_migration(
+        engine,
+        migration_id,
+        clients=targets,
+        now=NOW,
+        drain_timeout_seconds=2,
+        sleep_fn=lambda seconds: None,
+    )
+
+    assert result.state == "committed"
 
 
 def test_drain_timeout_never_deletes_source():

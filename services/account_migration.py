@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from uuid import uuid4
 
 from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from core.db import (
@@ -26,6 +27,7 @@ from core.db import (
     AccountIdentityModel,
     AccountMigrationModel,
     AccountModel,
+    AccountPoolModel,
     AccountTargetBindingModel,
     ChatGPTAuthStateModel,
     engine as default_engine,
@@ -221,7 +223,21 @@ def plan_migration(
             error_json="{}",
         )
         session.add(row)
-        session.commit()
+        try:
+            session.commit()
+        except IntegrityError:
+            # Another worker may have won the idempotency race between the
+            # initial SELECT and INSERT. Return that durable operation rather
+            # than leaking a uniqueness error to the API caller.
+            session.rollback()
+            existing = session.exec(
+                select(AccountMigrationModel).where(
+                    AccountMigrationModel.idempotency_key == key
+                )
+            ).first()
+            if existing is not None:
+                return str(existing.id)
+            raise
         return str(row.id)
 
 
@@ -230,6 +246,100 @@ def get_migration(database_engine, migration_id: str) -> MigrationResult | None:
     with Session(target_engine) as session:
         row = session.get(AccountMigrationModel, str(migration_id))
         return _result(row) if row is not None else None
+
+
+def reassign_account_pool(
+    database_engine,
+    *,
+    identity_id: str,
+    local_account_id: int,
+    source_target_id: int,
+    source_pool_id: str,
+    destination_pool_id: str,
+    expected_assignment_version: int,
+    reason: str = "sustained_low_utilization",
+) -> str:
+    """Commit a same-target pool move with the same CAS/audit guarantees.
+
+    Shrinking an enterprise pool usually hands the account to the local float
+    pool; no remote credential copy is needed when both pools share a target.
+    The operation is still serialized with login/delete/migration work and is
+    safe to retry with the same assignment version.
+    """
+
+    target_engine = database_engine or default_engine
+    destination_pool = _safe_text(destination_pool_id).upper()
+    source_pool = _safe_text(source_pool_id).upper()
+    if not destination_pool or destination_pool == source_pool:
+        raise ValueError("pool reassignment requires a different destination pool")
+    with chatgpt_account_operation_lock(int(local_account_id), blocking=False) as acquired:
+        if not acquired:
+            raise MigrationConflict("账号当前正在执行其他凭证操作")
+        with Session(target_engine) as session:
+            pool = session.get(AccountPoolModel, destination_pool)
+            if pool is None or not bool(pool.enabled):
+                raise ValueError("destination pool does not exist or is disabled")
+            assignment = session.exec(
+                select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.identity_id == str(identity_id),
+                    AccountAssignmentModel.local_account_id == int(local_account_id),
+                    AccountAssignmentModel.state.in_(
+                        ["active", "draining", "standby"]
+                    ),
+                )
+            ).first()
+            if assignment is None:
+                raise MigrationConflict("账号当前归属不存在")
+            if int(assignment.target_id) != int(source_target_id):
+                raise MigrationConflict("账号当前目标已变化")
+            if str(assignment.pool_id or "").upper() == destination_pool:
+                if int(assignment.assignment_version or 0) > int(
+                    expected_assignment_version
+                ):
+                    return (
+                        f"pool-reassign:{identity_id}:"
+                        f"{int(assignment.assignment_version)}"
+                    )
+            if str(assignment.pool_id or "").upper() != source_pool:
+                raise MigrationConflict("账号当前号池已变化")
+            if int(assignment.assignment_version or 0) != int(
+                expected_assignment_version
+            ):
+                raise MigrationConflict("账号归属版本已变化")
+            now = _utcnow()
+            result = session.exec(
+                update(AccountAssignmentModel)
+                .where(AccountAssignmentModel.id == assignment.id)
+                .where(
+                    AccountAssignmentModel.assignment_version
+                    == int(expected_assignment_version)
+                )
+                .values(
+                    pool_id=destination_pool,
+                    lease_reason=_safe_text(reason),
+                    assignment_version=int(expected_assignment_version) + 1,
+                    updated_at=now,
+                )
+            )
+            if int(getattr(result, "rowcount", 0) or 0) != 1:
+                session.rollback()
+                raise MigrationConflict("账号归属并发更新冲突")
+            session.add(
+                AccountAssignmentEventModel(
+                    identity_id=str(identity_id),
+                    local_account_id=int(local_account_id),
+                    event_type="pool_reassigned",
+                    from_pool_id=source_pool,
+                    to_pool_id=destination_pool,
+                    from_target_id=int(source_target_id),
+                    to_target_id=int(source_target_id),
+                    assignment_version=int(expected_assignment_version) + 1,
+                    reason=_safe_text(reason) or "pool_reassignment",
+                    created_at=now,
+                )
+            )
+            session.commit()
+            return f"pool-reassign:{identity_id}:{int(expected_assignment_version) + 1}"
 
 
 def _load_runtime_context(
@@ -444,8 +554,9 @@ def _verify_destination(
     remote_aliases = _remote_alias_values(row)
     if local_aliases and remote_aliases and local_aliases.isdisjoint(remote_aliases):
         raise MigrationError("目标节点账号身份别名验证失败")
-    if row.get("billed_7d") is None and row.get("usage_percent_7d") is None:
-        raise MigrationError("目标节点尚未返回可验证的额度快照")
+    # A newly imported account may not have its first quota sample yet. The
+    # target identity/test proof is sufficient to commit the migration; the
+    # quota worker will collect the first snapshot on its next target cycle.
     return row
 
 
@@ -1090,12 +1201,32 @@ def run_migration(
                             ),
                             None,
                         )
-                        if enabled_row is not None and enabled_row.get("enabled") is False:
+                        if enabled_row is None:
+                            raise MigrationError("目标节点账号在启用后未出现")
+                        if enabled_row.get("enabled") is False:
                             raise MigrationError("目标节点账号未成功启用")
                         try:
                             destination.set_locked(destination_remote_id, False)
                         except Exception:
                             logger.warning("destination unlock deferred after migration")
+                        with Session(target_engine) as binding_session:
+                            destination_binding = _find_binding(
+                                binding_session,
+                                migration.identity_id,
+                                destination_target_id,
+                            )
+                            if destination_binding is not None:
+                                binding_now = _utcnow()
+                                destination_binding.enabled = True
+                                destination_binding.sync_status = "synced"
+                                destination_binding.remote_status = str(
+                                    enabled_row.get("status") or "active"
+                                )
+                                destination_binding.last_error = ""
+                                destination_binding.last_sync_at = binding_now
+                                destination_binding.updated_at = binding_now
+                                binding_session.add(destination_binding)
+                                binding_session.commit()
                         return _transition(
                             target_engine,
                             migration_id,
@@ -1272,6 +1403,7 @@ __all__ = [
     "MigrationResult",
     "get_migration",
     "plan_migration",
+    "reassign_account_pool",
     "resume_pending_migrations",
     "rollback_migration",
     "run_migration",

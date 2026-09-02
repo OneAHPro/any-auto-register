@@ -115,6 +115,7 @@ class QuotaLedgerResult:
     fresh: bool
     scheduler_eligible: bool
     snapshot_id: int | None = None
+    target_id: int | None = None
 
 
 def _result_from_row(row: AccountQuotaSnapshotModel) -> QuotaLedgerResult:
@@ -159,6 +160,7 @@ def _result_from_row(row: AccountQuotaSnapshotModel) -> QuotaLedgerResult:
         fresh=fresh,
         scheduler_eligible=fresh and state not in {"unknown", "ambiguous", "stale"},
         snapshot_id=int(row.id) if row.id is not None else None,
+        target_id=int(row.target_id) if row.target_id is not None else None,
     )
 
 
@@ -378,15 +380,25 @@ def latest_snapshot(
     *,
     identity_id: str,
     window: str,
+    target_id: int | None = None,
 ) -> QuotaLedgerResult | None:
     target_engine = database_engine or default_engine
     with Session(target_engine) as session:
-        row = session.exec(
-            select(AccountQuotaSnapshotModel)
-            .where(AccountQuotaSnapshotModel.identity_id == str(identity_id or ""))
-            .where(AccountQuotaSnapshotModel.window == str(window or "").strip().lower())
-            .order_by(AccountQuotaSnapshotModel.captured_at.desc())
-        ).first()
+        if target_id is not None:
+            row = session.exec(
+                select(AccountQuotaSnapshotModel)
+                .where(AccountQuotaSnapshotModel.identity_id == str(identity_id or ""))
+                .where(AccountQuotaSnapshotModel.window == str(window or "").strip().lower())
+                .where(AccountQuotaSnapshotModel.target_id == int(target_id))
+                .order_by(AccountQuotaSnapshotModel.captured_at.desc())
+            ).first()
+        else:
+            row = session.exec(
+                select(AccountQuotaSnapshotModel)
+                .where(AccountQuotaSnapshotModel.identity_id == str(identity_id or ""))
+                .where(AccountQuotaSnapshotModel.window == str(window or "").strip().lower())
+                .order_by(AccountQuotaSnapshotModel.captured_at.desc())
+            ).first()
         return _result_from_row(row) if row is not None else None
 
 

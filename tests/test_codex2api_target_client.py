@@ -341,6 +341,41 @@ def test_configured_target_id_is_the_database_target_id(monkeypatch):
     assert get_target_client(2, engine).target.name == "node-b"
 
 
+def test_invalid_structured_target_config_does_not_disable_existing_targets(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services.codex2api_target_client import ensure_configured_targets
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    with Session(engine) as session:
+        session.add(
+            db.Codex2APITargetModel(
+                id=1,
+                name="existing",
+                base_url="https://existing",
+                admin_key_ref="legacy-key",
+                enabled=True,
+            )
+        )
+        session.commit()
+
+    rows = ensure_configured_targets(
+        engine,
+        {"codex2api_targets_json": "{not-json"},
+    )
+
+    assert [row.name for row in rows] == ["existing"]
+    with Session(engine) as session:
+        assert session.get(db.Codex2APITargetModel, 1).enabled is True
+
+
 def test_client_redacts_credentials_echoed_by_error_response(monkeypatch):
     from services import codex2api_target_client as module
 
@@ -674,3 +709,100 @@ def test_explicit_target_sync_persists_structured_binding():
     assert binding.target_id == 2
     assert binding.remote_account_id == 77
     assert binding.sync_status == "synced"
+
+
+def test_legacy_sync_call_routes_to_the_account_assignment_target(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services import external_sync
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="assigned@example.com",
+        password="password",
+        token="access-token",
+        identity_id="identity-assigned",
+        extra_json='{"refresh_token":"refresh-token","workspace_id":"ws-assigned"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.add(
+            db.Codex2APITargetModel(
+                id=2,
+                name="target-two",
+                base_url="https://target-two",
+                admin_key_ref="target-two-key",
+                enabled=True,
+            )
+        )
+        session.commit()
+        session.refresh(account)
+        account_id = int(account.id)
+        session.add(
+            db.AccountAssignmentModel(
+                identity_id="identity-assigned",
+                local_account_id=account.id,
+                pool_id="ENTERPRISE_A_POOL",
+                target_id=2,
+                state="active",
+                assignment_version=1,
+            )
+        )
+        session.add(
+            db.AccountIdentityModel(
+                id="identity-assigned",
+                platform="chatgpt",
+                canonical_email=account.email,
+                current_account_id=account.id,
+            )
+        )
+        session.commit()
+
+    class AssignedClient:
+        def __init__(self):
+            self.imports = 0
+
+        def import_full_json(self, payload):
+            self.imports += 1
+            return {"success": 1, "failed": 0}
+
+        def list_accounts(self):
+            return [{"id": 202, "email": "assigned@example.com", "status": "active", "enabled": True}]
+
+    assigned_client = AssignedClient()
+    monkeypatch.setattr(
+        "services.codex2api_target_client.get_target_client",
+        lambda target_id, database_engine: assigned_client,
+    )
+    monkeypatch.setattr(
+        "platforms.chatgpt.codex2api_upload.upload_to_codex2api",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("legacy target used")),
+    )
+    monkeypatch.setattr(
+        "core.config_store.config_store.get",
+        lambda key, default="": "1" if key == "codex2api_enabled" else default,
+    )
+
+    result = external_sync.sync_codex2api_account(
+        db.AccountModel(
+            id=account_id,
+            platform="chatgpt",
+            email="assigned@example.com",
+            password="password",
+            token="access-token",
+            identity_id="identity-assigned",
+            extra_json='{"refresh_token":"refresh-token","workspace_id":"ws-assigned"}',
+        ),
+        database_engine=engine,
+    )
+
+    assert result["ok"] is True
+    assert assigned_client.imports == 1

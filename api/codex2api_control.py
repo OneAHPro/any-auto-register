@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
@@ -33,6 +34,7 @@ from core.db import (
 from services.account_migration import (
     MigrationError,
     plan_migration,
+    reassign_account_pool,
     rollback_migration,
     run_migration,
 )
@@ -61,6 +63,10 @@ _POOL_TYPES = {"public", "enterprise", "float", "standby"}
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _operation_id() -> str:
+    return str(uuid4())
 
 
 def _normalize_url(value: str) -> str:
@@ -240,6 +246,7 @@ def list_targets(session: Session = Depends(get_session)):
         int(target_id): int(count)
         for target_id, count in session.exec(
             select(AccountTargetBindingModel.target_id, func.count(AccountTargetBindingModel.id))
+            .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
             .group_by(AccountTargetBindingModel.target_id)
         ).all()
     }
@@ -285,7 +292,7 @@ def create_target(body: TargetCreate, session: Session = Depends(get_session)):
     session.commit()
     session.refresh(row)
     return {
-        "operation_id": None,
+        "operation_id": _operation_id(),
         "status": "committed",
         "target": _target_payload(row),
     }
@@ -340,7 +347,7 @@ def update_target(
     session.commit()
     session.refresh(row)
     return {
-        "operation_id": None,
+        "operation_id": _operation_id(),
         "status": "committed",
         "target": _target_payload(row),
     }
@@ -362,7 +369,7 @@ def check_target_health(target_id: int, session: Session = Depends(get_session))
     except SecretStoreError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     return {
-        "operation_id": None,
+        "operation_id": _operation_id(),
         "status": "committed",
         "target_id": result.target_id,
         "health_status": result.health_status,
@@ -455,7 +462,7 @@ def create_pool(body: PoolCreate, session: Session = Depends(get_session)):
     session.commit()
     session.refresh(pool)
     return {
-        "operation_id": None,
+        "operation_id": _operation_id(),
         "status": "committed",
         "pool": {
             **pool.model_dump(),
@@ -474,21 +481,22 @@ def account_quota(account_id: int, session: Session = Depends(get_session)):
     identity_id = str(account.identity_id or "")
     if not identity_id:
         raise HTTPException(status_code=409, detail="账号身份尚未完成归档")
-    windows = {}
-    for window in ("5h", "7d", "monthly"):
-        snapshot = latest_snapshot(
-            session.get_bind(),
-            identity_id=identity_id,
-            window=window,
-        )
-        if snapshot is not None:
-            windows[window] = _quota_payload(snapshot)
     assignment = session.exec(
         select(AccountAssignmentModel).where(
             AccountAssignmentModel.identity_id == identity_id,
             AccountAssignmentModel.state.in_(["active", "draining", "standby"]),
         )
     ).first()
+    windows = {}
+    for window in ("5h", "7d", "monthly"):
+        snapshot = latest_snapshot(
+            session.get_bind(),
+            identity_id=identity_id,
+            window=window,
+            target_id=int(assignment.target_id) if assignment else None,
+        )
+        if snapshot is not None:
+            windows[window] = _quota_payload(snapshot)
     return {
         "account_id": int(account_id),
         "identity_id": identity_id,
@@ -543,7 +551,7 @@ def refresh_account_quota(account_id: int, session: Session = Depends(get_sessio
     except SecretStoreError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     return {
-        "operation_id": None,
+        "operation_id": _operation_id(),
         "status": "committed",
         "target_id": result.target_id,
         "collected_accounts": result.collected_accounts,
@@ -616,25 +624,58 @@ def create_scheduler_plan(
         if (row := session.get(SchedulerRunModel, run.id)) is not None
     ]
     return {
-        "operation_id": None,
+        "operation_id": runs[-1].id if runs else _operation_id(),
         "status": "awaiting_confirmation",
         "runs": [_run_payload(row, session) for row in rows],
     }
 
 
 def _validate_action_targets(session: Session, action: PoolAction) -> None:
-    if action.source_target_id == action.destination_target_id:
+    same_target_pool_move = (
+        action.action == "scale_down"
+        and action.source_target_id == action.destination_target_id
+    )
+    if action.source_target_id == action.destination_target_id and not same_target_pool_move:
         raise PlanError("source and destination targets must differ")
+    if same_target_pool_move:
+        destination_pool_id = str(action.destination_pool_id or "").strip().upper()
+        if not destination_pool_id or destination_pool_id == str(action.source_pool_id or "").strip().upper():
+            raise PlanError("scale-down action has no distinct destination pool")
+        destination_pool = session.get(AccountPoolModel, destination_pool_id)
+        if destination_pool is None or not destination_pool.enabled:
+            raise PlanError("scale-down destination pool is unavailable")
     for target_id in (action.source_target_id, action.destination_target_id):
         target = session.get(Codex2APITargetModel, int(target_id))
-        if target is None or not target.enabled:
+        if target is None or not target.enabled or target.health_status != "healthy":
             raise PlanError("scheduler target is unavailable")
         capabilities = _safe_json(target.capability_json, {})
-        if target_id == action.destination_target_id and (
-            target.health_status != "healthy"
-            or capabilities.get("migratable") is not True
+        if (
+            target_id == action.destination_target_id
+            and not same_target_pool_move
+            and capabilities.get("migratable") is not True
         ):
             raise PlanError("destination target is not migration-ready")
+    assignment = session.exec(
+        select(AccountAssignmentModel).where(
+            AccountAssignmentModel.identity_id == action.identity_id,
+            AccountAssignmentModel.local_account_id == action.local_account_id,
+            AccountAssignmentModel.state.in_(["active", "draining", "standby"]),
+        )
+    ).first()
+    if (
+        assignment is None
+        or int(assignment.target_id) != int(action.source_target_id)
+        or int(assignment.assignment_version or 0) != int(action.assignment_version)
+    ):
+        raise PlanError("scheduler assignment snapshot is stale")
+    quota = latest_snapshot(
+        session.get_bind(),
+        identity_id=action.identity_id,
+        window="7d",
+        target_id=int(action.source_target_id),
+    )
+    if quota is None or not quota.scheduler_eligible:
+        raise PlanError("scheduler quota snapshot is stale")
 
 
 @router.post("/scheduler/apply", status_code=status.HTTP_202_ACCEPTED)
@@ -648,11 +689,31 @@ def apply_scheduler_plan(
     run = load_plan(session.get_bind(), body.run_id)
     if run is None:
         raise HTTPException(status_code=404, detail="调度计划不存在")
+    stored_run = session.get(SchedulerRunModel, body.run_id)
+    stored_plan = _safe_json(stored_run.plan_json, {}) if stored_run is not None else {}
+    if (
+        stored_plan.get("executable") is False
+        or stored_plan.get("blockers")
+    ):
+        raise HTTPException(status_code=409, detail="调度计划当前不可执行")
     if run.status == "awaiting_confirmation":
         run = confirm_plan(session.get_bind(), body.run_id)
 
     def queue(action: PoolAction) -> str:
         _validate_action_targets(session, action)
+        source_pool_id = str(action.source_pool_id or "").strip().upper()
+        destination_pool_id = str(action.destination_pool_id or "").strip().upper()
+        if action.action == "scale_down" and action.source_target_id == action.destination_target_id:
+            return reassign_account_pool(
+                session.get_bind(),
+                identity_id=action.identity_id,
+                local_account_id=action.local_account_id,
+                source_target_id=action.source_target_id,
+                source_pool_id=source_pool_id,
+                destination_pool_id=destination_pool_id,
+                expected_assignment_version=action.assignment_version,
+                reason=action.reason,
+            )
         return plan_migration(
             session.get_bind(),
             identity_id=action.identity_id,
@@ -663,8 +724,8 @@ def apply_scheduler_plan(
             expected_credential_revision=action.credential_revision,
             idempotency_key=f"scheduler:{body.run_id}:{action.identity_id}:{action.action}",
             plan={
-                "source_pool_id": "",
-                "destination_pool_id": run.pool_id,
+                "source_pool_id": source_pool_id,
+                "destination_pool_id": destination_pool_id or run.pool_id,
                 "reason": action.reason,
             },
         )
@@ -778,7 +839,10 @@ def assign_account(
             )
         )
         session.commit()
-        return {"operation_id": None, "status": "committed"}
+        return {
+            "operation_id": f"assignment:{int(account.id)}:{previous_version + 1}",
+            "status": "committed",
+        }
     source_binding = session.exec(
         select(AccountTargetBindingModel).where(
             AccountTargetBindingModel.identity_id == identity.id,

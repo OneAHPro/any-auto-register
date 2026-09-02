@@ -445,12 +445,44 @@ def ensure_configured_targets(
     from core.config_store import ConfigItem
 
     ConfigItem.__table__.create(bind=target_engine, checkfirst=True)
-    targets = load_target_configs(config if config is not None else _config_snapshot())
     source_values = dict(config if config is not None else _config_snapshot())
+    raw_structured = source_values.get("codex2api_targets")
+    if raw_structured in (None, ""):
+        raw_structured = source_values.get("codex2api_targets_json")
+    structured_present = raw_structured not in (None, "")
+    parsed_structured: Any = raw_structured
+    if isinstance(parsed_structured, str):
+        try:
+            parsed_structured = json.loads(parsed_structured)
+        except (TypeError, ValueError):
+            parsed_structured = None
+    if isinstance(parsed_structured, Mapping):
+        structured_entries = [
+            item for item in parsed_structured.values() if isinstance(item, Mapping)
+        ]
+    elif isinstance(parsed_structured, list):
+        structured_entries = [
+            item for item in parsed_structured if isinstance(item, Mapping)
+        ]
+    else:
+        structured_entries = []
+    try:
+        targets = load_target_configs(source_values)
+    except ValueError:
+        # A malformed structured setting must never turn every persisted
+        # target off. Leave the database projection untouched until an
+        # operator supplies a valid complete configuration.
+        targets = []
     structured_source = bool(
-        source_values.get("codex2api_targets")
-        or source_values.get("codex2api_targets_json")
+        structured_present
+        and structured_entries
+        and len(targets) == len(structured_entries)
     )
+    if structured_present and not structured_source:
+        with Session(target_engine) as session:
+            return session.exec(
+                select(Codex2APITargetModel).order_by(Codex2APITargetModel.id)
+            ).all()
     materialized: list[Any] = []
     from services.secret_store import seal_secret
 

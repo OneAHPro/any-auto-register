@@ -110,6 +110,34 @@ def test_pool_thresholds_are_data_driven():
     assert shrink.scale_down_count == 2
 
 
+def test_candidate_shortfall_is_observe_only_and_cannot_be_applied():
+    from services.pool_scheduler import AccountCandidate, PoolInput, plan_pool
+
+    plan = plan_pool(
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=Decimal("5000"),
+            safe_7d_quota=Decimal("1800"),
+            current_accounts=1,
+            candidates=(
+                AccountCandidate(
+                    identity_id="only-candidate",
+                    local_account_id=1,
+                    health="healthy",
+                    remaining_usd=Decimal("500"),
+                    source_target_id=1,
+                    destination_target_id=2,
+                ),
+            ),
+        )
+    )
+
+    assert plan.scale_up_count == 2
+    assert len(plan.actions) == 1
+    assert plan.executable is False
+    assert "capacity_unavailable" in plan.blockers
+
+
 def test_stale_quota_or_unhealthy_target_is_observe_only():
     from services.pool_scheduler import PoolInput, plan_pool
 
@@ -384,3 +412,95 @@ def test_generate_scheduled_plan_uses_customer_usage_and_float_candidate():
     payload = json.loads(stored.plan_json)
     assert payload["cost_estimated"] is True
     assert payload["desired_costs"]["account_cost_cny"] == "2160.00"
+
+
+def test_generated_scale_down_moves_same_target_account_to_float_pool():
+    from services import pool_scheduler
+
+    engine = make_engine()
+    now = datetime.now(timezone.utc)
+    with Session(engine) as session:
+        session.add(
+            db.Codex2APITargetModel(
+                id=1,
+                name="public",
+                base_url="https://a",
+                admin_key_ref="a",
+                health_status="healthy",
+            )
+        )
+        for pool_id, name, pool_type in (
+            ("PUBLIC_POOL", "公共池", "public"),
+            ("FLOAT_POOL", "浮动池", "float"),
+        ):
+            session.add(db.AccountPoolModel(id=pool_id, name=name, pool_type=pool_type))
+        account = db.AccountModel(
+            platform="chatgpt",
+            email="shrink@example.com",
+            password="password",
+            identity_id="shrink-identity",
+        )
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+        session.add_all(
+            [
+                db.AccountIdentityModel(
+                    id="shrink-identity",
+                    platform="chatgpt",
+                    canonical_email=account.email,
+                    current_account_id=account.id,
+                ),
+                db.AccountAssignmentModel(
+                    identity_id="shrink-identity",
+                    local_account_id=account.id,
+                    pool_id="PUBLIC_POOL",
+                    target_id=1,
+                    state="active",
+                    assignment_version=1,
+                    lease_started_at=now - timedelta(hours=8),
+                ),
+                db.AccountTargetBindingModel(
+                    identity_id="shrink-identity",
+                    local_account_id=account.id,
+                    target_id=1,
+                    remote_account_id=91,
+                    remote_email=account.email,
+                    remote_status="active",
+                    enabled=True,
+                ),
+                db.AccountQuotaSnapshotModel(
+                    identity_id="shrink-identity",
+                    local_account_id=account.id,
+                    target_id=1,
+                    window="7d",
+                    billed_cents=100,
+                    continuous_billed_cents=100,
+                    remaining_cents=100000,
+                    reset_at=now + timedelta(days=3),
+                    captured_at=now,
+                    is_fresh=True,
+                    freshness_seconds=900,
+                ),
+            ]
+        )
+        session.commit()
+        for index in range(2):
+            pool_scheduler.create_dry_run(
+                engine,
+                pool_scheduler.PoolInput(
+                    pool_id="PUBLIC_POOL",
+                    current_accounts=1,
+                    utilization=Decimal("0.10"),
+                ),
+                trigger="automatic",
+                now=now - timedelta(minutes=index + 1),
+            )
+
+    runs = pool_scheduler.generate_scheduled_plans(engine, now=now)
+    public = next(run for run in runs if run.pool_id == "PUBLIC_POOL")
+
+    assert public.actions
+    assert public.actions[0].action == "scale_down"
+    assert public.actions[0].source_target_id == public.actions[0].destination_target_id == 1
+    assert public.actions[0].destination_pool_id == "FLOAT_POOL"

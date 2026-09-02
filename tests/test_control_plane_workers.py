@@ -189,6 +189,51 @@ def test_quota_collection_marks_missing_remote_binding_without_creating_snapshot
     assert snapshots == []
 
 
+def test_quota_collection_skips_enabled_binding_on_noncurrent_target():
+    from services.control_plane_workers import collect_target_quota
+
+    engine = make_engine()
+    with Session(engine) as session:
+        session.add(
+            db.AccountIdentityModel(
+                id="identity-moved",
+                platform="chatgpt",
+                canonical_email="moved@example.com",
+                current_account_id=1,
+            )
+        )
+        session.add(
+            db.AccountAssignmentModel(
+                identity_id="identity-moved",
+                local_account_id=1,
+                pool_id="PUBLIC_POOL",
+                target_id=2,
+                state="active",
+            )
+        )
+        session.add(
+            db.AccountTargetBindingModel(
+                identity_id="identity-moved",
+                local_account_id=1,
+                target_id=1,
+                remote_account_id=77,
+                remote_email="moved@example.com",
+                remote_status="active",
+                enabled=True,
+            )
+        )
+        session.commit()
+
+    result = collect_target_quota(
+        engine,
+        target_id=1,
+        client=FakeClient(),
+        now=NOW,
+    )
+
+    assert result.collected_accounts == 0
+
+
 def test_default_target_reconciliation_bootstraps_binding_and_assignment():
     from services.control_plane_workers import collect_target_quota
 

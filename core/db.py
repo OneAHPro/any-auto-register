@@ -1251,16 +1251,26 @@ def init_account_pool_schema(database_engine=None) -> None:
         ).fetchall()
         if quota_table:
             quota_columns = {str(row[1]) for row in quota_table}
-            if "continuous_billed_usd" not in quota_columns:
-                conn.exec_driver_sql(
-                    "ALTER TABLE account_quota_snapshots "
-                    "ADD COLUMN continuous_billed_usd FLOAT"
-                )
-            if "source_updated_at" not in quota_columns:
-                conn.exec_driver_sql(
-                    "ALTER TABLE account_quota_snapshots "
-                    "ADD COLUMN source_updated_at DATETIME"
-                )
+            for column, sql_type in (
+                ("billed_usd", "FLOAT"),
+                ("continuous_billed_usd", "FLOAT"),
+                ("remaining_usd", "FLOAT"),
+                ("continuous_remaining_usd", "FLOAT"),
+                ("source_updated_at", "DATETIME"),
+            ):
+                if column not in quota_columns:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE account_quota_snapshots "
+                        f"ADD COLUMN {column} {sql_type}"
+                    )
+            # Refresh after ALTER TABLE so legacy databases missing one of the
+            # amount columns are safe for the backfill below.
+            quota_columns = {
+                str(row[1])
+                for row in conn.exec_driver_sql(
+                    "PRAGMA table_info('account_quota_snapshots')"
+                ).fetchall()
+            }
             for column in (
                 "billed_cents",
                 "continuous_billed_cents",
@@ -1281,11 +1291,6 @@ def init_account_pool_schema(database_engine=None) -> None:
                     f"UPDATE account_quota_snapshots "
                     f"SET {cents_column} = CAST(ROUND({amount_column} * 100) AS INTEGER) "
                     f"WHERE {cents_column} IS NULL AND {amount_column} IS NOT NULL"
-                )
-            if "continuous_remaining_usd" not in quota_columns:
-                conn.exec_driver_sql(
-                    "ALTER TABLE account_quota_snapshots "
-                    "ADD COLUMN continuous_remaining_usd FLOAT"
                 )
             if "remaining_scope" not in quota_columns:
                 conn.exec_driver_sql(

@@ -157,11 +157,28 @@ def _remote_id(row: Mapping[str, Any]) -> int:
 
 def _binding_data(database_engine, target_id: int) -> list[dict[str, Any]]:
     with Session(database_engine) as session:
+        active_target_by_identity = {
+            str(assignment.identity_id): int(assignment.target_id)
+            for assignment in session.exec(
+                select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.state.in_(
+                        ["active", "draining", "standby"]
+                    )
+                )
+            ).all()
+        }
         bindings = session.exec(
             select(AccountTargetBindingModel).where(
                 AccountTargetBindingModel.target_id == int(target_id)
             )
+            .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
         ).all()
+        bindings = [
+            binding
+            for binding in bindings
+            if active_target_by_identity.get(str(binding.identity_id), int(target_id))
+            == int(target_id)
+        ]
         return [
             {
                 "id": int(binding.id or 0),
