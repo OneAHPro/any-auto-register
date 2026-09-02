@@ -27,6 +27,24 @@ def recover_stale_sms_pool(*, now: datetime) -> int:
     return sms_pool_service.recover_stale_active(now=now)
 
 
+def wake_codex2api_target_health() -> bool:
+    from services.control_plane_runtime import wake_target_health
+
+    return wake_target_health()
+
+
+def wake_account_quota_collection() -> bool:
+    from services.control_plane_runtime import wake_target_quota
+
+    return wake_target_quota()
+
+
+def wake_account_pool_planning() -> bool:
+    from services.control_plane_runtime import wake_pool_planning
+
+    return wake_pool_planning()
+
+
 class Scheduler:
     def __init__(self):
         self._running = False
@@ -37,10 +55,16 @@ class Scheduler:
         self._trial_check_interval_seconds = 3600
         self._task_history_cleanup_interval_seconds = 600
         self._sms_pool_recovery_interval_seconds = 600
+        self._target_health_interval_seconds = 300
+        self._quota_collection_interval_seconds = 300
+        self._pool_planning_interval_seconds = 900
         self._last_trial_check_at = 0.0
         self._last_cpa_maintenance_at = 0.0
         self._last_task_history_cleanup_at = 0.0
         self._last_sms_pool_recovery_at = 0.0
+        self._last_target_health_at = 0.0
+        self._last_quota_collection_at = 0.0
+        self._last_pool_planning_at = 0.0
 
     def start(self):
         with self._lifecycle_lock:
@@ -58,6 +82,9 @@ class Scheduler:
                 now - self._task_history_cleanup_interval_seconds
             )
             self._last_sms_pool_recovery_at = now
+            self._last_target_health_at = now - self._target_health_interval_seconds
+            self._last_quota_collection_at = now - self._quota_collection_interval_seconds
+            self._last_pool_planning_at = now - self._pool_planning_interval_seconds
 
             self._thread = threading.Thread(
                 target=self._loop,
@@ -86,6 +113,36 @@ class Scheduler:
             tick_chatgpt_auto_relogin(now=wall_now)
         except Exception as e:
             print(f"[Scheduler] ChatGPT 自动重登错误: {e}")
+
+        for last_attr, interval_attr, wake, label in (
+            (
+                "_last_target_health_at",
+                "_target_health_interval_seconds",
+                wake_codex2api_target_health,
+                "目标健康检查",
+            ),
+            (
+                "_last_quota_collection_at",
+                "_quota_collection_interval_seconds",
+                wake_account_quota_collection,
+                "额度采集",
+            ),
+            (
+                "_last_pool_planning_at",
+                "_pool_planning_interval_seconds",
+                wake_account_pool_planning,
+                "号池计划",
+            ),
+        ):
+            if monotonic_now - getattr(self, last_attr) < getattr(self, interval_attr):
+                continue
+            try:
+                submitted = wake()
+            except Exception as e:
+                print(f"[Scheduler] Codex2API {label}触发错误: {type(e).__name__}")
+            else:
+                if submitted:
+                    setattr(self, last_attr, monotonic_now)
 
         if (
             monotonic_now - self._last_sms_pool_recovery_at

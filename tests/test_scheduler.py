@@ -13,6 +13,49 @@ def test_task_history_cleanup_defaults_to_ten_minutes():
     assert scheduler._task_history_cleanup_interval_seconds == 600
 
 
+def test_control_plane_intervals_match_health_quota_and_planning_cadence():
+    scheduler = scheduler_module.Scheduler()
+
+    assert scheduler._target_health_interval_seconds == 300
+    assert scheduler._quota_collection_interval_seconds == 300
+    assert scheduler._pool_planning_interval_seconds == 900
+
+
+def test_control_plane_due_jobs_are_woken_without_running_network_inline(monkeypatch):
+    scheduler = scheduler_module.Scheduler()
+    scheduler._last_target_health_at = 0
+    scheduler._last_quota_collection_at = 0
+    scheduler._last_pool_planning_at = 0
+    scheduler._last_sms_pool_recovery_at = 900
+    scheduler._last_task_history_cleanup_at = 900
+    scheduler._last_trial_check_at = 900
+    scheduler._last_cpa_maintenance_at = 900
+    health = mock.Mock(return_value=True)
+    quota = mock.Mock(return_value=True)
+    planning = mock.Mock(return_value=True)
+    monkeypatch.setattr(scheduler_module, "tick_chatgpt_auto_relogin", mock.Mock())
+    monkeypatch.setattr(scheduler_module, "wake_codex2api_target_health", health)
+    monkeypatch.setattr(scheduler_module, "wake_account_quota_collection", quota)
+    monkeypatch.setattr(scheduler_module, "wake_account_pool_planning", planning)
+    monkeypatch.setattr(
+        scheduler,
+        "_get_cpa_maintenance_interval_seconds",
+        lambda: 3600,
+    )
+
+    scheduler.run_once(
+        wall_now=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        monotonic_now=900,
+    )
+
+    health.assert_called_once_with()
+    quota.assert_called_once_with()
+    planning.assert_called_once_with()
+    assert scheduler._last_target_health_at == 900
+    assert scheduler._last_quota_collection_at == 900
+    assert scheduler._last_pool_planning_at == 900
+
+
 def test_stale_sms_pool_recovery_defaults_to_ten_minutes():
     scheduler = scheduler_module.Scheduler()
 

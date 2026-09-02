@@ -162,6 +162,16 @@ CONFIG_KEYS = [
     "codex2api_api_url",
     "codex2api_admin_key",
     "codex2api_delete_on_account_remove_enabled",
+    "codex2api_scheduler_enabled",
+    "codex2api_scheduler_interval_minutes",
+    "codex2api_scheduler_dry_run",
+    "codex2api_scheduler_min_lease_hours",
+    "codex2api_scheduler_scale_up_threshold_usd",
+    "codex2api_scheduler_scale_down_utilization_percent",
+    "codex2api_scheduler_quota_freshness_minutes",
+    "account_monthly_rent_cny",
+    "customer_price_per_usd",
+    "bandwidth_price_per_mbps_cny",
     "team_manager_url",
     "team_manager_key",
     "codex_proxy_url",
@@ -398,6 +408,21 @@ def get_config():
         all_cfg.get("codex2api_delete_on_account_remove_enabled", "") or ""
     ).strip():
         all_cfg["codex2api_delete_on_account_remove_enabled"] = "0"
+    defaults = {
+        "codex2api_scheduler_enabled": "0",
+        "codex2api_scheduler_interval_minutes": "15",
+        "codex2api_scheduler_dry_run": "1",
+        "codex2api_scheduler_min_lease_hours": "6",
+        "codex2api_scheduler_scale_up_threshold_usd": "0.00",
+        "codex2api_scheduler_scale_down_utilization_percent": "60",
+        "codex2api_scheduler_quota_freshness_minutes": "15",
+        "account_monthly_rent_cny": "1080.00",
+        "customer_price_per_usd": "0.20",
+        "bandwidth_price_per_mbps_cny": "30.00",
+    }
+    for key, value in defaults.items():
+        if not str(all_cfg.get(key, "") or "").strip():
+            all_cfg[key] = value
     if not str(all_cfg.get("smtp_port", "") or "").strip():
         all_cfg["smtp_port"] = "587"
     if not str(all_cfg.get("smtp_use_ssl", "") or "").strip():
@@ -474,6 +499,8 @@ def update_config(body: ConfigUpdate):
         )
     for bool_key in (
         "codex2api_delete_on_account_remove_enabled",
+        "codex2api_scheduler_enabled",
+        "codex2api_scheduler_dry_run",
         "smtp_use_ssl",
         "smtp_force_auth_login",
         "bark_enabled",
@@ -503,6 +530,10 @@ def update_config(body: ConfigUpdate):
         ("chatgpt_auto_relogin_concurrency", 1, 3, "自动重登并发数"),
         ("chatgpt_auto_relogin_alert_threshold", 1, 10000, "重登失败告警阈值"),
         ("smtp_port", 1, 65535, "SMTP 端口"),
+        ("codex2api_scheduler_interval_minutes", 1, 1440, "号池调度间隔"),
+        ("codex2api_scheduler_min_lease_hours", 1, 720, "账号最小租约"),
+        ("codex2api_scheduler_scale_down_utilization_percent", 1, 99, "缩容利用率"),
+        ("codex2api_scheduler_quota_freshness_minutes", 1, 1440, "额度新鲜度"),
     ):
         if key not in safe:
             continue
@@ -516,6 +547,22 @@ def update_config(body: ConfigUpdate):
                 detail=f"{label}必须在 {minimum} 到 {maximum} 之间",
             )
         safe[key] = str(value)
+
+    for key, minimum, maximum, label in (
+        ("codex2api_scheduler_scale_up_threshold_usd", Decimal("0"), Decimal("10000000"), "扩容额度阈值"),
+        ("account_monthly_rent_cny", Decimal("0"), Decimal("10000000"), "账号月租"),
+        ("customer_price_per_usd", Decimal("0"), Decimal("100000"), "客户美元用量单价"),
+        ("bandwidth_price_per_mbps_cny", Decimal("0"), Decimal("100000"), "带宽单价"),
+    ):
+        if key not in safe:
+            continue
+        try:
+            value = Decimal(str(safe.get(key, "")).strip())
+        except (InvalidOperation, ValueError):
+            raise HTTPException(status_code=400, detail=f"{label}必须是有效数字") from None
+        if not value.is_finite() or not minimum <= value <= maximum:
+            raise HTTPException(status_code=400, detail=f"{label}超出允许范围")
+        safe[key] = f"{value.quantize(USD_CENT, rounding=ROUND_HALF_UP):.2f}"
 
     # Validate the effective point-in-time configuration before writing.  A
     # blank credential in this request has already been removed above, so the

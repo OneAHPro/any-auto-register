@@ -280,6 +280,8 @@ class Codex2APITargetModel(SQLModel, table=True):
     default_pool_id: str = "PUBLIC_POOL"
     enabled: bool = Field(default=True, index=True)
     health_status: str = Field(default="unknown", index=True)
+    health_success_count: int = 0
+    health_failure_count: int = 0
     capability_json: str = "{}"
     last_health_at: Optional[datetime] = None
     last_sync_at: Optional[datetime] = None
@@ -1319,6 +1321,20 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "), 'chatgpt') WHERE platform IS NULL OR TRIM(platform) = ''"
             )
 
+        target_table = conn.exec_driver_sql(
+            "PRAGMA table_info('codex2api_targets')"
+        ).fetchall()
+        if target_table:
+            target_columns = {str(row[1]) for row in target_table}
+            for column in ("health_success_count", "health_failure_count"):
+                if column not in target_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE codex2api_targets ADD COLUMN {column} INTEGER DEFAULT 0"
+                    )
+                conn.exec_driver_sql(
+                    f"UPDATE codex2api_targets SET {column} = 0 WHERE {column} IS NULL"
+                )
+
         # Field(index=True) covers fresh databases.  Explicit IF NOT EXISTS
         # statements also repair installations created by older SQLModel
         # versions whose metadata did not include every index.
@@ -1571,9 +1587,11 @@ def init_db():
     _recover_chatgpt_attempt_bindings()
     from services.account_identity import reconcile_existing_accounts
     from services.codex2api_target_client import ensure_default_target
+    from services.pool_scheduler import ensure_default_pools
 
     reconcile_existing_accounts(engine)
     ensure_default_target(engine)
+    ensure_default_pools(engine)
     from core.sms_pool import SmsPoolService
 
     sms_pool = SmsPoolService(engine)
