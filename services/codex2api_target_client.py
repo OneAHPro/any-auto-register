@@ -25,10 +25,10 @@ MAX_ERROR_DETAIL_LENGTH = 240
 class TargetConfig:
     """Connection details for one Codex2API instance."""
 
-    id: int
-    name: str
-    base_url: str
-    admin_key: str
+    id: int = 0
+    name: str = "default"
+    base_url: str = ""
+    admin_key: str = ""
     target_type: str = "public"
     server_label: str = ""
     default_pool_id: str = "PUBLIC_POOL"
@@ -86,6 +86,21 @@ def _redact(value: Any, secrets: list[str]) -> str:
     return result[:MAX_ERROR_DETAIL_LENGTH]
 
 
+def _collect_secrets(value: Any) -> list[str]:
+    """Collect string leaves from a request payload for error redaction."""
+
+    result: list[str] = []
+    if isinstance(value, Mapping):
+        for item in value.values():
+            result.extend(_collect_secrets(item))
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            result.extend(_collect_secrets(item))
+    elif isinstance(value, str) and value.strip():
+        result.append(value.strip())
+    return result
+
+
 def _response_detail(response: Any, secrets: list[str]) -> str:
     try:
         payload = response.json()
@@ -96,6 +111,77 @@ def _response_detail(response: Any, secrets: list[str]) -> str:
     else:
         value = getattr(response, "text", "")
     return _redact(value, secrets)
+
+
+def _contains_marker(value: Any, markers: tuple[str, ...]) -> bool:
+    normalized = _text(value).lower()
+    return any(marker in normalized for marker in markers)
+
+
+_AUTH_FAILURE_MARKERS = (
+    "token_invalidated",
+    "invalid_token",
+    "invalid token",
+    "unauthorized",
+    "authentication token",
+    "invalid_grant",
+)
+_USAGE_LIMIT_MARKERS = (
+    "usage_limit",
+    "usage limited",
+    "usage limit",
+    "quota_exhausted",
+    "quota exhausted",
+    "rate_limited",
+    "rate limited",
+)
+
+
+def _remote_secret_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if normalized in {
+        "allowed_api_key_ids",
+        "api_key_ids",
+        "group_ids",
+        "api_key_id",
+    }:
+        return False
+    return any(
+        marker in normalized
+        for marker in (
+            "refresh_token",
+            "access_token",
+            "session_token",
+            "id_token",
+            "cookie",
+            "password",
+            "private_key",
+            "admin_key",
+            "api_key",
+            "secret",
+            "token",
+            "credential",
+            "bearer",
+        )
+    )
+
+
+def _sanitize_remote_payload(value: Any, secrets: list[str]) -> Any:
+    """Keep remote operational fields while removing credential-shaped data."""
+
+    if isinstance(value, Mapping):
+        return {
+            str(key): _sanitize_remote_payload(child, secrets)
+            for key, child in value.items()
+            if not _remote_secret_key(key)
+        }
+    if isinstance(value, list):
+        return [_sanitize_remote_payload(item, secrets) for item in value[:1000]]
+    if isinstance(value, tuple):
+        return [_sanitize_remote_payload(item, secrets) for item in value[:1000]]
+    if isinstance(value, str):
+        return _redact(value, secrets)
+    return value
 
 
 def _parse_sse_payload(text: str) -> dict[str, Any] | None:
@@ -142,12 +228,14 @@ def _coerce_target_entry(raw: Mapping[str, Any], index: int) -> TargetConfig | N
     admin_key = _text(raw.get("admin_key") or raw.get("key") or raw.get("token"))
     if not base_url or not admin_key:
         return None
+    if raw.get("id") in (None, ""):
+        raise ValueError("structured Codex2API target requires a stable positive id")
     try:
-        target_id = int(raw.get("id") or index)
+        target_id = int(raw.get("id"))
     except (TypeError, ValueError):
-        target_id = index
+        raise ValueError("structured Codex2API target id must be an integer") from None
     if target_id <= 0:
-        target_id = index
+        raise ValueError("structured Codex2API target id must be positive")
     return TargetConfig(
         id=target_id,
         name=_text(raw.get("name") or raw.get("server_label"))
@@ -190,6 +278,10 @@ def load_target_configs(config: Mapping[str, Any] | None = None) -> list[TargetC
         for index, entry in enumerate(entries, start=1)
         if (target := _coerce_target_entry(entry, index)) is not None
     ]
+    ids = [target.id for target in targets]
+    names = [target.name.casefold() for target in targets]
+    if len(ids) != len(set(ids)) or len(names) != len(set(names)):
+        raise ValueError("Codex2API target IDs and names must be unique")
     if targets:
         return targets
 
@@ -232,7 +324,12 @@ def target_config_from_model(model: Any, secrets: Mapping[str, Any] | None = Non
 
     values = dict(secrets or {})
     ref = _text(getattr(model, "admin_key_ref", ""))
-    admin_key = _text(values.get(ref))
+    raw_admin_key = _text(values.get(ref))
+    admin_key = ""
+    if raw_admin_key:
+        from services.secret_store import open_secret
+
+        admin_key = open_secret(raw_admin_key, allow_legacy_plaintext=True)
     if not admin_key:
         # A caller may pass a mapping keyed by the numeric target id while
         # bootstrapping an installation.  This remains an in-memory fallback;
@@ -242,7 +339,11 @@ def target_config_from_model(model: Any, secrets: Mapping[str, Any] | None = Non
         # Installations upgraded from the original single-target settings keep
         # their key under this legacy name until the settings UI saves a
         # structured target secret.
-        admin_key = _text(values.get("codex2api_admin_key"))
+        raw_legacy_key = _text(values.get("codex2api_admin_key"))
+        if raw_legacy_key:
+            from services.secret_store import open_secret
+
+            admin_key = open_secret(raw_legacy_key, allow_legacy_plaintext=True)
     return TargetConfig(
         id=int(getattr(model, "id", 0) or 0),
         name=_text(getattr(model, "name", "")),
@@ -265,15 +366,15 @@ def load_db_target_configs(database_engine=None) -> list[TargetConfig]:
     target_engine = database_engine or default_engine
     values = _config_snapshot()
     with Session(target_engine) as session:
+        from core.config_store import ConfigItem
+
+        ConfigItem.__table__.create(bind=target_engine, checkfirst=True)
+        for item in session.exec(select(ConfigItem)).all():
+            values.setdefault(str(item.key), str(item.value or ""))
         rows = session.exec(
             select(Codex2APITargetModel).order_by(Codex2APITargetModel.id)
         ).all()
-    result: list[TargetConfig] = []
-    for row in rows:
-        target = target_config_from_model(row, values)
-        if target.admin_key:
-            result.append(target)
-    return result
+    return [target_config_from_model(row, values) for row in rows]
 
 
 def get_target_client(target_id: int, database_engine=None) -> "Codex2APITargetClient":
@@ -284,48 +385,147 @@ def get_target_client(target_id: int, database_engine=None) -> "Codex2APITargetC
 
     target_engine = database_engine or default_engine
     with Session(target_engine) as session:
+        from core.config_store import ConfigItem
+
         row = session.get(Codex2APITargetModel, int(target_id))
         if row is None:
             raise Codex2APITargetError(
                 "Codex2API 目标不存在",
                 endpoint="target",
             )
-        target = target_config_from_model(row, _config_snapshot())
+        if not bool(getattr(row, "enabled", True)):
+            raise Codex2APITargetError(
+                "Codex2API 目标已停用",
+                endpoint="target",
+            )
+        values = _config_snapshot()
+        secret = session.get(ConfigItem, str(row.admin_key_ref or ""))
+        if secret is not None:
+            values[str(row.admin_key_ref)] = str(secret.value or "")
+        target = target_config_from_model(row, values)
     return Codex2APITargetClient(target)
 
 
 def ensure_default_target(database_engine=None, config: Mapping[str, Any] | None = None):
-    """Materialize the legacy target in the structured target table once."""
+    """Materialize and return the first configured target."""
+
+    targets = ensure_configured_targets(database_engine, config)
+    return targets[0] if targets else None
+
+
+def _persist_target_secret(database_engine, key: str, value: str) -> None:
+    from core.config_store import ConfigItem
+    from sqlmodel import Session
+
+    from services.secret_store import seal_secret
+
+    ConfigItem.__table__.create(bind=database_engine, checkfirst=True)
+    sealed = seal_secret(value)
+    with Session(database_engine) as session:
+        item = session.get(ConfigItem, key)
+        if item is None:
+            item = ConfigItem(key=key, value=sealed)
+        else:
+            item.value = sealed
+        session.add(item)
+        session.commit()
+
+
+def ensure_configured_targets(
+    database_engine=None,
+    config: Mapping[str, Any] | None = None,
+) -> list[Any]:
+    """Materialize all configured targets and persist their keys by reference."""
 
     from core.db import Codex2APITargetModel, engine as default_engine
     from sqlmodel import Session, select
 
     target_engine = database_engine or default_engine
-    target = default_target_config(config)
-    if target is None:
-        return None
+    from core.config_store import ConfigItem
+
+    ConfigItem.__table__.create(bind=target_engine, checkfirst=True)
+    targets = load_target_configs(config if config is not None else _config_snapshot())
+    source_values = dict(config if config is not None else _config_snapshot())
+    structured_source = bool(
+        source_values.get("codex2api_targets")
+        or source_values.get("codex2api_targets_json")
+    )
+    materialized: list[Any] = []
+    from services.secret_store import seal_secret
+
+    sealed_secrets = (
+        {int(target.id): seal_secret(target.admin_key) for target in targets}
+        if structured_source
+        else {}
+    )
     with Session(target_engine) as session:
-        existing = session.exec(
-            select(Codex2APITargetModel).where(
-                Codex2APITargetModel.name == target.name
+        configured_ids = {int(target.id) for target in targets}
+        for target in targets:
+            existing = session.get(Codex2APITargetModel, int(target.id))
+            if existing is None:
+                existing = session.exec(
+                    select(Codex2APITargetModel).where(
+                        Codex2APITargetModel.name == target.name
+                    )
+                ).first()
+                if existing is not None and int(existing.id or 0) != int(target.id):
+                    raise ValueError(
+                        "Codex2API target name is already bound to a different id"
+                    )
+            row_id = int(existing.id) if existing is not None else int(target.id)
+            ref = (
+                f"codex2api_target_{row_id}_admin_key"
+                if structured_source
+                else "codex2api_admin_key"
             )
-        ).first()
-        if existing is not None:
-            return existing
-        row = Codex2APITargetModel(
-            name=target.name,
-            target_type=target.target_type,
-            server_label=target.server_label,
-            base_url=target.base_url,
-            admin_key_ref=f"codex2api_target_{target.id}_admin_key",
-            default_pool_id=target.default_pool_id,
-            enabled=target.enabled,
-            health_status="unknown",
-        )
-        session.add(row)
+            if existing is None:
+                existing = Codex2APITargetModel(
+                    id=row_id,
+                    name=target.name,
+                    target_type=target.target_type,
+                    server_label=target.server_label,
+                    base_url=target.base_url,
+                    admin_key_ref=ref,
+                    default_pool_id=target.default_pool_id,
+                    enabled=target.enabled,
+                    health_status="unknown",
+                )
+            else:
+                existing.name = target.name
+                existing.target_type = target.target_type
+                existing.server_label = target.server_label
+                existing.base_url = target.base_url
+                existing.admin_key_ref = ref
+                existing.default_pool_id = target.default_pool_id
+                existing.enabled = target.enabled
+                existing.updated_at = __import__("datetime").datetime.now(
+                    __import__("datetime").timezone.utc
+                )
+            session.add(existing)
+            session.flush()
+            materialized.append(existing)
+            if structured_source:
+                secret_item = session.get(ConfigItem, ref)
+                if secret_item is None:
+                    secret_item = ConfigItem(
+                        key=ref,
+                        value=sealed_secrets[int(target.id)],
+                    )
+                else:
+                    secret_item.value = sealed_secrets[int(target.id)]
+                session.add(secret_item)
+        if structured_source:
+            for stale in session.exec(select(Codex2APITargetModel)).all():
+                if int(stale.id or 0) not in configured_ids:
+                    stale.enabled = False
+                    stale.updated_at = __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    )
+                    session.add(stale)
         session.commit()
-        session.refresh(row)
-        return row
+        for row in materialized:
+            session.refresh(row)
+    return materialized
 
 
 class Codex2APITargetClient:
@@ -355,6 +555,7 @@ class Codex2APITargetClient:
         accept: str = "application/json",
         timeout: int = 20,
         allowed_statuses: tuple[int, ...] = (200, 201, 202, 204),
+        redaction_secrets: list[str] | None = None,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "headers": {
@@ -378,28 +579,78 @@ class Codex2APITargetClient:
         try:
             response = request_fn(self._url(path), **kwargs)
         except Exception as exc:
-            detail = _redact(exc, self._secrets)
+            detail = _redact(exc, [*self._secrets, *_collect_secrets(json_body), *(redaction_secrets or [])])
             raise Codex2APITargetError(
                 f"Codex2API 请求异常: {detail or type(exc).__name__}",
                 endpoint=path,
             ) from None
         status_code = int(getattr(response, "status_code", 0) or 0)
         if status_code not in allowed_statuses:
-            detail = _response_detail(response, self._secrets)
+            detail = _response_detail(
+                response,
+                [*self._secrets, *_collect_secrets(json_body), *(redaction_secrets or [])],
+            )
+            if (
+                status_code == 429
+                and path.rstrip("/").endswith("/test")
+                and not _contains_marker(detail, _AUTH_FAILURE_MARKERS)
+                and _contains_marker(detail, _USAGE_LIMIT_MARKERS)
+            ):
+                return {
+                    "success": True,
+                    "usage_limited": True,
+                    "message": "目标账号已鉴权，但当前处于用量限制",
+                }
             if status_code in (401, 403):
                 message = "Codex2API Admin Key 无效或无权限"
             else:
                 message = f"Codex2API 请求失败（HTTP {status_code}）"
                 if detail:
                     message += f": {detail}"
+            if path.rstrip("/").endswith("/test"):
+                return {
+                    "success": False,
+                    "verified": False,
+                    "auth_failed": _contains_marker(detail, _AUTH_FAILURE_MARKERS),
+                    "status_code": status_code,
+                    "message": (
+                        "目标账号鉴权失败"
+                        if status_code in (401, 403)
+                        else "目标账号测试未确认"
+                    ),
+                }
             raise Codex2APITargetError(
                 message,
                 status_code=status_code,
                 endpoint=path,
             )
         try:
-            return _parse_response_payload(response)
+            payload = _parse_response_payload(response)
+            return _sanitize_remote_payload(
+                payload,
+                [*self._secrets, *_collect_secrets(json_body), *(redaction_secrets or [])],
+            )
         except ValueError:
+            if (
+                status_code == 429
+                and path.rstrip("/").endswith("/test")
+            ):
+                detail = _response_detail(
+                    response,
+                    [*self._secrets, *_collect_secrets(json_body), *(redaction_secrets or [])],
+                )
+                if _contains_marker(detail, _AUTH_FAILURE_MARKERS):
+                    return {
+                        "success": False,
+                        "auth_failed": True,
+                        "message": "目标账号鉴权失败",
+                    }
+                if _contains_marker(detail, _USAGE_LIMIT_MARKERS):
+                    return {
+                        "success": True,
+                        "usage_limited": True,
+                        "message": "目标账号已鉴权，但当前处于用量限制",
+                    }
             raise Codex2APITargetError(
                 "Codex2API 响应无法解析",
                 status_code=status_code,
@@ -416,7 +667,11 @@ class Codex2APITargetClient:
 
     def capabilities(self) -> dict[str, Any]:
         settings = self._request("GET", "/api/admin/settings")
-        return {
+        # The pinned upstream contract uses soft delete and exposes restore.
+        # Older nodes that return 404 are downgraded by the operation error and
+        # the migration fallback re-imports the saved credential.
+        restore_supported = not bool(settings.get("restore_endpoint_disabled"))
+        capabilities = {
             "settings": settings,
             "list_accounts": True,
             "usage_probe": True,
@@ -424,9 +679,17 @@ class Codex2APITargetClient:
             "enable_toggle": True,
             "lock_toggle": True,
             "delete": True,
-            "restore": True,
+            # Delete is a soft-delete in supported Codex2API versions.  The
+            # restore route is version-dependent and is only advertised when
+            # the target explicitly reports it.
+            "restore": restore_supported,
+            "soft_delete": True,
+            # If the target does not advertise a restore endpoint, rollback
+            # can still re-import the saved credential after a soft delete.
             "migratable": True,
+            "rollback_strategy": "restore_or_reimport",
         }
+        return capabilities
 
     def list_accounts(self) -> list[dict[str, Any]]:
         payload = self._request("GET", "/api/admin/accounts?channel=codex")
@@ -466,17 +729,44 @@ class Codex2APITargetClient:
                 multipart=mime,
                 accept="text/event-stream, application/json",
                 timeout=30,
+                redaction_secrets=_collect_secrets(payload),
             )
         finally:
             mime.close()
 
     def test_account(self, remote_id: int) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"/api/admin/accounts/{int(remote_id)}/test",
-            accept="text/event-stream, application/json",
-            timeout=45,
-        )
+        try:
+            result = self._request(
+                "GET",
+                f"/api/admin/accounts/{int(remote_id)}/test",
+                accept="text/event-stream, application/json",
+                timeout=45,
+                allowed_statuses=(200, 201, 202, 204, 429),
+            )
+        except Codex2APITargetError as exc:
+            if exc.status_code == 429 and _contains_marker(
+                str(exc), _AUTH_FAILURE_MARKERS
+            ):
+                return {
+                    "success": False,
+                    "auth_failed": True,
+                    "message": "目标账号鉴权失败",
+                }
+            raise
+        status_text = json.dumps(result, ensure_ascii=False).lower()
+        if _contains_marker(status_text, _AUTH_FAILURE_MARKERS):
+            return {**result, "success": False, "auth_failed": True}
+        if _contains_marker(status_text, _USAGE_LIMIT_MARKERS):
+            return {**result, "success": True, "usage_limited": True}
+        if not bool(result.get("success")):
+            return {
+                **result,
+                "success": False,
+                "verified": False,
+            }
+        if not result:
+            return {"success": False, "verified": False, "message": "目标账号未返回测试结果"}
+        return result
 
     def set_enabled(self, remote_id: int, enabled: bool) -> dict[str, Any]:
         return self._request(
@@ -534,11 +824,19 @@ class Codex2APITargetClient:
                 None,
             )
             if row is None:
-                return True
+                raise Codex2APITargetError(
+                    "Codex2API 排空时未找到目标账号",
+                    endpoint="accounts",
+                )
             try:
-                active = int(row.get("active_requests") or 0)
+                if "active_requests" not in row:
+                    raise ValueError("missing")
+                active = int(row.get("active_requests"))
             except (TypeError, ValueError):
-                active = 0
+                raise Codex2APITargetError(
+                    "Codex2API 未提供可验证的活动请求数",
+                    endpoint="accounts",
+                ) from None
             if active <= 0:
                 return True
             if time.monotonic() >= deadline:

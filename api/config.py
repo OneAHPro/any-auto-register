@@ -416,6 +416,10 @@ def get_config():
     # LeadBee API credentials are write-only; product selection is public.
     all_cfg["leadbee_api_key"] = ""
     all_cfg["leadbee_api_secret"] = ""
+    # Codex2API Admin Key is write-only.  Target clients resolve the stored
+    # value internally; neither the legacy settings page nor control-plane API
+    # receives it back.
+    all_cfg["codex2api_admin_key"] = ""
     # 只返回已知 key，未设置的返回空字符串
     return {k: all_cfg.get(k, "") for k in CONFIG_KEYS}
 
@@ -458,6 +462,12 @@ def update_config(body: ConfigUpdate):
             else:
                 # Blank write-only fields mean "leave the persisted value alone".
                 safe.pop(credential_key, None)
+    if "codex2api_admin_key" in safe:
+        value = str(safe.get("codex2api_admin_key") or "").strip()
+        if value:
+            safe["codex2api_admin_key"] = value
+        else:
+            safe.pop("codex2api_admin_key", None)
     if "leadbee_api_product_id" in safe:
         safe["leadbee_api_product_id"] = _normalize_leadbee_product_id(
             safe["leadbee_api_product_id"]

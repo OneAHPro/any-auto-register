@@ -48,6 +48,14 @@ def test_pool_tables_and_account_identity_column_are_created():
             )
         }
     assert "continuous_billed_usd" in quota_columns
+    with engine.connect() as connection:
+        indexes = {
+            row[1]
+            for row in connection.exec_driver_sql(
+                "PRAGMA index_list('account_target_bindings')"
+            )
+        }
+    assert "uq_account_target_binding_identity_target" in indexes
 
 
 def test_schema_migration_is_idempotent():
@@ -77,3 +85,50 @@ def test_schema_migration_adds_identity_column_to_legacy_accounts_table():
             )
         }
     assert "identity_id" in columns
+
+
+def test_schema_migration_survives_duplicate_strong_aliases():
+    engine = make_engine()
+    db.init_account_pool_schema(engine)
+    timestamp = "2026-09-02T00:00:00+00:00"
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "DROP INDEX uq_account_identity_alias_platform_type_value"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_identities "
+            "(id, platform, canonical_email, state, current_account_id, created_at, updated_at) "
+            "VALUES ('i-1', 'chatgpt', 'one@example.com', 'active', 1, ?, ?)" ,
+            (timestamp, timestamp),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_identities "
+            "(id, platform, canonical_email, state, current_account_id, created_at, updated_at) "
+            "VALUES ('i-2', 'chatgpt', 'two@example.com', 'active', 2, ?, ?)" ,
+            (timestamp, timestamp),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_identity_aliases "
+            "(identity_id, platform, alias_type, normalized_value, source, first_seen_at, last_seen_at) "
+            "VALUES ('i-1', 'chatgpt', 'workspace_id', 'shared', '', ?, ?)"
+            ,
+            (timestamp, timestamp),
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_identity_aliases "
+            "(identity_id, platform, alias_type, normalized_value, source, first_seen_at, last_seen_at) "
+            "VALUES ('i-2', 'chatgpt', 'workspace_id', 'shared', '', ?, ?)"
+            ,
+            (timestamp, timestamp),
+        )
+
+    db.init_account_pool_schema(engine)
+
+    with engine.connect() as connection:
+        states = {
+            row[0]: row[1]
+            for row in connection.exec_driver_sql(
+                "SELECT id, state FROM account_identities WHERE id IN ('i-1', 'i-2')"
+            )
+        }
+    assert states == {"i-1": "ambiguous", "i-2": "ambiguous"}

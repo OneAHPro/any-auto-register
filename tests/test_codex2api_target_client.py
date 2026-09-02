@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 
@@ -60,6 +61,38 @@ def test_client_sets_enabled_with_json_payload(monkeypatch):
     assert result == {"message": "ok"}
     assert calls[0][0] == "https://node-a/api/admin/accounts/55/enable"
     assert calls[0][1]["json"] == {"enabled": False}
+
+
+def test_drain_requires_explicit_account_row_and_active_request_count(monkeypatch):
+    from services import codex2api_target_client as module
+
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+    client = module.Codex2APITargetClient(target)
+    monkeypatch.setattr(client, "list_accounts", lambda: [])
+    with pytest.raises(module.Codex2APITargetError):
+        client.wait_for_zero_active_requests(7, timeout_seconds=0)
+
+    monkeypatch.setattr(client, "list_accounts", lambda: [{"id": 7}])
+    with pytest.raises(module.Codex2APITargetError):
+        client.wait_for_zero_active_requests(7, timeout_seconds=0)
+
+
+def test_structured_target_rejects_missing_or_invalid_stable_id():
+    from services.codex2api_target_client import load_target_configs
+
+    with pytest.raises(ValueError):
+        load_target_configs(
+            {"codex2api_targets": [{"name": "node", "base_url": "https://node", "admin_key": "key"}]}
+        )
+    with pytest.raises(ValueError):
+        load_target_configs(
+            {"codex2api_targets": [{"id": 0, "name": "node", "base_url": "https://node", "admin_key": "key"}]}
+        )
 
 
 def test_client_parses_final_sse_complete_event(monkeypatch):
@@ -213,9 +246,259 @@ def test_ensure_default_target_materializes_legacy_configuration():
 
     assert row.name == "default"
     assert row.base_url == "https://legacy"
-    assert row.admin_key_ref == "codex2api_target_1_admin_key"
+    assert row.admin_key_ref == "codex2api_admin_key"
     with Session(engine) as session:
         assert session.get(db.Codex2APITargetModel, row.id) is not None
+
+
+def test_ensure_configured_targets_materializes_all_structured_targets(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.codex2api_target_client import ensure_configured_targets, load_db_target_configs
+    from cryptography.fernet import Fernet
+
+    monkeypatch.setenv("ACCOUNT_MANAGER_SECRET_KEY", Fernet.generate_key().decode())
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    config = {
+        "codex2api_targets": [
+            {"id": 1, "name": "node-a", "base_url": "https://a", "admin_key": "key-a"},
+            {"id": 2, "name": "node-b", "base_url": "https://b", "admin_key": "key-b"},
+        ]
+    }
+
+    rows = ensure_configured_targets(engine, config)
+
+    assert [row.name for row in rows] == ["node-a", "node-b"]
+    with mock.patch.object(module := __import__("services.codex2api_target_client", fromlist=["_config_snapshot"]), "_config_snapshot", return_value={
+        "codex2api_target_1_admin_key": "key-a",
+        "codex2api_target_2_admin_key": "key-b",
+    }):
+        configs = load_db_target_configs(engine)
+    assert [(item.name, item.admin_key) for item in configs] == [("node-a", "key-a"), ("node-b", "key-b")]
+
+
+def test_target_secret_is_persisted_under_reference_without_returning_from_model(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+    from cryptography.fernet import Fernet
+
+    from core import db
+    from core.config_store import ConfigItem
+    from services.codex2api_target_client import ensure_configured_targets
+
+    monkeypatch.setenv("ACCOUNT_MANAGER_SECRET_KEY", Fernet.generate_key().decode())
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    rows = ensure_configured_targets(
+        engine,
+        {"codex2api_targets": [{"id": 2, "name": "node-b", "base_url": "https://b", "admin_key": "secret-b"}]},
+    )
+
+    assert rows[0].admin_key_ref == "codex2api_target_2_admin_key"
+    assert not hasattr(rows[0], "admin_key")
+    with Session(engine) as session:
+        stored = session.get(ConfigItem, rows[0].admin_key_ref).value
+    assert "secret-b" not in stored
+    assert stored.startswith("fernet:v1:")
+
+
+def test_configured_target_id_is_the_database_target_id(monkeypatch):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import create_engine
+    from cryptography.fernet import Fernet
+
+    from core import db
+    from services.codex2api_target_client import ensure_configured_targets, get_target_client
+
+    monkeypatch.setenv("ACCOUNT_MANAGER_SECRET_KEY", Fernet.generate_key().decode())
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    rows = ensure_configured_targets(
+        engine,
+        {"codex2api_targets": [{"id": 2, "name": "node-b", "base_url": "https://b", "admin_key": "secret-b"}]},
+    )
+
+    assert rows[0].id == 2
+    assert get_target_client(2, engine).target.name == "node-b"
+
+
+def test_client_redacts_credentials_echoed_by_error_response(monkeypatch):
+    from services import codex2api_target_client as module
+
+    response = FakeResponse(
+        {"error": "refresh-secret access-secret session-secret"},
+        status_code=500,
+    )
+    monkeypatch.setattr(module.cffi_requests, "post", lambda *args, **kwargs: response)
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="admin-secret",
+    )
+
+    with pytest.raises(module.Codex2APITargetError) as exc_info:
+        module.Codex2APITargetClient(target)._request(
+            "POST",
+            "/api/admin/accounts",
+            json_body={
+                "refresh_token": "refresh-secret",
+                "access_token": "access-secret",
+                "session_token": "session-secret",
+            },
+        )
+
+    message = str(exc_info.value)
+    assert "refresh-secret" not in message
+    assert "access-secret" not in message
+    assert "session-secret" not in message
+
+
+def test_client_scrubs_credential_fields_from_success_payload(monkeypatch):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(
+        module.cffi_requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 7,
+                        "email": "a@example.com",
+                        "status": "active",
+                        "token": "access-secret",
+                        "credentials": {"refresh_token": "refresh-secret"},
+                        "allowed_api_key_ids": [1, 2],
+                    }
+                ]
+            }
+        ),
+    )
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+
+    rows = module.Codex2APITargetClient(target).list_accounts()
+
+    serialized = __import__("json").dumps(rows)
+    assert "access-secret" not in serialized
+    assert "refresh-secret" not in serialized
+    assert rows[0]["allowed_api_key_ids"] == [1, 2]
+
+
+def test_account_test_treats_usage_limit_as_authenticated(monkeypatch):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(
+        module.cffi_requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            {"error": {"type": "usage_limit_reached"}},
+            status_code=429,
+        ),
+    )
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+
+    result = module.Codex2APITargetClient(target).test_account(7)
+
+    assert result["success"] is True
+    assert result["usage_limited"] is True
+
+
+def test_account_test_keeps_auth_failure_precedence_over_usage_text(monkeypatch):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(
+        module.cffi_requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            payload=ValueError("not json"),
+            status_code=429,
+            text="token_invalidated; usage limit reached",
+        ),
+    )
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+
+    result = module.Codex2APITargetClient(target).test_account(7)
+
+    assert result["success"] is False
+    assert result["auth_failed"] is True
+
+
+def test_account_test_rejects_unclassified_rate_limit_response(monkeypatch):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(
+        module.cffi_requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse(
+            {"error": "temporary upstream issue"},
+            status_code=429,
+        ),
+    )
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+
+    result = module.Codex2APITargetClient(target).test_account(7)
+
+    assert result["success"] is False
+    assert result["verified"] is False
+
+
+def test_capabilities_include_restore_from_supported_upstream_contract(monkeypatch):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(
+        module.cffi_requests,
+        "get",
+        lambda *args, **kwargs: FakeResponse({"settings": {}}),
+    )
+    target = module.TargetConfig(
+        id=1,
+        name="node-a",
+        base_url="https://node-a",
+        admin_key="secret",
+    )
+
+    capabilities = module.Codex2APITargetClient(target).capabilities()
+
+    assert capabilities["restore"] is True
 
 
 def test_quota_reader_accepts_an_explicit_target_client():

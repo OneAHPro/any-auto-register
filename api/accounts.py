@@ -15,10 +15,75 @@ from services.chatgpt_account_removal import remove_account
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
+from urllib.parse import urlsplit, urlunsplit
 
 _CHATGPT_DIRECT_PASSWORD_DOMAINS = {"icloud.com", "me.com", "mac.com"}
 
 logger = logging.getLogger(__name__)
+
+_ACCOUNT_EXTRA_SECRET_KEYS = {
+    "access_token",
+    "accesstoken",
+    "refresh_token",
+    "refreshtoken",
+    "id_token",
+    "idtoken",
+    "session_token",
+    "sessiontoken",
+    "cookies",
+    "password",
+    "totp_secret",
+    "mfa_secret",
+    "recovery_code",
+    "mfa_recovery_code",
+}
+
+
+def _is_secret_key(key: object) -> bool:
+    normalized = str(key or "").strip().lower().replace("-", "_")
+    if normalized in _ACCOUNT_EXTRA_SECRET_KEYS:
+        return True
+    return any(
+        marker in normalized
+        for marker in (
+            "refresh_token",
+            "access_token",
+            "session_token",
+            "id_token",
+            "cookie",
+            "password",
+            "totp",
+            "mfa_secret",
+            "recovery_code",
+            "private_key",
+            "admin_key",
+            "api_key",
+        )
+    )
+
+
+def _scrub_nested_extra(value: object, key: object = "") -> object:
+    """Recursively remove credential-shaped fields from API projections."""
+
+    if isinstance(value, dict):
+        cleaned: dict[str, object] = {}
+        for child_key, child_value in value.items():
+            if _is_secret_key(child_key):
+                continue
+            cleaned[str(child_key)] = _scrub_nested_extra(child_value, child_key)
+        return cleaned
+    if isinstance(value, list):
+        return [_scrub_nested_extra(item, key) for item in value]
+    if isinstance(value, str) and "url" in str(key or "").lower():
+        try:
+            parsed = urlsplit(value)
+            if parsed.query or parsed.fragment:
+                # Keep the navigable endpoint/path while dropping query
+                # parameters that commonly carry bearer or checkout secrets.
+                return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+        except ValueError:
+            pass
+    return value
 
 router = APIRouter(prefix="/accounts", tags=["accounts"])
 
@@ -30,7 +95,11 @@ def _safe_float(value) -> float:
         return 0.0
 
 
-def _sanitize_account_extra_for_api(raw_extra: str) -> str:
+def _sanitize_account_extra_for_api(
+    raw_extra: str,
+    *,
+    strip_credentials: bool = False,
+) -> str:
     try:
         extra = json.loads(raw_extra or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
@@ -84,7 +153,8 @@ def _sanitize_account_extra_for_api(raw_extra: str) -> str:
             ),
         }
 
-    extra.pop("cookies", None)
+    if strip_credentials:
+        extra = _scrub_nested_extra(extra)
     return json.dumps(extra, ensure_ascii=False)
 
 
@@ -150,28 +220,48 @@ def _account_control_plane_summary(account: AccountModel, session: Session) -> d
         ).first()
         if snapshot is None:
             continue
-        continuity_state = str(snapshot.continuity_state or "normal")
-        fresh = bool(snapshot.is_fresh)
+        from services.quota_ledger import evaluate_snapshot
+
+        evaluated = evaluate_snapshot(snapshot)
+        continuity_state = evaluated.continuity_state
+        fresh = evaluated.fresh
         quota[window] = {
             "usage_percent": snapshot.usage_percent,
             "billed_usd": snapshot.billed_usd,
-            "continuous_billed_usd": snapshot.continuous_billed_usd,
-            "remaining_usd": snapshot.remaining_usd,
-            "reset_at": snapshot.reset_at.isoformat() if snapshot.reset_at else None,
-            "captured_at": snapshot.captured_at.isoformat(),
+            "continuous_billed_usd": float(evaluated.continuous_billed_usd),
+            "remaining_usd": float(evaluated.remaining_usd)
+            if evaluated.remaining_usd is not None
+            else None,
+            "continuous_remaining_usd": float(evaluated.continuous_remaining_usd)
+            if evaluated.continuous_remaining_usd is not None
+            else None,
+            "remaining_scope": evaluated.remaining_scope,
+            "reset_at": evaluated.reset_at.isoformat() if evaluated.reset_at else None,
+            "captured_at": evaluated.captured_at.isoformat(),
             "continuity_state": continuity_state,
             "fresh": fresh,
-            "scheduler_eligible": fresh
-            and continuity_state not in {"unknown", "ambiguous", "stale"},
+            "scheduler_eligible": evaluated.scheduler_eligible,
         }
     summary["quota"] = quota
     return summary
 
 
-def _account_for_response(account: AccountModel, session: Session | None = None) -> dict:
+def _account_for_response(
+    account: AccountModel,
+    session: Session | None = None,
+    *,
+    include_credentials: bool = True,
+) -> dict:
     payload = account.model_dump()
+    if not include_credentials:
+        payload.pop("password", None)
+        payload.pop("token", None)
+        cashier_url = str(payload.get("cashier_url") or "")
+        if cashier_url:
+            payload["cashier_url"] = _scrub_nested_extra(cashier_url, "cashier_url")
     payload["extra_json"] = _sanitize_account_extra_for_api(
-        str(payload.get("extra_json") or "{}")
+        str(payload.get("extra_json") or "{}"),
+        strip_credentials=not include_credentials,
     )
     if session is not None:
         payload.update(_account_control_plane_summary(account, session))

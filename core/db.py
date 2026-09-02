@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import os
 from typing import Optional
 from sqlalchemy import delete, event, func, update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 
@@ -257,6 +258,7 @@ class AccountIdentityAliasModel(SQLModel, table=True):
 
     id: Optional[int] = Field(default=None, primary_key=True)
     identity_id: str = Field(index=True)
+    platform: str = Field(default="chatgpt", index=True)
     alias_type: str = Field(index=True)
     normalized_value: str = Field(index=True)
     source: str = ""
@@ -343,9 +345,13 @@ class AccountQuotaSnapshotModel(SQLModel, table=True):
     # when a credential is imported into a fresh Codex2API instance.
     continuous_billed_usd: Optional[float] = None
     remaining_usd: Optional[float] = None
+    continuous_remaining_usd: Optional[float] = None
+    remaining_scope: str = "target_local"
     reset_at: Optional[datetime] = None
     source: str = "codex2api"
+    source_updated_at: Optional[datetime] = None
     captured_at: datetime = Field(default_factory=_utcnow, index=True)
+    freshness_seconds: int = 900
     is_fresh: bool = True
     raw_digest: str = ""
     continuity_state: str = "normal"
@@ -1097,6 +1103,51 @@ def init_account_pool_schema(database_engine=None) -> None:
                     "ALTER TABLE account_quota_snapshots "
                     "ADD COLUMN continuous_billed_usd FLOAT"
                 )
+            if "source_updated_at" not in quota_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_quota_snapshots "
+                    "ADD COLUMN source_updated_at DATETIME"
+                )
+            if "continuous_remaining_usd" not in quota_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_quota_snapshots "
+                    "ADD COLUMN continuous_remaining_usd FLOAT"
+                )
+            if "remaining_scope" not in quota_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_quota_snapshots "
+                    "ADD COLUMN remaining_scope TEXT DEFAULT 'target_local'"
+                )
+            conn.exec_driver_sql(
+                "UPDATE account_quota_snapshots SET remaining_scope = 'target_local' "
+                "WHERE remaining_scope IS NULL OR TRIM(remaining_scope) = ''"
+            )
+            if "freshness_seconds" not in quota_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_quota_snapshots "
+                    "ADD COLUMN freshness_seconds INTEGER DEFAULT 900"
+                )
+            conn.exec_driver_sql(
+                "UPDATE account_quota_snapshots SET freshness_seconds = 900 "
+                "WHERE freshness_seconds IS NULL OR freshness_seconds <= 0"
+            )
+
+        alias_table = conn.exec_driver_sql(
+            "PRAGMA table_info('account_identity_aliases')"
+        ).fetchall()
+        if alias_table:
+            alias_columns = {str(row[1]) for row in alias_table}
+            if "platform" not in alias_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE account_identity_aliases "
+                    "ADD COLUMN platform TEXT DEFAULT 'chatgpt'"
+                )
+            conn.exec_driver_sql(
+                "UPDATE account_identity_aliases SET platform = COALESCE(("
+                "SELECT platform FROM account_identities "
+                "WHERE account_identities.id = account_identity_aliases.identity_id"
+                "), 'chatgpt') WHERE platform IS NULL OR TRIM(platform) = ''"
+            )
 
         # Field(index=True) covers fresh databases.  Explicit IF NOT EXISTS
         # statements also repair installations created by older SQLModel
@@ -1140,6 +1191,177 @@ def init_account_pool_schema(database_engine=None) -> None:
                 f"CREATE INDEX IF NOT EXISTS {index_name} "
                 f"ON {table_name} ({columns})"
             )
+        unique_index_specs = (
+            (
+                "uq_account_identity_alias_platform_type_value",
+                "account_identity_aliases",
+                "platform, alias_type, normalized_value",
+                "WHERE alias_type != 'email'",
+            ),
+            (
+                "uq_account_target_binding_identity_target",
+                "account_target_bindings",
+                "identity_id, target_id",
+                "",
+            ),
+            (
+                "uq_account_target_binding_remote_id",
+                "account_target_bindings",
+                "target_id, remote_account_id",
+                "WHERE remote_account_id > 0",
+            ),
+            (
+                "uq_account_assignment_current_identity",
+                "account_assignments",
+                "identity_id",
+                "WHERE state IN ('active', 'draining', 'standby')",
+            ),
+            (
+                "uq_account_migration_idempotency_key",
+                "account_migrations",
+                "idempotency_key",
+                "",
+            ),
+        )
+        # Older experimental builds could write duplicate strong aliases or
+        # bindings before the control-plane constraints existed.  Preserve
+        # every affected identity by marking it ambiguous, then keep one
+        # representative row so the new unique indexes can be installed.
+        if "account_identity_aliases" in existing_tables:
+            duplicate_alias_rows = conn.exec_driver_sql(
+                "SELECT platform, alias_type, normalized_value "
+                "FROM account_identity_aliases "
+                "WHERE alias_type != 'email' "
+                "GROUP BY platform, alias_type, normalized_value "
+                "HAVING COUNT(*) > 1"
+            ).fetchall()
+            for platform, alias_type, normalized_value in duplicate_alias_rows:
+                rows = conn.exec_driver_sql(
+                    "SELECT id, identity_id FROM account_identity_aliases "
+                    "WHERE platform = ? AND alias_type = ? AND normalized_value = ? "
+                    "ORDER BY id",
+                    (platform, alias_type, normalized_value),
+                ).fetchall()
+                if len(rows) <= 1:
+                    continue
+                for _alias_id, identity_id in rows:
+                    conn.exec_driver_sql(
+                        "UPDATE account_identities SET state = 'ambiguous' "
+                        "WHERE id = ?",
+                        (identity_id,),
+                    )
+                for alias_id, _identity_id in rows[1:]:
+                    conn.exec_driver_sql(
+                        "DELETE FROM account_identity_aliases WHERE id = ?",
+                        (alias_id,),
+                    )
+        if "account_target_bindings" in existing_tables:
+            duplicate_binding_groups = conn.exec_driver_sql(
+                "SELECT identity_id, target_id FROM account_target_bindings "
+                "GROUP BY identity_id, target_id HAVING COUNT(*) > 1"
+            ).fetchall()
+            for identity_id, target_id in duplicate_binding_groups:
+                rows = conn.exec_driver_sql(
+                    "SELECT id FROM account_target_bindings "
+                    "WHERE identity_id = ? AND target_id = ? ORDER BY id",
+                    (identity_id, target_id),
+                ).fetchall()
+                conn.exec_driver_sql(
+                    "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                    (identity_id,),
+                )
+                for (binding_id,) in rows[1:]:
+                    conn.exec_driver_sql(
+                        "UPDATE account_target_bindings SET sync_status = 'ambiguous', enabled = 0 WHERE id = ?",
+                        (binding_id,),
+                    )
+                    conn.exec_driver_sql(
+                        "DELETE FROM account_target_bindings WHERE id = ?",
+                        (binding_id,),
+                    )
+            duplicate_remote_groups = conn.exec_driver_sql(
+                "SELECT target_id, remote_account_id FROM account_target_bindings "
+                "WHERE remote_account_id > 0 GROUP BY target_id, remote_account_id "
+                "HAVING COUNT(*) > 1"
+            ).fetchall()
+            for target_id, remote_id in duplicate_remote_groups:
+                rows = conn.exec_driver_sql(
+                    "SELECT id, identity_id FROM account_target_bindings "
+                    "WHERE target_id = ? AND remote_account_id = ? ORDER BY id",
+                    (target_id, remote_id),
+                ).fetchall()
+                for _binding_id, identity_id in rows:
+                    conn.exec_driver_sql(
+                        "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                        (identity_id,),
+                    )
+                for binding_id, _identity_id in rows[1:]:
+                    conn.exec_driver_sql(
+                        "DELETE FROM account_target_bindings WHERE id = ?",
+                        (binding_id,),
+                    )
+        if "account_assignments" in existing_tables:
+            duplicate_assignment_groups = conn.exec_driver_sql(
+                "SELECT identity_id FROM account_assignments "
+                "WHERE state IN ('active', 'draining', 'standby') "
+                "GROUP BY identity_id HAVING COUNT(*) > 1"
+            ).fetchall()
+            for (identity_id,) in duplicate_assignment_groups:
+                rows = conn.exec_driver_sql(
+                    "SELECT id FROM account_assignments WHERE identity_id = ? "
+                    "AND state IN ('active', 'draining', 'standby') "
+                    "ORDER BY id",
+                    (identity_id,),
+                ).fetchall()
+                conn.exec_driver_sql(
+                    "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                    (identity_id,),
+                )
+                for (assignment_id,) in rows[1:]:
+                    conn.exec_driver_sql(
+                        "UPDATE account_assignments SET state = 'revoked', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        (assignment_id,),
+                    )
+        if "account_migrations" in existing_tables:
+            duplicate_migration_groups = conn.exec_driver_sql(
+                "SELECT idempotency_key FROM account_migrations "
+                "GROUP BY idempotency_key HAVING COUNT(*) > 1"
+            ).fetchall()
+            for (idempotency_key,) in duplicate_migration_groups:
+                rows = conn.exec_driver_sql(
+                    "SELECT id FROM account_migrations WHERE idempotency_key = ? ORDER BY id",
+                    (idempotency_key,),
+                ).fetchall()
+                for (migration_id,) in rows[1:]:
+                    legacy_key = f"{idempotency_key}#legacy-{migration_id}"
+                    conn.exec_driver_sql(
+                        "UPDATE account_migrations SET idempotency_key = ?, state = 'rollback_required', "
+                        "error_json = ? WHERE id = ?",
+                        (
+                            legacy_key,
+                            json.dumps({"message": "legacy duplicate idempotency key"}, ensure_ascii=False),
+                            migration_id,
+                        ),
+                    )
+        for index_name, table_name, columns, condition in unique_index_specs:
+            if table_name not in existing_tables:
+                continue
+            try:
+                conn.exec_driver_sql(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {table_name} ({columns}) {condition}"
+                )
+            except IntegrityError:
+                # A legacy duplicate in a non-critical index must not stop a
+                # rolling deployment.  The application still performs
+                # identity/assignment CAS checks; a later maintenance run can
+                # install the index after an operator resolves the conflict.
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "deferred unique index creation for %s due to legacy duplicates",
+                    index_name,
+                )
 
 
 def init_db():

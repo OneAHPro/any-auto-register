@@ -59,7 +59,7 @@ class AccountApiSanitizationTests(unittest.TestCase):
             }
         )
 
-        payload = accounts_api._account_for_response(account)
+        payload = accounts_api._account_for_response(account, include_credentials=False)
         serialized = json.dumps(payload, ensure_ascii=False, default=str)
         extra = json.loads(payload["extra_json"])
 
@@ -100,6 +100,30 @@ class AccountApiSanitizationTests(unittest.TestCase):
                 "ready": True,
             },
         )
+
+    def test_account_response_never_exposes_password_or_tokens(self):
+        account = AccountModel(
+            platform="chatgpt",
+            email="safe@example.com",
+            password="password-secret",
+            token="access-secret",
+            extra_json=(
+                '{"refresh_token":"refresh-secret",'
+                '"access_token":"access-secret",'
+                '"id_token":"id-secret",'
+                '"session_token":"session-secret",'
+                '"workspace_id":"workspace-1"}'
+            ),
+        )
+
+        payload = accounts_api._account_for_response(account, include_credentials=False)
+        serialized = json.dumps(payload, ensure_ascii=False, default=str)
+
+        self.assertNotIn("password-secret", serialized)
+        self.assertNotIn("refresh-secret", serialized)
+        self.assertNotIn("access-secret", serialized)
+        self.assertNotIn("id-secret", serialized)
+        self.assertNotIn("session-secret", serialized)
 
 
 if __name__ == "__main__":

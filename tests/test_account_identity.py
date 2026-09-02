@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine, select
@@ -150,6 +151,80 @@ def test_credential_fingerprint_never_returns_the_raw_token():
     assert "access-secret" not in fingerprint
 
 
+def test_rotating_credentials_without_workspace_reuses_the_email_identity():
+    from services.account_identity import ensure_identity
+
+    engine = make_engine()
+    first = ensure_identity(
+        engine,
+        account_id=1,
+        platform="chatgpt",
+        email="rotate@example.com",
+        credential_fingerprint="fingerprint-one",
+    )
+    second = ensure_identity(
+        engine,
+        account_id=2,
+        platform="chatgpt",
+        email="rotate@example.com",
+        credential_fingerprint="fingerprint-two",
+    )
+
+    assert second.identity_id == first.identity_id
+    assert second.ambiguous is False
+
+
+def test_same_workspace_on_different_email_does_not_merge_identities():
+    from services.account_identity import ensure_identity
+
+    engine = make_engine()
+    first = ensure_identity(
+        engine,
+        account_id=1,
+        platform="chatgpt",
+        email="one@example.com",
+        workspace_id="shared-workspace",
+    )
+    second = ensure_identity(
+        engine,
+        account_id=2,
+        platform="chatgpt",
+        email="two@example.com",
+        workspace_id="shared-workspace",
+    )
+
+    assert second.identity_id != first.identity_id
+
+
+def test_exact_workspace_alias_reuses_identity_after_email_conflict():
+    from services.account_identity import ensure_identity
+
+    engine = make_engine()
+    first = ensure_identity(
+        engine,
+        account_id=1,
+        platform="chatgpt",
+        email="same@example.com",
+        workspace_id="workspace-a",
+    )
+    ensure_identity(
+        engine,
+        account_id=2,
+        platform="chatgpt",
+        email="same@example.com",
+        workspace_id="workspace-b",
+    )
+    resolved = ensure_identity(
+        engine,
+        account_id=3,
+        platform="chatgpt",
+        email="same@example.com",
+        workspace_id="workspace-a",
+    )
+
+    assert resolved.identity_id == first.identity_id
+
+
 def test_save_account_assigns_a_stable_identity():
     from unittest import mock
 
@@ -174,3 +249,50 @@ def test_save_account_assigns_a_stable_identity():
         identity = session.get(db.AccountIdentityModel, saved.identity_id)
     assert identity is not None
     assert identity.current_account_id == saved.id
+
+
+def test_reconcile_does_not_change_account_updated_at_after_identity_exists():
+    from services.account_identity import reconcile_existing_accounts
+
+    engine = make_engine()
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="stable@example.com",
+        password="password",
+        extra_json="{}",
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+    reconcile_existing_accounts(engine)
+    with Session(engine) as session:
+        first = session.get(db.AccountModel, account.id)
+        first_updated_at = first.updated_at
+
+    reconcile_existing_accounts(engine)
+
+    with Session(engine) as session:
+        second = session.get(db.AccountModel, account.id)
+    assert second.updated_at == first_updated_at
+
+
+def test_concurrent_identity_resolution_reuses_one_identity(tmp_path):
+    from services.account_identity import ensure_identity
+
+    database_path = tmp_path / "identity-race.db"
+    engine = db._create_database_engine(f"sqlite:///{database_path}")
+    db.init_account_pool_schema(engine)
+
+    def resolve(index):
+        return ensure_identity(
+            engine,
+            account_id=index + 1,
+            platform="chatgpt",
+            email="race@example.com",
+        ).identity_id
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        identity_ids = list(executor.map(resolve, range(20)))
+
+    assert len(set(identity_ids)) == 1

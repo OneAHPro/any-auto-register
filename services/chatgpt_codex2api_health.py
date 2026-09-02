@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import time
+from datetime import datetime
 from typing import Any, Iterable, Mapping
 
 from curl_cffi import requests as cffi_requests
@@ -29,6 +30,17 @@ class Codex2APIHealthError(RuntimeError):
 
 def _text(value: object) -> str:
     return str(value or "").strip()
+
+
+def _valid_timestamp(value: object) -> str:
+    text = _text(value)
+    if not text:
+        return ""
+    try:
+        datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    return text
 
 
 def _to_bool(value: object, *, default: bool = False) -> bool:
@@ -177,7 +189,11 @@ def _remote_id(row: Mapping[str, object]) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
+def _quota_record(
+    row: Mapping[str, object],
+    *,
+    include_reset_times: bool = False,
+) -> dict[str, object]:
     result = {
         "remote_id": _remote_id(row),
         "email": _remote_email(row),
@@ -191,6 +207,16 @@ def _quota_record(row: Mapping[str, object]) -> dict[str, object]:
     ):
         if row.get(source_key):
             result[output_key] = row.get(source_key)
+    if include_reset_times:
+        for output_key, source_keys in (
+            ("reset_5h_at", ("reset_5h_at", "codex_5h_reset_at")),
+            ("reset_7d_at", ("reset_7d_at", "codex_reset_at")),
+        ):
+            for source_key in source_keys:
+                timestamp = _valid_timestamp(row.get(source_key))
+                if timestamp:
+                    result[output_key] = timestamp
+                    break
     for key in (
         "plan_type",
         "usage_percent_5h",
@@ -233,7 +259,7 @@ def fetch_codex2api_quota_accounts(
         if not isinstance(rows, list):
             raise Codex2APIHealthError("Codex2API 账号清单格式无效")
         return [
-            _quota_record(row)
+            _quota_record(row, include_reset_times=True)
             for row in rows
             if isinstance(row, Mapping)
         ]
@@ -253,7 +279,7 @@ def fetch_codex2api_quota_accounts(
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
     return [
-        _quota_record(row)
+        _quota_record(row, include_reset_times=True)
         for row in rows
         if isinstance(row, dict)
     ]
@@ -590,7 +616,7 @@ def inspect_codex2api_account_health(
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
     if quota_accounts is not None:
         quota_accounts.extend(
-            _quota_record(raw_row)
+            _quota_record(raw_row, include_reset_times=False)
             for raw_row in rows
             if isinstance(raw_row, dict)
         )

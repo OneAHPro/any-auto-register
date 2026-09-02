@@ -5,12 +5,13 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable
 from uuid import uuid4
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlmodel import Session, select
 
 from core.db import (
@@ -22,7 +23,13 @@ from core.db import (
 
 
 _IDENTITY_HMAC_KEY = b"any-auto-register-account-identity-v1"
-_STRONG_ALIAS_TYPES = {"workspace_id", "chatgpt_account_id", "credential_fingerprint"}
+_IDENTITY_ALIAS_TYPES = {"workspace_id", "chatgpt_account_id"}
+_STRONG_ALIAS_TYPES = {
+    "workspace_id",
+    "chatgpt_account_id",
+    "credential_fingerprint",
+}
+_IDENTITY_MUTATION_LOCK = threading.RLock()
 
 
 def _utcnow() -> datetime:
@@ -94,6 +101,7 @@ def _identity_ids_for_aliases(
     session: Session,
     *,
     platform: str,
+    email: str,
     aliases: Iterable[tuple[str, str]],
 ) -> dict[tuple[str, str], set[str]]:
     normalized_platform = normalize_alias(platform)
@@ -106,6 +114,7 @@ def _identity_ids_for_aliases(
                 AccountIdentityModel.id == AccountIdentityAliasModel.identity_id,
             )
             .where(AccountIdentityModel.platform == normalized_platform)
+            .where(AccountIdentityModel.canonical_email == normalize_email(email))
             .where(AccountIdentityAliasModel.alias_type == alias_type)
             .where(AccountIdentityAliasModel.normalized_value == value)
         ).all()
@@ -133,13 +142,19 @@ def _upsert_aliases(
     source: str,
 ) -> set[str]:
     now = _utcnow()
+    identity = session.get(AccountIdentityModel, identity_id)
+    identity_platform = normalize_alias(identity.platform if identity else "")
     conflicts: set[str] = set()
     for alias_type, value in aliases:
         rows = session.exec(
-            select(AccountIdentityAliasModel).where(
-                AccountIdentityAliasModel.alias_type == alias_type,
-                AccountIdentityAliasModel.normalized_value == value,
+            select(AccountIdentityAliasModel)
+            .join(
+                AccountIdentityModel,
+                AccountIdentityModel.id == AccountIdentityAliasModel.identity_id,
             )
+            .where(AccountIdentityModel.platform == identity_platform)
+            .where(AccountIdentityAliasModel.alias_type == alias_type)
+            .where(AccountIdentityAliasModel.normalized_value == value)
         ).all()
         other_ids = {
             str(row.identity_id)
@@ -157,6 +172,7 @@ def _upsert_aliases(
             session.add(
                 AccountIdentityAliasModel(
                     identity_id=identity_id,
+                    platform=identity_platform,
                     alias_type=alias_type,
                     normalized_value=value,
                     source=str(source or ""),
@@ -172,7 +188,7 @@ def _upsert_aliases(
     return conflicts
 
 
-def ensure_identity(
+def _ensure_identity_impl(
     database_engine,
     *,
     account_id: int,
@@ -199,32 +215,62 @@ def ensure_identity(
         chatgpt_account_id=chatgpt_account_id,
         credential_fingerprint_value=credential_fingerprint,
     )
-    strong_aliases = [alias for alias in aliases if alias[0] in _STRONG_ALIAS_TYPES]
+    identity_aliases = [alias for alias in aliases if alias[0] in _IDENTITY_ALIAS_TYPES]
+    fingerprint_aliases = [
+        alias for alias in aliases if alias[0] == "credential_fingerprint"
+    ]
 
     with Session(target_engine) as session:
+        existing_account = session.get(AccountModel, int(account_id or 0))
+        existing_identity_id = str(
+            getattr(existing_account, "identity_id", "") or ""
+        ).strip()
+        existing_identity = (
+            session.get(AccountIdentityModel, existing_identity_id)
+            if existing_identity_id
+            else None
+        )
         ids_by_alias = _identity_ids_for_aliases(
             session,
             platform=normalized_platform,
+            email=normalized_email,
             aliases=aliases,
         )
-        strong_ids = set().union(
-            *(ids_by_alias.get(alias, set()) for alias in strong_aliases)
+        identity_ids = set().union(
+            *(ids_by_alias.get(alias, set()) for alias in identity_aliases)
+        )
+        fingerprint_ids = set().union(
+            *(ids_by_alias.get(alias, set()) for alias in fingerprint_aliases)
         )
         email_ids = ids_by_alias.get(("email", normalized_email), set())
         conflict_ids: set[str] = set()
         created = False
 
-        if len(strong_ids) == 1:
-            identity_id = next(iter(strong_ids))
+        if (
+            existing_identity is not None
+            and normalize_alias(existing_identity.platform) == normalized_platform
+        ):
+            # A re-login/upsert of the same local row is authoritative even
+            # when every remote credential fingerprint has changed.
+            identity_id = str(existing_identity.id)
             if email_ids and not email_ids.issubset({identity_id}):
                 conflict_ids.update(email_ids)
                 conflict_ids.add(identity_id)
-                identity_id = ""
-        elif len(strong_ids) > 1:
-            conflict_ids.update(strong_ids)
+        elif len(identity_ids) == 1:
+            identity_id = next(iter(identity_ids))
+            if email_ids and not email_ids.issubset({identity_id}):
+                # An exact workspace/account alias is stronger than a shared
+                # email.  Reuse it, but keep every same-email identity marked
+                # ambiguous for operator visibility.
+                conflict_ids.update(email_ids)
+                conflict_ids.add(identity_id)
+        elif len(identity_ids) > 1:
+            conflict_ids.update(identity_ids)
             identity_id = ""
-        elif len(email_ids) == 1 and not strong_aliases:
+        elif len(email_ids) == 1 and not identity_aliases:
             identity_id = next(iter(email_ids))
+        elif len(fingerprint_ids) == 1 and not identity_aliases:
+            identity_id = next(iter(fingerprint_ids))
         else:
             identity_id = ""
             conflict_ids.update(email_ids)
@@ -274,9 +320,10 @@ def ensure_identity(
 
         account = session.get(AccountModel, int(account_id or 0))
         if account is not None:
-            account.identity_id = identity_id
-            account.updated_at = _utcnow()
-            session.add(account)
+            if str(account.identity_id or "") != identity_id:
+                account.identity_id = identity_id
+                account.updated_at = _utcnow()
+                session.add(account)
         else:
             # Legacy test databases or an import race may not have the row;
             # the identity remains valid and can be linked during reconcile.
@@ -292,6 +339,32 @@ def ensure_identity(
             created=created,
             ambiguous=identity.state == "ambiguous",
             state=str(identity.state or "active"),
+        )
+
+
+def ensure_identity(
+    database_engine,
+    *,
+    account_id: int,
+    platform: str,
+    email: str,
+    workspace_id: str = "",
+    chatgpt_account_id: str = "",
+    credential_fingerprint: str = "",
+    source: str = "",
+) -> IdentityResolution:
+    """Serialize local identity upserts and retry a transient uniqueness race."""
+
+    with _IDENTITY_MUTATION_LOCK:
+        return _ensure_identity_impl(
+            database_engine,
+            account_id=account_id,
+            platform=platform,
+            email=email,
+            workspace_id=workspace_id,
+            chatgpt_account_id=chatgpt_account_id,
+            credential_fingerprint=credential_fingerprint,
+            source=source,
         )
 
 
@@ -341,7 +414,7 @@ def _account_identity_values(account: AccountModel) -> dict[str, str]:
                 return value
         return ""
 
-    workspace_id = first("workspace_id", "workspaceId", "chatgpt_account_id", "chatgptAccountId")
+    workspace_id = first("workspace_id", "workspaceId")
     account_id = first("chatgpt_account_id", "chatgptAccountId", "account_id", "accountId")
     fingerprint = credential_fingerprint(
         account.platform,
@@ -373,7 +446,7 @@ def reconcile_existing_accounts(database_engine=None) -> int:
         return 0
     with Session(target_engine) as session:
         accounts = session.exec(
-            select(AccountModel).where(AccountModel.platform == "chatgpt")
+            select(AccountModel).where(func.lower(AccountModel.platform) == "chatgpt")
         ).all()
         account_values = [
             (
