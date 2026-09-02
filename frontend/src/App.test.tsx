@@ -59,6 +59,17 @@ describe('App primary navigation', () => {
     await waitFor(() => expect(window.location.pathname).toBe('/codex2api'))
   })
 
+  it('opens target management and pool scheduling from primary navigation', async () => {
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(await screen.findByText('目标节点'))
+    await waitFor(() => expect(window.location.pathname).toBe('/codex2api/targets'))
+
+    await user.click(screen.getByText('号池调度'))
+    await waitFor(() => expect(window.location.pathname).toBe('/codex2api/scheduler'))
+  })
+
   it('opens mail import from the primary navigation', async () => {
     const user = userEvent.setup()
     render(<App />)

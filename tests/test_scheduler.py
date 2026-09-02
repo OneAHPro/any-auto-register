@@ -21,6 +21,21 @@ def test_control_plane_intervals_match_health_quota_and_planning_cadence():
     assert scheduler._pool_planning_interval_seconds == 900
 
 
+def test_pool_planning_interval_uses_bounded_runtime_config(monkeypatch):
+    from core.config_store import config_store
+
+    scheduler = scheduler_module.Scheduler()
+    monkeypatch.setattr(
+        config_store,
+        "get",
+        lambda key, default="": "30"
+        if key == "codex2api_scheduler_interval_minutes"
+        else default,
+    )
+
+    assert scheduler._get_pool_planning_interval_seconds() == 1800
+
+
 def test_control_plane_due_jobs_are_woken_without_running_network_inline(monkeypatch):
     scheduler = scheduler_module.Scheduler()
     scheduler._last_target_health_at = 0

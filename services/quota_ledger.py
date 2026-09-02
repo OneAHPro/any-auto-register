@@ -434,6 +434,7 @@ def merge_remote_rows(
     remote_id: int | None = None,
     rows: Iterable[Mapping[str, Any]] | Mapping[str, Any],
     captured_at: datetime | None = None,
+    freshness_seconds: int = DEFAULT_FRESHNESS_SECONDS,
 ) -> dict[str, QuotaLedgerResult]:
     """Record the supported 5h/7d fields from a target account row."""
 
@@ -491,6 +492,7 @@ def merge_remote_rows(
             reset_at=reset,
             captured_at=effective_captured_at,
             source_updated_at=source_updated_at,
+            freshness_seconds=freshness_seconds,
         )
     return result
 

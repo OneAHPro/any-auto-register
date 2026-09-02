@@ -96,6 +96,38 @@ def _safe_json(value: str, default: Any) -> Any:
     return parsed
 
 
+_PRIVATE_PLAN_KEYS = {
+    "credential_revision",
+    "expected_credential_revision",
+    "admin_key",
+    "password",
+    "token",
+    "access_token",
+    "refresh_token",
+    "cookie",
+}
+
+
+def _public_plan_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            str(key): _public_plan_value(child)
+            for key, child in value.items()
+            if str(key).lower() not in _PRIVATE_PLAN_KEYS
+        }
+    if isinstance(value, list):
+        return [_public_plan_value(child) for child in value]
+    return value
+
+
+def _positive_int(value: Any) -> int:
+    try:
+        parsed = int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
+
+
 def _target_payload(target: Codex2APITargetModel, binding_count: int = 0) -> dict[str, Any]:
     return {
         "id": int(target.id or 0),
@@ -185,7 +217,7 @@ class PoolCreate(BaseModel):
 
 
 class SchedulerPlanRequest(BaseModel):
-    pool_id: str = ""
+    pool_id: str = Field(default="", max_length=64)
 
 
 class SchedulerApplyRequest(BaseModel):
@@ -524,13 +556,38 @@ def _latest_run(session: Session) -> SchedulerRunModel | None:
     ).first()
 
 
-def _run_payload(run: SchedulerRunModel) -> dict[str, Any]:
+def _run_payload(run: SchedulerRunModel, session: Session | None = None) -> dict[str, Any]:
+    plan = _public_plan_value(_safe_json(run.plan_json, {}))
+    if session is not None and isinstance(plan, dict):
+        actions = plan.get("actions")
+        if isinstance(actions, list):
+            account_ids = {
+                _positive_int(action.get("local_account_id"))
+                for action in actions
+                if isinstance(action, dict)
+                and _positive_int(action.get("local_account_id")) > 0
+            }
+            emails = {
+                int(account.id or 0): account.email
+                for account in session.exec(
+                    select(AccountModel).where(AccountModel.id.in_(account_ids))
+                ).all()
+            } if account_ids else {}
+            plan["actions"] = [
+                {
+                    **action,
+                    "email": emails.get(_positive_int(action.get("local_account_id")), ""),
+                }
+                if isinstance(action, dict)
+                else action
+                for action in actions
+            ]
     return {
         "id": run.id,
         "mode": run.mode,
         "status": run.status,
         "trigger": run.trigger,
-        "plan": _safe_json(run.plan_json, {}),
+        "plan": plan,
         "executed": _safe_json(run.executed_json, []),
         "errors": _safe_json(run.error_json, {}),
         "created_at": run.created_at.isoformat(),
@@ -541,7 +598,7 @@ def _run_payload(run: SchedulerRunModel) -> dict[str, Any]:
 @router.get("/scheduler/plan")
 def get_scheduler_plan(session: Session = Depends(get_session)):
     run = _latest_run(session)
-    return {"run": _run_payload(run) if run is not None else None}
+    return {"run": _run_payload(run, session) if run is not None else None}
 
 
 @router.post("/scheduler/plan")
@@ -549,13 +606,19 @@ def create_scheduler_plan(
     body: SchedulerPlanRequest,
     session: Session = Depends(get_session),
 ):
-    runs = generate_scheduled_plans(session.get_bind())
-    if body.pool_id:
-        runs = [run for run in runs if run.pool_id == body.pool_id]
+    pool_id = body.pool_id.strip().upper()
+    if pool_id and not _POOL_ID_RE.fullmatch(pool_id):
+        raise HTTPException(status_code=422, detail="号池 ID 格式无效")
+    runs = generate_scheduled_plans(session.get_bind(), pool_id=pool_id)
+    rows = [
+        row
+        for run in runs
+        if (row := session.get(SchedulerRunModel, run.id)) is not None
+    ]
     return {
         "operation_id": None,
         "status": "awaiting_confirmation",
-        "runs": [run.__dict__ for run in runs],
+        "runs": [_run_payload(row, session) for row in rows],
     }
 
 
@@ -648,7 +711,7 @@ def list_scheduler_runs(limit: int = 50, session: Session = Depends(get_session)
         .order_by(SchedulerRunModel.created_at.desc())
         .limit(max(1, min(int(limit), 200)))
     ).all()
-    return {"runs": [_run_payload(row) for row in rows]}
+    return {"runs": [_run_payload(row, session) for row in rows]}
 
 
 @router.post("/accounts/{account_id}/assignment", status_code=status.HTTP_202_ACCEPTED)

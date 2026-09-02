@@ -1,3 +1,4 @@
+import json
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
@@ -49,6 +50,7 @@ def test_safe_quota_uses_p25_only_after_twenty_observations():
     assert safe_quota([Decimal("1000")] * 19) == Decimal("1800.00")
     observations = [Decimal(value) for value in range(1000, 3000, 100)]
     assert safe_quota(observations) == Decimal("1400.00")
+    assert safe_quota([Decimal("5000")] * 20) == Decimal("1800.00")
 
 
 def test_scale_down_requires_two_low_cycles_and_minimum_lease():
@@ -79,6 +81,33 @@ def test_scale_down_requires_two_low_cycles_and_minimum_lease():
 
     assert blocked.scale_down_count == 0
     assert allowed.scale_down_count == 4
+
+
+def test_pool_thresholds_are_data_driven():
+    from services.pool_scheduler import PoolInput, plan_pool
+
+    buffered = plan_pool(
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=Decimal("1800"),
+            safe_7d_quota=Decimal("1800"),
+            scale_up_threshold_usd=Decimal("200"),
+            current_accounts=1,
+        )
+    )
+    shrink = plan_pool(
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=Decimal("1800"),
+            current_accounts=3,
+            utilization=Decimal("0.69"),
+            scale_down_utilization=Decimal("0.70"),
+            low_utilization_cycles=2,
+        )
+    )
+
+    assert buffered.desired_count == 2
+    assert shrink.scale_down_count == 2
 
 
 def test_stale_quota_or_unhealthy_target_is_observe_only():
@@ -132,6 +161,40 @@ def test_cost_estimate_uses_integer_safe_decimal_math():
     assert result.account_cost_cny == Decimal("1620.00")
     assert result.bandwidth_cost_cny == Decimal("3000.00")
     assert result.margin_cny == Decimal("-2820.00")
+
+
+def test_pool_plan_exposes_current_and_desired_costs_only_when_inputs_are_complete():
+    from services.pool_scheduler import PoolInput, plan_pool
+
+    estimated = plan_pool(
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=Decimal("3600"),
+            safe_7d_quota=Decimal("1800"),
+            current_accounts=1,
+            customer_price_cny_per_usd=Decimal("0.20"),
+            account_monthly_rent_cny=Decimal("1080"),
+            bandwidth_mbps=100,
+            bandwidth_price_per_mbps_cny=Decimal("30"),
+            operations_cost_cny=Decimal("200"),
+            cost_data_complete=True,
+        )
+    )
+    incomplete = plan_pool(
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=Decimal("3600"),
+            current_accounts=1,
+        )
+    )
+
+    assert estimated.cost_estimated is True
+    assert estimated.current_costs is not None
+    assert estimated.desired_costs is not None
+    assert estimated.current_costs.account_cost_cny == Decimal("1080.00")
+    assert estimated.desired_costs.account_cost_cny == Decimal("2160.00")
+    assert incomplete.cost_estimated is False
+    assert incomplete.current_costs is None
 
 
 def test_dry_run_must_be_confirmed_before_apply(monkeypatch):
@@ -221,6 +284,7 @@ def test_generate_scheduled_plan_uses_customer_usage_and_float_candidate():
                 base_url="https://b",
                 admin_key_ref="b",
                 health_status="healthy",
+                capability_json='{"migratable":true}',
             )
         )
         session.add(
@@ -233,11 +297,13 @@ def test_generate_scheduled_plan_uses_customer_usage_and_float_candidate():
                 safe_concurrency_per_account=3,
             )
         )
+        session.add(db.CustomerModel(id="customer-a", name="企业 A"))
         session.add(
             db.PoolTargetPolicyModel(
                 pool_id="ENTERPRISE_A_POOL",
                 target_id=2,
                 priority=1,
+                bandwidth_mbps=100,
             )
         )
         account = db.AccountModel(
@@ -313,3 +379,8 @@ def test_generate_scheduled_plan_uses_customer_usage_and_float_candidate():
     assert len(enterprise.actions) == 1
     assert enterprise.actions[0].identity_id == "identity-1"
     assert enterprise.actions[0].destination_target_id == 2
+    with Session(engine) as session:
+        stored = session.get(db.SchedulerRunModel, enterprise.id)
+    payload = json.loads(stored.plan_json)
+    assert payload["cost_estimated"] is True
+    assert payload["desired_costs"]["account_cost_cny"] == "2160.00"

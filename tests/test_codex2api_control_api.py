@@ -290,6 +290,40 @@ def test_plan_apply_requires_explicit_confirmation(monkeypatch):
     assert called == []
 
 
+def test_scheduler_plan_response_enriches_email_and_hides_credential_revision(monkeypatch):
+    client, engine, _module = build_client(monkeypatch)
+    account_id = seed_migratable_account(engine)
+    from services.pool_scheduler import AccountCandidate, PoolInput, create_dry_run
+
+    create_dry_run(
+        engine,
+        PoolInput(
+            pool_id="ENTERPRISE_A_POOL",
+            forecast_7d_usd=1800,
+            current_accounts=0,
+            candidates=(
+                AccountCandidate(
+                    identity_id="identity-1",
+                    local_account_id=account_id,
+                    source_target_id=1,
+                    destination_target_id=2,
+                    assignment_version=1,
+                    credential_revision="credential-digest",
+                    health="healthy",
+                    remaining_usd=900,
+                ),
+            ),
+        ),
+    )
+
+    response = client.get("/api/scheduler/plan")
+
+    assert response.status_code == 200
+    action = response.json()["run"]["plan"]["actions"][0]
+    assert action["email"] == "a@example.com"
+    assert "credential_revision" not in response.text
+
+
 def test_assignment_endpoint_queues_migration_operation(monkeypatch):
     client, engine, module = build_client(monkeypatch)
     account_id = seed_migratable_account(engine)

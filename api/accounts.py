@@ -5,8 +5,10 @@ from pydantic import BaseModel
 from core.db import (
     AccountAssignmentModel,
     AccountModel,
+    AccountPoolModel,
     AccountQuotaSnapshotModel,
     AccountTargetBindingModel,
+    Codex2APITargetModel,
     get_session,
 )
 from core.mail_import_delimiters import split_mail_import_fields
@@ -194,6 +196,21 @@ def _account_control_plane_summaries(
     assignment_by_identity: dict[str, AccountAssignmentModel] = {}
     for assignment in assignments:
         assignment_by_identity.setdefault(str(assignment.identity_id), assignment)
+    target_ids = {int(assignment.target_id) for assignment in assignments}
+    pool_ids = {str(assignment.pool_id) for assignment in assignments}
+    target_names = {
+        int(target.id): target.name
+        for target in session.exec(
+            select(Codex2APITargetModel).where(Codex2APITargetModel.id.in_(target_ids))
+        ).all()
+        if target.id is not None
+    } if target_ids else {}
+    pool_names = {
+        str(pool.id): pool.name
+        for pool in session.exec(
+            select(AccountPoolModel).where(AccountPoolModel.id.in_(pool_ids))
+        ).all()
+    } if pool_ids else {}
 
     bindings = session.exec(
         select(AccountTargetBindingModel).where(
@@ -224,7 +241,9 @@ def _account_control_plane_summaries(
         if assignment is not None:
             summary["assignment"] = {
                 "pool_id": assignment.pool_id,
+                "pool_name": pool_names.get(str(assignment.pool_id), ""),
                 "target_id": int(assignment.target_id),
+                "target_name": target_names.get(int(assignment.target_id), ""),
                 "state": assignment.state,
                 "lease_owner": assignment.lease_owner,
                 "lease_reason": assignment.lease_reason,

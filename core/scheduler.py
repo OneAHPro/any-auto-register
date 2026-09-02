@@ -75,6 +75,9 @@ class Scheduler:
             self._stop_event = stop_event
 
             now = time.monotonic()
+            self._pool_planning_interval_seconds = (
+                self._get_pool_planning_interval_seconds()
+            )
             # 保持 trial/CPA 启动后先等完整周期；自动重登由首轮 tick 自行排期。
             self._last_trial_check_at = now
             self._last_cpa_maintenance_at = now
@@ -211,6 +214,22 @@ class Scheduler:
         from services.cpa_manager import get_cpa_maintenance_interval_seconds
 
         return get_cpa_maintenance_interval_seconds()
+
+    def _get_pool_planning_interval_seconds(self) -> int:
+        from core.config_store import config_store
+
+        try:
+            configured = config_store.get(
+                "codex2api_scheduler_interval_minutes",
+                "15",
+            )
+        except Exception:
+            configured = "15"
+        try:
+            minutes = int(str(configured).strip())
+        except (TypeError, ValueError):
+            minutes = 15
+        return min(max(minutes, 1), 1440) * 60
 
     def check_trial_expiry(self):
         """检查 trial 到期账号，更新状态"""

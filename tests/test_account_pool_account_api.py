@@ -37,6 +37,21 @@ def test_account_response_includes_assignment_and_continuous_quota():
     )
     with Session(engine) as session:
         session.add(
+            db.Codex2APITargetModel(
+                id=2,
+                name="enterprise-node",
+                base_url="https://node",
+                admin_key_ref="key",
+            )
+        )
+        session.add(
+            db.AccountPoolModel(
+                id="ENTERPRISE_A_POOL",
+                name="企业 A 号池",
+                pool_type="enterprise",
+            )
+        )
+        session.add(
             db.AccountAssignmentModel(
                 identity_id=identity.identity_id,
                 local_account_id=account.id,
@@ -63,5 +78,7 @@ def test_account_response_includes_assignment_and_continuous_quota():
 
     assert response["assignment"]["pool_id"] == "ENTERPRISE_A_POOL"
     assert response["assignment"]["target_id"] == 2
+    assert response["assignment"]["target_name"] == "enterprise-node"
+    assert response["assignment"]["pool_name"] == "企业 A 号池"
     assert response["quota"]["7d"]["continuous_billed_usd"] == 100.0
     assert response["quota"]["7d"]["scheduler_eligible"] is True

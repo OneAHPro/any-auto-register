@@ -14,6 +14,8 @@ import {
   MobileOutlined,
   ApiOutlined,
   ImportOutlined,
+  CloudServerOutlined,
+  ControlOutlined,
 } from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import Dashboard from '@/pages/Dashboard'
@@ -25,6 +27,8 @@ import TaskHistory from '@/pages/TaskHistory'
 import RunningTasks from '@/pages/RunningTasks'
 import Login from '@/pages/Login'
 import SmsPool from '@/pages/SmsPool'
+import Codex2APITargets from '@/pages/Codex2APITargets'
+import Codex2APIScheduler from '@/pages/Codex2APIScheduler'
 import { darkTheme, lightTheme } from './theme'
 import { apiFetch, clearToken, getToken } from '@/lib/utils'
 
@@ -100,6 +104,8 @@ function AppContent() {
     if (path === '/history') return ['/history']
     if (path === '/proxies') return ['/proxies']
     if (path === '/sms-pool') return ['/sms-pool']
+    if (path.startsWith('/codex2api/targets')) return ['/codex2api/targets']
+    if (path.startsWith('/codex2api/scheduler')) return ['/codex2api/scheduler']
     if (path === '/codex2api') return ['/codex2api']
     if (path === '/mail-import') return ['/mail-import']
     if (path === '/settings') return ['/settings']
@@ -150,6 +156,16 @@ function AppContent() {
       label: 'Codex2API',
     },
     {
+      key: '/codex2api/targets',
+      icon: <CloudServerOutlined />,
+      label: '目标节点',
+    },
+    {
+      key: '/codex2api/scheduler',
+      icon: <ControlOutlined />,
+      label: '号池调度',
+    },
+    {
       key: '/mail-import',
       icon: <ImportOutlined />,
       label: '邮箱导入',
@@ -168,6 +184,11 @@ function AppContent() {
         <Sider
           collapsible
           collapsed={collapsed}
+          collapsedWidth={64}
+          breakpoint="lg"
+          onBreakpoint={(broken) => {
+            if (broken) setCollapsed(true)
+          }}
           onCollapse={setCollapsed}
           style={{
             position: 'sticky',
@@ -277,6 +298,8 @@ function AppContent() {
             <Route path="/sms-pool" element={<SmsPool />} />
             <Route path="/settings" element={<Settings />} />
             <Route path="/codex2api" element={<Settings page="codex2api" />} />
+            <Route path="/codex2api/targets" element={<Codex2APITargets />} />
+            <Route path="/codex2api/scheduler" element={<Codex2APIScheduler />} />
             <Route path="/mail-import" element={<Settings page="mail-import" />} />
           </Routes>
         </Content>

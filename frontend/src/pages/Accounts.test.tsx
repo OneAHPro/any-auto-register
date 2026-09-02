@@ -398,6 +398,43 @@ describe('Accounts ChatGPT staged login integration', () => {
     )
   })
 
+  it('renders current target, pool assignment, and continuous seven-day quota', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return {
+          items: [{
+            ...eligibleAccount,
+            assignment: {
+              target_id: 2,
+              pool_id: 'ENTERPRISE_A_POOL',
+              state: 'active',
+              lease_expires_at: '2026-09-04T00:00:00Z',
+            },
+            binding: { sync_status: 'synced', remote_status: 'active', enabled: true },
+            quota: {
+              '7d': {
+                continuous_remaining_usd: 900,
+                reset_at: '2026-09-05T00:00:00Z',
+                fresh: true,
+              },
+            },
+          }],
+          total: 1,
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    expect((await screen.findAllByText('当前目标')).length).toBeGreaterThan(0)
+    expect(screen.getAllByText('7天剩余').length).toBeGreaterThan(0)
+    expect(screen.getByText('目标 #2')).toBeTruthy()
+    expect(screen.getByText('ENTERPRISE_A_POOL')).toBeTruthy()
+    expect(screen.getByText('$900.00')).toBeTruthy()
+  })
+
   it('constrains long refresh-token previews inside their table cell', async () => {
     render(<Accounts />)
 

@@ -20,6 +20,7 @@ from core.db import (
     AccountTargetBindingModel,
     ChatGPTAuthStateModel,
     Codex2APITargetModel,
+    CustomerModel,
     CustomerUsageSampleModel,
     PoolTargetPolicyModel,
     SchedulerActionModel,
@@ -93,6 +94,15 @@ class AccountCandidate:
 
 
 @dataclass(frozen=True)
+class CostEstimate:
+    revenue_cny: Decimal
+    account_cost_cny: Decimal
+    bandwidth_cost_cny: Decimal
+    operations_cost_cny: Decimal
+    margin_cny: Decimal
+
+
+@dataclass(frozen=True)
 class PoolInput:
     pool_id: str
     forecast_7d_usd: Decimal = Decimal("0")
@@ -104,11 +114,20 @@ class PoolInput:
     pool_max_accounts: int = 0
     current_accounts: int = 0
     utilization: Decimal = Decimal("0")
+    scale_up_threshold_usd: Decimal = Decimal("0")
+    scale_down_utilization: Decimal = Decimal("0.60")
     low_utilization_cycles: int = 0
     min_lease_elapsed: bool = True
     quota_fresh: bool = True
     target_healthy: bool = True
     confirmation_required: bool = True
+    customer_price_cny_per_usd: Decimal = Decimal("0")
+    account_monthly_rent_cny: Decimal = Decimal("0")
+    bandwidth_mbps: int = 0
+    bandwidth_price_per_mbps_cny: Decimal = Decimal("0")
+    operations_cost_cny: Decimal = Decimal("0")
+    account_occupancy_ratio: Decimal = Decimal("1")
+    cost_data_complete: bool = False
     candidates: tuple[AccountCandidate, ...] = ()
 
 
@@ -135,15 +154,10 @@ class PoolPlan:
     requires_confirmation: bool
     blockers: tuple[str, ...] = ()
     actions: tuple[PoolAction, ...] = ()
-
-
-@dataclass(frozen=True)
-class CostEstimate:
-    revenue_cny: Decimal
-    account_cost_cny: Decimal
-    bandwidth_cost_cny: Decimal
-    operations_cost_cny: Decimal
-    margin_cny: Decimal
+    cost_estimated: bool = False
+    cost_note: str = "customer_usage_or_bandwidth_missing"
+    current_costs: CostEstimate | None = None
+    desired_costs: CostEstimate | None = None
 
 
 @dataclass(frozen=True)
@@ -161,7 +175,7 @@ def safe_quota(observations: Iterable[Decimal]) -> Decimal:
     if len(values) < 20:
         return DEFAULT_SAFE_7D_QUOTA
     index = int(math.floor((len(values) - 1) * 0.25))
-    return values[index]
+    return min(values[index], DEFAULT_SAFE_7D_QUOTA)
 
 
 def rank_candidates(candidates: Iterable[AccountCandidate]) -> list[AccountCandidate]:
@@ -221,6 +235,29 @@ def estimate_costs(
     )
 
 
+def _plan_costs(
+    pool: PoolInput,
+    *,
+    current_count: int,
+    desired_count: int,
+) -> tuple[CostEstimate | None, CostEstimate | None]:
+    if not pool.cost_data_complete:
+        return None, None
+    common = {
+        "customer_usage_usd": pool.forecast_7d_usd,
+        "customer_price_cny_per_usd": pool.customer_price_cny_per_usd,
+        "account_monthly_rent_cny": pool.account_monthly_rent_cny,
+        "occupancy_ratio": pool.account_occupancy_ratio,
+        "bandwidth_mbps": pool.bandwidth_mbps,
+        "bandwidth_price_per_mbps_cny": pool.bandwidth_price_per_mbps_cny,
+        "operations_cost_cny": pool.operations_cost_cny,
+    }
+    return (
+        estimate_costs(account_count=current_count, **common),
+        estimate_costs(account_count=desired_count, **common),
+    )
+
+
 def plan_pool(pool: PoolInput) -> PoolPlan:
     blockers: list[str] = []
     if not pool.quota_fresh:
@@ -228,15 +265,25 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
     if not pool.target_healthy:
         blockers.append("target_unhealthy")
     if blockers:
+        current = max(int(pool.current_accounts), 0)
+        current_costs, desired_costs = _plan_costs(
+            pool,
+            current_count=current,
+            desired_count=current,
+        )
         return PoolPlan(
             pool_id=pool.pool_id,
-            current_count=max(int(pool.current_accounts), 0),
-            desired_count=max(int(pool.current_accounts), 0),
+            current_count=current,
+            desired_count=current,
             scale_up_count=0,
             scale_down_count=0,
             executable=False,
             requires_confirmation=False,
             blockers=tuple(blockers),
+            cost_estimated=bool(pool.cost_data_complete),
+            cost_note="" if pool.cost_data_complete else "customer_usage_or_bandwidth_missing",
+            current_costs=current_costs,
+            desired_costs=desired_costs,
         )
 
     quota = (
@@ -244,7 +291,11 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
         if pool.historical_7d_outputs
         else _money(pool.safe_7d_quota or DEFAULT_SAFE_7D_QUOTA)
     )
-    required_by_quota = _ceil_ratio(_decimal(pool.forecast_7d_usd), quota)
+    required_by_quota = _ceil_ratio(
+        _decimal(pool.forecast_7d_usd)
+        + max(_decimal(pool.scale_up_threshold_usd), Decimal("0")),
+        quota,
+    )
     required_by_concurrency = _ceil_ratio(
         Decimal(max(int(pool.peak_concurrency), 0)),
         Decimal(max(int(pool.safe_concurrency_per_account), 1)),
@@ -257,7 +308,10 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
     scale_down = 0
     if current > desired:
         if (
-            _decimal(pool.utilization) < Decimal("0.60")
+            _decimal(pool.utilization) < max(
+                min(_decimal(pool.scale_down_utilization), Decimal("1")),
+                Decimal("0"),
+            )
             and int(pool.low_utilization_cycles) >= 2
             and bool(pool.min_lease_elapsed)
         ):
@@ -303,6 +357,11 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
                     reason="sustained_low_utilization",
                 )
             )
+    current_costs, desired_costs = _plan_costs(
+        pool,
+        current_count=current,
+        desired_count=desired,
+    )
     return PoolPlan(
         pool_id=pool.pool_id,
         current_count=current,
@@ -312,6 +371,10 @@ def plan_pool(pool: PoolInput) -> PoolPlan:
         executable=True,
         requires_confirmation=bool(pool.confirmation_required and (scale_up or scale_down)),
         actions=tuple(actions),
+        cost_estimated=bool(pool.cost_data_complete),
+        cost_note="" if pool.cost_data_complete else "customer_usage_or_bandwidth_missing",
+        current_costs=current_costs,
+        desired_costs=desired_costs,
     )
 
 
@@ -550,12 +613,38 @@ def _latest_quota_by_identity(
     return result
 
 
+def _historical_7d_outputs(
+    session: Session,
+    *,
+    now: datetime,
+) -> tuple[Decimal, ...]:
+    rows = session.exec(
+        select(AccountQuotaSnapshotModel)
+        .where(AccountQuotaSnapshotModel.window == "7d")
+        .where(AccountQuotaSnapshotModel.captured_at >= now - timedelta(days=120))
+        .order_by(AccountQuotaSnapshotModel.captured_at)
+    ).all()
+    cycle_max: dict[tuple[str, str], int] = {}
+    for row in rows:
+        if row.reset_at is None or row.billed_cents is None:
+            continue
+        reset_key = _aware(row.reset_at).isoformat()
+        key = (str(row.identity_id), reset_key)
+        cycle_max[key] = max(cycle_max.get(key, 0), int(row.billed_cents or 0))
+    return tuple(
+        Decimal(value) / Decimal("100")
+        for value in cycle_max.values()
+        if value > 0
+    )
+
+
 def _build_pool_candidates(
     session: Session,
     *,
     destination_target_id: int,
     destination_pool_id: str,
     now: datetime,
+    min_lease_hours: int = 6,
 ) -> tuple[AccountCandidate, ...]:
     assignments = session.exec(
         select(AccountAssignmentModel)
@@ -613,7 +702,7 @@ def _build_pool_candidates(
         lease_elapsed = bool(
             assignment.lease_started_at is None
             or now - _aware(assignment.lease_started_at)
-            >= timedelta(hours=6)
+            >= timedelta(hours=max(int(min_lease_hours), 1))
         )
         candidates.append(
             AccountCandidate(
@@ -641,22 +730,76 @@ def _build_pool_candidates(
     return tuple(candidates)
 
 
+def _runtime_config_decimal(
+    target_engine,
+    key: str,
+    default: Decimal,
+) -> Decimal:
+    if target_engine is not default_engine:
+        return default
+    try:
+        from core.config_store import config_store
+
+        return _decimal(config_store.get(key, str(default)), default)
+    except Exception:
+        return default
+
+
 def generate_scheduled_plans(
     database_engine=None,
     *,
     now: datetime | None = None,
+    pool_id: str = "",
 ) -> list[PersistedPlan]:
     """Build data-backed dry-run plans for every enabled logical pool."""
 
     target_engine = database_engine or default_engine
     generated_at = _aware(now)
     ensure_default_pools(target_engine)
+    account_rent = _runtime_config_decimal(
+        target_engine,
+        "account_monthly_rent_cny",
+        Decimal("1080"),
+    )
+    default_customer_price = _runtime_config_decimal(
+        target_engine,
+        "customer_price_per_usd",
+        Decimal("0.20"),
+    )
+    bandwidth_price = _runtime_config_decimal(
+        target_engine,
+        "bandwidth_price_per_mbps_cny",
+        Decimal("30"),
+    )
+    configured_min_lease_hours = max(
+        int(
+            _runtime_config_decimal(
+                target_engine,
+                "codex2api_scheduler_min_lease_hours",
+                Decimal("6"),
+            )
+        ),
+        1,
+    )
+    scale_up_threshold = _runtime_config_decimal(
+        target_engine,
+        "codex2api_scheduler_scale_up_threshold_usd",
+        Decimal("0"),
+    )
+    scale_down_utilization = _runtime_config_decimal(
+        target_engine,
+        "codex2api_scheduler_scale_down_utilization_percent",
+        Decimal("60"),
+    ) / Decimal("100")
     with Session(target_engine) as session:
-        pools = session.exec(
-            select(AccountPoolModel)
-            .where(AccountPoolModel.enabled == True)  # noqa: E712
-            .order_by(AccountPoolModel.id)
-        ).all()
+        pool_query = select(AccountPoolModel).where(
+            AccountPoolModel.enabled == True  # noqa: E712
+        )
+        if str(pool_id or "").strip():
+            pool_query = pool_query.where(
+                AccountPoolModel.id == str(pool_id).strip().upper()
+            )
+        pools = session.exec(pool_query.order_by(AccountPoolModel.id)).all()
         assignments = session.exec(
             select(AccountAssignmentModel).where(
                 AccountAssignmentModel.state == "active"
@@ -672,6 +815,10 @@ def generate_scheduled_plans(
             for row in session.exec(select(Codex2APITargetModel)).all()
             if row.id is not None
         }
+        customers = {
+            str(row.id): row
+            for row in session.exec(select(CustomerModel)).all()
+        }
         usage_rows = session.exec(
             select(CustomerUsageSampleModel).where(
                 CustomerUsageSampleModel.bucket_start >= generated_at - timedelta(days=7)
@@ -683,6 +830,10 @@ def generate_scheduled_plans(
             .order_by(SchedulerRunModel.created_at.desc())
             .limit(100)
         ).all()
+        historical_outputs = _historical_7d_outputs(
+            session,
+            now=generated_at,
+        )
         plans: list[tuple[PoolInput, str]] = []
         for pool in pools:
             current = sum(1 for row in assignments if row.pool_id == pool.id)
@@ -690,18 +841,30 @@ def generate_scheduled_plans(
             forecast = Decimal(sum(int(row.billed_cents or 0) for row in pool_usage)) / 100
             peak = max((int(row.peak_concurrency or 0) for row in pool_usage), default=0)
             policy = next((row for row in policies if row.pool_id == pool.id), None)
+            customer = customers.get(str(pool.customer_id or ""))
             destination_target_id = int(policy.target_id) if policy is not None else 0
             target = targets.get(destination_target_id)
+            try:
+                target_capabilities = json.loads(
+                    target.capability_json or "{}"
+                ) if target is not None else {}
+            except (TypeError, ValueError):
+                target_capabilities = {}
             target_healthy = bool(
                 target is not None
                 and target.enabled
                 and target.health_status == "healthy"
+                and target_capabilities.get("migratable") is True
             )
             candidates = _build_pool_candidates(
                 session,
                 destination_target_id=destination_target_id,
                 destination_pool_id=str(pool.id),
                 now=generated_at,
+                min_lease_hours=max(
+                    int(pool.min_lease_hours or 0),
+                    configured_min_lease_hours,
+                ),
             ) if destination_target_id else ()
             capacity = Decimal(max(current, 1)) * DEFAULT_SAFE_7D_QUOTA
             utilization = min(forecast / capacity, Decimal("1")) if capacity > 0 else Decimal("0")
@@ -726,6 +889,7 @@ def generate_scheduled_plans(
                 pool_id=str(pool.id),
                 forecast_7d_usd=forecast,
                 safe_7d_quota=DEFAULT_SAFE_7D_QUOTA,
+                historical_7d_outputs=historical_outputs,
                 peak_concurrency=peak,
                 safe_concurrency_per_account=max(
                     int(pool.safe_concurrency_per_account or 1), 1
@@ -734,6 +898,8 @@ def generate_scheduled_plans(
                 pool_max_accounts=max(int(pool.max_accounts or 0), 0),
                 current_accounts=current,
                 utilization=utilization,
+                scale_up_threshold_usd=scale_up_threshold,
+                scale_down_utilization=scale_down_utilization,
                 low_utilization_cycles=low_cycles,
                 min_lease_elapsed=True,
                 quota_fresh=all(
@@ -745,6 +911,30 @@ def generate_scheduled_plans(
                     else str(pool.pool_type) in {"public", "float", "standby"}
                 ),
                 confirmation_required=True,
+                customer_price_cny_per_usd=(
+                    Decimal(int(customer.price_cny_micros_per_usd or 0))
+                    / Decimal("1000000")
+                    if customer is not None
+                    else default_customer_price
+                ),
+                account_monthly_rent_cny=account_rent,
+                bandwidth_mbps=max(int(policy.bandwidth_mbps or 0), 0)
+                if policy is not None
+                else 0,
+                bandwidth_price_per_mbps_cny=bandwidth_price,
+                operations_cost_cny=(
+                    Decimal(int(customer.operations_cost_cents_monthly or 0))
+                    / Decimal("100")
+                    if customer is not None
+                    else Decimal("0")
+                ),
+                account_occupancy_ratio=Decimal("1"),
+                cost_data_complete=bool(
+                    customer is not None
+                    and pool_usage
+                    and policy is not None
+                    and int(policy.bandwidth_mbps or 0) > 0
+                ),
                 candidates=candidates,
             )
             plans.append((pool_input, str(pool.pool_type)))

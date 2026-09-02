@@ -207,6 +207,207 @@ code {
   flex-wrap: wrap;
 }
 
+/* ── Codex2API 控制面 ───────────────────── */
+.control-plane-page {
+  width: 100%;
+  max-width: 1680px;
+  margin: 0 auto;
+}
+
+.control-plane-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 24px;
+  margin-bottom: 18px;
+}
+
+.control-plane-eyebrow {
+  color: #818cf8;
+  font-family: var(--font-family-mono);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.16em;
+}
+
+.control-plane-metrics {
+  margin-bottom: 16px;
+}
+
+.control-metric-card .ant-card-body {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 82px;
+}
+
+.control-metric-card .anticon {
+  color: #818cf8;
+  font-size: 22px;
+}
+
+.control-metric-card--healthy .anticon {
+  color: #34d399;
+}
+
+.control-metric-card strong,
+.control-metric-card span {
+  display: block;
+}
+
+.control-metric-card strong {
+  font-family: var(--font-family-mono);
+  font-size: 22px;
+  line-height: 1.1;
+}
+
+.control-metric-card span {
+  margin-top: 4px;
+  opacity: 0.66;
+  font-size: 12px;
+}
+
+.control-plane-table-card {
+  margin-top: 16px;
+  overflow: hidden;
+}
+
+.control-plane-rail {
+  display: inline-block;
+  width: 28px;
+  height: 3px;
+  border-radius: 3px;
+  background: #22d3ee;
+  box-shadow: 10px 0 0 rgba(99, 102, 241, 0.65);
+}
+
+.target-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #64748b;
+}
+
+.target-status-dot--healthy {
+  background: #34d399;
+  box-shadow: 0 0 0 4px rgba(52, 211, 153, 0.12);
+}
+
+.target-status-dot--recovering {
+  background: #60a5fa;
+  box-shadow: 0 0 0 4px rgba(96, 165, 250, 0.12);
+}
+
+.target-status-dot--degraded {
+  background: #fb7185;
+  box-shadow: 0 0 0 4px rgba(251, 113, 133, 0.12);
+}
+
+.pool-chip-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+
+.pool-chip {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+  padding: 12px 14px;
+  border: 1px solid;
+  border-radius: 8px;
+}
+
+.pool-chip > div:first-child {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.scheduler-plan-card {
+  overflow: hidden;
+}
+
+.scheduler-plan-strip {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(300px, 1.4fr) auto;
+  align-items: center;
+  gap: 24px;
+  padding: 20px 22px;
+  border-left: 3px solid #22d3ee;
+}
+
+.scheduler-plan-strip h3 {
+  margin: 3px 0 0 !important;
+}
+
+.scheduler-capacity-path,
+.scheduler-plan-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.scheduler-capacity-path span,
+.scheduler-capacity-path strong {
+  white-space: nowrap;
+}
+
+.scheduler-capacity-path strong {
+  font-family: var(--font-family-mono);
+  font-size: 18px;
+}
+
+.scheduler-plan-actions {
+  justify-content: flex-end;
+}
+
+.scheduler-signal-grid {
+  border-top: 1px solid rgba(127, 127, 127, 0.18);
+}
+
+.scheduler-signal {
+  display: flex;
+  flex-direction: column;
+  min-height: 116px;
+  padding: 18px 22px;
+  border-right: 1px solid rgba(127, 127, 127, 0.18);
+}
+
+.scheduler-signal-grid > div:last-child .scheduler-signal {
+  border-right: 0;
+}
+
+.scheduler-signal strong {
+  margin: 6px 0 3px;
+  font-family: var(--font-family-mono);
+  font-size: 20px;
+}
+
+.scheduler-signal span {
+  opacity: 0.66;
+  font-size: 12px;
+}
+
+.quota-history-list {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  margin-top: 14px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(127, 127, 127, 0.18);
+}
+
+.quota-history-row {
+  display: grid;
+  grid-template-columns: minmax(160px, 1fr) minmax(100px, auto) auto;
+  align-items: center;
+  gap: 10px;
+}
+
 @media (max-width: 1099px) and (pointer: coarse) {
   .running-task-card__actions .ant-btn {
     min-height: 44px;
@@ -216,6 +417,40 @@ code {
 @media (max-width: 767px) {
   .app-content {
     padding: 12px !important;
+  }
+
+  .control-plane-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .scheduler-plan-strip {
+    grid-template-columns: 1fr;
+  }
+
+  .scheduler-plan-actions {
+    justify-content: flex-start;
+  }
+
+  .scheduler-signal {
+    border-right: 0;
+    border-bottom: 1px solid rgba(127, 127, 127, 0.18);
+  }
+
+  .quota-history-row {
+    grid-template-columns: 1fr auto;
+  }
+
+  .quota-history-row > :first-child {
+    grid-column: 1 / -1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .control-plane-page,
+  .target-status-dot {
+    animation: none !important;
+    transition: none !important;
   }
 }
 

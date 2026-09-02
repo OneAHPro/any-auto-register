@@ -15,7 +15,9 @@ import {
   Dropdown,
   Typography,
   Alert,
+  Descriptions,
   DatePicker,
+  Timeline,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
@@ -173,7 +175,7 @@ function batchFailureDetails(items: BatchDeleteItem[]): string {
   return details.join('；')
 }
 
-function formatSyncTime(value?: string) {
+function formatSyncTime(value?: string | null) {
   if (!value) return ''
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
@@ -189,6 +191,83 @@ function formatCreatedAt(value?: string) {
     date: date.toLocaleDateString(),
     time: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
   }
+}
+
+function formatUsd(value: unknown) {
+  if (value === null || value === undefined || value === '') return '-'
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? `$${parsed.toFixed(2)}` : '-'
+}
+
+function assignmentStateMeta(value?: string) {
+  switch (value) {
+    case 'active':
+      return { color: 'success', label: '生效中' }
+    case 'draining':
+      return { color: 'processing', label: '排空中' }
+    case 'standby':
+      return { color: 'default', label: '备用' }
+    default:
+      return { color: 'default', label: '未分配' }
+  }
+}
+
+function migrationStateMeta(value?: string) {
+  switch (value) {
+    case 'committed':
+      return { color: 'green', label: '迁移完成' }
+    case 'rolled_back':
+      return { color: 'gray', label: '已回滚' }
+    case 'rollback_required':
+      return { color: 'red', label: '需人工回滚' }
+    case 'cleanup_pending':
+      return { color: 'orange', label: '待清理源副本' }
+    default:
+      return { color: 'blue', label: '迁移中' }
+  }
+}
+
+interface ControlTargetOption {
+  id: number
+  name: string
+  health_status: string
+  enabled: boolean
+}
+
+interface ControlPoolOption {
+  id: string
+  name: string
+  target_id?: number | null
+}
+
+interface MigrationRecord {
+  id: string
+  state: string
+  step: string
+  source_target_id: number
+  destination_target_id: number
+  error?: Record<string, unknown>
+  created_at: string
+  updated_at: string
+}
+
+interface AccountQuotaView {
+  continuous_remaining_usd?: unknown
+  remaining_usd?: unknown
+  reset_at?: string | null
+  captured_at?: string | null
+  fresh?: boolean
+}
+
+interface AccountControlRow {
+  assignment?: {
+    target_id?: number
+    target_name?: string
+    pool_id?: string
+    pool_name?: string
+    state?: string
+  } | null
+  quota?: Record<string, AccountQuotaView>
 }
 
 function authStateMeta(state?: string) {
@@ -657,6 +736,14 @@ export default function Accounts() {
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [detailModalOpen, setDetailModalOpen] = useState(false)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
+  const [controlQuota, setControlQuota] = useState<Record<string, AccountQuotaView>>({})
+  const [quotaHistory, setQuotaHistory] = useState<AccountQuotaView[]>([])
+  const [migrations, setMigrations] = useState<MigrationRecord[]>([])
+  const [controlDetailLoading, setControlDetailLoading] = useState(false)
+  const [assignmentModalOpen, setAssignmentModalOpen] = useState(false)
+  const [assignmentLoading, setAssignmentLoading] = useState(false)
+  const [controlTargets, setControlTargets] = useState<ControlTargetOption[]>([])
+  const [controlPools, setControlPools] = useState<ControlPoolOption[]>([])
   const [existingAccountLoginModalOpen, setExistingAccountLoginModalOpen] = useState(false)
   const [phoneVerificationAccount, setPhoneVerificationAccount] =
     useState<ChatGPTPhoneVerificationAccount | null>(null)
@@ -664,6 +751,7 @@ export default function Accounts() {
   const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
+  const [assignmentForm] = Form.useForm()
   const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
     usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
@@ -709,6 +797,43 @@ export default function Accounts() {
       token: currentAccount.token,
     })
   }, [detailModalOpen, currentAccount, detailForm])
+
+  useEffect(() => {
+    let cancelled = false
+    const timer = window.setTimeout(() => {
+      if (!detailModalOpen || !currentAccount || currentPlatform !== 'chatgpt') {
+        setControlQuota({})
+        setQuotaHistory([])
+        setMigrations([])
+        return
+      }
+      setControlDetailLoading(true)
+      Promise.all([
+        apiFetch(`/accounts/${currentAccount.id}/quota`),
+        apiFetch(`/accounts/${currentAccount.id}/quota/history?window=7d&limit=50`),
+        apiFetch(`/accounts/${currentAccount.id}/migrations`),
+      ])
+        .then(([quotaData, historyData, migrationData]) => {
+          if (cancelled) return
+          setControlQuota(quotaData?.windows || {})
+          setQuotaHistory(Array.isArray(historyData?.items) ? historyData.items : [])
+          setMigrations(Array.isArray(migrationData?.migrations) ? migrationData.migrations : [])
+        })
+        .catch(() => {
+          if (cancelled) return
+          setControlQuota(currentAccount.quota || {})
+          setQuotaHistory([])
+          setMigrations([])
+        })
+        .finally(() => {
+          if (!cancelled) setControlDetailLoading(false)
+        })
+    }, 0)
+    return () => {
+      cancelled = true
+      window.clearTimeout(timer)
+    }
+  }, [detailModalOpen, currentAccount, currentPlatform])
 
   const load = useCallback(async () => {
     if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
@@ -1184,6 +1309,53 @@ export default function Accounts() {
     load()
   }
 
+  const openAssignmentEditor = async () => {
+    if (!currentAccount) return
+    setAssignmentLoading(true)
+    try {
+      const [targetData, poolData] = await Promise.all([
+        apiFetch('/codex2api/targets'),
+        apiFetch('/codex2api/pools'),
+      ])
+      const targetRows = Array.isArray(targetData?.targets) ? targetData.targets : []
+      const poolRows = Array.isArray(poolData?.pools) ? poolData.pools : []
+      setControlTargets(targetRows)
+      setControlPools(poolRows)
+      assignmentForm.setFieldsValue({
+        target_id: currentAccount.assignment?.target_id,
+        pool_id: currentAccount.assignment?.pool_id,
+        reason: 'manual_assignment',
+      })
+      setAssignmentModalOpen(true)
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      message.error(`加载可选归属失败：${detail}`)
+    } finally {
+      setAssignmentLoading(false)
+    }
+  }
+
+  const saveAssignment = async () => {
+    if (!currentAccount) return
+    const values = await assignmentForm.validateFields()
+    setAssignmentLoading(true)
+    try {
+      const result = await apiFetch(`/accounts/${currentAccount.id}/assignment`, {
+        method: 'POST',
+        body: JSON.stringify(values),
+      })
+      setAssignmentModalOpen(false)
+      message.success(result?.operation_id ? '迁移已入队' : '号池归属已更新')
+      setDetailModalOpen(false)
+      await load()
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : String(error || '请求失败')
+      message.error(`调整归属失败：${detail}`)
+    } finally {
+      setAssignmentLoading(false)
+    }
+  }
+
   const showCpaSyncResult = (title: string, result: any) => {
     const lines = (result.items || [])
       .flatMap((item: any) =>
@@ -1594,6 +1766,54 @@ export default function Accounts() {
 
   if (isChatgptPlatform) {
     columns.push(
+      {
+        title: '当前目标',
+        key: 'assignment',
+        width: 210,
+        render: (_: unknown, record: AccountControlRow) => {
+          const assignment = record.assignment || {}
+          const meta = assignmentStateMeta(assignment.state)
+          return (
+            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
+              <Space size={6} wrap>
+                <Tag color={assignment.target_id ? 'blue' : 'default'}>
+                  {assignment.target_id
+                    ? assignment.target_name || `目标 #${assignment.target_id}`
+                    : '未分配'}
+                </Tag>
+                <Tag color={meta.color}>{meta.label}</Tag>
+              </Space>
+              <Text
+                type="secondary"
+                style={secondaryTextStyle}
+                ellipsis={{ tooltip: assignment.pool_name || assignment.pool_id || '未分配号池' }}
+              >
+                {assignment.pool_name || assignment.pool_id || '未分配号池'}
+              </Text>
+            </div>
+          )
+        },
+      },
+      {
+        title: '7天剩余',
+        key: 'quota_7d',
+        width: 180,
+        render: (_: unknown, record: AccountControlRow) => {
+          const quota = record.quota?.['7d'] || {}
+          const remaining = quota.continuous_remaining_usd ?? quota.remaining_usd
+          return (
+            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
+              <Space size={6}>
+                <Text strong>{formatUsd(remaining)}</Text>
+                {quota.fresh === false ? <Tag color="warning">已过期</Tag> : null}
+              </Space>
+              <Text type="secondary" style={secondaryTextStyle}>
+                {quota.reset_at ? `重置 ${formatSyncTime(quota.reset_at)}` : '尚无额度快照'}
+              </Text>
+            </div>
+          )
+        },
+      },
       {
         title: '本地状态',
         key: 'chatgpt_local_state',
@@ -2026,7 +2246,7 @@ export default function Accounts() {
           onChange: setSelectedRowKeys,
         }}
         pagination={{ total, current: page, pageSize, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'], onChange: (p, ps) => { setPage(p); setPageSize(ps) } }}
-        scroll={{ x: isChatgptPlatform ? 1440 : 980 }}
+        scroll={{ x: isChatgptPlatform ? 1830 : 980 }}
         onRow={(record) => ({
           onDoubleClick: () => {
             setCurrentAccount(record)
@@ -2226,6 +2446,91 @@ export default function Accounts() {
               </DetailSection>
             ) : null}
             {currentPlatform === 'chatgpt' ? (
+              <DetailSection title="号池归属与连续额度">
+                {(() => {
+                  const assignment = currentAccount.assignment || {}
+                  const binding = currentAccount.binding || {}
+                  const windows = Object.keys(controlQuota).length ? controlQuota : (currentAccount.quota || {})
+                  const fiveHour = windows['5h'] || {}
+                  const sevenDay = windows['7d'] || {}
+                  const assignmentMeta = assignmentStateMeta(assignment.state)
+                  return (
+                    <>
+                      <Descriptions size="small" column={{ xs: 1, sm: 2 }}>
+                        <Descriptions.Item label="当前目标">
+                          {assignment.target_id
+                            ? assignment.target_name || `目标 #${assignment.target_id}`
+                            : '未分配'}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="当前号池">
+                          {assignment.pool_name || assignment.pool_id || '未分配'}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="租约状态"><Tag color={assignmentMeta.color}>{assignmentMeta.label}</Tag></Descriptions.Item>
+                        <Descriptions.Item label="绑定状态">{binding.sync_status || '尚未同步'}</Descriptions.Item>
+                        <Descriptions.Item label="5 小时剩余">
+                          {formatUsd(fiveHour.continuous_remaining_usd ?? fiveHour.remaining_usd)}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="7 天剩余">
+                          {formatUsd(sevenDay.continuous_remaining_usd ?? sevenDay.remaining_usd)}
+                        </Descriptions.Item>
+                        <Descriptions.Item label="7 天重置时间" span={2}>
+                          {sevenDay.reset_at ? formatSyncTime(sevenDay.reset_at) : '尚无数据'}
+                        </Descriptions.Item>
+                      </Descriptions>
+                      <Button
+                        size="small"
+                        loading={assignmentLoading}
+                        onClick={openAssignmentEditor}
+                        style={{ marginTop: 10 }}
+                      >
+                        调整目标与号池
+                      </Button>
+                      {controlDetailLoading ? <Text type="secondary" style={{ marginLeft: 10 }}>正在读取最新账本…</Text> : null}
+                    </>
+                  )
+                })()}
+
+                {quotaHistory.length ? (
+                  <div className="quota-history-list">
+                    <Text strong>7 天额度采样</Text>
+                    {quotaHistory.slice(0, 6).map((item, index) => (
+                      <div className="quota-history-row" key={`${item.captured_at || index}:${index}`}>
+                        <Text type="secondary">{formatSyncTime(item.captured_at)}</Text>
+                        <Text>{formatUsd(item.continuous_remaining_usd ?? item.remaining_usd)} 剩余</Text>
+                        <Tag color={item.fresh === false ? 'warning' : 'success'}>{item.fresh === false ? '过期' : '有效'}</Tag>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+              </DetailSection>
+            ) : null}
+            {currentPlatform === 'chatgpt' && migrations.length ? (
+              <DetailSection title="迁移时间线">
+                <Timeline
+                  items={migrations.map((item) => {
+                    const meta = migrationStateMeta(item.state)
+                    const errorMessage = item.error && typeof item.error === 'object'
+                      ? String(item.error.message || item.error.detail || '')
+                      : ''
+                    return {
+                      color: meta.color,
+                      children: (
+                        <div>
+                          <Space wrap>
+                            <Tag color={meta.color}>{meta.label}</Tag>
+                            <Text>目标 #{item.source_target_id} → 目标 #{item.destination_target_id}</Text>
+                            <Text type="secondary">{formatSyncTime(item.updated_at || item.created_at)}</Text>
+                          </Space>
+                          <div><Text type="secondary">当前步骤：{item.step || item.state}</Text></div>
+                          {errorMessage ? <Alert type="warning" showIcon message={errorMessage} style={{ marginTop: 8 }} /> : null}
+                        </div>
+                      ),
+                    }
+                  })}
+                />
+              </DetailSection>
+            ) : null}
+            {currentPlatform === 'chatgpt' ? (
               <DetailSection title="本地真实状态">
                 {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
                   <LocalProbeSummary probe={currentAccount.chatgptLocal} />
@@ -2245,6 +2550,42 @@ export default function Accounts() {
             ) : null}
           </>
         )}
+      </Modal>
+
+      <Modal
+        title={`调整账号归属${currentAccount?.email ? ` · ${currentAccount.email}` : ''}`}
+        open={assignmentModalOpen}
+        onCancel={() => setAssignmentModalOpen(false)}
+        onOk={saveAssignment}
+        okText="确认调整"
+        cancelText="取消"
+        confirmLoading={assignmentLoading}
+        destroyOnHidden
+      >
+        <Alert
+          type="info"
+          showIcon
+          message="跨目标调整会启动可恢复迁移"
+          description="源账号会先排空，目标端验证成功后才提交归属。"
+          style={{ marginBottom: 16 }}
+        />
+        <Form form={assignmentForm} layout="vertical">
+          <Form.Item name="target_id" label="目标节点" rules={[{ required: true, message: '请选择目标节点' }]}>
+            <Select
+              options={controlTargets.map(item => ({
+                value: item.id,
+                label: `${item.name} · #${item.id}${item.health_status === 'healthy' ? '' : ' · 未就绪'}`,
+                disabled: !item.enabled || item.health_status !== 'healthy',
+              }))}
+            />
+          </Form.Item>
+          <Form.Item name="pool_id" label="逻辑号池" rules={[{ required: true, message: '请选择号池' }]}>
+            <Select options={controlPools.map(item => ({ value: item.id, label: `${item.name} · ${item.id}` }))} />
+          </Form.Item>
+          <Form.Item name="reason" label="调整原因" rules={[{ required: true }]}>
+            <Input maxLength={200} />
+          </Form.Item>
+        </Form>
       </Modal>
     </div>
   )

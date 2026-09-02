@@ -276,12 +276,31 @@ def collect_target_quota(
     now: datetime | None = None,
     probe_poll_attempts: int = 30,
     probe_poll_interval_seconds: float = 1,
+    freshness_seconds: int | None = None,
     sleep_fn=time.sleep,
 ) -> TargetQuotaResult:
     """Run one target-level probe and persist every bound account snapshot."""
 
     target_engine = database_engine or default_engine
     captured_at = _aware(now)
+    if freshness_seconds is None:
+        configured_minutes = 15
+        if target_engine is default_engine:
+            try:
+                from core.config_store import config_store
+
+                configured_minutes = int(
+                    str(
+                        config_store.get(
+                            "codex2api_scheduler_quota_freshness_minutes",
+                            "15",
+                        )
+                    ).strip()
+                )
+            except Exception:
+                configured_minutes = 15
+        freshness_seconds = min(max(configured_minutes, 1), 1440) * 60
+    freshness_seconds = min(max(int(freshness_seconds), 1), 86400)
     with Session(target_engine) as session:
         target = session.get(Codex2APITargetModel, int(target_id))
         if target is None:
@@ -364,6 +383,7 @@ def collect_target_quota(
             email=str(item["remote_email"]),
             rows=[row],
             captured_at=captured_at,
+            freshness_seconds=freshness_seconds,
         )
         with Session(target_engine) as session:
             binding = session.get(AccountTargetBindingModel, int(item["id"]))

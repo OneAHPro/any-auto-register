@@ -347,6 +347,26 @@ const TAB_ITEMS = [
           },
         ],
       },
+      {
+        title: '账号池观测与计划',
+        desc: '定时采集目标健康度和额度，只生成预览计划；扩容、缩容均需在调度页人工确认。',
+        fields: [
+          {
+            key: 'codex2api_scheduler_enabled',
+            label: '启用额度采集与预览计划',
+            type: 'boolean',
+            help: '启用后不会自动迁移账号。',
+          },
+          { key: 'codex2api_scheduler_interval_minutes', label: '计划周期（分钟）', placeholder: '15' },
+          { key: 'codex2api_scheduler_min_lease_hours', label: '最小租约（小时）', placeholder: '6' },
+          { key: 'codex2api_scheduler_scale_up_threshold_usd', label: '扩容安全余量（美元）', placeholder: '0.00' },
+          { key: 'codex2api_scheduler_scale_down_utilization_percent', label: '缩容利用率阈值（%）', placeholder: '60' },
+          { key: 'codex2api_scheduler_quota_freshness_minutes', label: '额度有效期（分钟）', placeholder: '15' },
+          { key: 'account_monthly_rent_cny', label: '账号月租（元）', placeholder: '1080.00' },
+          { key: 'customer_price_per_usd', label: '客户每美元用量单价（元）', placeholder: '0.20' },
+          { key: 'bandwidth_price_per_mbps_cny', label: '带宽单价（元/Mbps）', placeholder: '30.00' },
+        ],
+      },
     ],
   },
   {

@@ -141,7 +141,13 @@ def test_quota_collection_batches_target_and_updates_binding_and_ledger():
         session.commit()
     client = FakeClient()
 
-    result = collect_target_quota(engine, target_id=1, client=client, now=NOW)
+    result = collect_target_quota(
+        engine,
+        target_id=1,
+        client=client,
+        now=NOW,
+        freshness_seconds=60,
+    )
 
     assert result.collected_accounts == 1
     assert client.calls == ["probe", "runtime", "list"]
@@ -153,6 +159,7 @@ def test_quota_collection_batches_target_and_updates_binding_and_ledger():
     assert snapshot.identity_id == "identity-1"
     assert snapshot.window == "7d"
     assert snapshot.billed_cents == 10000
+    assert snapshot.freshness_seconds == 60
 
 
 def test_quota_collection_marks_missing_remote_binding_without_creating_snapshot():
