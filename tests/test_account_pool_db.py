@@ -31,6 +31,12 @@ def test_pool_tables_and_account_identity_column_are_created():
         "account_migrations",
         "scheduler_runs",
         "scheduler_actions",
+        "customers",
+        "account_pools",
+        "pool_target_policies",
+        "account_assignment_events",
+        "account_quota_rollups",
+        "customer_usage_samples",
     } <= tables
     with engine.connect() as connection:
         columns = {
@@ -132,3 +138,73 @@ def test_schema_migration_survives_duplicate_strong_aliases():
             )
         }
     assert states == {"i-1": "ambiguous", "i-2": "ambiguous"}
+
+
+def test_account_cleanup_retires_control_plane_state_but_preserves_quota():
+    from datetime import datetime, timezone
+
+    engine = make_engine()
+    db.init_account_pool_schema(engine)
+    with Session(engine) as session:
+        account = db.AccountModel(
+            platform="chatgpt",
+            email="retire@example.com",
+            password="password",
+            identity_id="identity-1",
+        )
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+        session.add(
+            db.AccountIdentityModel(
+                id="identity-1",
+                platform="chatgpt",
+                canonical_email=account.email,
+                current_account_id=account.id,
+            )
+        )
+        session.add(
+            db.AccountAssignmentModel(
+                identity_id="identity-1",
+                local_account_id=account.id,
+                pool_id="PUBLIC_POOL",
+                target_id=1,
+                state="active",
+            )
+        )
+        session.add(
+            db.AccountTargetBindingModel(
+                identity_id="identity-1",
+                local_account_id=account.id,
+                target_id=1,
+                remote_account_id=77,
+                enabled=True,
+            )
+        )
+        session.add(
+            db.AccountQuotaSnapshotModel(
+                identity_id="identity-1",
+                local_account_id=account.id,
+                target_id=1,
+                window="7d",
+                billed_usd=100,
+                continuous_billed_usd=100,
+                reset_at=datetime(2026, 9, 5, tzinfo=timezone.utc),
+            )
+        )
+        session.commit()
+
+        db.cleanup_chatgpt_account_dependents(session, account.id)
+        session.commit()
+
+        identity = session.get(db.AccountIdentityModel, "identity-1")
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        quota = session.exec(select(db.AccountQuotaSnapshotModel)).one()
+
+    assert identity.state == "retired"
+    assert identity.current_account_id == 0
+    assert assignment.state == "revoked"
+    assert binding.enabled is False
+    assert binding.sync_status == "retired"
+    assert quota.continuous_billed_usd == 100

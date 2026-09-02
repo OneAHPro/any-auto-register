@@ -47,6 +47,22 @@ def _money(value: Any) -> Decimal | None:
         return None
 
 
+def _cents(value: Decimal | None) -> int | None:
+    if value is None:
+        return None
+    return int((value * 100).to_integral_value(rounding=ROUND_HALF_UP))
+
+
+def _money_from_columns(row: Any, cents_name: str, legacy_name: str) -> Decimal | None:
+    cents = getattr(row, cents_name, None)
+    if cents is not None:
+        try:
+            return (Decimal(int(cents)) / 100).quantize(CENT)
+        except (TypeError, ValueError, InvalidOperation):
+            return None
+    return _money(getattr(row, legacy_name, None))
+
+
 def _coerce_datetime(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -102,16 +118,18 @@ class QuotaLedgerResult:
 
 
 def _result_from_row(row: AccountQuotaSnapshotModel) -> QuotaLedgerResult:
-    billed = _money(row.billed_usd)
-    continuous = _money(
-        row.continuous_billed_usd
-        if row.continuous_billed_usd is not None
-        else row.billed_usd
-    ) or Decimal("0.00")
+    billed = _money_from_columns(row, "billed_cents", "billed_usd")
+    continuous = _money_from_columns(
+        row,
+        "continuous_billed_cents",
+        "continuous_billed_usd",
+    ) or billed or Decimal("0.00")
     percent = _decimal(row.usage_percent)
-    remaining = _money(row.remaining_usd)
-    continuous_remaining = _money(
-        getattr(row, "continuous_remaining_usd", None)
+    remaining = _money_from_columns(row, "remaining_cents", "remaining_usd")
+    continuous_remaining = _money_from_columns(
+        row,
+        "continuous_remaining_cents",
+        "continuous_remaining_usd",
     )
     remaining_scope = str(getattr(row, "remaining_scope", "target_local") or "target_local")
     reset_at = _coerce_datetime(row.reset_at)
@@ -239,16 +257,20 @@ def record_snapshot(
             ):
                 return _result_from_row(prior)
 
-        prior_billed = _money(
-            prior.billed_usd
+        prior_billed = (
+            _money_from_columns(prior, "billed_cents", "billed_usd")
             if prior is not None
             else None
         )
-        prior_continuous = _money(
-            prior.continuous_billed_usd
-            if prior is not None and prior.continuous_billed_usd is not None
-            else prior_billed
-        ) or Decimal("0.00")
+        prior_continuous = (
+            _money_from_columns(
+                prior,
+                "continuous_billed_cents",
+                "continuous_billed_usd",
+            )
+            if prior is not None
+            else None
+        ) or prior_billed or Decimal("0.00")
         continuity_state = "normal"
         continuous = billed or Decimal("0.00")
 
@@ -270,7 +292,13 @@ def record_snapshot(
                     fresh = False
             else:
                 target_previous = _money(
-                    prior_target.billed_usd if prior_target is not None else None
+                    _money_from_columns(
+                        prior_target,
+                        "billed_cents",
+                        "billed_usd",
+                    )
+                    if prior_target is not None
+                    else None
                 )
                 if billed is None:
                     continuous = prior_continuous
@@ -318,13 +346,17 @@ def record_snapshot(
             window=normalized_window,
             usage_percent=float(percent) if percent is not None else None,
             billed_usd=float(billed) if billed is not None else None,
+            billed_cents=_cents(billed),
             continuous_billed_usd=float(continuous),
+            continuous_billed_cents=_cents(continuous),
             remaining_usd=float(remaining) if remaining is not None else None,
+            remaining_cents=_cents(remaining),
             continuous_remaining_usd=(
                 float(continuous_remaining)
                 if continuous_remaining is not None
                 else None
             ),
+            continuous_remaining_cents=_cents(continuous_remaining),
             remaining_scope=remaining_scope,
             reset_at=reset,
             source=str(source or "codex2api"),

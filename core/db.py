@@ -329,6 +329,74 @@ class AccountAssignmentModel(SQLModel, table=True):
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
+class CustomerModel(SQLModel, table=True):
+    """Business customer whose demand drives an enterprise pool."""
+
+    __tablename__ = "customers"
+
+    id: str = Field(primary_key=True)
+    name: str = Field(index=True, sa_column_kwargs={"unique": True})
+    enabled: bool = Field(default=True, index=True)
+    price_cny_micros_per_usd: int = 200000
+    operations_cost_cents_monthly: int = 0
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountPoolModel(SQLModel, table=True):
+    """Logical public/enterprise/float/standby account pool."""
+
+    __tablename__ = "account_pools"
+
+    id: str = Field(primary_key=True)
+    name: str = Field(index=True, sa_column_kwargs={"unique": True})
+    pool_type: str = Field(default="public", index=True)
+    customer_id: str = Field(default="", index=True)
+    min_accounts: int = 0
+    max_accounts: int = 0
+    safe_concurrency_per_account: int = 1
+    min_lease_hours: int = 6
+    enabled: bool = Field(default=True, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class PoolTargetPolicyModel(SQLModel, table=True):
+    """Allowed target and capacity preference for one logical pool."""
+
+    __tablename__ = "pool_target_policies"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    pool_id: str = Field(index=True)
+    target_id: int = Field(index=True)
+    priority: int = 100
+    min_accounts: int = 0
+    max_accounts: int = 0
+    enabled: bool = Field(default=True, index=True)
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class AccountAssignmentEventModel(SQLModel, table=True):
+    """Append-only audit event for assignment and lease changes."""
+
+    __tablename__ = "account_assignment_events"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    local_account_id: int = Field(index=True)
+    event_type: str = Field(index=True)
+    from_pool_id: str = ""
+    to_pool_id: str = ""
+    from_target_id: int = 0
+    to_target_id: int = 0
+    assignment_version: int = 0
+    migration_id: str = Field(default="", index=True)
+    reason: str = ""
+    detail_json: str = "{}"
+    created_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
 class AccountQuotaSnapshotModel(SQLModel, table=True):
     """Point-in-time quota evidence from one target."""
 
@@ -341,11 +409,15 @@ class AccountQuotaSnapshotModel(SQLModel, table=True):
     window: str = Field(index=True)
     usage_percent: Optional[float] = None
     billed_usd: Optional[float] = None
+    billed_cents: Optional[int] = None
     # Control-plane cumulative value; differs from the target-local counter
     # when a credential is imported into a fresh Codex2API instance.
     continuous_billed_usd: Optional[float] = None
+    continuous_billed_cents: Optional[int] = None
     remaining_usd: Optional[float] = None
+    remaining_cents: Optional[int] = None
     continuous_remaining_usd: Optional[float] = None
+    continuous_remaining_cents: Optional[int] = None
     remaining_scope: str = "target_local"
     reset_at: Optional[datetime] = None
     source: str = "codex2api"
@@ -355,6 +427,42 @@ class AccountQuotaSnapshotModel(SQLModel, table=True):
     is_fresh: bool = True
     raw_digest: str = ""
     continuity_state: str = "normal"
+
+
+class AccountQuotaRollupModel(SQLModel, table=True):
+    """Hourly/daily compact quota history retained beyond raw snapshots."""
+
+    __tablename__ = "account_quota_rollups"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    identity_id: str = Field(index=True)
+    window: str = Field(index=True)
+    bucket: str = Field(index=True)
+    bucket_start: datetime = Field(index=True)
+    bucket_end: datetime
+    min_billed_cents: Optional[int] = None
+    max_billed_cents: Optional[int] = None
+    final_continuous_billed_cents: Optional[int] = None
+    sample_count: int = 0
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
+class CustomerUsageSampleModel(SQLModel, table=True):
+    """Target/API-key demand sample used for forecast and margin planning."""
+
+    __tablename__ = "customer_usage_samples"
+
+    id: Optional[int] = Field(default=None, primary_key=True)
+    customer_id: str = Field(index=True)
+    pool_id: str = Field(index=True)
+    target_id: int = Field(index=True)
+    remote_api_key_id: int = Field(default=0, index=True)
+    bucket_start: datetime = Field(index=True)
+    bucket_end: datetime
+    billed_cents: int = 0
+    request_count: int = 0
+    peak_concurrency: int = 0
+    captured_at: datetime = Field(default_factory=_utcnow, index=True)
 
 
 class AccountMigrationModel(SQLModel, table=True):
@@ -708,6 +816,47 @@ def cleanup_chatgpt_account_dependents(
             bound_account_id=0,
             quarantine_reason=str(quarantine_reason or "account_deleted")[:120],
             last_error="local ChatGPT account identity was deleted",
+            updated_at=now,
+        )
+    )
+    session.exec(
+        update(AccountIdentityModel)
+        .where(AccountIdentityModel.current_account_id == normalized_id)
+        .values(
+            state="retired",
+            current_account_id=0,
+            updated_at=now,
+        )
+    )
+    session.exec(
+        update(AccountAssignmentModel)
+        .where(AccountAssignmentModel.local_account_id == normalized_id)
+        .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
+        .values(state="revoked", updated_at=now)
+    )
+    session.exec(
+        update(AccountTargetBindingModel)
+        .where(AccountTargetBindingModel.local_account_id == normalized_id)
+        .values(
+            enabled=False,
+            sync_status="retired",
+            updated_at=now,
+        )
+    )
+    session.exec(
+        update(AccountMigrationModel)
+        .where(AccountMigrationModel.local_account_id == normalized_id)
+        .where(
+            AccountMigrationModel.state.not_in(
+                ["committed", "rolled_back", "rollback_required"]
+            )
+        )
+        .values(
+            state="rollback_required",
+            error_json=json.dumps(
+                {"message": "local account deleted during migration"},
+                ensure_ascii=False,
+            ),
             updated_at=now,
         )
     )
@@ -1108,6 +1257,27 @@ def init_account_pool_schema(database_engine=None) -> None:
                     "ALTER TABLE account_quota_snapshots "
                     "ADD COLUMN source_updated_at DATETIME"
                 )
+            for column in (
+                "billed_cents",
+                "continuous_billed_cents",
+                "remaining_cents",
+                "continuous_remaining_cents",
+            ):
+                if column not in quota_columns:
+                    conn.exec_driver_sql(
+                        f"ALTER TABLE account_quota_snapshots ADD COLUMN {column} INTEGER"
+                    )
+            for cents_column, amount_column in (
+                ("billed_cents", "billed_usd"),
+                ("continuous_billed_cents", "continuous_billed_usd"),
+                ("remaining_cents", "remaining_usd"),
+                ("continuous_remaining_cents", "continuous_remaining_usd"),
+            ):
+                conn.exec_driver_sql(
+                    f"UPDATE account_quota_snapshots "
+                    f"SET {cents_column} = CAST(ROUND({amount_column} * 100) AS INTEGER) "
+                    f"WHERE {cents_column} IS NULL AND {amount_column} IS NOT NULL"
+                )
             if "continuous_remaining_usd" not in quota_columns:
                 conn.exec_driver_sql(
                     "ALTER TABLE account_quota_snapshots "
@@ -1183,6 +1353,16 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "scheduler_actions",
                 "run_id, status",
             ),
+            (
+                "ix_assignment_event_identity_time",
+                "account_assignment_events",
+                "identity_id, created_at",
+            ),
+            (
+                "ix_customer_usage_customer_time",
+                "customer_usage_samples",
+                "customer_id, bucket_start",
+            ),
         )
         for index_name, table_name, columns in index_specs:
             if table_name not in existing_tables:
@@ -1220,6 +1400,24 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "uq_account_migration_idempotency_key",
                 "account_migrations",
                 "idempotency_key",
+                "",
+            ),
+            (
+                "uq_pool_target_policy_pool_target",
+                "pool_target_policies",
+                "pool_id, target_id",
+                "",
+            ),
+            (
+                "uq_quota_rollup_identity_window_bucket",
+                "account_quota_rollups",
+                "identity_id, window, bucket, bucket_start",
+                "",
+            ),
+            (
+                "uq_customer_usage_sample_bucket",
+                "customer_usage_samples",
+                "customer_id, target_id, remote_api_key_id, bucket_start",
                 "",
             ),
         )

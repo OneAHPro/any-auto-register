@@ -158,92 +158,134 @@ def _sanitize_account_extra_for_api(
     return json.dumps(extra, ensure_ascii=False)
 
 
-def _account_control_plane_summary(account: AccountModel, session: Session) -> dict:
-    """Return non-secret identity, assignment, binding and quota projections."""
-
-    identity_id = str(getattr(account, "identity_id", "") or "").strip()
-    summary: dict[str, object] = {
+def _empty_control_plane_summary(identity_id: str = "") -> dict[str, object]:
+    return {
         "identity_id": identity_id,
         "assignment": None,
         "binding": None,
         "quota": {},
     }
-    if not identity_id:
-        return summary
 
-    assignment = session.exec(
+
+def _account_control_plane_summaries(
+    accounts: list[AccountModel],
+    session: Session,
+) -> dict[str, dict[str, object]]:
+    """Batch-load control-plane projections for one paginated account list."""
+
+    identity_ids = {
+        str(account.identity_id or "").strip()
+        for account in accounts
+        if str(account.identity_id or "").strip()
+    }
+    summaries = {
+        identity_id: _empty_control_plane_summary(identity_id)
+        for identity_id in identity_ids
+    }
+    if not identity_ids:
+        return summaries
+
+    assignments = session.exec(
         select(AccountAssignmentModel)
-        .where(AccountAssignmentModel.identity_id == identity_id)
+        .where(AccountAssignmentModel.identity_id.in_(identity_ids))
         .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
         .order_by(AccountAssignmentModel.updated_at.desc())
-    ).first()
-    if assignment is not None:
-        summary["assignment"] = {
-            "pool_id": assignment.pool_id,
-            "target_id": int(assignment.target_id),
-            "state": assignment.state,
-            "lease_owner": assignment.lease_owner,
-            "lease_reason": assignment.lease_reason,
-            "lease_started_at": assignment.lease_started_at.isoformat()
-            if assignment.lease_started_at
-            else None,
-            "lease_expires_at": assignment.lease_expires_at.isoformat()
-            if assignment.lease_expires_at
-            else None,
-            "assignment_version": int(assignment.assignment_version or 0),
-        }
-        binding = session.exec(
-            select(AccountTargetBindingModel)
-            .where(AccountTargetBindingModel.identity_id == identity_id)
-            .where(AccountTargetBindingModel.target_id == assignment.target_id)
-        ).first()
-        if binding is not None:
-            summary["binding"] = {
-                "target_id": int(binding.target_id),
-                "remote_account_id": int(binding.remote_account_id or 0),
-                "sync_status": binding.sync_status,
-                "remote_status": binding.remote_status,
-                "enabled": bool(binding.enabled),
-                "last_sync_at": binding.last_sync_at.isoformat()
-                if binding.last_sync_at
+    ).all()
+    assignment_by_identity: dict[str, AccountAssignmentModel] = {}
+    for assignment in assignments:
+        assignment_by_identity.setdefault(str(assignment.identity_id), assignment)
+
+    bindings = session.exec(
+        select(AccountTargetBindingModel).where(
+            AccountTargetBindingModel.identity_id.in_(identity_ids)
+        )
+    ).all()
+    binding_by_key = {
+        (str(binding.identity_id), int(binding.target_id)): binding
+        for binding in bindings
+    }
+    snapshots = session.exec(
+        select(AccountQuotaSnapshotModel)
+        .where(AccountQuotaSnapshotModel.identity_id.in_(identity_ids))
+        .where(AccountQuotaSnapshotModel.window.in_(["5h", "7d", "monthly"]))
+        .order_by(AccountQuotaSnapshotModel.captured_at.desc())
+    ).all()
+    snapshot_by_key: dict[tuple[str, str], AccountQuotaSnapshotModel] = {}
+    for snapshot in snapshots:
+        snapshot_by_key.setdefault(
+            (str(snapshot.identity_id), str(snapshot.window)),
+            snapshot,
+        )
+
+    from services.quota_ledger import evaluate_snapshot
+
+    for identity_id, summary in summaries.items():
+        assignment = assignment_by_identity.get(identity_id)
+        if assignment is not None:
+            summary["assignment"] = {
+                "pool_id": assignment.pool_id,
+                "target_id": int(assignment.target_id),
+                "state": assignment.state,
+                "lease_owner": assignment.lease_owner,
+                "lease_reason": assignment.lease_reason,
+                "lease_started_at": assignment.lease_started_at.isoformat()
+                if assignment.lease_started_at
                 else None,
-                "last_error": binding.last_error,
+                "lease_expires_at": assignment.lease_expires_at.isoformat()
+                if assignment.lease_expires_at
+                else None,
+                "assignment_version": int(assignment.assignment_version or 0),
             }
+            binding = binding_by_key.get((identity_id, int(assignment.target_id)))
+            if binding is not None:
+                summary["binding"] = {
+                    "target_id": int(binding.target_id),
+                    "remote_account_id": int(binding.remote_account_id or 0),
+                    "sync_status": binding.sync_status,
+                    "remote_status": binding.remote_status,
+                    "enabled": bool(binding.enabled),
+                    "last_sync_at": binding.last_sync_at.isoformat()
+                    if binding.last_sync_at
+                    else None,
+                    "last_error": binding.last_error,
+                }
+        quota: dict[str, dict[str, object]] = {}
+        for window in ("5h", "7d", "monthly"):
+            snapshot = snapshot_by_key.get((identity_id, window))
+            if snapshot is None:
+                continue
+            evaluated = evaluate_snapshot(snapshot)
+            quota[window] = {
+                "usage_percent": snapshot.usage_percent,
+                "billed_usd": snapshot.billed_usd,
+                "continuous_billed_usd": float(evaluated.continuous_billed_usd),
+                "remaining_usd": float(evaluated.remaining_usd)
+                if evaluated.remaining_usd is not None
+                else None,
+                "continuous_remaining_usd": float(evaluated.continuous_remaining_usd)
+                if evaluated.continuous_remaining_usd is not None
+                else None,
+                "remaining_scope": evaluated.remaining_scope,
+                "reset_at": evaluated.reset_at.isoformat()
+                if evaluated.reset_at
+                else None,
+                "captured_at": evaluated.captured_at.isoformat(),
+                "continuity_state": evaluated.continuity_state,
+                "fresh": evaluated.fresh,
+                "scheduler_eligible": evaluated.scheduler_eligible,
+            }
+        summary["quota"] = quota
+    return summaries
 
-    quota: dict[str, dict[str, object]] = {}
-    for window in ("5h", "7d", "monthly"):
-        snapshot = session.exec(
-            select(AccountQuotaSnapshotModel)
-            .where(AccountQuotaSnapshotModel.identity_id == identity_id)
-            .where(AccountQuotaSnapshotModel.window == window)
-            .order_by(AccountQuotaSnapshotModel.captured_at.desc())
-        ).first()
-        if snapshot is None:
-            continue
-        from services.quota_ledger import evaluate_snapshot
 
-        evaluated = evaluate_snapshot(snapshot)
-        continuity_state = evaluated.continuity_state
-        fresh = evaluated.fresh
-        quota[window] = {
-            "usage_percent": snapshot.usage_percent,
-            "billed_usd": snapshot.billed_usd,
-            "continuous_billed_usd": float(evaluated.continuous_billed_usd),
-            "remaining_usd": float(evaluated.remaining_usd)
-            if evaluated.remaining_usd is not None
-            else None,
-            "continuous_remaining_usd": float(evaluated.continuous_remaining_usd)
-            if evaluated.continuous_remaining_usd is not None
-            else None,
-            "remaining_scope": evaluated.remaining_scope,
-            "reset_at": evaluated.reset_at.isoformat() if evaluated.reset_at else None,
-            "captured_at": evaluated.captured_at.isoformat(),
-            "continuity_state": continuity_state,
-            "fresh": fresh,
-            "scheduler_eligible": evaluated.scheduler_eligible,
-        }
-    summary["quota"] = quota
-    return summary
+def _account_control_plane_summary(account: AccountModel, session: Session) -> dict:
+    identity_id = str(getattr(account, "identity_id", "") or "").strip()
+    if not identity_id:
+        return _empty_control_plane_summary()
+    return _account_control_plane_summaries([account], session).get(
+        identity_id,
+        _empty_control_plane_summary(identity_id),
+    )
 
 
 def _account_for_response(
@@ -251,6 +293,7 @@ def _account_for_response(
     session: Session | None = None,
     *,
     include_credentials: bool = True,
+    control_plane_summary: dict[str, object] | None = None,
 ) -> dict:
     payload = account.model_dump()
     if not include_credentials:
@@ -263,7 +306,9 @@ def _account_for_response(
         str(payload.get("extra_json") or "{}"),
         strip_credentials=not include_credentials,
     )
-    if session is not None:
+    if control_plane_summary is not None:
+        payload.update(control_plane_summary)
+    elif session is not None:
         payload.update(_account_control_plane_summary(account, session))
     return payload
 
@@ -321,12 +366,26 @@ def list_accounts(
         if account_is_visible_in_default_list(account)
     ]
     total = len(visible_accounts)
+    page_size = max(1, min(int(page_size or 20), 200))
+    page = max(1, int(page or 1))
     start = (page - 1) * page_size
     items = visible_accounts[start:start + page_size]
+    summaries = _account_control_plane_summaries(items, session)
     return {
         "total": total,
         "page": page,
-        "items": [_account_for_response(item, session=session) for item in items],
+        "items": [
+            _account_for_response(
+                item,
+                control_plane_summary=summaries.get(
+                    str(item.identity_id or "").strip(),
+                    _empty_control_plane_summary(
+                        str(item.identity_id or "").strip()
+                    ),
+                ),
+            )
+            for item in items
+        ],
     }
 
 

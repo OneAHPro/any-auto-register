@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from services.chatgpt_sync import (
@@ -93,6 +94,93 @@ def _build_chatgpt_upload_account(account):
     return upload_account
 
 
+def _persist_explicit_target_binding(
+    account: Any,
+    *,
+    target_id: int,
+    client: Any,
+    database_engine: Any,
+) -> None:
+    """Persist the verified remote row for a successful explicit-target sync."""
+
+    from sqlmodel import Session, select
+
+    from core.db import (
+        AccountModel,
+        AccountTargetBindingModel,
+        ChatGPTAuthStateModel,
+    )
+    from services.account_identity import ensure_identity_for_model
+    from services.chatgpt_sync import update_account_model_codex2api_sync
+
+    if not isinstance(account, AccountModel) or account.id is None:
+        return
+    identity_id = str(account.identity_id or "").strip()
+    if not identity_id:
+        identity_id = ensure_identity_for_model(database_engine, account).identity_id
+    rows = client.list_accounts()
+    normalized_email = str(account.email or "").strip().lower()
+    matches = [
+        row
+        for row in rows
+        if isinstance(row, dict)
+        and str(row.get("email") or row.get("name") or "").strip().lower()
+        == normalized_email
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("目标账号同步后身份不唯一")
+    row = matches[0]
+    try:
+        remote_id = int(row.get("id") or row.get("remote_id") or 0)
+    except (TypeError, ValueError):
+        remote_id = 0
+    if remote_id <= 0:
+        raise RuntimeError("目标账号同步后缺少远端 ID")
+    with Session(database_engine) as session:
+        saved = session.get(AccountModel, int(account.id))
+        if saved is None:
+            raise RuntimeError("本地账号不存在")
+        auth_state = session.exec(
+            select(ChatGPTAuthStateModel).where(
+                ChatGPTAuthStateModel.account_id == int(account.id)
+            )
+        ).first()
+        credential_revision = str(
+            auth_state.credential_revision if auth_state is not None else ""
+        )
+        binding = session.exec(
+            select(AccountTargetBindingModel)
+            .where(AccountTargetBindingModel.identity_id == identity_id)
+            .where(AccountTargetBindingModel.target_id == int(target_id))
+        ).first()
+        now = datetime.now(timezone.utc)
+        if binding is None:
+            binding = AccountTargetBindingModel(
+                identity_id=identity_id,
+                local_account_id=int(account.id),
+                target_id=int(target_id),
+                created_at=now,
+            )
+        binding.remote_account_id = remote_id
+        binding.remote_email = normalized_email
+        binding.sync_status = "synced"
+        binding.remote_status = str(row.get("status") or "")
+        binding.enabled = bool(row.get("enabled", True))
+        binding.credential_revision = credential_revision
+        binding.last_sync_at = now
+        binding.last_error = ""
+        binding.updated_at = now
+        session.add(binding)
+        update_account_model_codex2api_sync(
+            saved,
+            True,
+            "目标账号已导入",
+            session=session,
+            commit=False,
+        )
+        session.commit()
+
+
 def sync_codex2api_account(
     account,
     *,
@@ -100,6 +188,7 @@ def sync_codex2api_account(
     replace_existing: bool = False,
     target: Any | None = None,
     client: Any | None = None,
+    database_engine: Any | None = None,
 ) -> dict[str, Any] | None:
     """只同步 Codex2API，并独立记录该目标的结果。"""
     from core.config_store import config_store
@@ -133,15 +222,18 @@ def sync_codex2api_account(
             value = _pick_text({"value": getattr(upload_account, key, "")}, "value")
             if value:
                 payload[key] = value
+        if payload.get("workspace_id"):
+            payload["account_id"] = payload["workspace_id"]
         try:
-            if payload.get("refresh_token") and payload.get("access_token"):
-                response = client.import_full_json(payload)
-            elif payload.get("refresh_token"):
-                response = client.import_refresh_token(payload)
-            elif payload.get("access_token"):
-                response = client.import_access_token(payload)
-            else:
-                return {"name": "Codex2API", "ok": False, "msg": "账号缺少凭证"}
+            with codex2api_account_mutation_lock():
+                if payload.get("refresh_token") and payload.get("access_token"):
+                    response = client.import_full_json(payload)
+                elif payload.get("refresh_token"):
+                    response = client.import_refresh_token(payload)
+                elif payload.get("access_token"):
+                    response = client.import_access_token(payload)
+                else:
+                    return {"name": "Codex2API", "ok": False, "msg": "账号缺少凭证"}
             response = response if isinstance(response, dict) else {}
             failed = int(response.get("failed") or 0)
             successful = sum(
@@ -156,6 +248,15 @@ def sync_codex2api_account(
                     or "Codex2API 未确认账号已导入"
                 ).strip()[:200]
                 return {"name": "Codex2API", "ok": False, "msg": message}
+            if target is not None and getattr(target, "id", None) is not None:
+                from core.db import engine as default_engine
+
+                _persist_explicit_target_binding(
+                    account,
+                    target_id=int(target.id),
+                    client=client,
+                    database_engine=database_engine or default_engine,
+                )
             return {"name": "Codex2API", "ok": True, "msg": "目标账号已导入"}
         except Exception as exc:
             logger.error("Codex2API target sync failed (%s)", type(exc).__name__)

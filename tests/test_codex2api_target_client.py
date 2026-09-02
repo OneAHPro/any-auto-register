@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from unittest import mock
@@ -529,7 +530,11 @@ def test_sync_accepts_an_explicit_target_client(monkeypatch):
         email="a@example.com",
         token="access-token",
         user_id="workspace-1",
-        get_extra=lambda: {"refresh_token": "refresh-token"},
+        get_extra=lambda: {
+            "refresh_token": "refresh-token",
+            "workspace_id": "workspace-1",
+            "account_id": "different-account-id",
+        },
     )
     calls = []
 
@@ -547,3 +552,98 @@ def test_sync_accepts_an_explicit_target_client(monkeypatch):
     assert result == {"name": "Codex2API", "ok": True, "msg": "目标账号已导入"}
     assert calls[0]["email"] == "a@example.com"
     assert calls[0]["refresh_token"] == "refresh-token"
+    assert calls[0]["account_id"] == "workspace-1"
+
+
+def test_explicit_target_sync_holds_shared_mutation_lock(monkeypatch):
+    from services import external_sync
+
+    events = []
+
+    @contextmanager
+    def tracked_lock():
+        events.append("enter")
+        try:
+            yield
+        finally:
+            events.append("exit")
+
+    class FakeTarget:
+        def import_full_json(self, payload):
+            events.append("import")
+            return {"success": 1, "failed": 0}
+
+    monkeypatch.setattr(external_sync, "codex2api_account_mutation_lock", tracked_lock)
+    account = SimpleNamespace(
+        email="a@example.com",
+        token="access-token",
+        user_id="workspace-1",
+        get_extra=lambda: {"refresh_token": "refresh-token"},
+    )
+
+    result = external_sync.sync_codex2api_account(
+        account,
+        target=SimpleNamespace(id=2),
+        client=FakeTarget(),
+    )
+
+    assert result["ok"] is True
+    assert events == ["enter", "import", "exit"]
+
+
+def test_explicit_target_sync_persists_structured_binding():
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.account_identity import ensure_identity
+    from services import external_sync
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="a@example.com",
+        password="password",
+        token="access-token",
+        extra_json='{"refresh_token":"refresh-token","workspace_id":"workspace-1"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+    identity = ensure_identity(
+        engine,
+        account_id=account.id,
+        platform="chatgpt",
+        email=account.email,
+        workspace_id="workspace-1",
+    )
+    with Session(engine) as session:
+        account = session.get(db.AccountModel, account.id)
+
+    class FakeTarget:
+        def import_full_json(self, payload):
+            return {"success": 1, "failed": 0}
+
+        def list_accounts(self):
+            return [{"id": 77, "email": "a@example.com", "status": "active", "enabled": True}]
+
+    result = external_sync.sync_codex2api_account(
+        account,
+        target=SimpleNamespace(id=2),
+        client=FakeTarget(),
+        database_engine=engine,
+    )
+
+    assert result["ok"] is True
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+    assert binding.identity_id == identity.identity_id
+    assert binding.target_id == 2
+    assert binding.remote_account_id == 77
+    assert binding.sync_status == "synced"
