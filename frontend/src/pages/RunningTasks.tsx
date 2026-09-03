@@ -224,6 +224,9 @@ export default function RunningTasks() {
     const currentWindowFresh = task.meta?.quota_current_fresh !== false
     const totalWindowFresh = task.meta?.quota_total_fresh !== false
     const currentWindowStatus = String(task.meta?.quota_current_status ?? '')
+    const quotaPostProcessing = task.status === 'done'
+      && task.meta?.quota_alert_reason === 'pending'
+      && currentWindowStatus === 'pending'
     const currentDataCount = Math.max(0, Number(task.meta?.quota_current_data_count) || 0)
     const currentTotalCount = Math.max(0, Number(task.meta?.quota_current_total_count) || 0)
     const rawTotalRemainingQuota = formatRemainingQuota(
@@ -265,7 +268,7 @@ export default function RunningTasks() {
           <div className="running-task-card__identity">
             <Space direction="vertical" size={2}>
               {isAutomaticAuthentication ? (
-                isActive(task) ? (
+                isActive(task) || quotaPostProcessing ? (
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     本次探针额度统计中
                   </Text>

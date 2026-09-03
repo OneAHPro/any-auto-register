@@ -150,6 +150,25 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.queryByText('$0.00')).toBeNull()
   })
 
+  it('keeps showing quota statistics in progress during terminal post-processing', async () => {
+    configureApi(automaticSummary({
+      status: 'done',
+      meta: {
+        automation: true,
+        estimated_remaining_usd: '0.00',
+        quota_data_available: false,
+        quota_alert_reason: 'pending',
+        quota_current_status: 'pending',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('本次探针额度统计中')).toBeTruthy()
+    expect(screen.queryByText('本次探针额度未生成')).toBeNull()
+    expect(screen.queryByText('$0.00')).toBeNull()
+  })
+
   it('shows an unavailable quota state for a finished probe with invalid metadata', async () => {
     configureApi(automaticSummary({
       meta: {

@@ -10,7 +10,12 @@ from typing import Any, Iterable, Mapping
 from curl_cffi import requests as cffi_requests
 from sqlmodel import Session, select
 
-from core.db import AccountAssignmentModel, AccountModel, engine
+from core.db import (
+    AccountAssignmentModel,
+    AccountModel,
+    Codex2APITargetModel,
+    engine,
+)
 
 
 AUTH_FAILED_STATUSES = {
@@ -183,7 +188,7 @@ def _remote_email(row: Mapping[str, object]) -> str:
 
 def _remote_id(row: Mapping[str, object]) -> int | None:
     try:
-        parsed = int(row.get("id") or 0)
+        parsed = int(row.get("id") or row.get("remote_id") or 0)
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
@@ -194,6 +199,8 @@ def _quota_record(
     *,
     include_reset_times: bool = False,
 ) -> dict[str, object]:
+    raw_email = _text(row.get("email"))
+    remote_name = _text(row.get("name"))
     result = {
         "remote_id": _remote_id(row),
         "email": _remote_email(row),
@@ -201,6 +208,10 @@ def _quota_record(
         "usage_percent_7d": row.get("usage_percent_7d"),
         "billed_7d": row.get("billed_7d"),
     }
+    if not raw_email:
+        result["_remote_email_missing"] = True
+        if remote_name.lower().startswith("at-import-"):
+            result["quota_placeholder"] = True
     for output_key, source_key in (
         ("quota_5h_updated_at", "codex_5h_usage_updated_at"),
         ("quota_7d_updated_at", "codex_usage_updated_at"),
@@ -247,31 +258,12 @@ def fetch_codex2api_quota_accounts(
     database_engine=engine,
     _skip_assignment_routing: bool = False,
 ) -> list[dict[str, object]]:
-    """Read the latest Codex2API account quota rows without probing."""
+    """Read the latest quota inventory from every enabled target without probing."""
 
     if client is None and config is None and not _skip_assignment_routing:
-        try:
-            with Session(database_engine) as session:
-                assigned_ids = [
-                    int(row.local_account_id)
-                    for row in session.exec(
-                        select(AccountAssignmentModel).where(
-                            AccountAssignmentModel.state.in_(
-                                ["active", "draining", "standby"]
-                            )
-                        )
-                    ).all()
-                    if int(row.local_account_id or 0) > 0
-                ]
-        except Exception:
-            assigned_ids = []
-        if assigned_ids:
-            routed = _fetch_assigned_target_quota(
-                sorted(set(assigned_ids)),
-                database_engine=database_engine,
-            )
-            if routed is not None:
-                return routed
+        routed = _fetch_enabled_target_quota(database_engine=database_engine)
+        if routed is not None:
+            return routed
 
     if client is not None:
         try:
@@ -455,52 +447,208 @@ def _assigned_target_groups(
     return groups, unassigned
 
 
-def _fetch_assigned_target_quota(
-    account_ids: list[int],
+def _quota_target_context(
+    database_engine,
+) -> tuple[list[int], dict[str, int]] | None:
+    """Resolve readable targets and current assignment preference by email."""
+
+    try:
+        with Session(database_engine) as session:
+            targets = session.exec(select(Codex2APITargetModel)).all()
+            assignments = session.exec(
+                select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.state.in_(
+                        ["active", "draining", "standby"]
+                    )
+                )
+            ).all()
+            account_ids = sorted(
+                {
+                    int(row.local_account_id)
+                    for row in assignments
+                    if int(row.local_account_id or 0) > 0
+                }
+            )
+            accounts = (
+                session.exec(
+                    select(AccountModel).where(
+                        AccountModel.id.in_(account_ids),
+                        AccountModel.platform == "chatgpt",
+                    )
+                ).all()
+                if account_ids
+                else []
+            )
+    except Exception:
+        return None
+
+    known_target_ids = {
+        int(row.id)
+        for row in targets
+        if int(row.id or 0) > 0
+    }
+    enabled_target_ids = {
+        int(row.id)
+        for row in targets
+        if int(row.id or 0) > 0 and bool(row.enabled)
+    }
+    assignment_target_ids = {
+        int(row.target_id)
+        for row in assignments
+        if int(row.target_id or 0) > 0
+    }
+    # Older upgrade/test databases can have assignment rows before the target
+    # registry is materialized. Keep those targets readable, but never revive
+    # a target that is explicitly present and disabled.
+    target_ids = sorted(
+        enabled_target_ids | (assignment_target_ids - known_target_ids)
+    )
+    if not target_ids:
+        # A populated registry is authoritative even when every target is
+        # disabled. Falling through here would silently revive the legacy URL.
+        return ([], {}) if known_target_ids else None
+
+    email_by_account_id = {
+        int(row.id): _text(row.email).lower()
+        for row in accounts
+        if int(row.id or 0) > 0 and _text(row.email)
+    }
+    preferred_candidates: dict[str, set[int]] = defaultdict(set)
+    for assignment in assignments:
+        email = email_by_account_id.get(int(assignment.local_account_id or 0), "")
+        target_id = int(assignment.target_id or 0)
+        if email and target_id in target_ids:
+            preferred_candidates[email].add(target_id)
+    preferred_targets = {
+        email: next(iter(candidate_ids))
+        for email, candidate_ids in preferred_candidates.items()
+        if len(candidate_ids) == 1
+    }
+    return target_ids, preferred_targets
+
+
+def _quota_number(value: object) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed == parsed and abs(parsed) != float("inf") else None
+
+
+def _quota_row_quality(
+    row: Mapping[str, object],
+    *,
+    preferred_target_id: int | None,
+) -> tuple[object, ...]:
+    target_id = int(row.get("target_id") or 0)
+    percent_7d = _quota_number(row.get("usage_percent_7d"))
+    billed_7d = _quota_number(row.get("billed_7d"))
+    total_complete = bool(
+        percent_7d is not None
+        and percent_7d > 0
+        and (
+            percent_7d >= 100
+            or (billed_7d is not None and billed_7d >= 0)
+        )
+    )
+    percent_5h = _quota_number(row.get("usage_percent_5h"))
+    billed_5h = _quota_number(row.get("billed_5h"))
+    current_complete = bool(
+        not row.get("has_5h_window")
+        or (
+            percent_5h is not None
+            and percent_5h > 0
+            and (
+                percent_5h >= 100
+                or (billed_5h is not None and billed_5h >= 0)
+            )
+        )
+    )
+    updated_at = max(
+        _text(row.get("quota_5h_updated_at")),
+        _text(row.get("quota_7d_updated_at")),
+    )
+    return (
+        preferred_target_id is not None and target_id == preferred_target_id,
+        total_complete,
+        current_complete,
+        updated_at,
+    )
+
+
+def _deduplicate_target_quota_rows(
+    rows: list[dict[str, object]],
+    *,
+    preferred_targets: Mapping[str, int],
+) -> list[dict[str, object]]:
+    selected: dict[tuple[object, ...], dict[str, object]] = {}
+    for index, row in enumerate(rows):
+        email = _text(row.get("email")).lower()
+        remote_id = _remote_id(row)
+        target_id = int(row.get("target_id") or 0)
+        has_remote_email = bool(email and not row.get("_remote_email_missing"))
+        identity = (
+            ("email", email)
+            if has_remote_email
+            else ("remote", target_id, remote_id or index + 1)
+        )
+        current = selected.get(identity)
+        preferred_target_id = (
+            preferred_targets.get(email) if has_remote_email else None
+        )
+        if current is None or _quota_row_quality(
+            row,
+            preferred_target_id=preferred_target_id,
+        ) > _quota_row_quality(
+            current,
+            preferred_target_id=preferred_target_id,
+        ):
+            selected[identity] = row
+    return sorted(
+        selected.values(),
+        key=lambda row: (
+            _text(row.get("email")).lower(),
+            int(row.get("target_id") or 0),
+            int(row.get("remote_id") or 0),
+        ),
+    )
+
+
+def _fetch_enabled_target_quota(
     *,
     database_engine,
 ) -> list[dict[str, object]] | None:
-    grouped = _assigned_target_groups(
-        account_ids,
-        database_engine=database_engine,
-    )
-    if grouped is None:
+    context = _quota_target_context(database_engine)
+    if context is None:
         return None
-    target_groups, unassigned = grouped
+    target_ids, preferred_targets = context
     rows: list[dict[str, object]] = []
-    if unassigned:
-        rows.extend(
-            fetch_codex2api_quota_accounts(
-                database_engine=database_engine,
-                _skip_assignment_routing=True,
-            )
-        )
-    for target_id, grouped_ids in target_groups.items():
+    for target_id in target_ids:
         try:
             from services.codex2api_target_client import get_target_client
 
             client = get_target_client(target_id, database_engine)
             remote_rows = client.list_accounts()
-        except Exception:
-            continue
-        local_accounts = _load_local_accounts(
-            grouped_ids,
-            database_engine=database_engine,
-        )
-        local_emails = {
-            str(email).strip().lower()
-            for email in local_accounts.values()
-            if str(email).strip()
-        }
-        for raw_row in remote_rows if isinstance(remote_rows, list) else []:
+        except Exception as exc:
+            raise Codex2APIHealthError(
+                f"读取 Codex2API 目标 {target_id} 状态异常（{type(exc).__name__}）"
+            ) from None
+        if not isinstance(remote_rows, list):
+            raise Codex2APIHealthError(
+                f"Codex2API 目标 {target_id} 账号清单格式无效"
+            )
+        for raw_row in remote_rows:
             if not isinstance(raw_row, Mapping):
                 continue
             row = _quota_record(raw_row, include_reset_times=True)
-            email = str(row.get("email") or "").strip().lower()
-            if email in local_emails:
-                row["target_id"] = int(target_id)
-                rows.append(row)
-    return rows
+            row["target_id"] = int(target_id)
+            rows.append(row)
+    return _deduplicate_target_quota_rows(
+        rows,
+        preferred_targets=preferred_targets,
+    )
 
 
 def _inspect_assigned_targets(
@@ -1062,7 +1210,7 @@ def inspect_codex2api_account_health(
         )
         if quota_accounts is not None:
             quota_accounts.extend(
-                _quota_record(raw_row, include_reset_times=False)
+                _quota_record(raw_row, include_reset_times=True)
                 for raw_row in rows
             )
         return _classify_remote_rows(
@@ -1130,7 +1278,7 @@ def inspect_codex2api_account_health(
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
     if quota_accounts is not None:
         quota_accounts.extend(
-            _quota_record(raw_row, include_reset_times=False)
+            _quota_record(raw_row, include_reset_times=True)
             for raw_row in rows
             if isinstance(raw_row, dict)
         )

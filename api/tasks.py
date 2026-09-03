@@ -2632,7 +2632,7 @@ def _run_chatgpt_relogin_task_inner(
 
     if automation and final_status == "done":
         from services.chatgpt_codex2api_quota import (
-            merge_quota_rows,
+            stabilize_quota_rows,
             summarize_available_quota,
         )
 
@@ -2645,6 +2645,7 @@ def _run_chatgpt_relogin_task_inner(
 
             quota_report = None
             quota_query_errors = 0
+            stable_quota_accounts = list(remote_quota_accounts)
             for quota_attempt in range(QUOTA_QUERY_MAX_ATTEMPTS):
                 try:
                     final_quota_accounts = fetch_codex2api_quota_accounts()
@@ -2673,11 +2674,12 @@ def _run_chatgpt_relogin_task_inner(
                         )
                     time.sleep(1.0)
                     continue
+                stable_quota_accounts = stabilize_quota_rows(
+                    final_quota_accounts,
+                    stable_quota_accounts,
+                )
                 candidate_report = summarize_available_quota(
-                    merge_quota_rows(
-                        final_quota_accounts,
-                        remote_quota_accounts,
-                    )
+                    stable_quota_accounts
                 )
                 if (
                     candidate_report.available

@@ -1422,6 +1422,123 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(meta["estimated_current_remaining_usd"], "5.00")
         self.assertEqual(meta["estimated_total_remaining_usd"], "10.00")
 
+    def test_final_quota_query_uses_same_task_stable_snapshot_during_cost_gap(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [251],
+            source="schedule",
+            automation=True,
+        )
+        initial_rows = [
+            {
+                "target_id": 1,
+                "remote_id": 501,
+                "email": "ready@example.com",
+                "plan_type": "pro",
+                "has_5h_window": False,
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+                "quota_7d_updated_at": "2026-09-03T00:59:00Z",
+            }
+        ]
+        self.final_quota_reader.return_value = [
+            {
+                **initial_rows[0],
+                "usage_percent_7d": 55,
+                "billed_7d": None,
+                "quota_7d_updated_at": "2026-09-03T01:00:00Z",
+            }
+        ]
+
+        def inspect(_account_ids, *, quota_accounts=None, **_kwargs):
+            quota_accounts.extend(initial_rows)
+            return {
+                251: {
+                    "account_id": 251,
+                    "email": "ready@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            side_effect=inspect,
+        ), mock.patch("api.tasks.QUOTA_QUERY_MAX_ATTEMPTS", 2), mock.patch(
+            "api.tasks.time.sleep"
+        ):
+            _run_chatgpt_relogin_task(task_id, [251])
+
+        meta = _task_store.snapshot(task_id)["meta"]
+        self.assertEqual(self.final_quota_reader.call_count, 1)
+        self.assertTrue(meta["quota_data_available"])
+        self.assertEqual(meta["estimated_total_remaining_usd"], "20.00")
+        self.assertFalse(meta["quota_current_fresh"])
+        self.assertFalse(meta["quota_total_fresh"])
+        self.assertEqual(
+            meta["quota_alert_reason"],
+            "quota_total_window_pending",
+        )
+        self.quota_alert_sender.assert_not_called()
+        self.bark_quota_alert_sender.assert_not_called()
+
+    def test_final_quota_query_does_not_reuse_cost_without_explicit_reset(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [252],
+            source="schedule",
+            automation=True,
+        )
+        initial_rows = [
+            {
+                "target_id": 1,
+                "remote_id": 502,
+                "email": "ready@example.com",
+                "plan_type": "pro",
+                "has_5h_window": False,
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+            }
+        ]
+        self.final_quota_reader.return_value = [
+            {
+                **initial_rows[0],
+                "billed_7d": None,
+            }
+        ]
+
+        def inspect(_account_ids, *, quota_accounts=None, **_kwargs):
+            quota_accounts.extend(initial_rows)
+            return {
+                252: {
+                    "account_id": 252,
+                    "email": "ready@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            side_effect=inspect,
+        ), mock.patch("api.tasks.QUOTA_QUERY_MAX_ATTEMPTS", 1):
+            _run_chatgpt_relogin_task(task_id, [252])
+
+        meta = _task_store.snapshot(task_id)["meta"]
+        self.assertEqual(self.final_quota_reader.call_count, 1)
+        self.assertFalse(meta["quota_data_available"])
+        self.assertEqual(meta["estimated_total_remaining_usd"], "0.00")
+        self.assertEqual(meta["quota_alert_reason"], "quota_query_failed")
+
     def test_final_quota_query_keeps_polling_through_transient_refresh_window(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(

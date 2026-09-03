@@ -106,11 +106,22 @@ def _remote_id(value: object) -> int | None:
 def _quota_row_identities(row: Mapping[str, object]) -> tuple[tuple[str, str], ...]:
     identities: list[tuple[str, str]] = []
     remote_id = _remote_id(row.get("remote_id") or row.get("id"))
+    target_id = _remote_id(row.get("target_id"))
     if remote_id is not None:
-        identities.append(("id", str(remote_id)))
+        identities.append(
+            (
+                "target_id" if target_id is not None else "id",
+                f"{target_id}:{remote_id}" if target_id is not None else str(remote_id),
+            )
+        )
     email = str(row.get("email") or row.get("name") or "").strip().lower()
-    if email:
-        identities.append(("email", email))
+    if email and not row.get("_remote_email_missing"):
+        identities.append(
+            (
+                "target_email" if target_id is not None else "email",
+                f"{target_id}:{email}" if target_id is not None else email,
+            )
+        )
     return tuple(identities)
 
 
@@ -183,6 +194,77 @@ def merge_quota_rows(
     return merged_rows
 
 
+def _window_is_complete(row: Mapping[str, object], suffix: str) -> bool:
+    percent = _decimal(row.get(f"usage_percent_{suffix}"))
+    if percent is None or percent <= 0:
+        return False
+    if percent >= HUNDRED:
+        return True
+    billed = _decimal(row.get(f"billed_{suffix}"))
+    return billed is not None and billed >= 0
+
+
+def stabilize_quota_rows(
+    rows: Iterable[Mapping[str, object]],
+    fallback_rows: Iterable[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    """Reuse a complete same-window observation during a transient cost gap.
+
+    Unlike :func:`merge_quota_rows`, this helper may restore the complete
+    percent/cost pair from an older observation.  It requires the same target,
+    account identity, and explicit reset boundary, so values from a previous
+    provider window or another Codex2API node are never combined.
+    """
+
+    fallback_by_identity: dict[tuple[str, str], dict[str, object]] = {}
+    for raw_fallback in fallback_rows:
+        if not isinstance(raw_fallback, Mapping):
+            continue
+        fallback = dict(raw_fallback)
+        for identity in _quota_row_identities(fallback):
+            fallback_by_identity.setdefault(identity, fallback)
+
+    stabilized: list[dict[str, object]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, Mapping):
+            continue
+        row = dict(raw_row)
+        fallback = next(
+            (
+                fallback_by_identity.get(identity)
+                for identity in _quota_row_identities(row)
+                if fallback_by_identity.get(identity) is not None
+            ),
+            None,
+        )
+        if fallback is not None:
+            row_target = _remote_id(row.get("target_id"))
+            fallback_target = _remote_id(fallback.get("target_id"))
+            same_target = row_target == fallback_target
+            if same_target:
+                for suffix in ("5h", "7d"):
+                    if _window_is_complete(row, suffix):
+                        continue
+                    if not _window_is_complete(fallback, suffix):
+                        continue
+                    reset_key = f"reset_{suffix}_at"
+                    current_reset = str(row.get(reset_key) or "").strip()
+                    fallback_reset = str(fallback.get(reset_key) or "").strip()
+                    if not current_reset or current_reset != fallback_reset:
+                        continue
+                    for key in (
+                        f"usage_percent_{suffix}",
+                        f"billed_{suffix}",
+                        f"quota_{suffix}_updated_at",
+                        reset_key,
+                    ):
+                        if key in fallback:
+                            row[key] = fallback[key]
+                    row[f"_quota_fallback_{suffix}"] = True
+        stabilized.append(row)
+    return stabilized
+
+
 def _has_5h_window(row: Mapping[str, object], plan_type: str) -> bool:
     value = row.get("has_5h_window")
     if value is not None:
@@ -216,15 +298,21 @@ def estimate_account_quota(row: Mapping[str, object]) -> QuotaEstimate:
 def _estimate_quota_values(percent_value: object, billed_value: object) -> QuotaEstimate:
     percent = _decimal(percent_value)
     billed = _decimal(billed_value)
-    if percent is None or billed is None or billed < 0 or percent <= 0:
+    if percent is None or percent <= 0:
         return QuotaEstimate(state="invalid")
     if percent >= HUNDRED:
         return QuotaEstimate(
             state="exhausted",
             usage_percent=percent,
-            billed_usd=billed.quantize(CENT, rounding=ROUND_HALF_UP),
+            billed_usd=(
+                billed.quantize(CENT, rounding=ROUND_HALF_UP)
+                if billed is not None and billed >= 0
+                else None
+            ),
             remaining_usd=Decimal("0.00"),
         )
+    if billed is None or billed < 0:
+        return QuotaEstimate(state="invalid")
 
     remaining = (
         billed * (HUNDRED - percent) / percent
@@ -268,19 +356,18 @@ def summarize_available_quota(
         # not real subscription accounts and have no quota window to report;
         # counting them as healthy makes an otherwise usable snapshot look
         # incomplete forever.
-        if not raw_email and email.lower().startswith("at-import-"):
+        if row.get("quota_placeholder") or (
+            not raw_email and email.lower().startswith("at-import-")
+        ):
             continue
         plan_type = str(row.get("plan_type") or "").strip().lower()
         if plan_type == "api":
             continue
         if _is_non_finite_row(row, plan_type):
             continue
-        current_used_fallback = current_used_fallback or bool(
-            row.get("_quota_fallback_5h")
-        )
-        total_used_fallback = total_used_fallback or bool(
-            row.get("_quota_fallback_7d")
-        )
+        fallback_5h = bool(row.get("_quota_fallback_5h"))
+        fallback_7d = bool(row.get("_quota_fallback_7d"))
+        total_used_fallback = total_used_fallback or fallback_7d
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
         short_estimate = estimate_window_quota(row, "5h")
@@ -288,6 +375,9 @@ def summarize_available_quota(
         # Accounts without that window (for example Pro) use their weekly
         # estimate so they remain represented instead of contributing zero.
         has_5h_window = _has_5h_window(row, plan_type)
+        current_used_fallback = current_used_fallback or fallback_5h or (
+            not has_5h_window and fallback_7d
+        )
         if short_estimate.state in {"available", "exhausted"}:
             current_estimate = short_estimate
         elif not has_5h_window:
@@ -416,5 +506,6 @@ __all__ = [
     "estimate_account_quota",
     "estimate_window_quota",
     "merge_quota_rows",
+    "stabilize_quota_rows",
     "summarize_available_quota",
 ]

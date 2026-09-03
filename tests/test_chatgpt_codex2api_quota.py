@@ -31,6 +31,28 @@ def test_estimate_account_quota_marks_over_one_hundred_percent_exhausted():
     assert estimate.remaining_usd == Decimal("0.00")
 
 
+def test_exhausted_window_is_complete_even_when_billed_cost_is_temporarily_missing():
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota(
+        [
+            {
+                "email": "exhausted@example.com",
+                "plan_type": "pro",
+                "has_5h_window": False,
+                "remote_status": "rate_limited",
+                "usage_percent_7d": 100,
+                "billed_7d": None,
+            }
+        ]
+    )
+
+    assert report.estimated_remaining_usd == Decimal("0.00")
+    assert report.total_data_count == 1
+    assert report.total_data_complete
+    assert report.available
+
+
 def test_estimate_account_quota_calculates_remaining_usd():
     from services.chatgpt_codex2api_quota import estimate_account_quota
 
@@ -183,6 +205,111 @@ def test_merge_quota_rows_requires_matching_usage_without_timestamps():
     )
 
     assert merged[0]["billed_7d"] is None
+
+
+def test_stabilize_quota_rows_reuses_complete_reset_compatible_window():
+    from services.chatgpt_codex2api_quota import stabilize_quota_rows
+
+    merged = stabilize_quota_rows(
+        [
+            {
+                "target_id": 1,
+                "remote_id": 7,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 55,
+                "billed_7d": None,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+                "quota_7d_updated_at": "2026-09-03T01:00:00Z",
+            }
+        ],
+        [
+            {
+                "target_id": 1,
+                "remote_id": 7,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+                "quota_7d_updated_at": "2026-09-03T00:59:00Z",
+            }
+        ],
+    )
+
+    assert merged[0]["usage_percent_7d"] == 50
+    assert merged[0]["billed_7d"] == 20
+    assert merged[0]["quota_7d_updated_at"] == "2026-09-03T00:59:00Z"
+    assert merged[0]["_quota_fallback_7d"] is True
+
+
+def test_stabilize_quota_rows_rejects_previous_reset_window():
+    from services.chatgpt_codex2api_quota import stabilize_quota_rows
+
+    merged = stabilize_quota_rows(
+        [
+            {
+                "target_id": 1,
+                "remote_id": 7,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 5,
+                "billed_7d": None,
+                "reset_7d_at": "2026-09-17T00:00:00Z",
+            }
+        ],
+        [
+            {
+                "target_id": 1,
+                "remote_id": 7,
+                "email": "one@example.com",
+                "remote_status": "active",
+                "usage_percent_7d": 95,
+                "billed_7d": 100,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+            }
+        ],
+    )
+
+    assert merged[0]["usage_percent_7d"] == 5
+    assert merged[0]["billed_7d"] is None
+    assert "_quota_fallback_7d" not in merged[0]
+
+
+def test_stabilize_quota_rows_never_matches_name_only_accounts_by_name():
+    from services.chatgpt_codex2api_quota import stabilize_quota_rows
+
+    merged = stabilize_quota_rows(
+        [
+            {
+                "target_id": 1,
+                "remote_id": 114,
+                "email": "managed-account",
+                "_remote_email_missing": True,
+                "remote_status": "active",
+                "usage_percent_7d": 55,
+                "billed_7d": None,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+            }
+        ],
+        [
+            {
+                "target_id": 1,
+                "remote_id": 113,
+                "email": "managed-account",
+                "_remote_email_missing": True,
+                "remote_status": "active",
+                "usage_percent_7d": 50,
+                "billed_7d": 20,
+                "reset_7d_at": "2026-09-10T00:00:00Z",
+            }
+        ],
+    )
+
+    assert merged[0]["remote_id"] == 114
+    assert merged[0]["usage_percent_7d"] == 55
+    assert merged[0]["billed_7d"] is None
+    assert "_quota_fallback_7d" not in merged[0]
 
 
 def test_estimate_account_quota_rejects_missing_zero_or_invalid_values():

@@ -306,6 +306,45 @@ def test_fetch_quota_accounts_ignores_missing_quota_on_unauthorized_oauth_rows()
     assert len(rows) == 2
 
 
+def test_fetch_quota_accounts_marks_token_import_placeholders_for_summary():
+    from services import chatgpt_codex2api_health as health
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 100,
+                        "email": "",
+                        "name": "at-import-1",
+                        "status": "active",
+                    },
+                    {
+                        "id": 101,
+                        "email": "ready@example.com",
+                        "status": "active",
+                        "plan_type": "pro",
+                        "usage_percent_7d": 50,
+                        "billed_7d": 20,
+                    },
+                ]
+            }
+        ),
+    ):
+        rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+
+    report = summarize_available_quota(rows)
+
+    assert rows[0]["quota_placeholder"] is True
+    assert report.remote_account_count == 2
+    assert report.account_count == 1
+    assert report.total_data_complete
+    assert report.available
+
+
 def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     from services import chatgpt_codex2api_health as health
 
@@ -434,7 +473,9 @@ def test_health_snapshot_matches_accounts_and_only_marks_auth_failures():
     assert snapshot[8]["remote_status"] == "error"
     assert snapshot[8]["probe_mode"] == "wham_only"
     assert {row["remote_id"] for row in quota_accounts} == set(range(101, 110))
-    assert all("reset_7d_at" not in row for row in quota_accounts)
+    assert next(
+        row for row in quota_accounts if row["remote_id"] == 101
+    )["reset_7d_at"] == "2026-08-13T17:35:22+08:00"
     assert next(
         row for row in quota_accounts if row["remote_id"] == 108
     ) == {
@@ -836,7 +877,7 @@ def test_auth_failure_confirmation_uses_the_health_target_client(monkeypatch):
     assert client.calls == [("refresh", 222), "list"]
 
 
-def test_final_quota_reader_uses_assigned_targets_without_a_legacy_target_call(monkeypatch):
+def test_final_quota_reader_includes_remote_only_accounts_on_assigned_targets(monkeypatch):
     from sqlalchemy.pool import StaticPool
     from sqlmodel import Session, create_engine
 
@@ -875,22 +916,33 @@ def test_final_quota_reader_uses_assigned_targets_without_a_legacy_target_call(m
         session.commit()
 
     class Client:
-        def __init__(self, email, remote_id):
+        def __init__(self, email, remote_id, remote_only_email, remote_only_id):
             self.email = email
             self.remote_id = remote_id
+            self.remote_only_email = remote_only_email
+            self.remote_only_id = remote_only_id
 
         def list_accounts(self):
-            return [{
-                "id": self.remote_id,
-                "email": self.email,
-                "status": "active",
-                "usage_percent_7d": 10,
-                "billed_7d": 2,
-            }]
+            return [
+                {
+                    "id": self.remote_id,
+                    "email": self.email,
+                    "status": "active",
+                    "usage_percent_7d": 10,
+                    "billed_7d": 2,
+                },
+                {
+                    "id": self.remote_only_id,
+                    "email": self.remote_only_email,
+                    "status": "active",
+                    "usage_percent_7d": 20,
+                    "billed_7d": 4,
+                },
+            ]
 
     clients = {
-        11: Client("one@example.com", 111),
-        22: Client("two@example.com", 222),
+        11: Client("one@example.com", 111, "manual-one@example.com", 112),
+        22: Client("two@example.com", 222, "manual-two@example.com", 223),
     }
     monkeypatch.setattr(
         "services.codex2api_target_client.get_target_client",
@@ -901,8 +953,202 @@ def test_final_quota_reader_uses_assigned_targets_without_a_legacy_target_call(m
 
     assert {(row["email"], row["target_id"]) for row in rows} == {
         ("one@example.com", 11),
+        ("manual-one@example.com", 11),
         ("two@example.com", 22),
+        ("manual-two@example.com", 22),
     }
+
+
+def test_final_quota_reader_uses_enabled_targets_and_deduplicates_by_assignment(
+    monkeypatch,
+):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services import chatgpt_codex2api_health as health
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                db.Codex2APITargetModel(
+                    id=11,
+                    name="target-one",
+                    base_url="https://one.example.test",
+                    admin_key_ref="target-one-key",
+                    enabled=True,
+                ),
+                db.Codex2APITargetModel(
+                    id=22,
+                    name="target-two",
+                    base_url="https://two.example.test",
+                    admin_key_ref="target-two-key",
+                    enabled=True,
+                ),
+                db.Codex2APITargetModel(
+                    id=33,
+                    name="target-disabled",
+                    base_url="https://disabled.example.test",
+                    admin_key_ref="target-disabled-key",
+                    enabled=False,
+                ),
+                db.AccountModel(
+                    id=1,
+                    platform="chatgpt",
+                    email="shared@example.com",
+                    password="fixture",
+                    identity_id="identity-shared",
+                ),
+                db.AccountAssignmentModel(
+                    identity_id="identity-shared",
+                    local_account_id=1,
+                    pool_id="PUBLIC_POOL",
+                    target_id=22,
+                    state="active",
+                ),
+            ]
+        )
+        session.commit()
+
+    class Client:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def list_accounts(self):
+            return list(self.rows)
+
+    clients = {
+        11: Client(
+            [
+                {
+                    "id": 111,
+                    "email": "shared@example.com",
+                    "status": "active",
+                    "usage_percent_7d": 10,
+                    "billed_7d": 1,
+                },
+                {
+                    "id": 112,
+                    "email": "manual@example.com",
+                    "status": "active",
+                    "usage_percent_7d": 25,
+                    "billed_7d": 5,
+                },
+                {
+                    "id": 113,
+                    "email": "",
+                    "name": "managed-account",
+                    "status": "active",
+                    "usage_percent_7d": 30,
+                    "billed_7d": 6,
+                },
+            ]
+        ),
+        22: Client(
+            [
+                {
+                    "id": 221,
+                    "email": "shared@example.com",
+                    "status": "active",
+                    "usage_percent_7d": 20,
+                    "billed_7d": 4,
+                },
+                {
+                    "id": 222,
+                    "email": "",
+                    "name": "managed-account",
+                    "status": "active",
+                    "usage_percent_7d": 35,
+                    "billed_7d": 7,
+                },
+            ]
+        ),
+    }
+    requested_targets = []
+
+    def get_client(target_id, database_engine):
+        requested_targets.append(int(target_id))
+        return clients[int(target_id)]
+
+    monkeypatch.setattr(
+        "services.codex2api_target_client.get_target_client",
+        get_client,
+    )
+
+    rows = health.fetch_codex2api_quota_accounts(database_engine=engine)
+
+    assert requested_targets == [11, 22]
+    assert {(row["email"], row["target_id"]) for row in rows} == {
+        ("managed-account", 11),
+        ("managed-account", 22),
+        ("manual@example.com", 11),
+        ("shared@example.com", 22),
+    }
+    shared = next(row for row in rows if row["email"] == "shared@example.com")
+    assert shared["remote_id"] == 221
+    assert shared["billed_7d"] == 4
+    assert {
+        row["remote_id"]
+        for row in rows
+        if row["email"] == "managed-account"
+    } == {113, 222}
+
+
+def test_final_quota_reader_never_falls_back_to_legacy_when_registry_is_disabled(
+    monkeypatch,
+):
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine
+
+    from core import db
+    from services import chatgpt_codex2api_health as health
+
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    with Session(engine) as session:
+        session.add(
+            db.Codex2APITargetModel(
+                id=11,
+                name="disabled-target",
+                base_url="https://disabled.example.test",
+                admin_key_ref="disabled-target-key",
+                enabled=False,
+            )
+        )
+        session.commit()
+
+    monkeypatch.setattr(health, "_get_config", lambda: dict(BASE_CONFIG))
+    legacy_request = mock.Mock(
+        return_value=FakeResponse(
+            {
+                "accounts": [
+                    {
+                        "id": 999,
+                        "email": "legacy@example.com",
+                        "status": "active",
+                        "usage_percent_7d": 50,
+                        "billed_7d": 20,
+                    }
+                ]
+            }
+        )
+    )
+    monkeypatch.setattr(health.cffi_requests, "get", legacy_request)
+
+    rows = health.fetch_codex2api_quota_accounts(database_engine=engine)
+
+    assert rows == []
+    legacy_request.assert_not_called()
 
 
 def test_auth_failure_confirmation_accepts_updated_persistent_unauthorized():
