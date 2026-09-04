@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from decimal import Decimal
 
 import pytest
 
@@ -219,6 +220,78 @@ def test_quota_threshold_alert_sends_below_threshold_every_call(monkeypatch):
     assert "额度告警阈值" not in html
     assert "a@example.com" not in plain
     assert "a@example.com" not in html
+
+
+def test_quota_threshold_alert_uses_fresh_total_when_current_window_is_partial(
+    monkeypatch,
+):
+    from services import chatgpt_auto_relogin_alerts as alerts
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    report = AvailableQuotaReport(
+        account_count=1,
+        remote_account_count=15,
+        estimated_remaining_usd=Decimal("12.71"),
+        current_remaining_usd=Decimal("0.00"),
+        total_remaining_usd=Decimal("12.71"),
+        accounts=(),
+        current_status="partial_unestimable",
+        current_fresh=False,
+        total_fresh=True,
+    )
+    monkeypatch.setattr(alerts.smtplib, "SMTP", FakeSMTP)
+
+    result = alerts.send_quota_threshold_alert(
+        task_id="task-partial-current",
+        quota_report=report,
+        quota_eligible_failure_count=0,
+        quota_exhausted_failure_count=0,
+        relogin_failed_count=0,
+        deleted_account_count=0,
+        config={
+            **BASE_CONFIG,
+            "chatgpt_auto_relogin_quota_alert_threshold_usd": "200.00",
+        },
+    )
+
+    assert result["sent"] is True
+    assert result["reason"] == "sent"
+    assert result["estimated_remaining_usd"] == "12.71"
+    message = FakeSMTP.instances[0].message
+    assert message["Subject"].startswith("$12.71｜")
+    assert "总计剩余可用额度（当前窗口未完整）：$12.71" in message.get_body(
+        preferencelist=("plain",)
+    ).get_content()
+
+
+def test_quota_threshold_alert_still_blocks_when_total_window_is_stale(monkeypatch):
+    from services import chatgpt_auto_relogin_alerts as alerts
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    report = AvailableQuotaReport(
+        account_count=1,
+        remote_account_count=15,
+        estimated_remaining_usd=Decimal("12.71"),
+        current_remaining_usd=Decimal("12.71"),
+        total_remaining_usd=Decimal("12.71"),
+        accounts=(),
+        current_fresh=True,
+        total_fresh=False,
+    )
+    monkeypatch.setattr(alerts.smtplib, "SMTP", pytest.fail)
+    monkeypatch.setattr(alerts.smtplib, "SMTP_SSL", pytest.fail)
+
+    result = alerts.send_quota_threshold_alert(
+        task_id="task-stale-total",
+        quota_report=report,
+        quota_eligible_failure_count=0,
+        quota_exhausted_failure_count=0,
+        relogin_failed_count=0,
+        config={"chatgpt_auto_relogin_quota_alert_threshold_usd": "200.00"},
+    )
+
+    assert result["sent"] is False
+    assert result["reason"] == "quota_data_stale"
 
 
 @pytest.mark.parametrize(

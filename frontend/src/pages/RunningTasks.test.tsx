@@ -106,13 +106,93 @@ describe('RunningTasks lightweight summaries', () => {
     expect(screen.getByText('已删除账号 3')).toBeTruthy()
     expect(screen.getByText('鉴权失效 6')).toBeTruthy()
     expect(screen.getByText('重登失败 5')).toBeTruthy()
-    expect(screen.getByText('邮件已提醒')).toBeTruthy()
+    expect(screen.getByText('重登告警已提醒')).toBeTruthy()
     expect(screen.getByText('$98.85')).toBeTruthy()
     expect(screen.getByText('当前剩余可用额度')).toBeTruthy()
     expect(screen.getByText('总计剩余可用额度')).toBeTruthy()
     expect(screen.getByText('$120.00')).toBeTruthy()
     expect(screen.queryByText('本次探针剩余可用额度')).toBeNull()
     expect(screen.queryByText('task-auto-history')).toBeNull()
+  })
+
+  it('shows the balance alert result separately from the relogin alert result', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        estimated_remaining_usd: '12.71',
+        estimated_current_remaining_usd: '0.00',
+        estimated_total_remaining_usd: '12.71',
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        quota_alert_sent: true,
+        quota_alert_reason: 'sent',
+        bark_quota_alert_sent: true,
+        bark_quota_alert_reason: 'sent',
+        alert_sent: false,
+        alert_reason: 'below_threshold',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('余额告警已提醒')).toBeTruthy()
+    expect(screen.getByText('重登告警未触发')).toBeTruthy()
+  })
+
+  it('shows a balance alert refresh state when the current window is partial', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        estimated_remaining_usd: '12.71',
+        estimated_total_remaining_usd: '12.71',
+        quota_data_available: true,
+        quota_current_fresh: false,
+        quota_total_fresh: true,
+        quota_alert_sent: false,
+        quota_alert_reason: 'quota_current_partial_unestimable',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('余额告警待刷新')).toBeTruthy()
+  })
+
+  it('shows balance alert delivery failures instead of hiding them', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        estimated_remaining_usd: '12.71',
+        quota_data_available: true,
+        quota_alert_sent: false,
+        quota_alert_reason: 'send_failed',
+        bark_quota_alert_sent: false,
+        bark_quota_alert_reason: 'send_failed',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('余额告警发送失败')).toBeTruthy()
+  })
+
+  it('shows a balance failure when only the email channel fails', async () => {
+    configureApi(automaticSummary({
+      meta: {
+        automation: true,
+        estimated_remaining_usd: '12.71',
+        quota_data_available: true,
+        quota_alert_sent: false,
+        quota_alert_reason: 'send_failed',
+        bark_quota_alert_sent: false,
+        bark_quota_alert_reason: 'bark_disabled',
+      },
+    }))
+
+    render(<RunningTasks />)
+
+    expect(await screen.findByText('余额告警发送失败')).toBeTruthy()
   })
 
   it('uses responsive card regions and keeps compact metrics from breaking vertically', async () => {

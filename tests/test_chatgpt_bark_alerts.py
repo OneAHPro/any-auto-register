@@ -240,6 +240,63 @@ def test_bark_quota_threshold_uses_current_remaining_amount(monkeypatch):
     assert result["estimated_remaining_usd"] == "80.00"
 
 
+def test_bark_quota_threshold_uses_fresh_total_when_current_window_is_partial(
+    monkeypatch,
+):
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    report = AvailableQuotaReport(
+        account_count=1,
+        remote_account_count=15,
+        estimated_remaining_usd=Decimal("12.71"),
+        current_remaining_usd=Decimal("0.00"),
+        total_remaining_usd=Decimal("12.71"),
+        accounts=(),
+        current_status="partial_unestimable",
+        current_fresh=False,
+        total_fresh=True,
+    )
+    calls: list[tuple[object, float]] = []
+    monkeypatch.setattr(alerts, "_open_bark_request", _success_urlopen(calls))
+
+    result = alerts.send_bark_quota_threshold_alert(
+        task_id="task-partial-current",
+        quota_report=report,
+        config={**BASE_CONFIG, "chatgpt_auto_relogin_quota_alert_threshold_usd": "200.00"},
+    )
+
+    assert result["sent"] is True
+    assert result["estimated_remaining_usd"] == "12.71"
+    payload = json.loads(calls[0][0].data.decode("utf-8"))
+    assert payload["title"].startswith("$12.71｜")
+    assert "总计剩余可用额度（当前窗口未完整）：$12.71" in payload["body"]
+
+
+def test_bark_quota_threshold_still_blocks_when_total_window_is_stale(monkeypatch):
+    from services.chatgpt_codex2api_quota import AvailableQuotaReport
+
+    report = AvailableQuotaReport(
+        account_count=1,
+        remote_account_count=15,
+        estimated_remaining_usd=Decimal("12.71"),
+        current_remaining_usd=Decimal("12.71"),
+        total_remaining_usd=Decimal("12.71"),
+        accounts=(),
+        current_fresh=True,
+        total_fresh=False,
+    )
+    monkeypatch.setattr(alerts, "_open_bark_request", pytest.fail)
+
+    result = alerts.send_bark_quota_threshold_alert(
+        task_id="task-stale-total",
+        quota_report=report,
+        config={**BASE_CONFIG, "chatgpt_auto_relogin_quota_alert_threshold_usd": "200.00"},
+    )
+
+    assert result["sent"] is False
+    assert result["reason"] == "quota_data_stale"
+
+
 @pytest.mark.parametrize(
     "response",
     [

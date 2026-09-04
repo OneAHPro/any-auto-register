@@ -56,6 +56,9 @@ interface TaskSnapshot {
     alert_sent?: boolean
     alert_reason?: string
     quota_alert_reason?: string
+    quota_alert_sent?: boolean
+    bark_quota_alert_sent?: boolean
+    bark_quota_alert_reason?: string
   }
 }
 
@@ -376,9 +379,24 @@ export default function RunningTasks() {
                       已删除账号 {deletedAccountCount}
                     </Tag>
                     {task.meta?.alert_sent ? (
-                      <Tag color="processing" style={{ margin: 0 }}>邮件已提醒</Tag>
+                      <Tag color="processing" style={{ margin: 0 }}>重登告警已提醒</Tag>
                     ) : task.meta?.alert_reason === 'below_threshold' ? (
-                      <Tag style={{ margin: 0 }}>未触发邮件</Tag>
+                      <Tag style={{ margin: 0 }}>重登告警未触发</Tag>
+                    ) : null}
+                    {task.meta?.quota_alert_sent || task.meta?.bark_quota_alert_sent ? (
+                      <Tag color="error" style={{ margin: 0 }}>余额告警已提醒</Tag>
+                    ) : task.meta?.quota_alert_reason === 'send_failed'
+                      || task.meta?.bark_quota_alert_reason === 'send_failed' ? (
+                      <Tag color="error" style={{ margin: 0 }}>余额告警发送失败</Tag>
+                    ) : [
+                      'quota_current_partial_unestimable',
+                      'quota_current_window_pending',
+                      'quota_current_snapshot_fallback',
+                      'quota_total_window_pending',
+                    ].includes(String(task.meta?.quota_alert_reason ?? '')) ? (
+                      <Tag color="warning" style={{ margin: 0 }}>余额告警待刷新</Tag>
+                    ) : task.meta?.quota_alert_reason === 'quota_not_below_threshold' ? (
+                      <Tag style={{ margin: 0 }}>余额充足</Tag>
                     ) : null}
                   </>
                 )}

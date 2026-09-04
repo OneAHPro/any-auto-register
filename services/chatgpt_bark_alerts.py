@@ -90,6 +90,22 @@ def _business_alert_title(
     )
 
 
+def _quota_alert_amount(quota_report: AvailableQuotaReport) -> Decimal:
+    """Use the freshest complete balance available for threshold alerts."""
+
+    if quota_report.current_fresh:
+        return quota_report.current_remaining_usd
+    return quota_report.total_remaining_usd
+
+
+def _quota_alert_amount_label(quota_report: AvailableQuotaReport) -> str:
+    return (
+        "当前剩余可用额度"
+        if quota_report.current_fresh
+        else "总计剩余可用额度（当前窗口未完整）"
+    )
+
+
 def normalize_bark_endpoint(value: object) -> str:
     """Validate and normalize an official Bark device endpoint."""
 
@@ -259,14 +275,14 @@ def send_bark_quota_threshold_alert(
     threshold_usd = _quota_alert_threshold(
         snapshot.get("chatgpt_auto_relogin_quota_alert_threshold_usd")
     )
-    if not quota_report.current_fresh or not quota_report.total_fresh:
+    if not quota_report.total_fresh:
         return {
             "sent": False,
             "reason": "quota_data_stale",
             "threshold_usd": f"{threshold_usd:.2f}",
-            "estimated_remaining_usd": f"{quota_report.current_remaining_usd:.2f}",
+            "estimated_remaining_usd": f"{quota_report.total_remaining_usd:.2f}",
         }
-    remaining_usd = quota_report.current_remaining_usd.quantize(
+    remaining_usd = _quota_alert_amount(quota_report).quantize(
         USD_CENT,
         rounding=ROUND_HALF_UP,
     )
@@ -294,7 +310,7 @@ def send_bark_quota_threshold_alert(
         return {"sent": False, "reason": endpoint_error, **base_result}
 
     body = (
-        f"当前剩余可用额度：${remaining_usd:.2f}\n"
+        f"{_quota_alert_amount_label(quota_report)}：${remaining_usd:.2f}\n"
         f"告警阈值：${threshold_usd:.2f}\n"
         f"正常可用账号：{quota_report.account_count}\n"
         f"账号总数：{quota_report.remote_account_count}\n"
@@ -303,7 +319,7 @@ def send_bark_quota_threshold_alert(
     result = _send_bark(
         endpoint=endpoint,
         title=(
-            f"${quota_report.current_remaining_usd:.2f}｜"
+            f"${remaining_usd:.2f}｜"
             f"正常可用账号 {quota_report.account_count} 个｜Codex 剩余额度不足告警"
         ),
         body=body,

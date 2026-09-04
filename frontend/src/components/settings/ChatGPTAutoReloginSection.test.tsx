@@ -90,6 +90,7 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(quotaThreshold.getAttribute('aria-valuemax')).toBe('10000000')
     expect(screen.getByText(/重登失败账号数达到或超过此值时通过已启用的通知渠道发送提醒/)).toBeTruthy()
     expect(screen.getByText(/当前剩余可用额度低于此值都会通过已启用的通知渠道发送提醒/)).toBeTruthy()
+    expect(screen.getByText(/当前窗口不完整时使用新鲜的总计窗口判定/)).toBeTruthy()
     expect(screen.getByRole('textbox', { name: 'SMTP 服务器地址' })).toBeTruthy()
     expect(screen.getByLabelText('SMTP 访问凭证')).toBeTruthy()
     expect(screen.getByRole('textbox', { name: '告警接收邮箱' })).toBeTruthy()

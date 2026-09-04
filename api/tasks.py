@@ -2776,7 +2776,7 @@ def _run_chatgpt_relogin_task_inner(
             _log(
                 task_id,
                 "Codex2API 当前窗口额度仍在刷新，已保留本轮总计额度；"
-                "暂不触发当前额度阈值告警",
+                "余额告警将使用完整总计窗口判定",
             )
         elif quota_report.current_status == "partial_unestimable":
             _task_store.update_meta(
@@ -2790,7 +2790,8 @@ def _run_chatgpt_relogin_task_inner(
                 task_id,
                 "Codex2API 当前窗口有账号返回 0% 用量，无法反推有限美元上限；"
                 f"已保存可估算部分 {quota_report.current_data_count}/"
-                f"{quota_report.current_data_total_count}，暂不触发额度阈值告警",
+                f"{quota_report.current_data_total_count}，"
+                "余额告警将使用完整总计窗口判定",
             )
         elif not quota_report.current_fresh:
             _task_store.update_meta(
@@ -2802,7 +2803,8 @@ def _run_chatgpt_relogin_task_inner(
             )
             _log(
                 task_id,
-                "Codex2API 当前窗口暂用同轮探针快照，暂不触发额度阈值告警",
+                "Codex2API 当前窗口暂用同轮探针快照；"
+                "余额告警将使用完整总计窗口判定",
             )
 
         try:
@@ -2924,7 +2926,7 @@ def _run_chatgpt_relogin_task_inner(
                 f"[ALERT] 重登失败 Bark 强提醒发送失败（{error_type}）",
             )
 
-        if quota_query_succeeded and quota_report.current_fresh and quota_report.total_fresh:
+        if quota_query_succeeded and quota_report.total_fresh:
             try:
                 from services.chatgpt_auto_relogin_alerts import (
                     send_quota_threshold_alert,

@@ -1487,6 +1487,62 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.quota_alert_sender.assert_not_called()
         self.bark_quota_alert_sender.assert_not_called()
 
+    def test_partial_current_window_still_runs_balance_alert_from_fresh_total(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(
+            task_id,
+            [253],
+            source="schedule",
+            automation=True,
+        )
+        self.final_quota_reader.return_value = [
+            {
+                "email": "partial@example.com",
+                "plan_type": "plus",
+                "has_5h_window": True,
+                "remote_status": "active",
+                "usage_percent_5h": 0,
+                "billed_5h": 0.004,
+                "usage_percent_7d": 50,
+                "billed_7d": 10,
+            }
+        ]
+        self.quota_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold_usd": "200.00",
+            "estimated_remaining_usd": "10.00",
+        }
+        self.bark_quota_alert_sender.return_value = {
+            "sent": True,
+            "reason": "sent",
+            "threshold_usd": "200.00",
+            "estimated_remaining_usd": "10.00",
+        }
+
+        with mock.patch(
+            "services.chatgpt_codex2api_health."
+            "inspect_codex2api_account_health",
+            return_value={
+                253: {
+                    "account_id": 253,
+                    "email": "partial@example.com",
+                    "state": "healthy",
+                    "remote_status": "active",
+                    "message": "Codex2API 鉴权状态正常",
+                }
+            },
+        ):
+            _run_chatgpt_relogin_task(task_id, [253])
+
+        self.quota_alert_sender.assert_called_once()
+        self.bark_quota_alert_sender.assert_called_once()
+        meta = _task_store.snapshot(task_id)["meta"]
+        self.assertTrue(meta["quota_alert_sent"])
+        self.assertEqual(meta["quota_alert_reason"], "sent")
+        self.assertTrue(meta["bark_quota_alert_sent"])
+        self.assertEqual(meta["bark_quota_alert_reason"], "sent")
+
     def test_final_quota_query_does_not_reuse_cost_without_explicit_reset(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
@@ -1799,11 +1855,11 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(meta["quota_current_missing_count"], 0)
         self.assertEqual(
             meta["quota_alert_reason"],
-            "quota_current_partial_unestimable",
+            "quota_alert_disabled",
         )
         self.assertFalse(meta["quota_alert_sent"])
-        self.quota_alert_sender.assert_not_called()
-        self.bark_quota_alert_sender.assert_not_called()
+        self.quota_alert_sender.assert_called_once()
+        self.bark_quota_alert_sender.assert_called_once()
 
     def test_quota_alert_exception_does_not_change_terminal_task_outcome(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
