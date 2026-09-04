@@ -398,6 +398,16 @@ describe('Accounts ChatGPT staged login integration', () => {
     )
   })
 
+  it('renders one responsive card per account and keeps a current-page select-all control', async () => {
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    expect(screen.getByTestId('account-card-list')).toBeTruthy()
+    expect(screen.getByTestId('account-card-grid')).toBeTruthy()
+    expect(screen.getAllByTestId('account-card')).toHaveLength(2)
+    expect(screen.getByRole('checkbox', { name: /全选当前页/ })).toBeTruthy()
+  })
+
   it('renders current target, pool assignment, and continuous seven-day quota', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path.startsWith('/accounts?')) {

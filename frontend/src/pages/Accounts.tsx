@@ -1,7 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from 'react'
 import { useParams } from 'react-router-dom'
 import {
-  Table,
   Button,
   Input,
   InputNumber,
@@ -18,13 +17,15 @@ import {
   Descriptions,
   DatePicker,
   Timeline,
+  Checkbox,
+  Empty,
+  Pagination,
+  Skeleton,
   theme,
 } from 'antd'
 import type { MenuProps } from 'antd'
 import {
   ReloadOutlined,
-  CopyOutlined,
-  LinkOutlined,
   PlusOutlined,
   DownloadOutlined,
   UploadOutlined,
@@ -42,6 +43,7 @@ import {
 } from '@/components/ChatGPTPhoneVerificationModal'
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { AccountCard } from '@/components/accounts/AccountCard'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { canStartChatGPTPhoneVerification } from '@/lib/chatgptStagedLogin'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
@@ -56,14 +58,6 @@ import {
 const { Text } = Typography
 const CHATGPT_RELOGIN_MAX_CONCURRENCY = 10
 const CHATGPT_MFA_RESET_CONCURRENCY = 5
-
-const STATUS_COLORS: Record<string, string> = {
-  registered: 'default',
-  trial: 'success',
-  subscribed: 'success',
-  expired: 'warning',
-  invalid: 'error',
-}
 
 function parseExtraJson(raw: string | undefined) {
   if (!raw) return {}
@@ -181,18 +175,6 @@ function formatSyncTime(value?: string | null) {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleString()
 }
 
-function formatCreatedAt(value?: string) {
-  if (!value) return { date: '-', time: '' }
-  const date = new Date(value)
-  if (Number.isNaN(date.getTime())) {
-    return { date: value, time: '' }
-  }
-  return {
-    date: date.toLocaleDateString(),
-    time: date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-  }
-}
-
 function formatUsd(value: unknown) {
   if (value === null || value === undefined || value === '') return '-'
   const parsed = Number(value)
@@ -257,17 +239,6 @@ interface AccountQuotaView {
   reset_at?: string | null
   captured_at?: string | null
   fresh?: boolean
-}
-
-interface AccountControlRow {
-  assignment?: {
-    target_id?: number
-    target_name?: string
-    pool_id?: string
-    pool_name?: string
-    state?: string
-  } | null
-  quota?: Record<string, AccountQuotaView>
 }
 
 function authStateMeta(state?: string) {
@@ -491,22 +462,6 @@ function cliproxyStateMeta(sync: any) {
   return { color: 'default', label: '未同步' }
 }
 
-function uploadSyncMeta(sync: any) {
-  if (!sync || Object.keys(sync).length === 0) {
-    return { color: 'default', label: '未上传' }
-  }
-  if (sync.uploaded || sync.uploaded_at) {
-    return { color: 'success', label: '已上传' }
-  }
-  if (sync.last_attempt_ok === false) {
-    return { color: 'error', label: '失败' }
-  }
-  if (sync.last_attempt_ok === true || sync.last_attempt_at) {
-    return { color: 'processing', label: '已尝试' }
-  }
-  return { color: 'default', label: '未上传' }
-}
-
 function uploadSyncTitle(name: string, sync: any) {
   if (!sync || Object.keys(sync).length === 0) {
     return `${name} 未上传`
@@ -646,6 +601,7 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
           type="link"
           size="small"
           icon={<MoreOutlined />}
+          aria-label="更多操作"
           loading={Boolean(runningActionId)}
         />
       </Dropdown>
@@ -1669,297 +1625,43 @@ export default function Accounts() {
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const hasUploadCpaAction = platformActions.some((item) => item?.id === 'upload_cpa')
   const hasUploadCodex2APIAction = platformActions.some((item) => item?.id === 'upload_codex2api')
-  const monospaceStyle: React.CSSProperties = {
-    fontFamily: 'SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace',
-    fontSize: 12,
-  }
-  const secondaryTextStyle: React.CSSProperties = {
-    fontSize: 12,
-    color: token.colorTextSecondary,
-  }
-  const cellStackStyle: React.CSSProperties = {
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 6,
-    minWidth: 0,
-  }
-  const secretPreviewStyle: React.CSSProperties = {
-    ...monospaceStyle,
-    display: 'inline-block',
-    filter: 'blur(4px)',
-    whiteSpace: 'nowrap',
-    overflow: 'hidden',
-    textOverflow: 'ellipsis',
-    maxWidth: '100%',
-    opacity: 0.9,
-  }
-  const compactPanelStyle: React.CSSProperties = {
-    padding: '8px 10px',
-    borderRadius: token.borderRadiusLG,
-    border: `1px solid ${token.colorBorder}`,
-    background: token.colorFillAlter,
+  const visibleAccountIds = accounts
+    .map((account) => account?.id)
+    .filter((id) => id !== undefined && id !== null)
+  const selectedIdSet = new Set(selectedRowKeys.map((id) => String(id)))
+  const selectedVisibleCount = visibleAccountIds.filter((id) => selectedIdSet.has(String(id))).length
+  const allVisibleSelected = visibleAccountIds.length > 0 && selectedVisibleCount === visibleAccountIds.length
+  const someVisibleSelected = selectedVisibleCount > 0 && !allVisibleSelected
+  const cardThemeStyle = {
+    '--account-card-surface': token.colorBgContainer,
+    '--account-card-elevated': token.colorBgElevated,
+    '--account-card-fill': token.colorFillAlter,
+    '--account-card-border': token.colorBorder,
+    '--account-card-ink': token.colorText,
+    '--account-card-muted': token.colorTextSecondary,
+    '--account-card-subtle': token.colorTextTertiary,
+    '--account-card-progress-trail': token.colorFillSecondary,
+  } as React.CSSProperties
+
+  const handleCardSelection = (id: React.Key, checked: boolean) => {
+    setSelectedRowKeys((current) => {
+      const next = new Set(current.map((value) => String(value)))
+      if (checked) next.add(String(id))
+      else next.delete(String(id))
+      return Array.from(next)
+    })
   }
 
-  const columns: any[] = [
-    {
-      title: '邮箱',
-      dataIndex: 'email',
-      key: 'email',
-      width: 260,
-      fixed: isChatgptPlatform ? 'left' : undefined,
-      render: (text: string, record: any) => (
-        <div style={cellStackStyle}>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 6, minWidth: 0 }}>
-            <Text
-              style={{ ...monospaceStyle, flex: 1, minWidth: 0, whiteSpace: 'nowrap' }}
-              ellipsis={{ tooltip: text }}
-            >
-              {text}
-            </Text>
-            <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
-          </div>
-          <Text type="secondary" style={secondaryTextStyle} ellipsis={{ tooltip: record.user_id || `账号 #${record.id}` }}>
-            {record.user_id ? `UID: ${record.user_id}` : `账号 #${record.id}`}
-          </Text>
-        </div>
-      ),
-    },
-    {
-      title: '密码',
-      dataIndex: 'password',
-      key: 'password',
-      width: 150,
-      render: (text: string) => (
-        <Space size={6} style={{ width: '100%', justifyContent: 'space-between' }}>
-          <Text style={{ ...secretPreviewStyle, maxWidth: 90 }} title={text}>
-            {text}
-          </Text>
-          <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(text)} />
-        </Space>
-      ),
-    },
-    {
-      title: 'RT',
-      key: 'refresh_token',
-      width: 120,
-      render: (_: any, record: any) => {
-        const rt = getRefreshToken(record)
-        if (!rt) return <span style={{ color: '#ccc' }}>-</span>
-        return (
-          <Space size={6} style={{ width: '100%', justifyContent: 'space-between' }}>
-            <Text style={{ ...secretPreviewStyle, fontSize: 11, maxWidth: 58 }} title={rt}>
-              {rt}
-            </Text>
-            <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(rt)} />
-          </Space>
-        )
-      },
-    },
-    {
-      title: '状态',
-      dataIndex: 'status',
-      key: 'status',
-      width: 110,
-      render: (status: string) => <Tag color={STATUS_COLORS[status] || 'default'}>{status}</Tag>,
-    },
-  ]
-
-  if (isChatgptPlatform) {
-    columns.push(
-      {
-        title: '当前目标',
-        key: 'assignment',
-        width: 210,
-        render: (_: unknown, record: AccountControlRow) => {
-          const assignment = record.assignment || {}
-          const meta = assignmentStateMeta(assignment.state)
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <Space size={6} wrap>
-                <Tag color={assignment.target_id ? 'blue' : 'default'}>
-                  {assignment.target_id
-                    ? assignment.target_name || `目标 #${assignment.target_id}`
-                    : '未分配'}
-                </Tag>
-                <Tag color={meta.color}>{meta.label}</Tag>
-              </Space>
-              <Text
-                type="secondary"
-                style={secondaryTextStyle}
-                ellipsis={{ tooltip: assignment.pool_name || assignment.pool_id || '未分配号池' }}
-              >
-                {assignment.pool_name || assignment.pool_id || '未分配号池'}
-              </Text>
-            </div>
-          )
-        },
-      },
-      {
-        title: '7天剩余',
-        key: 'quota_7d',
-        width: 180,
-        render: (_: unknown, record: AccountControlRow) => {
-          const quota = record.quota?.['7d'] || {}
-          const remaining = quota.continuous_remaining_usd ?? quota.remaining_usd
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <Space size={6}>
-                <Text strong>{formatUsd(remaining)}</Text>
-                {quota.fresh === false ? <Tag color="warning">已过期</Tag> : null}
-              </Space>
-              <Text type="secondary" style={secondaryTextStyle}>
-                {quota.reset_at ? `重置 ${formatSyncTime(quota.reset_at)}` : '尚无额度快照'}
-              </Text>
-            </div>
-          )
-        },
-      },
-      {
-        title: '本地状态',
-        key: 'chatgpt_local_state',
-        width: 320,
-        render: (_: any, record: any) => {
-          const auth = record.chatgptLocal?.auth || {}
-          const subscription = record.chatgptLocal?.subscription || {}
-          const codex = record.chatgptLocal?.codex || {}
-          const cpaSync = record.cpaSync || {}
-          const sub2apiSync = record.sub2apiSync || {}
-          const codex2apiSync = record.codex2apiSync || {}
-          const authMeta = authStateMeta(auth.state)
-          const planTag = planMeta(subscription.plan)
-          const codexMeta = codexStateMeta(codex.state)
-          const cpaMeta = uploadSyncMeta(cpaSync)
-          const sub2apiMeta = uploadSyncMeta(sub2apiSync)
-          const codex2apiMeta = uploadSyncMeta(codex2apiSync)
-
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                <Tag color={authMeta.color}>{authMeta.label}</Tag>
-                <Tag color={planTag.color}>{planTag.label}</Tag>
-                <Tag color={codexMeta.color}>Codex {codexMeta.label}</Tag>
-              </div>
-              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', cpaSync)}>
-                  CPA {cpaMeta.label}
-                </Tag>
-                <Tag color={sub2apiMeta.color} title={uploadSyncTitle('Sub2API', sub2apiSync)}>
-                  Sub2API {sub2apiMeta.label}
-                </Tag>
-                <Tag color={codex2apiMeta.color} title={uploadSyncTitle('Codex2API', codex2apiSync)}>
-                  Codex2API {codex2apiMeta.label}
-                </Tag>
-              </div>
-            </div>
-          )
-        },
-      },
-      {
-        title: 'CLIProxyAPI',
-        key: 'cliproxy_sync',
-        width: 170,
-        render: (_: any, record: any) => {
-          const sync = record.cliproxySync || {}
-          const meta = cliproxyStateMeta(sync)
-
-          return (
-            <div style={{ ...cellStackStyle, ...compactPanelStyle }}>
-              <Tag color={meta.color}>{meta.label}</Tag>
-            </div>
-          )
-        },
-      },
-    )
-  } else {
-    if (hasUploadCpaAction) {
-      columns.push({
-        title: 'CPA',
-        key: 'cpa_sync',
-        width: 120,
-        render: (_: any, record: any) => {
-          const cpaMeta = uploadSyncMeta(record.cpaSync || {})
-          return (
-            <Tag color={cpaMeta.color} title={uploadSyncTitle('CPA', record.cpaSync || {})}>
-              {cpaMeta.label}
-            </Tag>
-          )
-        },
-      })
-    }
-
-    columns.push(
-      {
-        title: '地区',
-        dataIndex: 'region',
-        key: 'region',
-        width: 100,
-        render: (text: string) => text || '-',
-      },
-      {
-        title: '试用链接',
-        dataIndex: 'cashier_url',
-        key: 'cashier_url',
-        width: 120,
-        render: (url: string) =>
-          url ? (
-            <Space size={0}>
-              <Button type="text" size="small" icon={<CopyOutlined />} onClick={() => copyText(url)} />
-              <Button type="text" size="small" icon={<LinkOutlined />} onClick={() => window.open(url, '_blank')} />
-            </Space>
-          ) : (
-            '-'
-          ),
-      },
-    )
+  const handleSelectVisible = (checked: boolean) => {
+    setSelectedRowKeys((current) => {
+      const next = new Set(current.map((value) => String(value)))
+      for (const id of visibleAccountIds) {
+        if (checked) next.add(String(id))
+        else next.delete(String(id))
+      }
+      return Array.from(next)
+    })
   }
-
-  columns.push(
-    {
-      title: '注册时间',
-      dataIndex: 'created_at',
-      key: 'created_at',
-      width: 132,
-      render: (text: string) => {
-        const formatted = formatCreatedAt(text)
-        return (
-          <div style={cellStackStyle}>
-            <Text style={{ fontSize: 13 }}>{formatted.date}</Text>
-            {formatted.time ? <Text type="secondary" style={secondaryTextStyle}>{formatted.time}</Text> : null}
-          </div>
-        )
-      },
-    },
-    {
-      title: '操作',
-      key: 'action',
-      width: 150,
-      fixed: isChatgptPlatform ? 'right' : undefined,
-      render: (_: any, record: any) => (
-        <Space size={4} wrap>
-          {isChatgptPlatform && canStartChatGPTPhoneVerification(record) ? (
-            <Button type="link" size="small" onClick={() => setPhoneVerificationAccount(record)}>
-              接码
-            </Button>
-          ) : null}
-          <Button type="link" size="small" onClick={() => { setCurrentAccount(record); setDetailModalOpen(true); }}>
-            详情
-          </Button>
-          <Popconfirm
-            title="确认删除该账号吗？"
-            onConfirm={() => handleDelete(record.id)}
-            okText="删除"
-            cancelText="取消"
-            okButtonProps={{ danger: true }}
-          >
-            <Button type="link" size="small" danger>
-              删除
-            </Button>
-          </Popconfirm>
-          <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
-        </Space>
-      ),
-    },
-  )
 
   const statusSyncMenuItems: MenuProps['items'] = [
     {
@@ -1982,8 +1684,8 @@ export default function Accounts() {
 
   return (
     <div>
-      <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <Space>
+      <div className="accounts-toolbar" style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
+        <Space className="accounts-toolbar__filters" wrap>
           <Input.Search
             placeholder="搜索邮箱..."
             allowClear
@@ -2042,7 +1744,7 @@ export default function Accounts() {
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
           )}
         </Space>
-        <Space>
+        <Space className="accounts-toolbar__actions" wrap>
           {currentPlatform === 'chatgpt' && (
             <Button icon={<LoginOutlined />} onClick={() => setExistingAccountLoginModalOpen(true)}>
               登录
@@ -2235,25 +1937,80 @@ export default function Accounts() {
         />
       ) : null}
 
-      <Table
-        rowKey="id"
-        columns={columns}
-        dataSource={accounts}
-        loading={loading}
-        size="middle"
-        rowSelection={{
-          selectedRowKeys,
-          onChange: setSelectedRowKeys,
-        }}
-        pagination={{ total, current: page, pageSize, showSizeChanger: true, pageSizeOptions: ['20', '50', '100'], onChange: (p, ps) => { setPage(p); setPageSize(ps) } }}
-        scroll={{ x: isChatgptPlatform ? 1830 : 980 }}
-        onRow={(record) => ({
-          onDoubleClick: () => {
-            setCurrentAccount(record)
-            setDetailModalOpen(true)
-          },
-        })}
-      />
+      <div className="account-card-list-shell" style={cardThemeStyle} data-testid="account-card-list">
+        <div className="account-card-list-toolbar">
+          <Checkbox
+            checked={allVisibleSelected}
+            indeterminate={someVisibleSelected}
+            disabled={visibleAccountIds.length === 0}
+            onChange={(event) => handleSelectVisible(event.target.checked)}
+          >
+            全选当前页
+          </Checkbox>
+          <Text type="secondary">每个账号一张卡片，双击卡片可打开详情</Text>
+        </div>
+
+        {loading && accounts.length === 0 ? (
+          <div className="account-card-skeleton-grid" aria-label="正在加载账号">
+            {Array.from({ length: 6 }, (_, index) => (
+              <div className="account-card-skeleton" key={index}>
+                <Skeleton active paragraph={{ rows: 5 }} title={{ width: '62%' }} />
+              </div>
+            ))}
+          </div>
+        ) : accounts.length > 0 ? (
+          <table className="account-card-list" aria-label="账号列表" data-testid="account-card-grid">
+            <thead className="account-card-list__head">
+              <tr>
+                <th className="ant-table-cell-fix-left" scope="col">邮箱</th>
+              </tr>
+            </thead>
+            <tbody>
+              {accounts.map((record) => (
+                <tr key={record.id}>
+                  <td>
+                    <AccountCard
+                      account={record}
+                      platform={currentPlatform}
+                      selected={selectedIdSet.has(String(record.id))}
+                      onSelect={handleCardSelection}
+                      onCopy={copyText}
+                      onOpenDetails={(account) => {
+                        setCurrentAccount(account)
+                        setDetailModalOpen(true)
+                      }}
+                      onDelete={handleDelete}
+                      onPhoneVerification={setPhoneVerificationAccount}
+                      canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
+                      moreAction={platformActions.length ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} /> : null}
+                      codex2apiSyncTitle={uploadSyncTitle('Codex2API', record.codex2apiSync || {})}
+                    />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        ) : (
+          <Empty description="暂无账号" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+        )}
+
+        {accounts.length > 0 ? (
+          <div className="account-card-pagination">
+            <Pagination
+              total={total}
+              current={page}
+              pageSize={pageSize}
+              showSizeChanger
+              pageSizeOptions={['20', '50', '100']}
+              showTotal={(count) => `共 ${count} 个账号`}
+              onChange={(nextPage, nextPageSize) => {
+                setPage(nextPageSize !== pageSize ? 1 : nextPage)
+                setPageSize(nextPageSize)
+              }}
+            />
+          </div>
+        ) : null}
+      </div>
 
       <ChatGPTExistingAccountLoginModal
         open={existingAccountLoginModalOpen && currentPlatform === 'chatgpt'}
