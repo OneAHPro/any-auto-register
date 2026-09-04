@@ -1950,6 +1950,12 @@ export default function Accounts() {
           <Text type="secondary">每个账号一张卡片，双击卡片可打开详情</Text>
         </div>
 
+        {loading && accounts.length > 0 ? (
+          <div className="account-card-list-loading" role="status" aria-live="polite">
+            <ReloadOutlined spin /> 正在刷新账号列表…
+          </div>
+        ) : null}
+
         {loading && accounts.length === 0 ? (
           <div className="account-card-skeleton-grid" aria-label="正在加载账号">
             {Array.from({ length: 6 }, (_, index) => (

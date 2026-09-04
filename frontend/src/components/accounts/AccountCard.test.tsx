@@ -121,6 +121,29 @@ describe('AccountCard', () => {
     expect(onOpenDetails).not.toHaveBeenCalled()
   })
 
+  it('opens details from the focused card and preserves non-ChatGPT link copy', () => {
+    const onOpenDetails = vi.fn()
+    const onCopy = vi.fn()
+    render(
+      <AccountCard
+        account={{ ...account, platform: 'kiro', cashier_url: 'https://checkout.example.test/trial' }}
+        platform="kiro"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={onCopy}
+        onOpenDetails={onOpenDetails}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    fireEvent.keyDown(card, { key: 'Enter' })
+    expect(onOpenDetails).toHaveBeenCalledWith(expect.objectContaining({ platform: 'kiro' }))
+    fireEvent.click(within(card).getByRole('button', { name: '复制试用链接' }))
+    expect(onCopy).toHaveBeenCalledWith('https://checkout.example.test/trial')
+  })
+
   it('keeps missing quota explicit instead of inventing usage values', () => {
     render(
       <AccountCard

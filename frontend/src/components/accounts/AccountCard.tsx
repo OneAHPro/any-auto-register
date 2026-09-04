@@ -1,4 +1,4 @@
-import type { CSSProperties, Key, ReactNode } from 'react'
+import type { CSSProperties, Key, KeyboardEvent, ReactNode } from 'react'
 import {
   Alert,
   Avatar,
@@ -201,6 +201,14 @@ function planMeta(value: unknown): Meta {
   return PLAN_META[key] || { color: 'default', label: key ? String(value) : '套餐未读取' }
 }
 
+function syncMeta(sync: any): Meta {
+  if (!sync || Object.keys(sync).length === 0) return { color: 'default', label: '未同步' }
+  if (sync.uploaded || sync.uploaded_at) return { color: 'success', label: '已上传' }
+  if (sync.last_attempt_ok === false) return { color: 'error', label: '失败' }
+  if (sync.last_attempt_ok === true || sync.last_attempt_at) return { color: 'processing', label: '已尝试' }
+  return { color: 'default', label: '未上传' }
+}
+
 function getStatusCode(account: any, auth: any, codex: any): number | null {
   const value = firstNumber(account, [
     ['chatgptLocal', 'codex', 'http_status'],
@@ -245,9 +253,10 @@ function SecretLine({ label, value, onCopy, icon }: { label: string; value: stri
   return (
     <div className="account-card__secret-line">
       <span className="account-card__field-label">{icon}{label}</span>
-      <span className="account-card__secret-value" title={value}>{maskSecret(value)}</span>
+      <span className="account-card__secret-value" title="已隐藏，点击复制" aria-hidden="true">{maskSecret(value)}</span>
       <span
         className="account-card__secret-accessible"
+        aria-hidden="true"
         style={{ display: 'inline-block' }}
       >
         {value}
@@ -288,7 +297,8 @@ export function AccountCard({
   const codexPayload = parseJsonObject(codex.message)
   const primaryWindow = codexPayload.rate_limit?.primary_window || codexPayload.rateLimit?.primary_window || {}
   const assignment = account?.assignment || {}
-  const quota = account?.quota?.['7d'] || account?.quota?.['monthly'] || {}
+  const quotaWindow = account?.quota?.['7d'] ? '7d' : account?.quota?.['monthly'] ? 'monthly' : ''
+  const quota = quotaWindow ? account.quota[quotaWindow] : {}
   const accountStatus = statusMeta(account?.status)
   const subscriptionPlan = String(subscription.plan || '').trim().toLowerCase()
   const plan = planMeta(
@@ -316,7 +326,6 @@ export function AccountCard({
       || authPayload.orgs?.data?.[0]?.name
       || extra.workspace_name
       || extra.workspaceName
-      || assignment.pool_name
       || '工作区未读取',
   )
   const workspacePlan = String(
@@ -340,6 +349,20 @@ export function AccountCard({
   const issue = platform === 'chatgpt' ? getIssue(auth, codex) : null
   const usagePercent = firstNumber(quota, [['usage_percent']])
     ?? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']])
+  const usageWindowTitle = quotaWindow === 'monthly'
+    ? '本月使用'
+    : quotaWindow === '7d'
+      ? '本周使用'
+      : usagePercent !== null
+        ? '当前窗口'
+        : '本周使用'
+  const usageWindowLabel = quotaWindow === 'monthly'
+    ? '月度剩余'
+    : quotaWindow === '7d'
+      ? '7天剩余'
+      : usagePercent !== null
+        ? '当前窗口剩余'
+        : '7天剩余'
   const remainingPercent = usagePercent === null ? null : clampPercent(100 - usagePercent)
   const billed = firstValue(quota, [['continuous_billed_usd'], ['billed_usd']])
   const remaining = firstValue(quota, [['continuous_remaining_usd'], ['remaining_usd']])
@@ -394,6 +417,27 @@ export function AccountCard({
   ])
   const checkedAt = firstValue(local, [['checked_at'], ['codex', 'checked_at'], ['auth', 'checked_at']])
   const codexSync = account?.codex2apiSync || {}
+  const authStatus = AUTH_META[String(auth?.state || '').toLowerCase()] || { color: 'default', label: '未探测' }
+  const codexStatus = CODEX_META[String(codex?.state || '').toLowerCase()] || { color: 'default', label: '未探测' }
+  const cpaStatus = syncMeta(account?.cpaSync)
+  const sub2apiStatus = syncMeta(account?.sub2apiSync)
+  const codex2apiStatus = syncMeta(account?.codex2apiSync)
+  const cliproxyStatus = syncMeta(account?.cliproxySync)
+  const assignmentStatus = assignment.state === 'active'
+    ? { color: 'success', label: '生效中' }
+    : assignment.state === 'draining'
+      ? { color: 'processing', label: '排空中' }
+      : assignment.state === 'standby'
+        ? { color: 'default', label: '备用' }
+        : { color: 'default', label: '未分配' }
+  const openDetails = () => onOpenDetails(account)
+  const handleCardKeyDown = (event: KeyboardEvent<HTMLElement>) => {
+    if (event.currentTarget !== event.target) return
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault()
+      openDetails()
+    }
+  }
   const refreshToken = String(
     extra.refresh_token
       || extra.refreshToken
@@ -418,7 +462,10 @@ export function AccountCard({
       data-testid="account-card"
       data-account-id={account?.id}
       style={token}
-      onDoubleClick={() => onOpenDetails(account)}
+      tabIndex={0}
+      aria-label={`${email}，按回车查看详情`}
+      onDoubleClick={openDetails}
+      onKeyDown={handleCardKeyDown}
     >
       <header className="account-card__header">
         <Checkbox
@@ -489,6 +536,16 @@ export function AccountCard({
         </div>
       </div>
 
+      <div className="account-card__status-row" aria-label="账号运行状态">
+        <Tag color={authStatus.color}>认证 {authStatus.label}</Tag>
+        {platform === 'chatgpt' ? <Tag color={codexStatus.color}>Codex {codexStatus.label}</Tag> : null}
+        {platform === 'chatgpt' ? <Tag color={assignmentStatus.color}>号池 {assignmentStatus.label}</Tag> : null}
+        {platform === 'chatgpt' && Object.keys(account?.cpaSync || {}).length > 0 ? <Tag color={cpaStatus.color}>CPA {cpaStatus.label}</Tag> : null}
+        {platform === 'chatgpt' && Object.keys(account?.sub2apiSync || {}).length > 0 ? <Tag color={sub2apiStatus.color}>Sub2API {sub2apiStatus.label}</Tag> : null}
+        {platform === 'chatgpt' && Object.keys(account?.codex2apiSync || {}).length > 0 ? <Tag color={codex2apiStatus.color}>Codex2API {codex2apiStatus.label}</Tag> : null}
+        {platform === 'chatgpt' && Object.keys(account?.cliproxySync || {}).length > 0 ? <Tag color={cliproxyStatus.color}>CLIProxy {cliproxyStatus.label}</Tag> : null}
+      </div>
+
       {issue ? (
         <Alert
           className="account-card__issue"
@@ -514,10 +571,10 @@ export function AccountCard({
       ) : null}
 
       {platform === 'chatgpt' ? (
-        <section className="account-card__quota" aria-label="本周额度">
+        <section className="account-card__quota" aria-label={usageWindowTitle}>
           <div className="account-card__section-heading">
-            <span><ClockCircleOutlined />本周使用</span>
-            <span className="account-card__window-label">7天剩余</span>
+            <span><ClockCircleOutlined />{usageWindowTitle}</span>
+            <span className="account-card__window-label">{usageWindowLabel}</span>
             <Text type="secondary">{quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '重置时间未读取'}</Text>
           </div>
           {remainingPercent !== null ? (
@@ -598,9 +655,14 @@ export function AccountCard({
           ) : null}
           <Button aria-label="详情" type="text" size="small" icon={<EyeOutlined />} onClick={() => onOpenDetails(account)}>详情</Button>
           {account?.cashier_url ? (
-            <Tooltip title="打开试用链接">
-              <Button type="text" size="small" aria-label="打开试用链接" icon={<LinkOutlined />} onClick={() => window.open(account.cashier_url, '_blank', 'noopener,noreferrer')} />
-            </Tooltip>
+            <>
+              <Tooltip title="复制试用链接">
+                <Button type="text" size="small" aria-label="复制试用链接" icon={<CopyOutlined />} onClick={() => onCopy(account.cashier_url)} />
+              </Tooltip>
+              <Tooltip title="打开试用链接">
+                <Button type="text" size="small" aria-label="打开试用链接" icon={<LinkOutlined />} onClick={() => window.open(account.cashier_url, '_blank', 'noopener,noreferrer')} />
+              </Tooltip>
+            </>
           ) : null}
           <Popconfirm
             title="确认删除该账号吗？"

@@ -528,6 +528,19 @@ code {
   white-space: nowrap;
 }
 
+.account-card-list-loading {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 12px 2px;
+  color: var(--account-card-subtle);
+  font-size: 11px;
+}
+
+.account-card-list-loading .anticon {
+  color: var(--account-card-primary, #4f46e5);
+}
+
 .account-card-list {
   width: 100%;
   border-collapse: separate;
@@ -612,6 +625,11 @@ code {
   border-color: color-mix(in srgb, var(--account-card-primary, #4f46e5) 58%, var(--account-card-border));
   box-shadow: 0 16px 34px rgba(15, 23, 42, 0.16);
   transform: translateY(-2px);
+}
+
+.account-card:focus-visible {
+  outline: 2px solid var(--account-card-primary, #4f46e5);
+  outline-offset: 3px;
 }
 
 .account-card--selected {
@@ -704,6 +722,19 @@ code {
   padding: 14px 0;
   border-top: 1px solid var(--account-card-border);
   border-bottom: 1px solid var(--account-card-border);
+}
+
+.account-card__status-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 10px;
+}
+
+.account-card__status-row .ant-tag {
+  margin: 0;
+  font-size: 10px;
+  line-height: 20px;
 }
 
 .account-card__identity-item {
