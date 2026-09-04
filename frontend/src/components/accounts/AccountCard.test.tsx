@@ -200,4 +200,32 @@ describe('AccountCard', () => {
     expect(within(card).getByText('76%')).toBeTruthy()
     expect(within(card).getByText('probe-account-1')).toBeTruthy()
   })
+
+  it('does not borrow a different quota window when the seven-day snapshot is incomplete', () => {
+    render(
+      <AccountCard
+        account={{
+          ...account,
+          quota: { '7d': { remaining_usd: 12, reset_at: '2026-09-07T00:00:00Z' } },
+          chatgptLocal: {
+            ...account.chatgptLocal,
+            codex: {
+              ...account.chatgptLocal.codex,
+              message: JSON.stringify({ rate_limit: { primary_window: { used_percent: 24 } } }),
+            },
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    expect(screen.getByText('额度快照缺少使用百分比')).toBeTruthy()
+    expect(screen.queryByText('76%')).toBeNull()
+  })
 })

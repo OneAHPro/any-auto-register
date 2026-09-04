@@ -347,8 +347,9 @@ export function AccountCard({
   )
   const statusCode = platform === 'chatgpt' ? getStatusCode(account, auth, codex) : null
   const issue = platform === 'chatgpt' ? getIssue(auth, codex) : null
-  const usagePercent = firstNumber(quota, [['usage_percent']])
-    ?? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']])
+  const ledgerUsagePercent = firstNumber(quota, [['usage_percent']])
+  const usagePercent = ledgerUsagePercent
+    ?? (!quotaWindow ? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']]) : null)
   const usageWindowTitle = quotaWindow === 'monthly'
     ? '本月使用'
     : quotaWindow === '7d'
@@ -407,8 +408,7 @@ export function AccountCard({
     ['subscription', 'active_until'],
   ]) || firstValue(account, [['expires_at'], ['extra', 'expires_at'], ['extra', 'valid_until']])
   const quotaResetAt = firstValue(quota, [['reset_at']])
-    || firstValue(primaryWindow, [['reset_at']])
-    || firstValue(codexPayload, [['reset_at']])
+    || (!quotaWindow ? firstValue(primaryWindow, [['reset_at']]) || firstValue(codexPayload, [['reset_at']]) : undefined)
   const validityDays = firstNumber(account, [
     ['validity_days'],
     ['valid_days'],
@@ -463,7 +463,7 @@ export function AccountCard({
       data-account-id={account?.id}
       style={token}
       tabIndex={0}
-      aria-label={`${email}，按回车查看详情`}
+      aria-label={`${maskEmail(email)}，按回车查看详情`}
       onDoubleClick={openDetails}
       onKeyDown={handleCardKeyDown}
     >
@@ -478,10 +478,10 @@ export function AccountCard({
         </Avatar>
         <div className="account-card__identity">
           <div className="account-card__email-row">
-            <Tooltip title={email}>
+            <Tooltip title="复制邮箱">
               <Text className="account-card__email" ellipsis={{ tooltip: false }}>{maskEmail(email)}</Text>
             </Tooltip>
-            <span className="account-card__email-accessible">{email}</span>
+            <span className="account-card__email-accessible" aria-hidden="true">{email}</span>
             <Tooltip title="复制邮箱">
               <Button
                 type="text"
@@ -540,10 +540,10 @@ export function AccountCard({
         <Tag color={authStatus.color}>认证 {authStatus.label}</Tag>
         {platform === 'chatgpt' ? <Tag color={codexStatus.color}>Codex {codexStatus.label}</Tag> : null}
         {platform === 'chatgpt' ? <Tag color={assignmentStatus.color}>号池 {assignmentStatus.label}</Tag> : null}
-        {platform === 'chatgpt' && Object.keys(account?.cpaSync || {}).length > 0 ? <Tag color={cpaStatus.color}>CPA {cpaStatus.label}</Tag> : null}
-        {platform === 'chatgpt' && Object.keys(account?.sub2apiSync || {}).length > 0 ? <Tag color={sub2apiStatus.color}>Sub2API {sub2apiStatus.label}</Tag> : null}
-        {platform === 'chatgpt' && Object.keys(account?.codex2apiSync || {}).length > 0 ? <Tag color={codex2apiStatus.color}>Codex2API {codex2apiStatus.label}</Tag> : null}
-        {platform === 'chatgpt' && Object.keys(account?.cliproxySync || {}).length > 0 ? <Tag color={cliproxyStatus.color}>CLIProxy {cliproxyStatus.label}</Tag> : null}
+        {platform === 'chatgpt' ? <Tag color={cpaStatus.color}>CPA {cpaStatus.label}</Tag> : null}
+        {platform === 'chatgpt' ? <Tag color={sub2apiStatus.color}>Sub2API {sub2apiStatus.label}</Tag> : null}
+        {platform === 'chatgpt' ? <Tag color={codex2apiStatus.color} title={codex2apiSyncTitle}>Codex2API {codex2apiStatus.label}</Tag> : null}
+        {platform === 'chatgpt' ? <Tag color={cliproxyStatus.color}>CLIProxy {cliproxyStatus.label}</Tag> : null}
       </div>
 
       {issue ? (
@@ -593,7 +593,9 @@ export function AccountCard({
               />
             </>
           ) : (
-            <div className="account-card__quota-empty">尚无额度快照</div>
+            <div className="account-card__quota-empty">
+              {quotaWindow ? '额度快照缺少使用百分比' : '尚无额度快照'}
+            </div>
           )}
           <div className="account-card__metrics-grid">
             <Metric label="请求数" value={formatNumber(requestCount)} />
