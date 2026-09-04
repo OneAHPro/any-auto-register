@@ -496,7 +496,7 @@ export function AccountCard({
           <div className="account-card__tag-row">
             <Tag color={accountStatus.color}>{accountStatus.label}</Tag>
             {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
-            {platform === 'chatgpt' && workspacePlan ? <Tag color="blue">{planMeta(workspacePlan).label}</Tag> : null}
+            {platform === 'chatgpt' && workspacePlan && planMeta(workspacePlan).label !== plan.label ? <Tag color="blue">{planMeta(workspacePlan).label}</Tag> : null}
             {statusCode ? <Tag color={statusCode >= 400 ? 'error' : 'success'}>HTTP {statusCode}</Tag> : null}
             {codexSync.uploaded ? <Tag color="success" title={codex2apiSyncTitle}>API 已同步</Tag> : null}
             {resetCount !== null ? <Tag color="default">重置 {resetCount}</Tag> : null}
