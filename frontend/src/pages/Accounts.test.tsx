@@ -408,6 +408,52 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(screen.getByRole('checkbox', { name: /全选当前页/ })).toBeTruthy()
   })
 
+  it('requests the live ChatGPT display projection with the account list', async () => {
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    const accountRequest = vi.mocked(apiFetch).mock.calls.find(([path]) => String(path).startsWith('/accounts?'))
+    expect(accountRequest?.[0]).toContain('include_live=1')
+  })
+
+  it('renders the live plan and quota projection returned by the account API', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return {
+          items: [{
+            ...eligibleAccount,
+            chatgpt_display: {
+              plan_type: 'self_serve_business_prolite',
+              plan_source: 'codex2api_live',
+              quota_status: 'live',
+              subscription_active_until: '2026-10-04T01:56:53Z',
+              quota: {
+                window: '7d',
+                usage_percent: 36,
+                billed_usd: 144.07,
+                reset_at: '2026-09-11T21:54:13+08:00',
+                request_count: 1639,
+                remote_status: 'active',
+              },
+            },
+          }],
+          total: 1,
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    const card = (await screen.findAllByTestId('account-card'))[0]
+    expect(within(card).getByText('Business Pro Lite')).toBeTruthy()
+    expect(within(card).getByText('36%')).toBeTruthy()
+    expect(within(card).getByText('1,639')).toBeTruthy()
+    expect(within(card).getByText('$144.07')).toBeTruthy()
+    expect(within(card).queryByText('剩余估算')).toBeNull()
+  })
+
   it('renders current target, pool assignment, and continuous seven-day quota', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path.startsWith('/accounts?')) {
@@ -439,7 +485,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     render(<Accounts />)
 
     expect((await screen.findAllByText('当前目标')).length).toBeGreaterThan(0)
-    expect(screen.getAllByText('7天剩余').length).toBeGreaterThan(0)
+    expect(screen.getAllByText('7天窗口').length).toBeGreaterThan(0)
     expect(screen.getByText('目标 #2')).toBeTruthy()
     expect(screen.getByText('ENTERPRISE_A_POOL')).toBeTruthy()
     expect(screen.getByText('$900.00')).toBeTruthy()

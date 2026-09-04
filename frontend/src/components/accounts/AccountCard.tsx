@@ -44,7 +44,6 @@ export interface AccountCardProps {
   onPhoneVerification?: (account: any) => void
   canPhoneVerification?: boolean
   moreAction?: ReactNode
-  codex2apiSyncTitle?: string
 }
 
 type Meta = { color: string; label: string }
@@ -62,7 +61,20 @@ const PLAN_META: Record<string, Meta> = {
   team: { color: 'processing', label: 'Team' },
   enterprise: { color: 'processing', label: 'Enterprise' },
   pro: { color: 'processing', label: 'Pro' },
+  self_serve_business_prolite: { color: 'processing', label: 'Business Pro Lite' },
+  business_pro_lite: { color: 'processing', label: 'Business Pro Lite' },
+  business_pro: { color: 'processing', label: 'Business Pro' },
   free: { color: 'default', label: 'Free' },
+}
+
+const LIVE_STATUS_META: Record<string, Meta> = {
+  active: { color: 'success', label: '可用' },
+  ready: { color: 'success', label: '可用' },
+  rate_limited: { color: 'warning', label: '限流中' },
+  error: { color: 'error', label: '异常' },
+  invalid: { color: 'error', label: '已失效' },
+  unauthorized: { color: 'error', label: '未授权' },
+  disabled: { color: 'default', label: '已停用' },
 }
 
 const AUTH_META: Record<string, Meta> = {
@@ -198,25 +210,15 @@ function statusMeta(value: unknown): Meta {
 
 function planMeta(value: unknown): Meta {
   const key = String(value || '').toLowerCase()
-  return PLAN_META[key] || { color: 'default', label: key ? String(value) : '套餐未读取' }
+  if (['', 'unknown', 'none', 'null', 'n/a', 'unread', 'not_available'].includes(key)) {
+    return { color: 'default', label: '—' }
+  }
+  return PLAN_META[key] || { color: 'default', label: key ? String(value) : '—' }
 }
 
-function syncMeta(sync: any): Meta {
-  if (!sync || Object.keys(sync).length === 0) return { color: 'default', label: '未同步' }
-  if (sync.uploaded || sync.uploaded_at) return { color: 'success', label: '已上传' }
-  if (sync.last_attempt_ok === false) return { color: 'error', label: '失败' }
-  if (sync.last_attempt_ok === true || sync.last_attempt_at) return { color: 'processing', label: '已尝试' }
-  return { color: 'default', label: '未上传' }
-}
-
-function getStatusCode(account: any, auth: any, codex: any): number | null {
-  const value = firstNumber(account, [
-    ['chatgptLocal', 'codex', 'http_status'],
-    ['chatgptLocal', 'auth', 'http_status'],
-    ['extra', 'chatgpt_local', 'codex', 'http_status'],
-    ['extra', 'chatgpt_local', 'auth', 'http_status'],
-  ]) ?? firstNumber({ auth, codex }, [['codex', 'http_status'], ['auth', 'http_status']])
-  return value && value > 0 ? Math.round(value) : null
+function liveStatusMeta(value: unknown, fallback: Meta): Meta {
+  const key = String(value || '').toLowerCase()
+  return LIVE_STATUS_META[key] || fallback
 }
 
 function getIssue(auth: any, codex: any): { message: string; type: 'error' | 'warning' } | null {
@@ -286,7 +288,6 @@ export function AccountCard({
   onPhoneVerification,
   canPhoneVerification = false,
   moreAction,
-  codex2apiSyncTitle,
 }: AccountCardProps) {
   const extra = parseExtra(account)
   const local = account?.chatgptLocal || extra.chatgpt_local || {}
@@ -297,21 +298,30 @@ export function AccountCard({
   const codexPayload = parseJsonObject(codex.message)
   const primaryWindow = codexPayload.rate_limit?.primary_window || codexPayload.rateLimit?.primary_window || {}
   const assignment = account?.assignment || {}
-  const quotaWindow = account?.quota?.['7d'] ? '7d' : account?.quota?.['monthly'] ? 'monthly' : ''
-  const quota = quotaWindow ? account.quota[quotaWindow] : {}
+  const liveDisplay = account?.chatgpt_display && typeof account.chatgpt_display === 'object'
+    ? account.chatgpt_display
+    : null
+  const liveQuota = liveDisplay?.quota && typeof liveDisplay.quota === 'object'
+    ? liveDisplay.quota
+    : null
+  const legacyQuotaWindow = account?.quota?.['7d'] ? '7d' : account?.quota?.['monthly'] ? 'monthly' : ''
+  const quotaWindow = liveDisplay ? String(liveQuota?.window || '') : legacyQuotaWindow
+  const quota = liveDisplay ? (liveQuota || {}) : (legacyQuotaWindow ? account.quota[legacyQuotaWindow] : {})
   const accountStatus = statusMeta(account?.status)
   const subscriptionPlan = String(subscription.plan || '').trim().toLowerCase()
   const plan = planMeta(
-    (!subscriptionPlan || subscriptionPlan === 'unknown')
-      ? codexPayload.plan_type
-        || codexPayload.planType
-        || extra.plan
-        || extra.subscription_plan
-      : subscription.plan,
+    liveDisplay?.plan_type
+      || ((!subscriptionPlan || subscriptionPlan === 'unknown')
+        ? codexPayload.plan_type
+          || codexPayload.planType
+          || extra.plan
+          || extra.subscription_plan
+        : subscription.plan),
   )
   const email = String(account?.email || `账号 #${account?.id ?? '—'}`)
   const userId = String(
-    account?.user_id
+    liveDisplay?.chatgpt_account_id
+      || account?.user_id
       || subscription.chatgpt_account_id
       || codex.chatgpt_account_id
       || codexPayload.account_id
@@ -321,21 +331,15 @@ export function AccountCard({
       || '',
   ).trim()
   const workspaceName = String(
-    subscription.workspace_name
+    liveDisplay?.workspace_name
+      || subscription.workspace_name
       || subscription.workspaceName
       || authPayload.orgs?.data?.[0]?.name
       || extra.workspace_name
       || extra.workspaceName
-      || '工作区未读取',
+      || liveDisplay?.workspace_id
+      || '—',
   )
-  const workspacePlan = String(
-    subscription.workspace_plan_type
-      || subscription.workspacePlanType
-      || codexPayload.workspace_plan_type
-      || codexPayload.workspacePlanType
-      || extra.workspace_plan_type
-      || '',
-  ).trim()
   const provider = providerLabel(
     firstValue(account, [
       ['extra', 'mailbox_login_context', 'provider'],
@@ -345,42 +349,63 @@ export function AccountCard({
     ]),
     platform,
   )
-  const statusCode = platform === 'chatgpt' ? getStatusCode(account, auth, codex) : null
   const issue = platform === 'chatgpt' ? getIssue(auth, codex) : null
-  const ledgerUsagePercent = firstNumber(quota, [['usage_percent']])
-  const usagePercent = ledgerUsagePercent
-    ?? (!quotaWindow ? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']]) : null)
+  const displayStatus = platform === 'chatgpt'
+    ? liveDisplay
+      ? liveDisplay.quota_status === 'error'
+        ? { color: 'warning', label: '实时不可用' }
+        : liveDisplay.remote_status
+          ? liveStatusMeta(liveDisplay.remote_status, accountStatus)
+          : accountStatus
+      : accountStatus
+    : accountStatus
+  const usagePercent = liveDisplay
+    ? firstNumber(quota, [['usage_percent']])
+    : firstNumber(quota, [['usage_percent']])
+      ?? (!quotaWindow ? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']]) : null)
   const usageWindowTitle = quotaWindow === 'monthly'
-    ? '本月使用'
+    ? '月度使用'
     : quotaWindow === '7d'
-      ? '本周使用'
-      : usagePercent !== null
-        ? '当前窗口'
-        : '本周使用'
+      ? '7天使用'
+      : liveDisplay
+        ? '实时使用'
+        : usagePercent !== null
+        ? '当前使用'
+        : '7天使用'
   const usageWindowLabel = quotaWindow === 'monthly'
-    ? '月度剩余'
+    ? '月度窗口'
     : quotaWindow === '7d'
-      ? '7天剩余'
-      : usagePercent !== null
-        ? '当前窗口剩余'
-        : '7天剩余'
-  const remainingPercent = usagePercent === null ? null : clampPercent(100 - usagePercent)
-  const billed = firstValue(quota, [['continuous_billed_usd'], ['billed_usd']])
-  const remaining = firstValue(quota, [['continuous_remaining_usd'], ['remaining_usd']])
-  const requestCount = firstNumber(account, [
-    ['request_count'],
-    ['extra', 'request_count'],
-    ['extra', 'usage', 'weekly', 'requests'],
-    ['extra', 'usage_detail', 'request_count'],
-    ['extra', 'usage_detail', 'requests'],
-  ]) ?? firstNumber(codexPayload, [['requests'], ['request_count'], ['rate_limit', 'primary_window', 'requests']])
-  const bandwidth = firstNumber(account, [
-    ['bytes_used'],
-    ['extra', 'bytes_used'],
-    ['extra', 'usage', 'weekly', 'bytes'],
-    ['extra', 'usage_detail', 'bytes'],
-    ['extra', 'usage_detail', 'bandwidth'],
-  ]) ?? firstNumber(codexPayload, [['bytes'], ['bytes_used'], ['usage_bytes']])
+      ? '7天窗口'
+      : liveDisplay
+        ? '实时窗口'
+        : usagePercent !== null
+        ? '当前窗口'
+        : '7天窗口'
+  const usagePercentDisplay = usagePercent === null ? null : clampPercent(usagePercent)
+  const billed = liveDisplay
+    ? firstValue(quota, [['billed_usd']])
+    : firstValue(quota, [['continuous_billed_usd'], ['billed_usd']])
+  const remaining = liveDisplay
+    ? undefined
+    : firstValue(quota, [['continuous_remaining_usd'], ['remaining_usd']])
+  const requestCount = liveDisplay
+    ? firstNumber(quota, [['request_count']])
+    : firstNumber(account, [
+      ['request_count'],
+      ['extra', 'request_count'],
+      ['extra', 'usage', 'weekly', 'requests'],
+      ['extra', 'usage_detail', 'request_count'],
+      ['extra', 'usage_detail', 'requests'],
+    ]) ?? firstNumber(codexPayload, [['requests'], ['request_count'], ['rate_limit', 'primary_window', 'requests']])
+  const bandwidth = liveDisplay
+    ? firstNumber(quota, [['bytes_used'], ['bytes']])
+    : firstNumber(account, [
+      ['bytes_used'],
+      ['extra', 'bytes_used'],
+      ['extra', 'usage', 'weekly', 'bytes'],
+      ['extra', 'usage_detail', 'bytes'],
+      ['extra', 'usage_detail', 'bandwidth'],
+    ]) ?? firstNumber(codexPayload, [['bytes'], ['bytes_used'], ['usage_bytes']])
   const actualPrice = firstValue(account, [
     ['actual_price'],
     ['extra', 'actual_price'],
@@ -398,12 +423,7 @@ export function AccountCard({
     ['extra', 'note'],
     ['extra', 'notes'],
   ]) || '').trim()
-  const resetCount = firstNumber(account, [
-    ['reset_count'],
-    ['extra', 'reset_count'],
-    ['extra', 'mfa_reset_count'],
-  ])
-  const activeUntil = firstValue(local, [
+  const activeUntil = firstValue(liveDisplay, [['subscription_active_until']]) || firstValue(local, [
     ['subscription', 'subscription_active_until'],
     ['subscription', 'active_until'],
   ]) || firstValue(account, [['expires_at'], ['extra', 'expires_at'], ['extra', 'valid_until']])
@@ -416,20 +436,15 @@ export function AccountCard({
     ['extra', 'valid_days'],
   ])
   const checkedAt = firstValue(local, [['checked_at'], ['codex', 'checked_at'], ['auth', 'checked_at']])
-  const codexSync = account?.codex2apiSync || {}
-  const authStatus = AUTH_META[String(auth?.state || '').toLowerCase()] || { color: 'default', label: '未探测' }
-  const codexStatus = CODEX_META[String(codex?.state || '').toLowerCase()] || { color: 'default', label: '未探测' }
-  const cpaStatus = syncMeta(account?.cpaSync)
-  const sub2apiStatus = syncMeta(account?.sub2apiSync)
-  const codex2apiStatus = syncMeta(account?.codex2apiSync)
-  const cliproxyStatus = syncMeta(account?.cliproxySync)
-  const assignmentStatus = assignment.state === 'active'
-    ? { color: 'success', label: '生效中' }
-    : assignment.state === 'draining'
-      ? { color: 'processing', label: '排空中' }
-      : assignment.state === 'standby'
-        ? { color: 'default', label: '备用' }
-        : { color: 'default', label: '未分配' }
+  const quotaEmptyLabel = liveDisplay
+    ? liveDisplay.quota_status === 'error'
+      ? '实时额度暂不可用'
+      : liveDisplay.quota_status === 'not_found'
+        ? '暂无实时额度'
+        : '暂无可用额度'
+    : quotaWindow
+      ? '额度快照缺少使用百分比'
+      : '尚无额度快照'
   const openDetails = () => onOpenDetails(account)
   const handleCardKeyDown = (event: KeyboardEvent<HTMLElement>) => {
     if (event.currentTarget !== event.target) return
@@ -445,15 +460,14 @@ export function AccountCard({
       || '',
   ).trim()
   const password = String(account?.password || '').trim()
-  const syncStates = [
-    account?.cpaSync,
-    account?.sub2apiSync,
-    account?.codex2apiSync,
-    account?.cliproxySync,
-  ].filter((value) => value && Object.keys(value).length > 0)
   const createdAt = formatDate(account?.created_at, true)
+  const statusColor = displayStatus.color === 'error'
+    ? '#f97373'
+    : displayStatus.color === 'warning'
+      ? '#fbbf24'
+      : '#4ade80'
   const token = {
-    '--account-card-primary': statusCode && statusCode >= 400 ? '#f97373' : '#4ade80',
+    '--account-card-primary': statusColor,
   } as CSSProperties
 
   return (
@@ -494,12 +508,8 @@ export function AccountCard({
             </Tooltip>
           </div>
           <div className="account-card__tag-row">
-            <Tag color={accountStatus.color}>{accountStatus.label}</Tag>
+            <Tag color={displayStatus.color}>{displayStatus.label}</Tag>
             {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
-            {platform === 'chatgpt' && workspacePlan && planMeta(workspacePlan).label !== plan.label ? <Tag color="blue">{planMeta(workspacePlan).label}</Tag> : null}
-            {statusCode ? <Tag color={statusCode >= 400 ? 'error' : 'success'}>HTTP {statusCode}</Tag> : null}
-            {codexSync.uploaded ? <Tag color="success" title={codex2apiSyncTitle}>API 已同步</Tag> : null}
-            {resetCount !== null ? <Tag color="default">重置 {resetCount}</Tag> : null}
           </div>
         </div>
         <div className="account-card__header-actions">{moreAction}</div>
@@ -530,20 +540,6 @@ export function AccountCard({
           <span className="account-card__field-label"><UserOutlined />用户 ID</span>
           <Text ellipsis={{ tooltip: userId || `账号 #${account?.id ?? '—'}` }}>{userId || `账号 #${account?.id ?? '—'}`}</Text>
         </div>
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><LinkOutlined />同步状态</span>
-          <Text>{syncStates.length ? `${syncStates.length} 个目标已记录` : '尚未同步'}</Text>
-        </div>
-      </div>
-
-      <div className="account-card__status-row" aria-label="账号运行状态">
-        <Tag color={authStatus.color}>认证 {authStatus.label}</Tag>
-        {platform === 'chatgpt' ? <Tag color={codexStatus.color}>Codex {codexStatus.label}</Tag> : null}
-        {platform === 'chatgpt' ? <Tag color={assignmentStatus.color}>号池 {assignmentStatus.label}</Tag> : null}
-        {platform === 'chatgpt' ? <Tag color={cpaStatus.color}>CPA {cpaStatus.label}</Tag> : null}
-        {platform === 'chatgpt' ? <Tag color={sub2apiStatus.color}>Sub2API {sub2apiStatus.label}</Tag> : null}
-        {platform === 'chatgpt' ? <Tag color={codex2apiStatus.color} title={codex2apiSyncTitle}>Codex2API {codex2apiStatus.label}</Tag> : null}
-        {platform === 'chatgpt' ? <Tag color={cliproxyStatus.color}>CLIProxy {cliproxyStatus.label}</Tag> : null}
       </div>
 
       {issue ? (
@@ -575,33 +571,35 @@ export function AccountCard({
           <div className="account-card__section-heading">
             <span><ClockCircleOutlined />{usageWindowTitle}</span>
             <span className="account-card__window-label">{usageWindowLabel}</span>
-            <Text type="secondary">{quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '重置时间未读取'}</Text>
+            <Text type="secondary">{quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '—'}</Text>
           </div>
-          {remainingPercent !== null ? (
+          {usagePercentDisplay !== null ? (
             <>
               <div className="account-card__quota-headline">
-                <strong>{remainingPercent}%</strong>
-                <span>剩余窗口</span>
-                {quota.fresh === false ? <Tag color="warning">数据过期</Tag> : <Tag color="success">数据有效</Tag>}
+                <strong>{usagePercentDisplay}%</strong>
+                <span>已用窗口</span>
+                {liveDisplay ? <Tag color="success">实时</Tag> : quota.fresh === false ? <Tag color="warning">数据过期</Tag> : <Tag color="success">数据有效</Tag>}
               </div>
               <Progress
-                percent={remainingPercent}
+                percent={usagePercentDisplay}
                 showInfo={false}
-                strokeColor={remainingPercent <= 20 ? '#f97373' : '#32c36c'}
+                strokeColor={usagePercentDisplay >= 80 ? '#f97373' : '#32c36c'}
                 trailColor="var(--account-card-progress-trail)"
                 size={{ height: 8 }}
               />
             </>
           ) : (
-            <div className="account-card__quota-empty">
-              {quotaWindow ? '额度快照缺少使用百分比' : '尚无额度快照'}
-            </div>
+            <div className="account-card__quota-empty">{quotaEmptyLabel}</div>
           )}
           <div className="account-card__metrics-grid">
             <Metric label="请求数" value={formatNumber(requestCount)} />
             <Metric label="流量" value={formatBytes(bandwidth)} />
             <Metric label="已计费" value={formatMoney(billed)} />
-            <Metric label="剩余估算" value={formatMoney(remaining)} accent />
+            {liveDisplay ? (
+              <Metric label="状态" value={displayStatus.label} accent />
+            ) : (
+              <Metric label="剩余估算" value={formatMoney(remaining)} accent />
+            )}
           </div>
         </section>
       ) : (

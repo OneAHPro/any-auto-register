@@ -562,8 +562,8 @@ code {
 
 .account-card-list > tbody {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
 }
 
 .account-card-list > tbody > tr {
@@ -580,16 +580,16 @@ code {
 
 .account-card-skeleton-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
-  gap: 16px;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 12px;
 }
 
 .account-card-skeleton {
-  min-height: 360px;
-  padding: 18px;
+  min-height: 280px;
+  padding: 14px;
   background: var(--account-card-surface);
   border: 1px solid var(--account-card-border);
-  border-radius: 18px;
+  border-radius: 14px;
 }
 
 .account-card {
@@ -598,22 +598,22 @@ code {
   flex-direction: column;
   min-width: 0;
   min-height: 100%;
-  padding: 18px;
+  padding: 12px;
   overflow: hidden;
   color: var(--account-card-ink);
   background: var(--account-card-surface);
   border: 1px solid var(--account-card-border);
-  border-radius: 18px;
-  box-shadow: 0 12px 30px rgba(15, 23, 42, 0.1);
+  border-radius: 14px;
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.1);
   transition: border-color 180ms ease, box-shadow 180ms ease, transform 180ms ease;
 }
 
 .account-card::before {
   position: absolute;
   top: 0;
-  right: 18px;
-  left: 18px;
-  height: 3px;
+  right: 12px;
+  left: 12px;
+  height: 2px;
   content: '';
   background: var(--account-card-primary, #4f46e5);
   border-radius: 0 0 4px 4px;
@@ -623,7 +623,7 @@ code {
 .account-card:hover,
 .account-card--selected {
   border-color: color-mix(in srgb, var(--account-card-primary, #4f46e5) 58%, var(--account-card-border));
-  box-shadow: 0 16px 34px rgba(15, 23, 42, 0.16);
+  box-shadow: 0 12px 24px rgba(15, 23, 42, 0.16);
   transform: translateY(-2px);
 }
 
@@ -633,20 +633,20 @@ code {
 }
 
 .account-card--selected {
-  box-shadow: 0 0 0 2px color-mix(in srgb, var(--account-card-primary, #4f46e5) 28%, transparent), 0 16px 34px rgba(15, 23, 42, 0.16);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--account-card-primary, #4f46e5) 28%, transparent), 0 12px 24px rgba(15, 23, 42, 0.16);
 }
 
 .account-card__header {
   display: grid;
   grid-template-columns: auto auto minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 7px;
   align-items: start;
   min-width: 0;
   padding-top: 2px;
 }
 
 .account-card__header .ant-checkbox-wrapper {
-  margin-top: 8px;
+  margin-top: 5px;
 }
 
 .account-card__avatar {
@@ -717,37 +717,24 @@ code {
 .account-card__identity-grid {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 10px;
-  margin-top: 16px;
-  padding: 14px 0;
+  gap: 7px 12px;
+  margin-top: 10px;
+  padding: 10px 0;
   border-top: 1px solid var(--account-card-border);
   border-bottom: 1px solid var(--account-card-border);
-}
-
-.account-card__status-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
-  margin-top: 10px;
-}
-
-.account-card__status-row .ant-tag {
-  margin: 0;
-  font-size: 10px;
-  line-height: 20px;
 }
 
 .account-card__identity-item {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  gap: 4px;
+  gap: 2px;
 }
 
 .account-card__identity-item > .ant-typography {
   min-width: 0;
   color: var(--account-card-ink);
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .account-card__field-label {
@@ -785,8 +772,8 @@ code {
 .account-card__credentials {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  margin-top: 12px;
+  gap: 1px;
+  margin-top: 8px;
 }
 
 .account-card__note {
@@ -795,7 +782,7 @@ code {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  margin-top: 10px;
+  margin-top: 7px;
   color: var(--account-card-muted);
   font-size: 11px;
 }
@@ -815,11 +802,11 @@ code {
 
 .account-card__secret-line {
   display: grid;
-  grid-template-columns: minmax(106px, auto) minmax(0, 1fr) auto;
+  grid-template-columns: minmax(96px, auto) minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
   min-width: 0;
-  padding: 5px 0;
+  padding: 3px 0;
 }
 
 .account-card__secret-value {
@@ -846,11 +833,11 @@ code {
 
 .account-card__quota,
 .account-card__commercial {
-  margin-top: 14px;
-  padding: 13px;
+  margin-top: 10px;
+  padding: 10px;
   background: var(--account-card-fill);
   border: 1px solid var(--account-card-border);
-  border-radius: 12px;
+  border-radius: 10px;
 }
 
 .account-card__section-heading,
@@ -892,13 +879,13 @@ code {
 
 .account-card__quota-headline {
   justify-content: flex-start;
-  margin-top: 12px;
+  margin-top: 8px;
 }
 
 .account-card__quota-headline strong {
   color: var(--account-card-primary, #4f46e5);
   font-family: var(--font-family-mono);
-  font-size: 24px;
+  font-size: 21px;
   line-height: 1;
   font-variant-numeric: tabular-nums;
 }
@@ -915,13 +902,13 @@ code {
 }
 
 .account-card__quota .ant-progress {
-  margin: 10px 0 0;
+  margin: 7px 0 0;
 }
 
 .account-card__quota-empty {
   display: flex;
   align-items: center;
-  min-height: 46px;
+  min-height: 32px;
   color: var(--account-card-subtle);
   font-size: 12px;
 }
@@ -929,8 +916,8 @@ code {
 .account-card__metrics-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));
-  gap: 8px;
-  margin-top: 12px;
+  gap: 6px;
+  margin-top: 8px;
 }
 
 .account-card__metric {
@@ -978,7 +965,7 @@ code {
 }
 
 .account-card__divider {
-  margin: 16px 0 12px;
+  margin: 10px 0 7px;
   border-color: var(--account-card-border);
 }
 
@@ -986,7 +973,7 @@ code {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
   min-width: 0;
   margin-top: auto;
 }
@@ -1018,8 +1005,8 @@ code {
 }
 
 .account-card__actions .ant-btn {
-  min-height: 30px;
-  padding-inline: 7px;
+  min-height: 27px;
+  padding-inline: 5px;
   color: var(--account-card-muted);
   font-size: 11px;
 }
@@ -1068,7 +1055,7 @@ code {
   }
 
   .account-card {
-    padding: 16px;
+    padding: 12px;
   }
 }
 

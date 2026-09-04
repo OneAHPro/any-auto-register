@@ -81,12 +81,10 @@ describe('AccountCard', () => {
     const card = screen.getByTestId('account-card')
     expect(within(card).getByText('operator@example.com')).toBeTruthy()
     expect(within(card).getByText('Pro')).toBeTruthy()
-    expect(within(card).getByText('HTTP 200')).toBeTruthy()
-    expect(within(card).getByText('Team')).toBeTruthy()
     expect(within(card).getByText('Microsoft')).toBeTruthy()
     expect(within(card).getByText('user-42')).toBeTruthy()
-    expect(within(card).getByText('本周使用')).toBeTruthy()
-    expect(within(card).getByText('88%')).toBeTruthy()
+    expect(within(card).getByText('7天使用')).toBeTruthy()
+    expect(within(card).getByText('12%')).toBeTruthy()
     expect(within(card).getByText('$98.34')).toBeTruthy()
     expect(within(card).getByText('$721.66')).toBeTruthy()
     expect(within(card).getByText('有效期至')).toBeTruthy()
@@ -197,7 +195,7 @@ describe('AccountCard', () => {
 
     const card = screen.getByTestId('account-card')
     expect(within(card).getByText('Pro')).toBeTruthy()
-    expect(within(card).getByText('76%')).toBeTruthy()
+    expect(within(card).getByText('24%')).toBeTruthy()
     expect(within(card).getByText('probe-account-1')).toBeTruthy()
   })
 
@@ -226,6 +224,51 @@ describe('AccountCard', () => {
     )
 
     expect(screen.getByText('额度快照缺少使用百分比')).toBeTruthy()
-    expect(screen.queryByText('76%')).toBeNull()
+    expect(screen.queryByText('24%')).toBeNull()
+  })
+
+  it('uses the live account projection for an accurate compact quota card and removes the legacy status strip', () => {
+    render(
+      <AccountCard
+        account={{
+          id: 77,
+          platform: 'chatgpt',
+          email: 'live@example.com',
+          password: 'password',
+          status: 'registered',
+          chatgpt_display: {
+            plan_type: 'self_serve_business_prolite',
+            plan_source: 'codex2api_live',
+            subscription_active_until: '2026-10-04T01:56:53Z',
+            quota_status: 'live',
+            quota: {
+              window: '7d',
+              usage_percent: 25,
+              billed_usd: 98.34,
+              reset_at: '2026-09-11T21:54:07+08:00',
+              captured_at: '2026-09-05T02:17:39+08:00',
+              request_count: 506,
+              remote_status: 'active',
+              source: 'codex2api_live',
+            },
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getByText('Business Pro Lite')).toBeTruthy()
+    expect(within(card).getByText('25%')).toBeTruthy()
+    expect(within(card).getByText('506')).toBeTruthy()
+    expect(within(card).getByText('$98.34')).toBeTruthy()
+    expect(card.querySelector('.account-card__status-row')).toBeNull()
+    expect(within(card).queryByText('剩余估算')).toBeNull()
   })
 })

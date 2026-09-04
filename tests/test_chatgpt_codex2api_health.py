@@ -99,6 +99,48 @@ def test_fetch_quota_accounts_preserves_independent_5h_and_weekly_fields():
     assert rows[0]["billed_7d"] == 20
 
 
+def test_fetch_quota_accounts_exposes_display_fields_only_when_requested():
+    from services import chatgpt_codex2api_health as health
+
+    payload = {
+        "accounts": [
+            {
+                "id": 101,
+                "email": "one@example.com",
+                "status": "active",
+                "plan_type": "pro",
+                "chatgpt_account_id": "acct-101",
+                "effective_workspace_id": "workspace-101",
+                "subscription_expires_at": "2026-10-01T00:00:00Z",
+                "usage_percent_7d": 40,
+                "billed_7d": 20,
+                "usage_7d_detail": {"requests": 123, "account_billed": 999},
+            }
+        ]
+    }
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(payload),
+    ):
+        legacy_rows = health.fetch_codex2api_quota_accounts(config=BASE_CONFIG)
+    with mock.patch.object(
+        health.cffi_requests,
+        "get",
+        return_value=FakeResponse(payload),
+    ):
+        display_rows = health.fetch_codex2api_quota_accounts(
+            config=BASE_CONFIG,
+            include_display_fields=True,
+        )
+
+    assert "chatgpt_account_id" not in legacy_rows[0]
+    assert display_rows[0]["chatgpt_account_id"] == "acct-101"
+    assert display_rows[0]["effective_workspace_id"] == "workspace-101"
+    assert display_rows[0]["subscription_expires_at"] == "2026-10-01T00:00:00Z"
+    assert display_rows[0]["usage_7d_requests"] == 123
+
+
 def test_fetch_quota_accounts_preserves_window_reset_times():
     from services import chatgpt_codex2api_health as health
 

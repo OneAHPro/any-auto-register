@@ -198,6 +198,7 @@ def _quota_record(
     row: Mapping[str, object],
     *,
     include_reset_times: bool = False,
+    include_display_fields: bool = False,
 ) -> dict[str, object]:
     raw_email = _text(row.get("email"))
     remote_name = _text(row.get("name"))
@@ -235,6 +236,34 @@ def _quota_record(
     ):
         if key in row and row.get(key) is not None:
             result[key] = row.get(key)
+
+    if include_display_fields:
+        # Safe, non-credential fields used by the account-manager display.
+        # Keep them behind an explicit opt-in so the legacy quota-reader
+        # contract remains unchanged for scheduler and health consumers.
+        for output_key, source_keys in (
+            (
+                "chatgpt_account_id",
+                ("chatgpt_account_id", "account_id"),
+            ),
+            ("effective_workspace_id", ("effective_workspace_id",)),
+            ("workspace_name", ("workspace_name",)),
+            (
+                "subscription_expires_at",
+                ("subscription_expires_at", "chatgpt_subscription_active_until"),
+            ),
+            ("updated_at", ("updated_at",)),
+        ):
+            for source_key in source_keys:
+                value = row.get(source_key)
+                if value is not None and _text(value):
+                    result[output_key] = value
+                    break
+        usage_detail = row.get("usage_7d_detail")
+        if isinstance(usage_detail, Mapping):
+            request_count = usage_detail.get("requests")
+            if request_count is not None:
+                result["usage_7d_requests"] = request_count
     # `billed_*` are reset-aligned quota-window costs from the API summary.
     # The `usage_*_detail.account_billed` values are rolling gateway costs and
     # must never be substituted into the quota estimator.
@@ -257,11 +286,15 @@ def fetch_codex2api_quota_accounts(
     client: Any | None = None,
     database_engine=engine,
     _skip_assignment_routing: bool = False,
+    include_display_fields: bool = False,
 ) -> list[dict[str, object]]:
     """Read the latest quota inventory from every enabled target without probing."""
 
     if client is None and config is None and not _skip_assignment_routing:
-        routed = _fetch_enabled_target_quota(database_engine=database_engine)
+        routed = _fetch_enabled_target_quota(
+            database_engine=database_engine,
+            include_display_fields=include_display_fields,
+        )
         if routed is not None:
             return routed
 
@@ -277,7 +310,11 @@ def fetch_codex2api_quota_accounts(
         if not isinstance(rows, list):
             raise Codex2APIHealthError("Codex2API 账号清单格式无效")
         return [
-            _quota_record(row, include_reset_times=True)
+            _quota_record(
+                row,
+                include_reset_times=True,
+                include_display_fields=include_display_fields,
+            )
             for row in rows
             if isinstance(row, Mapping)
         ]
@@ -297,7 +334,11 @@ def fetch_codex2api_quota_accounts(
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
     return [
-        _quota_record(row, include_reset_times=True)
+        _quota_record(
+            row,
+            include_reset_times=True,
+            include_display_fields=include_display_fields,
+        )
         for row in rows
         if isinstance(row, dict)
     ]
@@ -619,6 +660,7 @@ def _deduplicate_target_quota_rows(
 def _fetch_enabled_target_quota(
     *,
     database_engine,
+    include_display_fields: bool = False,
 ) -> list[dict[str, object]] | None:
     context = _quota_target_context(database_engine)
     if context is None:
@@ -642,7 +684,11 @@ def _fetch_enabled_target_quota(
         for raw_row in remote_rows:
             if not isinstance(raw_row, Mapping):
                 continue
-            row = _quota_record(raw_row, include_reset_times=True)
+            row = _quota_record(
+                raw_row,
+                include_reset_times=True,
+                include_display_fields=include_display_fields,
+            )
             row["target_id"] = int(target_id)
             rows.append(row)
     return _deduplicate_target_quota_rows(

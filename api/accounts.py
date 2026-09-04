@@ -376,6 +376,7 @@ def list_accounts(
     created_at_end: Optional[datetime] = None,
     page: int = 1,
     page_size: int = 20,
+    include_live: bool = False,
     session: Session = Depends(get_session),
 ):
     q = select(AccountModel)
@@ -400,21 +401,59 @@ def list_accounts(
     start = (page - 1) * page_size
     items = visible_accounts[start:start + page_size]
     summaries = _account_control_plane_summaries(items, session)
+
+    live_display: dict[int | None, dict[str, object]] = {}
+    if include_live and str(platform or "").strip().lower() == "chatgpt":
+        live_rows: list[dict[str, object]] | None = None
+        live_error = ""
+        try:
+            from services.chatgpt_codex2api_health import fetch_codex2api_quota_accounts
+
+            fetched = fetch_codex2api_quota_accounts(
+                database_engine=session.get_bind(),
+                include_display_fields=True,
+            )
+            if fetched is not None:
+                live_rows = [
+                    row for row in fetched if isinstance(row, dict)
+                ]
+        except Exception as exc:
+            # The list endpoint remains usable when a remote target is down;
+            # the projection marks quota as unavailable instead of serving a
+            # stale local estimate as current data.
+            live_error = type(exc).__name__
+            logger.warning("读取 ChatGPT 实时展示数据失败: %s", live_error)
+
+        from services.chatgpt_account_display import build_chatgpt_account_display_map
+
+        live_display = build_chatgpt_account_display_map(
+            items,
+            live_rows or [],
+            live_available=live_rows is not None,
+            live_error=live_error,
+        )
+
+    response_items = []
+    for item in items:
+        payload = _account_for_response(
+            item,
+            control_plane_summary=summaries.get(
+                str(item.identity_id or "").strip(),
+                _empty_control_plane_summary(
+                    str(item.identity_id or "").strip()
+                ),
+            ),
+        )
+        if include_live and str(platform or "").strip().lower() == "chatgpt":
+            payload["chatgpt_display"] = live_display.get(
+                item.id,
+                {"plan_type": None, "plan_source": "none", "quota": None, "quota_status": "not_configured"},
+            )
+        response_items.append(payload)
     return {
         "total": total,
         "page": page,
-        "items": [
-            _account_for_response(
-                item,
-                control_plane_summary=summaries.get(
-                    str(item.identity_id or "").strip(),
-                    _empty_control_plane_summary(
-                        str(item.identity_id or "").strip()
-                    ),
-                ),
-            )
-            for item in items
-        ],
+        "items": response_items,
     }
 
 

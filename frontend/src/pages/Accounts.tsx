@@ -181,6 +181,24 @@ function formatUsd(value: unknown) {
   return Number.isFinite(parsed) ? `$${parsed.toFixed(2)}` : '-'
 }
 
+function uploadSyncTitle(name: string, sync: any) {
+  if (!sync || Object.keys(sync).length === 0) {
+    return `${name} 未上传`
+  }
+
+  const parts: string[] = []
+  if (sync.uploaded_at) {
+    parts.push(`成功时间: ${formatSyncTime(sync.uploaded_at)}`)
+  }
+  if (sync.last_attempt_at) {
+    parts.push(`最近尝试: ${formatSyncTime(sync.last_attempt_at)}`)
+  }
+  if (sync.last_message) {
+    parts.push(`结果: ${sync.last_message}`)
+  }
+  return parts.join('\n') || `${name} 已记录状态`
+}
+
 function assignmentStateMeta(value?: string) {
   switch (value) {
     case 'active':
@@ -462,24 +480,6 @@ function cliproxyStateMeta(sync: any) {
   return { color: 'default', label: '未同步' }
 }
 
-function uploadSyncTitle(name: string, sync: any) {
-  if (!sync || Object.keys(sync).length === 0) {
-    return `${name} 未上传`
-  }
-
-  const parts: string[] = []
-  if (sync.uploaded_at) {
-    parts.push(`成功时间: ${formatSyncTime(sync.uploaded_at)}`)
-  }
-  if (sync.last_attempt_at) {
-    parts.push(`最近尝试: ${formatSyncTime(sync.last_attempt_at)}`)
-  }
-  if (sync.last_message) {
-    parts.push(`结果: ${sync.last_message}`)
-  }
-  return parts.join('\n') || `${name} 已记录状态`
-}
-
 function CliproxySyncSummary({ sync }: { sync: any }) {
   const meta = cliproxyStateMeta(sync)
   return (
@@ -602,6 +602,7 @@ function ActionMenu({ acc, onRefresh, actions }: { acc: any; onRefresh: () => vo
           size="small"
           icon={<MoreOutlined />}
           aria-label="更多操作"
+          title={acc?.platform === 'chatgpt' ? uploadSyncTitle('Codex2API', acc.codex2apiSync || {}) : undefined}
           loading={Boolean(runningActionId)}
         />
       </Dropdown>
@@ -802,6 +803,7 @@ export default function Accounts() {
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
+      if (currentPlatform === 'chatgpt') params.set('include_live', '1')
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (createdAtStart) params.set('created_at_start', createdAtStart)
@@ -1989,7 +1991,6 @@ export default function Accounts() {
                       onPhoneVerification={setPhoneVerificationAccount}
                       canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
                       moreAction={platformActions.length ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} /> : null}
-                      codex2apiSyncTitle={uploadSyncTitle('Codex2API', record.codex2apiSync || {})}
                     />
                   </td>
                 </tr>
