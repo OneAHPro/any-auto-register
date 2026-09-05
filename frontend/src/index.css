@@ -563,16 +563,20 @@ code {
 .account-card-list > tbody {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  grid-auto-rows: 660px;
+  align-items: stretch;
   gap: 12px;
 }
 
 .account-card-list > tbody > tr {
   display: block;
+  height: 660px;
   min-width: 0;
 }
 
 .account-card-list > tbody > tr > td {
   display: block;
+  height: 100%;
   padding: 0 !important;
   border: 0 !important;
   background: transparent !important;
@@ -585,7 +589,8 @@ code {
 }
 
 .account-card-skeleton {
-  min-height: 280px;
+  height: 660px;
+  min-height: 660px;
   padding: 14px;
   background: var(--account-card-surface);
   border: 1px solid var(--account-card-border);
@@ -597,7 +602,8 @@ code {
   display: flex;
   flex-direction: column;
   min-width: 0;
-  min-height: 100%;
+  height: 660px;
+  min-height: 660px;
   padding: 12px;
   overflow: hidden;
   color: var(--account-card-ink);
@@ -774,6 +780,19 @@ code {
   flex-direction: column;
   gap: 1px;
   margin-top: 8px;
+}
+
+.account-card__managed-credentials {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 28px;
+  color: var(--account-card-muted);
+  font-size: 11px;
+}
+
+.account-card__managed-credentials .anticon {
+  color: var(--account-card-primary, #4f46e5);
 }
 
 .account-card__note {
@@ -1048,6 +1067,7 @@ code {
 
   .account-card-list > tbody {
     grid-template-columns: minmax(0, 1fr);
+    grid-auto-rows: 660px;
   }
 
   .account-card-skeleton-grid {
@@ -1056,6 +1076,8 @@ code {
 
   .account-card {
     padding: 12px;
+    height: 660px;
+    min-height: 660px;
   }
 }
 

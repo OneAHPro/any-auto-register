@@ -167,6 +167,49 @@ describe('Accounts ChatGPT staged login integration', () => {
     ).toBe('10:00')
   })
 
+  it('renders Codex2API-only accounts and requests a fresh remote quota on refresh', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return {
+          items: [{
+            id: -90210,
+            platform: 'chatgpt',
+            email: 'json-imported@example.com',
+            password: '',
+            token: '',
+            status: 'registered',
+            remote_only: true,
+            account_source: 'codex2api',
+            chatgpt_display: {
+              plan_type: 'pro',
+              remote_status: 'active',
+              quota_status: 'live',
+              quota: { usage_percent: 42, billed_usd: 18.75, request_count: 1234 },
+            },
+          }],
+          total: 1,
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    expect(await screen.findByText('json-imported@example.com')).toBeTruthy()
+    expect(screen.getAllByText('Codex2API 托管').length).toBeGreaterThanOrEqual(1)
+    const refreshCallsBefore = vi.mocked(apiFetch).mock.calls.length
+    await user.click(screen.getByRole('button', { name: '刷新账号列表' }))
+    await waitFor(() => {
+      const accountCalls = vi.mocked(apiFetch).mock.calls
+        .filter(([path]) => String(path).startsWith('/accounts?'))
+      expect(accountCalls.length).toBeGreaterThanOrEqual(2)
+      expect(String(accountCalls.at(-1)?.[0])).toContain('refresh_live=1')
+    })
+    expect(vi.mocked(apiFetch).mock.calls.length).toBeGreaterThan(refreshCallsBefore)
+  })
+
   it('opens staged login and phone verification from the ChatGPT account page and refreshes after completion', async () => {
     const user = userEvent.setup()
     render(<Accounts />)

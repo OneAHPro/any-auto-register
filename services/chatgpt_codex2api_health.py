@@ -241,6 +241,9 @@ def _quota_record(
         # Safe, non-credential fields used by the account-manager display.
         # Keep them behind an explicit opt-in so the legacy quota-reader
         # contract remains unchanged for scheduler and health consumers.
+        result["enabled"] = _to_bool(row.get("enabled"), default=True)
+        result["locked"] = _to_bool(row.get("locked"), default=False)
+        result["account_type"] = _text(row.get("account_type"))
         for output_key, source_keys in (
             (
                 "chatgpt_account_id",
@@ -264,6 +267,15 @@ def _quota_record(
             request_count = usage_detail.get("requests")
             if request_count is not None:
                 result["usage_7d_requests"] = request_count
+            if row.get("billed_7d") is None:
+                for billing_key in ("account_billed", "user_billed"):
+                    if usage_detail.get(billing_key) is not None:
+                        result["display_billed_usd"] = usage_detail.get(billing_key)
+                        result["billed_source"] = "rolling_detail"
+                        break
+        if row.get("billed_7d") is not None:
+            result["display_billed_usd"] = row.get("billed_7d")
+            result["billed_source"] = "quota_window"
     # `billed_*` are reset-aligned quota-window costs from the API summary.
     # The `usage_*_detail.account_billed` values are rolling gateway costs and
     # must never be substituted into the quota estimator.
@@ -287,18 +299,22 @@ def fetch_codex2api_quota_accounts(
     database_engine=engine,
     _skip_assignment_routing: bool = False,
     include_display_fields: bool = False,
+    refresh: bool = False,
 ) -> list[dict[str, object]]:
-    """Read the latest quota inventory from every enabled target without probing."""
+    """Read quota inventory, optionally refreshing each enabled target first."""
 
     if client is None and config is None and not _skip_assignment_routing:
         routed = _fetch_enabled_target_quota(
             database_engine=database_engine,
             include_display_fields=include_display_fields,
+            refresh=refresh,
         )
         if routed is not None:
             return routed
 
     if client is not None:
+        if refresh:
+            _refresh_target_usage(client)
         try:
             rows = client.list_accounts()
         except Exception as exc:
@@ -325,6 +341,20 @@ def fetch_codex2api_quota_accounts(
     if not base_url or not admin_key:
         raise Codex2APIHealthError("Codex2API 地址或 Admin Key 未配置")
 
+    if refresh:
+        from services.codex2api_target_client import Codex2APITargetClient, TargetConfig
+
+        _refresh_target_usage(
+            Codex2APITargetClient(
+                TargetConfig(
+                    id=1,
+                    name="default",
+                    base_url=base_url,
+                    admin_key=admin_key,
+                )
+            )
+        )
+
     payload = _get_json(
         base_url,
         "/api/admin/accounts?channel=codex",
@@ -333,15 +363,19 @@ def fetch_codex2api_quota_accounts(
     rows = payload.get("accounts") if isinstance(payload, dict) else payload
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
-    return [
-        _quota_record(
+    result = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        normalized = _quota_record(
             row,
             include_reset_times=True,
             include_display_fields=include_display_fields,
         )
-        for row in rows
-        if isinstance(row, dict)
-    ]
+        if include_display_fields:
+            normalized["target_id"] = 1
+        result.append(normalized)
+    return result
 
 
 def _record(
@@ -661,22 +695,25 @@ def _fetch_enabled_target_quota(
     *,
     database_engine,
     include_display_fields: bool = False,
+    refresh: bool = False,
 ) -> list[dict[str, object]] | None:
     context = _quota_target_context(database_engine)
     if context is None:
         return None
     target_ids, preferred_targets = context
     rows: list[dict[str, object]] = []
+    failures = 0
     for target_id in target_ids:
         try:
             from services.codex2api_target_client import get_target_client
 
             client = get_target_client(target_id, database_engine)
+            if refresh:
+                _refresh_target_usage(client)
             remote_rows = client.list_accounts()
         except Exception as exc:
-            raise Codex2APIHealthError(
-                f"读取 Codex2API 目标 {target_id} 状态异常（{type(exc).__name__}）"
-            ) from None
+            failures += 1
+            continue
         if not isinstance(remote_rows, list):
             raise Codex2APIHealthError(
                 f"Codex2API 目标 {target_id} 账号清单格式无效"
@@ -691,10 +728,36 @@ def _fetch_enabled_target_quota(
             )
             row["target_id"] = int(target_id)
             rows.append(row)
+    if failures and failures == len(target_ids):
+        raise Codex2APIHealthError("读取 Codex2API 目标状态异常")
     return _deduplicate_target_quota_rows(
         rows,
         preferred_targets=preferred_targets,
     )
+
+
+def _refresh_target_usage(
+    client: Any,
+    *,
+    attempts: int = 20,
+    interval_seconds: float = 0.5,
+    sleep_fn=time.sleep,
+) -> None:
+    """Trigger and bounded-wait for one Codex2API usage snapshot."""
+
+    trigger = getattr(client, "trigger_usage_probe", None)
+    runtime_status = getattr(client, "runtime_status", None)
+    if not callable(trigger) or not callable(runtime_status):
+        raise Codex2APIHealthError("Codex2API 未提供实时额度探针接口")
+    trigger()
+    for attempt in range(max(min(int(attempts), 60), 1)):
+        runtime = runtime_status()
+        probes = runtime.get("probes") if isinstance(runtime, Mapping) else {}
+        if not isinstance(probes, Mapping) or not probes.get("usage_probe_running"):
+            return
+        if attempt + 1 < attempts:
+            sleep_fn(max(float(interval_seconds), 0.05))
+    raise Codex2APIHealthError("Codex2API 实时额度探针超时")
 
 
 def _inspect_assigned_targets(

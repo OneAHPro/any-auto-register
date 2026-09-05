@@ -187,6 +187,8 @@ def _remote_quota(row: Mapping[str, Any]) -> dict[str, Any] | None:
         return None
     usage_percent = min(100.0, usage_percent)
     billed = _finite_number(row.get("billed_7d"))
+    if billed is None:
+        billed = _finite_number(row.get("display_billed_usd"))
     request_count = _finite_number(row.get("usage_7d_requests"))
     if request_count is None:
         detail = row.get("usage_7d_detail")
@@ -276,9 +278,16 @@ def build_chatgpt_account_display(
         "quota": quota,
         "quota_status": quota_status,
         "remote_status": remote_status,
+        "remote_enabled": bool(remote.get("enabled", True)) if remote is not None else None,
+        "remote_locked": bool(remote.get("locked", False)) if remote is not None else None,
         "remote_id": remote_id,
         "match": match if remote is not None else None,
         "fetched_at": _now_iso(now),
+        "live_updated_at": (
+            _text(remote.get("updated_at") or remote.get("quota_7d_updated_at"))
+            if remote is not None
+            else None
+        ),
     }
 
 

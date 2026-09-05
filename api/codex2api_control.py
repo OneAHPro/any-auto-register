@@ -631,19 +631,16 @@ def create_scheduler_plan(
 
 
 def _validate_action_targets(session: Session, action: PoolAction) -> None:
-    same_target_pool_move = (
-        action.action == "scale_down"
-        and action.source_target_id == action.destination_target_id
-    )
-    if action.source_target_id == action.destination_target_id and not same_target_pool_move:
-        raise PlanError("source and destination targets must differ")
+    same_target_pool_move = action.source_target_id == action.destination_target_id
+    if int(action.local_account_id or 0) <= 0 and not same_target_pool_move:
+        raise PlanError("远端托管账号跨目标调整需要原始 JSON")
     if same_target_pool_move:
         destination_pool_id = str(action.destination_pool_id or "").strip().upper()
         if not destination_pool_id or destination_pool_id == str(action.source_pool_id or "").strip().upper():
-            raise PlanError("scale-down action has no distinct destination pool")
+            raise PlanError("同目标调整没有不同的目标号池")
         destination_pool = session.get(AccountPoolModel, destination_pool_id)
         if destination_pool is None or not destination_pool.enabled:
-            raise PlanError("scale-down destination pool is unavailable")
+            raise PlanError("同目标调整的目标号池不可用")
     for target_id in (action.source_target_id, action.destination_target_id):
         target = session.get(Codex2APITargetModel, int(target_id))
         if target is None or not target.enabled or target.health_status != "healthy":
@@ -703,7 +700,7 @@ def apply_scheduler_plan(
         _validate_action_targets(session, action)
         source_pool_id = str(action.source_pool_id or "").strip().upper()
         destination_pool_id = str(action.destination_pool_id or "").strip().upper()
-        if action.action == "scale_down" and action.source_target_id == action.destination_target_id:
+        if action.source_target_id == action.destination_target_id:
             return reassign_account_pool(
                 session.get_bind(),
                 identity_id=action.identity_id,

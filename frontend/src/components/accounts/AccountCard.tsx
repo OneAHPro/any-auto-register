@@ -75,6 +75,7 @@ const LIVE_STATUS_META: Record<string, Meta> = {
   invalid: { color: 'error', label: '已失效' },
   unauthorized: { color: 'error', label: '未授权' },
   disabled: { color: 'default', label: '已停用' },
+  locked: { color: 'warning', label: '已锁定' },
 }
 
 const AUTH_META: Record<string, Meta> = {
@@ -290,6 +291,7 @@ export function AccountCard({
   moreAction,
 }: AccountCardProps) {
   const extra = parseExtra(account)
+  const remoteOnly = account?.remote_only === true || account?.account_source === 'codex2api'
   const local = account?.chatgptLocal || extra.chatgpt_local || {}
   const auth = local.auth || {}
   const subscription = local.subscription || {}
@@ -340,20 +342,26 @@ export function AccountCard({
       || liveDisplay?.workspace_id
       || '—',
   )
-  const provider = providerLabel(
-    firstValue(account, [
-      ['extra', 'mailbox_login_context', 'provider'],
-      ['extra', 'provider'],
-      ['extra', 'mail_provider'],
-      ['login_method'],
-    ]),
-    platform,
-  )
+  const provider = remoteOnly
+    ? 'Codex2API 托管'
+    : providerLabel(
+      firstValue(account, [
+        ['extra', 'mailbox_login_context', 'provider'],
+        ['extra', 'provider'],
+        ['extra', 'mail_provider'],
+        ['login_method'],
+      ]),
+      platform,
+    )
   const issue = platform === 'chatgpt' ? getIssue(auth, codex) : null
   const displayStatus = platform === 'chatgpt'
     ? liveDisplay
       ? liveDisplay.quota_status === 'error'
         ? { color: 'warning', label: '实时不可用' }
+        : liveDisplay.remote_locked
+          ? LIVE_STATUS_META.locked
+          : liveDisplay.remote_enabled === false
+            ? LIVE_STATUS_META.disabled
         : liveDisplay.remote_status
           ? liveStatusMeta(liveDisplay.remote_status, accountStatus)
           : accountStatus
@@ -436,6 +444,7 @@ export function AccountCard({
     ['extra', 'valid_days'],
   ])
   const checkedAt = firstValue(local, [['checked_at'], ['codex', 'checked_at'], ['auth', 'checked_at']])
+  const liveUpdatedAt = firstValue(liveDisplay, [['live_updated_at'], ['quota', 'captured_at']])
   const quotaEmptyLabel = liveDisplay
     ? liveDisplay.quota_status === 'error'
       ? '实时额度暂不可用'
@@ -472,7 +481,7 @@ export function AccountCard({
 
   return (
     <article
-      className={`account-card${selected ? ' account-card--selected' : ''}`}
+      className={`account-card${remoteOnly ? ' account-card--remote' : ''}${selected ? ' account-card--selected' : ''}`}
       data-testid="account-card"
       data-account-id={account?.id}
       style={token}
@@ -484,6 +493,7 @@ export function AccountCard({
       <header className="account-card__header">
         <Checkbox
           checked={selected}
+          disabled={remoteOnly}
           aria-label={`选择 ${email}`}
           onChange={(event) => onSelect(account?.id, event.target.checked)}
         />
@@ -510,6 +520,7 @@ export function AccountCard({
           <div className="account-card__tag-row">
             <Tag color={displayStatus.color}>{displayStatus.label}</Tag>
             {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
+            {remoteOnly ? <Tag color="blue">Codex2API 托管</Tag> : null}
           </div>
         </div>
         <div className="account-card__header-actions">{moreAction}</div>
@@ -554,8 +565,17 @@ export function AccountCard({
       ) : null}
 
       <div className="account-card__credentials">
-        <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
-        <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
+        {remoteOnly ? (
+          <div className="account-card__managed-credentials">
+            <SyncOutlined />
+            <span>凭据由 Codex2API 节点托管</span>
+          </div>
+        ) : (
+          <>
+            <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
+            <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
+          </>
+        )}
       </div>
 
       {note ? (
@@ -571,7 +591,9 @@ export function AccountCard({
           <div className="account-card__section-heading">
             <span><ClockCircleOutlined />{usageWindowTitle}</span>
             <span className="account-card__window-label">{usageWindowLabel}</span>
-            <Text type="secondary">{quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '—'}</Text>
+            <Text type="secondary">
+              {liveUpdatedAt ? `更新 ${formatDate(liveUpdatedAt, true)}` : quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '—'}
+            </Text>
           </div>
           {usagePercentDisplay !== null ? (
             <>
@@ -664,15 +686,17 @@ export function AccountCard({
               </Tooltip>
             </>
           ) : null}
-          <Popconfirm
-            title="确认删除该账号吗？"
-            onConfirm={() => onDelete(account?.id)}
-            okText="删除"
-            cancelText="取消"
-            okButtonProps={{ danger: true }}
-          >
-            <Button aria-label="删除" type="text" size="small" danger icon={<DeleteOutlined />}>删除</Button>
-          </Popconfirm>
+          {!remoteOnly ? (
+            <Popconfirm
+              title="确认删除该账号吗？"
+              onConfirm={() => onDelete(account?.id)}
+              okText="删除"
+              cancelText="取消"
+              okButtonProps={{ danger: true }}
+            >
+              <Button aria-label="删除" type="text" size="small" danger icon={<DeleteOutlined />}>删除</Button>
+            </Popconfirm>
+          ) : null}
         </Space>
       </footer>
     </article>

@@ -17,12 +17,19 @@ from core.db import (
     AccountModel,
     AccountPoolModel,
     AccountTargetBindingModel,
+    AccountIdentityModel,
     Codex2APITargetModel,
     CustomerUsageSampleModel,
     PoolTargetPolicyModel,
     engine as default_engine,
 )
 from services.quota_ledger import merge_remote_rows
+from services.codex2api_remote_accounts import (
+    remote_account_email,
+    remote_account_id,
+    remote_account_is_schedulable,
+    remote_identity_id,
+)
 
 
 def _utcnow() -> datetime:
@@ -197,6 +204,7 @@ def reconcile_target_bindings(
     target_id: int,
     rows: list[dict[str, Any]],
     now: datetime,
+    include_remote_only: bool = False,
 ) -> int:
     """Bootstrap local binding/assignment rows from a target account list."""
 
@@ -242,7 +250,7 @@ def reconcile_target_bindings(
                     remote_email=email,
                     sync_status="synced",
                     remote_status=str(remote.get("status") or ""),
-                    enabled=bool(remote.get("enabled", True)),
+                    enabled=bool(remote.get("enabled", True)) and not bool(remote.get("locked", False)),
                     last_sync_at=now,
                     created_at=now,
                     updated_at=now,
@@ -281,6 +289,114 @@ def reconcile_target_bindings(
                         created_at=now,
                     )
                 )
+
+        # JSON-imported accounts can exist only on the Codex2API node. Keep a
+        # credential-free identity/binding for each such row so it can be
+        # displayed and scheduled by the control plane. Background quota
+        # collection leaves this opt-in off so a missing local account does
+        # not unexpectedly create a new control-plane asset.
+        for remote in rows if include_remote_only else []:
+            remote_id = remote_account_id(remote)
+            email = remote_account_email(remote).strip().lower()
+            if remote_id <= 0:
+                continue
+            identity_email = email or f"remote:{int(target_id)}:{remote_id}"
+            local_matches = local_by_email.get(email, []) if email else []
+            if len(local_matches) == 1 and str(local_matches[0].identity_id or "").strip():
+                continue
+            identity_key = remote_identity_id(int(target_id), remote_id)
+            identity = session.get(AccountIdentityModel, identity_key)
+            if identity is None:
+                identity = AccountIdentityModel(
+                    id=identity_key,
+                    platform="chatgpt",
+                    canonical_email=identity_email,
+                    state="active",
+                    current_account_id=0,
+                    created_at=now,
+                    updated_at=now,
+                )
+            else:
+                identity.canonical_email = identity_email
+                identity.platform = "chatgpt"
+                identity.current_account_id = 0
+                identity.state = "active"
+                identity.updated_at = now
+            session.add(identity)
+
+            binding = session.exec(
+                select(AccountTargetBindingModel)
+                .where(AccountTargetBindingModel.identity_id == identity_key)
+                .where(AccountTargetBindingModel.target_id == int(target_id))
+            ).first()
+            if binding is None:
+                binding = AccountTargetBindingModel(
+                    identity_id=identity_key,
+                    local_account_id=0,
+                    target_id=int(target_id),
+                    remote_account_id=remote_id,
+                    remote_email=identity_email,
+                    sync_status="synced",
+                    remote_status=str(remote.get("remote_status") or remote.get("status") or ""),
+                    enabled=bool(remote.get("enabled", True)),
+                    last_sync_at=now,
+                    created_at=now,
+                    updated_at=now,
+                )
+            else:
+                binding.local_account_id = 0
+                binding.remote_account_id = remote_id
+                binding.remote_email = identity_email
+                binding.remote_status = str(remote.get("remote_status") or remote.get("status") or "")
+                binding.enabled = bool(remote.get("enabled", True)) and not bool(remote.get("locked", False))
+                binding.sync_status = "synced"
+                binding.last_sync_at = now
+                binding.last_error = ""
+                binding.updated_at = now
+            session.add(binding)
+
+            assignment = session.exec(
+                select(AccountAssignmentModel)
+                .where(AccountAssignmentModel.identity_id == identity_key)
+                .where(AccountAssignmentModel.local_account_id == 0)
+                .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
+            ).first()
+            if remote_account_is_schedulable(remote):
+                if assignment is None:
+                    assignment = AccountAssignmentModel(
+                        identity_id=identity_key,
+                        local_account_id=0,
+                        pool_id=str(target.default_pool_id or "PUBLIC_POOL"),
+                        target_id=int(target_id),
+                        state="active",
+                        lease_reason="remote_account_reconcile",
+                        lease_started_at=now,
+                        assignment_version=1,
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(
+                        AccountAssignmentEventModel(
+                            identity_id=identity_key,
+                            local_account_id=0,
+                            event_type="initial_assignment",
+                            to_pool_id=assignment.pool_id,
+                            to_target_id=int(target_id),
+                            assignment_version=1,
+                            reason="remote_account_reconcile",
+                            created_at=now,
+                        )
+                    )
+                else:
+                    assignment.state = "active"
+                    assignment.target_id = int(target_id)
+                    assignment.updated_at = now
+                session.add(assignment)
+            elif assignment is not None and assignment.state == "active":
+                assignment.state = "standby"
+                assignment.lease_reason = "remote_account_not_schedulable"
+                assignment.updated_at = now
+                session.add(assignment)
         session.commit()
         return created
 
@@ -380,6 +496,9 @@ def collect_target_quota(
                     binding = session.get(AccountTargetBindingModel, int(item["id"]))
                     if binding is not None:
                         binding.sync_status = status
+                        if int(item["local_account_id"] or 0) <= 0:
+                            binding.enabled = False
+                            binding.remote_status = "remote_missing"
                         binding.last_error = (
                             "目标节点存在多个同邮箱账号"
                             if status == "ambiguous"
@@ -387,6 +506,18 @@ def collect_target_quota(
                         )
                         binding.updated_at = captured_at
                         session.add(binding)
+                        if int(item["local_account_id"] or 0) <= 0:
+                            assignment = session.exec(
+                                select(AccountAssignmentModel)
+                                .where(AccountAssignmentModel.identity_id == str(item["identity_id"]))
+                                .where(AccountAssignmentModel.local_account_id == 0)
+                                .where(AccountAssignmentModel.state == "active")
+                            ).first()
+                            if assignment is not None:
+                                assignment.state = "standby"
+                                assignment.lease_reason = "remote_account_missing"
+                                assignment.updated_at = captured_at
+                                session.add(assignment)
                         session.commit()
                 continue
 
@@ -410,7 +541,7 @@ def collect_target_quota(
                     row.get("email") or row.get("name") or binding.remote_email
                 ).strip().lower()
                 binding.remote_status = str(row.get("status") or "")
-                binding.enabled = bool(row.get("enabled", True))
+                binding.enabled = bool(row.get("enabled", True)) and not bool(row.get("locked", False))
                 binding.sync_status = "synced"
                 binding.last_sync_at = captured_at
                 binding.last_error = ""

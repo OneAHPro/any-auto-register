@@ -724,12 +724,21 @@ def _build_pool_candidates(
         health = "healthy"
         if identity is None or str(identity.state) != "active":
             health = "ambiguous"
-        elif binding is None or str(binding.remote_status or "").lower() not in {
-            "active",
-            "ready",
-            "rate_limited",
-        }:
+        elif (
+            binding is None
+            or not bool(binding.enabled)
+            or str(binding.remote_status or "").lower()
+            not in {"active", "ready", "rate_limited"}
+        ):
             health = "error"
+        elif (
+            int(assignment.local_account_id or 0) <= 0
+            and int(assignment.target_id or 0) != int(destination_target_id)
+        ):
+            # A remote-only account has no credential payload in the control
+            # plane, so it may be moved between pools on its current target
+            # but cannot be copied to another target by a migration Saga.
+            health = "remote_only_cross_target"
         elif quota is None or not quota.scheduler_eligible:
             health = "stale"
         auth = auth_states.get(int(assignment.local_account_id))

@@ -70,6 +70,26 @@ def test_live_projection_prefers_codex2api_plan_and_weekly_usage():
     }
 
 
+def test_live_projection_uses_display_billing_when_window_billing_is_missing():
+    account = _account(email="rolling@example.com", plan="pro", account_id="acct-roll")
+    result = build_chatgpt_account_display_map(
+        [account],
+        [
+            {
+                "email": "rolling@example.com",
+                "chatgpt_account_id": "acct-roll",
+                "plan_type": "pro",
+                "usage_percent_7d": 55,
+                "billed_7d": None,
+                "display_billed_usd": 18.75,
+                "usage_7d_requests": 1234,
+            },
+        ],
+    )[None]
+
+    assert result["quota"]["billed_usd"] == 18.75
+
+
 def test_live_projection_uses_unique_account_id_when_email_changed():
     account = _account(email="renamed-local@example.com", plan="plus", account_id="acct-2")
     rows = [

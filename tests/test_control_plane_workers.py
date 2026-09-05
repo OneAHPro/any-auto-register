@@ -189,6 +189,52 @@ def test_quota_collection_marks_missing_remote_binding_without_creating_snapshot
     assert snapshots == []
 
 
+def test_quota_collection_stands_by_missing_remote_only_assignment():
+    from services.control_plane_workers import collect_target_quota
+
+    engine = make_engine()
+    with Session(engine) as session:
+        session.add(
+            db.AccountIdentityModel(
+                id="codex2api:1:999",
+                platform="chatgpt",
+                canonical_email="missing@example.com",
+                current_account_id=0,
+            )
+        )
+        session.add(
+            db.AccountTargetBindingModel(
+                identity_id="codex2api:1:999",
+                local_account_id=0,
+                target_id=1,
+                remote_account_id=999,
+                remote_email="missing@example.com",
+                remote_status="active",
+                enabled=True,
+            )
+        )
+        session.add(
+            db.AccountAssignmentModel(
+                identity_id="codex2api:1:999",
+                local_account_id=0,
+                pool_id="PUBLIC_POOL",
+                target_id=1,
+                state="active",
+            )
+        )
+        session.commit()
+
+    result = collect_target_quota(engine, target_id=1, client=FakeClient(), now=NOW)
+
+    assert result.missing_accounts == 1
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+    assert binding.enabled is False
+    assert binding.remote_status == "remote_missing"
+    assert assignment.state == "standby"
+
+
 def test_quota_collection_skips_enabled_binding_on_noncurrent_target():
     from services.control_plane_workers import collect_target_quota
 

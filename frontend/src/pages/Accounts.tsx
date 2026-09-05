@@ -764,6 +764,13 @@ export default function Accounts() {
         setMigrations([])
         return
       }
+      if (currentAccount.remote_only) {
+        setControlQuota(currentAccount.quota || {})
+        setQuotaHistory([])
+        setMigrations([])
+        setControlDetailLoading(false)
+        return
+      }
       setControlDetailLoading(true)
       Promise.all([
         apiFetch(`/accounts/${currentAccount.id}/quota`),
@@ -792,7 +799,7 @@ export default function Accounts() {
     }
   }, [detailModalOpen, currentAccount, currentPlatform])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceLive = false) => {
     if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
       message.warning('开始时间不能晚于结束时间')
       setAccounts([])
@@ -803,7 +810,10 @@ export default function Accounts() {
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
-      if (currentPlatform === 'chatgpt') params.set('include_live', '1')
+      if (currentPlatform === 'chatgpt') {
+        params.set('include_live', '1')
+        if (forceLive) params.set('refresh_live', '1')
+      }
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (createdAtStart) params.set('created_at_start', createdAtStart)
@@ -817,8 +827,16 @@ export default function Accounts() {
   }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd, page, pageSize])
 
   useEffect(() => {
-    load()
-  }, [load])
+    void load(currentPlatform === 'chatgpt')
+  }, [load, currentPlatform])
+
+  useEffect(() => {
+    if (currentPlatform !== 'chatgpt') return
+    const timer = window.setInterval(() => {
+      void load(true)
+    }, 60_000)
+    return () => window.clearInterval(timer)
+  }, [load, currentPlatform])
 
   useEffect(() => {
     apiFetch(`/actions/${currentPlatform}`)
@@ -1257,6 +1275,10 @@ export default function Accounts() {
   }
 
   const handleDetailSave = async () => {
+    if (currentAccount?.remote_only) {
+      setDetailModalOpen(false)
+      return
+    }
     const values = await detailForm.validateFields()
     await apiFetch(`/accounts/${currentAccount.id}`, {
       method: 'PATCH',
@@ -1628,6 +1650,7 @@ export default function Accounts() {
   const hasUploadCpaAction = platformActions.some((item) => item?.id === 'upload_cpa')
   const hasUploadCodex2APIAction = platformActions.some((item) => item?.id === 'upload_codex2api')
   const visibleAccountIds = accounts
+    .filter((account) => !account?.remote_only)
     .map((account) => account?.id)
     .filter((id) => id !== undefined && id !== null)
   const selectedIdSet = new Set(selectedRowKeys.map((id) => String(id)))
@@ -1924,7 +1947,7 @@ export default function Accounts() {
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
           <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button icon={<ReloadOutlined spin={loading} />} onClick={load} />
+          <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void load(true) }} />
         </Space>
       </div>
 
@@ -1990,7 +2013,9 @@ export default function Accounts() {
                       onDelete={handleDelete}
                       onPhoneVerification={setPhoneVerificationAccount}
                       canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
-                      moreAction={platformActions.length ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} /> : null}
+                      moreAction={platformActions.length && !record.remote_only
+                        ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
+                        : null}
                     />
                   </td>
                 </tr>
@@ -2152,7 +2177,7 @@ export default function Accounts() {
         open={detailModalOpen}
         onCancel={() => setDetailModalOpen(false)}
         onOk={handleDetailSave}
-        okText="保存"
+        okText={currentAccount?.remote_only ? '关闭' : '保存'}
         cancelText="取消"
         maskClosable={false}
         width={760}
@@ -2160,7 +2185,7 @@ export default function Accounts() {
       >
         {currentAccount && (
           <>
-            <Form form={detailForm} layout="vertical" initialValues={currentAccount}>
+            <Form form={detailForm} layout="vertical" initialValues={currentAccount} disabled={currentAccount.remote_only}>
               <Form.Item name="status" label="状态">
                 <Select
                   options={[
@@ -2241,14 +2266,16 @@ export default function Accounts() {
                           {sevenDay.reset_at ? formatSyncTime(sevenDay.reset_at) : '尚无数据'}
                         </Descriptions.Item>
                       </Descriptions>
-                      <Button
-                        size="small"
-                        loading={assignmentLoading}
-                        onClick={openAssignmentEditor}
-                        style={{ marginTop: 10 }}
-                      >
-                        调整目标与号池
-                      </Button>
+                      {!currentAccount.remote_only ? (
+                        <Button
+                          size="small"
+                          loading={assignmentLoading}
+                          onClick={openAssignmentEditor}
+                          style={{ marginTop: 10 }}
+                        >
+                          调整目标与号池
+                        </Button>
+                      ) : null}
                       {controlDetailLoading ? <Text type="secondary" style={{ marginLeft: 10 }}>正在读取最新账本…</Text> : null}
                     </>
                   )
@@ -2294,7 +2321,7 @@ export default function Accounts() {
                 />
               </DetailSection>
             ) : null}
-            {currentPlatform === 'chatgpt' ? (
+            {currentPlatform === 'chatgpt' && !currentAccount.remote_only ? (
               <DetailSection title="本地真实状态">
                 {currentAccount.chatgptLocal && Object.keys(currentAccount.chatgptLocal).length > 0 ? (
                   <LocalProbeSummary probe={currentAccount.chatgptLocal} />
@@ -2303,7 +2330,7 @@ export default function Accounts() {
                 )}
               </DetailSection>
             ) : null}
-            {currentPlatform === 'chatgpt' ? (
+            {currentPlatform === 'chatgpt' && !currentAccount.remote_only ? (
               <DetailSection title="CLIProxyAPI 状态">
                 {currentAccount.cliproxySync && Object.keys(currentAccount.cliproxySync).length > 0 ? (
                   <CliproxySyncSummary sync={currentAccount.cliproxySync} />

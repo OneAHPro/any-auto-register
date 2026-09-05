@@ -17,7 +17,15 @@ from services.chatgpt_account_removal import remove_account
 from typing import Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
+from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
+from services.codex2api_remote_accounts import (
+    remote_account_email,
+    remote_account_id,
+    remote_account_payload,
+    remote_identity_id,
+    remote_virtual_account_id,
+)
 
 _CHATGPT_DIRECT_PASSWORD_DOMAINS = {"icloud.com", "me.com", "mac.com"}
 
@@ -377,6 +385,7 @@ def list_accounts(
     page: int = 1,
     page_size: int = 20,
     include_live: bool = False,
+    refresh_live: bool = False,
     session: Session = Depends(get_session),
 ):
     q = select(AccountModel)
@@ -395,28 +404,21 @@ def list_accounts(
         for account in session.exec(q).all()
         if account_is_visible_in_default_list(account)
     ]
-    total = len(visible_accounts)
-    page_size = max(1, min(int(page_size or 20), 200))
-    page = max(1, int(page or 1))
-    start = (page - 1) * page_size
-    items = visible_accounts[start:start + page_size]
-    summaries = _account_control_plane_summaries(items, session)
-
+    live_rows: list[dict[str, object]] | None = None
+    live_error = ""
     live_display: dict[int | None, dict[str, object]] = {}
+    remote_items: list[dict[str, object]] = []
     if include_live and str(platform or "").strip().lower() == "chatgpt":
-        live_rows: list[dict[str, object]] | None = None
-        live_error = ""
         try:
             from services.chatgpt_codex2api_health import fetch_codex2api_quota_accounts
 
             fetched = fetch_codex2api_quota_accounts(
                 database_engine=session.get_bind(),
                 include_display_fields=True,
+                refresh=bool(refresh_live),
             )
             if fetched is not None:
-                live_rows = [
-                    row for row in fetched if isinstance(row, dict)
-                ]
+                live_rows = [row for row in fetched if isinstance(row, dict)]
         except Exception as exc:
             # The list endpoint remains usable when a remote target is down;
             # the projection marks quota as unavailable instead of serving a
@@ -424,29 +426,152 @@ def list_accounts(
             live_error = type(exc).__name__
             logger.warning("读取 ChatGPT 实时展示数据失败: %s", live_error)
 
+        if live_rows is not None:
+            from services.control_plane_workers import reconcile_target_bindings
+            from services.chatgpt_account_display import build_chatgpt_account_display
+
+            now = datetime.now(timezone.utc)
+            rows_by_target: dict[int, list[dict[str, object]]] = {}
+            for row in live_rows:
+                try:
+                    target_id = int(row.get("target_id") or 0)
+                except (TypeError, ValueError):
+                    target_id = 0
+                if target_id > 0:
+                    rows_by_target.setdefault(target_id, []).append(row)
+            for target_id, rows in rows_by_target.items():
+                reconcile_target_bindings(
+                    session.get_bind(),
+                    target_id=target_id,
+                    rows=rows,
+                    now=now,
+                    include_remote_only=True,
+                )
+
+            local_emails = {
+                str(account.email or "").strip().lower()
+                for account in visible_accounts
+                if str(account.email or "").strip()
+            }
+            from services.quota_ledger import merge_remote_rows
+
+            for target_id, rows in rows_by_target.items():
+                for row in rows:
+                    remote_id = remote_account_id(row)
+                    remote_email = remote_account_email(row).strip().lower()
+                    if remote_id <= 0 or remote_email in local_emails:
+                        continue
+                    merge_remote_rows(
+                        session.get_bind(),
+                        identity_id=remote_identity_id(target_id, remote_id),
+                        local_account_id=0,
+                        target_id=target_id,
+                        remote_id=remote_id,
+                        rows=[row],
+                        captured_at=now,
+                    )
+            for row in live_rows:
+                target_id = int(row.get("target_id") or 0)
+                remote_id = remote_account_id(row)
+                remote_email = remote_account_email(row).strip().lower()
+                display_email = (
+                    remote_email
+                    or str(row.get("name") or "").strip().lower()
+                    or f"remote-account-{remote_id}"
+                )
+                if target_id <= 0 or remote_id <= 0:
+                    continue
+                if remote_email and remote_email in local_emails:
+                    continue
+                remote_status = str(
+                    row.get("remote_status") or row.get("status") or ""
+                ).strip().lower()
+                list_status = (
+                    "invalid"
+                    if remote_status in {"invalid", "unauthorized", "auth_error", "token_invalidated"}
+                    else "registered"
+                )
+                if status and str(status).strip().lower() != list_status:
+                    continue
+                if email and str(email).strip().lower() not in display_email:
+                    continue
+                identity_id = f"codex2api:{target_id}:{remote_id}"
+                proxy = SimpleNamespace(
+                    id=remote_virtual_account_id(target_id, remote_id),
+                    email=display_email,
+                    identity_id=identity_id,
+                    user_id=str(
+                        row.get("chatgpt_account_id")
+                        or row.get("effective_workspace_id")
+                        or ""
+                    ),
+                    extra_json=json.dumps(
+                        {
+                            "account_source": "codex2api",
+                            "remote_only": True,
+                            "account_id": str(row.get("chatgpt_account_id") or ""),
+                        },
+                        ensure_ascii=False,
+                    ),
+                )
+                display = build_chatgpt_account_display(
+                    proxy,
+                    [row],
+                    live_available=True,
+                    now=now,
+                )
+                summary = _account_control_plane_summaries(
+                    [proxy],  # type: ignore[arg-type]
+                    session,
+                ).get(identity_id, _empty_control_plane_summary(identity_id))
+                remote_item = remote_account_payload(
+                    row,
+                    target_id=target_id,
+                    assignment=summary.get("assignment"),
+                    binding=summary.get("binding"),
+                )
+                remote_item["chatgpt_display"] = display
+                remote_item["quota"] = summary.get("quota") or {}
+                remote_items.append(remote_item)
+
+    combined: list[tuple[str, object]] = [("local", account) for account in visible_accounts]
+    combined.extend(("remote", item) for item in remote_items)
+    total = len(combined)
+    page_size = max(1, min(int(page_size or 20), 200))
+    page = max(1, int(page or 1))
+    start = (page - 1) * page_size
+    selected = combined[start:start + page_size]
+    local_items = [item for kind, item in selected if kind == "local"]
+    if include_live and str(platform or "").strip().lower() == "chatgpt":
         from services.chatgpt_account_display import build_chatgpt_account_display_map
 
         live_display = build_chatgpt_account_display_map(
-            items,
+            local_items,
             live_rows or [],
             live_available=live_rows is not None,
             live_error=live_error,
         )
 
     response_items = []
-    for item in items:
+    summaries = _account_control_plane_summaries(local_items, session)
+    for kind, item in selected:
+        if kind == "remote":
+            payload = dict(item)  # type: ignore[arg-type]
+            response_items.append(payload)
+            continue
+        local_item = item  # type: ignore[assignment]
         payload = _account_for_response(
-            item,
+            local_item,
             control_plane_summary=summaries.get(
-                str(item.identity_id or "").strip(),
+                str(local_item.identity_id or "").strip(),
                 _empty_control_plane_summary(
-                    str(item.identity_id or "").strip()
+                    str(local_item.identity_id or "").strip()
                 ),
             ),
         )
         if include_live and str(platform or "").strip().lower() == "chatgpt":
             payload["chatgpt_display"] = live_display.get(
-                item.id,
+                local_item.id,
                 {"plan_type": None, "plan_source": "none", "quota": None, "quota_status": "not_configured"},
             )
         response_items.append(payload)

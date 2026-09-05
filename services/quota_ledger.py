@@ -144,6 +144,17 @@ def _result_from_row(row: AccountQuotaSnapshotModel) -> QuotaLedgerResult:
         and age_seconds >= -60
     )
     state = str(row.continuity_state or "normal")
+    remote_status_only = bool(
+        not fresh
+        and int(getattr(row, "local_account_id", 0) or 0) == 0
+        and str(getattr(row, "source", "") or "").strip().lower() == "codex2api"
+        and billed is None
+        and percent is not None
+        and reset_at is not None
+        and age_seconds <= freshness_seconds
+        and age_seconds >= -60
+        and state not in {"ambiguous", "stale"}
+    )
     return QuotaLedgerResult(
         identity_id=str(row.identity_id),
         window=str(row.window),
@@ -158,7 +169,13 @@ def _result_from_row(row: AccountQuotaSnapshotModel) -> QuotaLedgerResult:
         captured_at=captured_at,
         continuity_state=state,
         fresh=fresh,
-        scheduler_eligible=fresh and state not in {"unknown", "ambiguous", "stale"},
+        # Remote-only Codex2API rows may expose a fresh usage percentage and
+        # reset window before the optional billing field is available. They
+        # can participate in pool scheduling by status/concurrency, while
+        # remaining-dollar estimates stay unavailable.
+        scheduler_eligible=(
+            fresh and state not in {"unknown", "ambiguous", "stale"}
+        ) or remote_status_only,
         snapshot_id=int(row.id) if row.id is not None else None,
         target_id=int(row.target_id) if row.target_id is not None else None,
     )

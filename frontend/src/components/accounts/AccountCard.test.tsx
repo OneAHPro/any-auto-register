@@ -92,6 +92,55 @@ describe('AccountCard', () => {
     expect(within(card).getByRole('button', { name: '删除' })).toBeTruthy()
   })
 
+  it('renders a remote Codex2API account with live billing and no local credential actions', () => {
+    render(
+      <AccountCard
+        account={{
+          id: -90210,
+          platform: 'chatgpt',
+          email: 'json-imported@example.com',
+          password: '',
+          token: '',
+          status: 'registered',
+          account_source: 'codex2api',
+          remote_only: true,
+          remote_id: 90210,
+          target_name: 'default',
+          chatgpt_display: {
+            plan_type: 'pro',
+            remote_status: 'active',
+            quota_status: 'live',
+            live_updated_at: '2026-09-05T06:59:00Z',
+            quota: {
+              window: '7d',
+              usage_percent: 42,
+              billed_usd: 18.75,
+              request_count: 1234,
+              captured_at: '2026-09-05T06:59:00Z',
+              reset_at: '2026-09-11T00:00:00Z',
+            },
+          },
+          assignment: { target_name: 'default', pool_name: '公共池', state: 'active' },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getAllByText('Codex2API 托管').length).toBeGreaterThanOrEqual(1)
+    expect(within(card).getByText('$18.75')).toBeTruthy()
+    expect(within(card).getByText('1,234')).toBeTruthy()
+    expect(within(card).queryByRole('button', { name: '删除' })).toBeNull()
+    expect(card.className).toContain('account-card--remote')
+    expect((within(card).getByRole('checkbox') as HTMLInputElement).disabled).toBe(true)
+  })
+
   it('emits selection and copy actions without opening details', () => {
     const onSelect = vi.fn()
     const onCopy = vi.fn()

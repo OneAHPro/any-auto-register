@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy.pool import StaticPool
@@ -279,6 +279,27 @@ def test_remote_row_uses_window_reset_timestamp_for_freshness():
 
     assert merged["7d"].fresh is True
     assert merged["7d"].reset_at == RESET
+
+
+def test_remote_only_percent_and_reset_are_schedulable_without_window_billing():
+    from services import quota_ledger
+
+    engine = make_engine()
+    captured_at = datetime.now(timezone.utc)
+    result = quota_ledger.record_snapshot(
+        engine,
+        identity_id="codex2api:1:77",
+        local_account_id=0,
+        target_id=1,
+        window="7d",
+        billed_usd=None,
+        usage_percent=25,
+        reset_at=captured_at + timedelta(days=2),
+        captured_at=captured_at,
+    )
+
+    assert result.fresh is False
+    assert result.scheduler_eligible is True
 
 
 def test_remote_row_selection_does_not_assign_first_account_to_another_identity():
