@@ -152,6 +152,81 @@ describe('Accounts ChatGPT staged login integration', () => {
     cleanup()
   })
 
+  it('keeps the account list in a loading state while the first list request is pending', async () => {
+    let resolveAccounts!: (value: Record<string, unknown>) => void
+    const pendingAccounts = new Promise<Record<string, unknown>>((resolve) => {
+      resolveAccounts = resolve
+    })
+    const sync = vi.fn(async () => ({ status: 'completed' }))
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/codex-import/sync') return sync()
+      if (path.startsWith('/accounts?')) return pendingAccounts
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    expect(await screen.findByLabelText('正在加载账号')).toBeTruthy()
+    expect(screen.queryByText('暂无账号')).toBeNull()
+    expect(sync).not.toHaveBeenCalled()
+    resolveAccounts({ items: [eligibleAccount], total: 1 })
+  })
+
+  it('loads a subscription filter without synchronizing the remote inventory', async () => {
+    const sync = vi.fn(async () => ({ status: 'completed' }))
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/codex-import/sync') return sync()
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    const initialAccountRequest = vi.mocked(apiFetch).mock.calls
+      .find(([path]) => String(path).startsWith('/accounts?'))
+    expect(String(initialAccountRequest?.[0])).not.toContain('refresh_live=1')
+    const syncCallsBeforeFilter = sync.mock.calls.length
+    await user.click(screen.getByText('Pro', { selector: '.ant-segmented-item-label' }))
+
+    await waitFor(() => {
+      const requests = vi.mocked(apiFetch).mock.calls
+        .filter(([path]) => String(path).startsWith('/accounts?'))
+      expect(String(requests.at(-1)?.[0])).toContain('subscription_plan=pro')
+    })
+    expect(sync).toHaveBeenCalledTimes(syncCallsBeforeFilter)
+  })
+
+  it('ignores an older list response after a subscription filter changes', async () => {
+    const pendingRequests: Array<(value: Record<string, unknown>) => void> = []
+    const filteredAccount = { ...eligibleAccount, id: 27, email: 'pro@example.com' }
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return new Promise((resolve) => {
+          pendingRequests.push(resolve)
+        })
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await waitFor(() => expect(pendingRequests).toHaveLength(1))
+    await user.click(screen.getByText('Pro', { selector: '.ant-segmented-item-label' }))
+    await waitFor(() => expect(pendingRequests).toHaveLength(2))
+
+    pendingRequests[1]({ items: [filteredAccount], total: 1 })
+    expect(await screen.findByText('pro@example.com')).toBeTruthy()
+    pendingRequests[0]({ items: [eligibleAccount], total: 1 })
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(screen.getByText('pro@example.com')).toBeTruthy()
+    expect(screen.queryByText('eligible@example.com')).toBeNull()
+  })
+
   it('formats the next automatic authentication deadline as a live countdown', () => {
     const now = Date.parse('2026-08-03T00:00:00Z')
 

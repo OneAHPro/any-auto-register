@@ -736,6 +736,7 @@ export default function Accounts() {
   const [mfaResetLoading, setMfaResetLoading] = useState(false)
   const [reloginStartError, setReloginStartError] = useState('')
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
+  const accountLoadEpochRef = useRef(0)
   const reloginRequestEpochRef = useRef(0)
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
@@ -813,18 +814,20 @@ export default function Accounts() {
     }
   }, [detailModalOpen, currentAccount, currentPlatform])
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceLive = false) => {
+    const requestEpoch = ++accountLoadEpochRef.current
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
       if (currentPlatform === 'chatgpt') {
         params.set('include_live', '1')
-        params.set('refresh_live', '1')
+        if (forceLive) params.set('refresh_live', '1')
       }
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (subscriptionPlan) params.set('subscription_plan', subscriptionPlan)
       const data = await apiFetch(`/accounts?${params}`)
+      if (requestEpoch !== accountLoadEpochRef.current) return
       const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
         const rank = (x: any) => {
           const status = String(x.chatgpt_display?.remote_status || x.remote_status || x.status || x.health_status || '').toLowerCase()
@@ -836,28 +839,31 @@ export default function Accounts() {
       setTotal(data.total)
       setAccountLoadError('')
     } catch (error) {
+      if (requestEpoch !== accountLoadEpochRef.current) return
       const detail = error instanceof Error ? error.message : '加载账号列表失败'
       setAccountLoadError(detail)
       message.error(`刷新账号列表失败：${detail}`)
-    } finally { setLoading(false) }
+    } finally {
+      if (requestEpoch === accountLoadEpochRef.current) setLoading(false)
+    }
   }, [currentPlatform, search, filterStatus, subscriptionPlan, page, pageSize])
 
   const refreshAccounts = useCallback(async () => {
     let syncError = ''
     try { await apiFetch('/codex-import/sync', { method: 'POST' }) }
     catch (error) { syncError = error instanceof Error ? error.message : '同步账号库存失败' }
-    await load()
+    await load(true)
     if (syncError) setAccountLoadError(syncError)
   }, [load])
 
   useEffect(() => {
-    void (currentPlatform === 'chatgpt' ? refreshAccounts() : load())
-  }, [load, refreshAccounts, currentPlatform])
+    void load()
+  }, [load])
 
   useEffect(() => {
     if (currentPlatform !== 'chatgpt') return
     const timer = window.setInterval(() => {
-      void load()
+      void load(true)
     }, 60_000)
     return () => window.clearInterval(timer)
   }, [load, currentPlatform])
