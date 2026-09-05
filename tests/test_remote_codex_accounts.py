@@ -230,3 +230,49 @@ def test_one_unavailable_target_does_not_hide_accounts_from_healthy_targets(monk
     rows = health.fetch_codex2api_quota_accounts(database_engine=object())
 
     assert [row["email"] for row in rows] == ["healthy@example.com"]
+
+
+def test_remote_reconcile_reuses_binding_left_by_deleted_local_account(monkeypatch):
+    target_engine = make_engine()
+    with Session(target_engine) as session:
+        session.add(
+            db.AccountIdentityModel(
+                id="old-local-identity",
+                platform="chatgpt",
+                canonical_email="json-imported@example.com",
+                current_account_id=0,
+                state="retired",
+            )
+        )
+        session.add(
+            db.AccountTargetBindingModel(
+                identity_id="old-local-identity",
+                local_account_id=999,
+                target_id=1,
+                remote_account_id=90210,
+                remote_email="json-imported@example.com",
+                sync_status="retired",
+                remote_status="active",
+                enabled=True,
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(
+        "services.chatgpt_codex2api_health.fetch_codex2api_quota_accounts",
+        lambda **kwargs: [remote_row()],
+    )
+
+    with Session(target_engine) as session:
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            session=session,
+        )
+        bindings = session.exec(select(db.AccountTargetBindingModel)).all()
+
+    assert result["total"] == 1
+    assert len(bindings) == 1
+    assert bindings[0].identity_id == "old-local-identity"
+    assert bindings[0].local_account_id == 0

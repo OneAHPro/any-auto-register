@@ -304,7 +304,22 @@ def reconcile_target_bindings(
             local_matches = local_by_email.get(email, []) if email else []
             if len(local_matches) == 1 and str(local_matches[0].identity_id or "").strip():
                 continue
-            identity_key = remote_identity_id(int(target_id), remote_id)
+            existing_remote_binding = session.exec(
+                select(AccountTargetBindingModel)
+                .where(AccountTargetBindingModel.target_id == int(target_id))
+                .where(AccountTargetBindingModel.remote_account_id == remote_id)
+            ).first()
+            if existing_remote_binding is not None:
+                bound_account = (
+                    session.get(AccountModel, int(existing_remote_binding.local_account_id))
+                    if int(existing_remote_binding.local_account_id or 0) > 0
+                    else None
+                )
+                if bound_account is not None:
+                    continue
+                identity_key = str(existing_remote_binding.identity_id)
+            else:
+                identity_key = remote_identity_id(int(target_id), remote_id)
             identity = session.get(AccountIdentityModel, identity_key)
             if identity is None:
                 identity = AccountIdentityModel(

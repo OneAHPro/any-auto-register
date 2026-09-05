@@ -495,7 +495,16 @@ def list_accounts(
                     continue
                 if email and str(email).strip().lower() not in display_email:
                     continue
-                identity_id = f"codex2api:{target_id}:{remote_id}"
+                binding_row = session.exec(
+                    select(AccountTargetBindingModel)
+                    .where(AccountTargetBindingModel.target_id == target_id)
+                    .where(AccountTargetBindingModel.remote_account_id == remote_id)
+                ).first()
+                identity_id = (
+                    str(binding_row.identity_id)
+                    if binding_row is not None
+                    else remote_identity_id(target_id, remote_id)
+                )
                 proxy = SimpleNamespace(
                     id=remote_virtual_account_id(target_id, remote_id),
                     email=display_email,
