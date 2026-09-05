@@ -82,7 +82,10 @@ describe('AccountCard', () => {
     expect(within(card).getByText('operator@example.com')).toBeTruthy()
     expect(within(card).getByText('Pro')).toBeTruthy()
     expect(within(card).getByText('Microsoft')).toBeTruthy()
-    expect(within(card).getByText('user-42')).toBeTruthy()
+    expect(within(card).queryByText('user-42')).toBeNull()
+    expect(within(card).queryByText('工作区')).toBeNull()
+    expect(within(card).queryByText('当前目标')).toBeNull()
+    expect(within(card).getByText('Team pool')).toBeTruthy()
     expect(within(card).getByText('7天使用')).toBeTruthy()
     expect(within(card).getByText('12%')).toBeTruthy()
     expect(within(card).getByText('$98.34')).toBeTruthy()
@@ -133,7 +136,8 @@ describe('AccountCard', () => {
     )
 
     const card = screen.getByTestId('account-card')
-    expect(within(card).getAllByText('Codex2API 托管').length).toBeGreaterThanOrEqual(1)
+    expect(within(card).queryByText('Codex2API 托管')).toBeNull()
+    expect(within(card).getByText('Codex')).toBeTruthy()
     expect(within(card).getByText('$18.75')).toBeTruthy()
     expect(within(card).getByText('1,234')).toBeTruthy()
     expect(within(card).queryByRole('button', { name: '删除' })).toBeNull()
@@ -245,7 +249,7 @@ describe('AccountCard', () => {
     const card = screen.getByTestId('account-card')
     expect(within(card).getByText('Pro')).toBeTruthy()
     expect(within(card).getByText('24%')).toBeTruthy()
-    expect(within(card).getByText('probe-account-1')).toBeTruthy()
+    expect(within(card).queryByText('probe-account-1')).toBeNull()
   })
 
   it('does not borrow a different quota window when the seven-day snapshot is incomplete', () => {

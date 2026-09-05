@@ -16,7 +16,6 @@ import {
   Typography,
   Alert,
   Descriptions,
-  DatePicker,
   Timeline,
   Checkbox,
   Empty,
@@ -700,8 +699,6 @@ export default function Accounts() {
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
   const [subscriptionPlan, setSubscriptionPlan] = useState('')
-  const [createdAtStart, setCreatedAtStart] = useState('')
-  const [createdAtEnd, setCreatedAtEnd] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
@@ -817,10 +814,6 @@ export default function Accounts() {
   }, [detailModalOpen, currentAccount, currentPlatform])
 
   const load = useCallback(async () => {
-    if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
-      message.warning('开始时间不能晚于结束时间')
-      return
-    }
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
@@ -831,8 +824,6 @@ export default function Accounts() {
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (subscriptionPlan) params.set('subscription_plan', subscriptionPlan)
-      if (createdAtStart) params.set('created_at_start', createdAtStart)
-      if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
       const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
         const rank = (x: any) => {
@@ -849,7 +840,7 @@ export default function Accounts() {
       setAccountLoadError(detail)
       message.error(`刷新账号列表失败：${detail}`)
     } finally { setLoading(false) }
-  }, [currentPlatform, search, filterStatus, subscriptionPlan, createdAtStart, createdAtEnd, page, pageSize])
+  }, [currentPlatform, search, filterStatus, subscriptionPlan, page, pageSize])
 
   const refreshAccounts = useCallback(async () => {
     let syncError = ''
@@ -1601,18 +1592,6 @@ export default function Accounts() {
             ]}
           />
           {currentPlatform === 'chatgpt' && <Segmented aria-label="订阅计划" value={subscriptionPlan || 'all'} onChange={(value) => { setPage(1); setSubscriptionPlan(value === 'all' ? '' : String(value)) }} options={[{ value: 'all', label: '全部' }, { value: 'pro', label: 'Pro' }, { value: 'prolite', label: 'ProLite' }, { value: 'plus', label: 'Plus' }, { value: 'team', label: 'Team' }, { value: 'k12', label: 'K12' }, { value: 'free', label: 'Free' }]} /> }
-          <DatePicker
-            showTime
-            allowClear
-            placeholder="开始时间"
-            onChange={(value) => { setPage(1); setCreatedAtStart(value ? value.toISOString() : '') }}
-          />
-          <DatePicker
-            showTime
-            allowClear
-            placeholder="结束时间"
-            onChange={(value) => { setPage(1); setCreatedAtEnd(value ? value.toISOString() : '') }}
-          />
           <Text type="secondary">{total} 个账号</Text>
           {currentPlatform === 'chatgpt' && (
             <Text type="secondary">

@@ -1,4 +1,4 @@
-import type { CSSProperties, Key, KeyboardEvent, ReactNode } from 'react'
+import type { Key, KeyboardEvent, ReactNode } from 'react'
 import {
   Alert,
   Avatar,
@@ -27,7 +27,6 @@ import {
   MailOutlined,
   SyncOutlined,
   TeamOutlined,
-  UserOutlined,
   WarningOutlined,
 } from '@ant-design/icons'
 
@@ -175,14 +174,6 @@ function formatNumber(value: number | null): string {
   return new Intl.NumberFormat().format(value)
 }
 
-function formatBytes(value: number | null): string {
-  if (value === null) return '—'
-  if (value < 1024) return `${Math.round(value)} B`
-  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KB`
-  if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1)} MB`
-  return `${(value / 1024 / 1024 / 1024).toFixed(1)} GB`
-}
-
 function maskSecret(value: string): string {
   if (!value) return ''
   return '••••••••••••'
@@ -296,7 +287,6 @@ export function AccountCard({
   const auth = local.auth || {}
   const subscription = local.subscription || {}
   const codex = local.codex || {}
-  const authPayload = parseJsonObject(auth.message)
   const codexPayload = parseJsonObject(codex.message)
   const primaryWindow = codexPayload.rate_limit?.primary_window || codexPayload.rateLimit?.primary_window || {}
   const assignment = account?.assignment || {}
@@ -321,29 +311,8 @@ export function AccountCard({
         : subscription.plan),
   )
   const email = String(account?.email || `账号 #${account?.id ?? '—'}`)
-  const userId = String(
-    liveDisplay?.chatgpt_account_id
-      || account?.user_id
-      || subscription.chatgpt_account_id
-      || codex.chatgpt_account_id
-      || codexPayload.account_id
-      || authPayload.id
-      || extra.chatgpt_user_id
-      || extra.user_id
-      || '',
-  ).trim()
-  const workspaceName = String(
-    liveDisplay?.workspace_name
-      || subscription.workspace_name
-      || subscription.workspaceName
-      || authPayload.orgs?.data?.[0]?.name
-      || extra.workspace_name
-      || extra.workspaceName
-      || liveDisplay?.workspace_id
-      || '—',
-  )
   const provider = remoteOnly
-    ? 'Codex2API 托管'
+    ? 'Codex'
     : providerLabel(
       firstValue(account, [
         ['extra', 'mailbox_login_context', 'provider'],
@@ -405,15 +374,6 @@ export function AccountCard({
       ['extra', 'usage_detail', 'request_count'],
       ['extra', 'usage_detail', 'requests'],
     ]) ?? firstNumber(codexPayload, [['requests'], ['request_count'], ['rate_limit', 'primary_window', 'requests']])
-  const bandwidth = liveDisplay
-    ? firstNumber(quota, [['bytes_used'], ['bytes']])
-    : firstNumber(account, [
-      ['bytes_used'],
-      ['extra', 'bytes_used'],
-      ['extra', 'usage', 'weekly', 'bytes'],
-      ['extra', 'usage_detail', 'bytes'],
-      ['extra', 'usage_detail', 'bandwidth'],
-    ]) ?? firstNumber(codexPayload, [['bytes'], ['bytes_used'], ['usage_bytes']])
   const actualPrice = firstValue(account, [
     ['actual_price'],
     ['extra', 'actual_price'],
@@ -470,21 +430,11 @@ export function AccountCard({
   ).trim()
   const password = String(account?.password || '').trim()
   const createdAt = formatDate(account?.created_at, true)
-  const statusColor = displayStatus.color === 'error'
-    ? '#f97373'
-    : displayStatus.color === 'warning'
-      ? '#fbbf24'
-      : '#4ade80'
-  const token = {
-    '--account-card-primary': statusColor,
-  } as CSSProperties
-
   return (
     <article
       className={`account-card${remoteOnly ? ' account-card--remote' : ''}${selected ? ' account-card--selected' : ''}`}
       data-testid="account-card"
       data-account-id={account?.id}
-      style={token}
       tabIndex={0}
       aria-label={`${maskEmail(email)}，按回车查看详情`}
       onDoubleClick={openDetails}
@@ -520,23 +470,12 @@ export function AccountCard({
           <div className="account-card__tag-row">
             <Tag color={displayStatus.color}>{displayStatus.label}</Tag>
             {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
-            {remoteOnly ? <Tag color="blue">Codex2API 托管</Tag> : null}
           </div>
         </div>
         <div className="account-card__header-actions">{moreAction}</div>
       </header>
 
-      <div className="account-card__identity-grid">
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><TeamOutlined />工作区</span>
-          <Text ellipsis={{ tooltip: workspaceName }}>{workspaceName}</Text>
-        </div>
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><LinkOutlined />当前目标</span>
-          <Text ellipsis={{ tooltip: assignment.target_name || (assignment.target_id ? `目标 #${assignment.target_id}` : '未分配目标') }}>
-            {assignment.target_name || (assignment.target_id ? `目标 #${assignment.target_id}` : '未分配目标')}
-          </Text>
-        </div>
+      <div className="account-card__identity-grid account-card__identity-grid--compact">
         <div className="account-card__identity-item">
           <span className="account-card__field-label"><TeamOutlined />号池</span>
           <Text ellipsis={{ tooltip: assignment.pool_name || assignment.pool_id || '未分配号池' }}>
@@ -546,10 +485,6 @@ export function AccountCard({
         <div className="account-card__identity-item">
           <span className="account-card__field-label"><LoginOutlined />登录方式</span>
           <Text>{provider}</Text>
-        </div>
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><UserOutlined />用户 ID</span>
-          <Text ellipsis={{ tooltip: userId || `账号 #${account?.id ?? '—'}` }}>{userId || `账号 #${account?.id ?? '—'}`}</Text>
         </div>
       </div>
 
@@ -564,19 +499,12 @@ export function AccountCard({
         />
       ) : null}
 
-      <div className="account-card__credentials">
-        {remoteOnly ? (
-          <div className="account-card__managed-credentials">
-            <SyncOutlined />
-            <span>凭据由 Codex2API 节点托管</span>
-          </div>
-        ) : (
-          <>
-            <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
-            <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
-          </>
-        )}
-      </div>
+      {!remoteOnly ? (
+        <div className="account-card__credentials">
+          <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
+          <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
+        </div>
+      ) : null}
 
       {note ? (
         <div className="account-card__note">
@@ -615,7 +543,6 @@ export function AccountCard({
           )}
           <div className="account-card__metrics-grid">
             <Metric label="请求数" value={formatNumber(requestCount)} />
-            <Metric label="流量" value={formatBytes(bandwidth)} />
             <Metric label="已计费" value={formatMoney(billed)} />
             {liveDisplay ? (
               <Metric label="状态" value={displayStatus.label} accent />
@@ -636,34 +563,28 @@ export function AccountCard({
         </section>
       )}
 
-      {(actualPrice !== undefined || rate !== undefined || activeUntil || validityDays !== null || checkedAt) ? (
-        <section className="account-card__commercial" aria-label="有效期与价格">
-          {activeUntil || validityDays !== null ? (
-            <div className="account-card__commercial-row">
-              <span><CalendarOutlined />有效期{validityDays !== null ? ` ${validityDays}天` : '至'}</span>
-              <strong>{formatDate(activeUntil)}</strong>
-            </div>
-          ) : null}
-          {actualPrice !== undefined ? (
-            <div className="account-card__commercial-row">
-              <span><DollarOutlined />实际价格</span>
-              <strong>{formatCny(actualPrice)}</strong>
-            </div>
-          ) : null}
-          {rate !== undefined ? (
-            <div className="account-card__commercial-row">
-              <span><CheckCircleOutlined />倍率</span>
-              <strong>{String(rate)}×</strong>
-            </div>
-          ) : null}
-          {checkedAt ? (
-            <div className="account-card__commercial-row">
-              <span><ClockCircleOutlined />最近检查</span>
-              <strong>{formatDate(checkedAt, true)}</strong>
-            </div>
-          ) : null}
-        </section>
-      ) : null}
+      <section className="account-card__commercial" aria-label="有效期与检查">
+        <div className="account-card__commercial-row">
+          <span><CalendarOutlined />有效期{validityDays !== null ? ` ${validityDays}天` : '至'}</span>
+          <strong>{formatDate(activeUntil)}</strong>
+        </div>
+        {actualPrice !== undefined ? (
+          <div className="account-card__commercial-row">
+            <span><DollarOutlined />实际价格</span>
+            <strong>{formatCny(actualPrice)}</strong>
+          </div>
+        ) : null}
+        {rate !== undefined ? (
+          <div className="account-card__commercial-row">
+            <span><CheckCircleOutlined />倍率</span>
+            <strong>{String(rate)}×</strong>
+          </div>
+        ) : null}
+        <div className="account-card__commercial-row">
+          <span><ClockCircleOutlined />最近检查</span>
+          <strong>{formatDate(checkedAt, true)}</strong>
+        </div>
+      </section>
 
       <Divider className="account-card__divider" />
 

@@ -198,7 +198,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     render(<Accounts />)
 
     expect(await screen.findByText('json-imported@example.com')).toBeTruthy()
-    expect(screen.getAllByText('Codex2API 托管').length).toBeGreaterThanOrEqual(1)
+    expect(screen.queryByText('Codex2API 托管')).toBeNull()
     const refreshCallsBefore = vi.mocked(apiFetch).mock.calls.length
     await user.click(screen.getByRole('button', { name: '刷新账号列表' }))
     await waitFor(() => {
@@ -497,7 +497,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(within(card).queryByText('剩余估算')).toBeNull()
   })
 
-  it('renders current target, pool assignment, and continuous seven-day quota', async () => {
+  it('renders pool assignment and continuous seven-day quota', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path.startsWith('/accounts?')) {
         return {
@@ -527,9 +527,9 @@ describe('Accounts ChatGPT staged login integration', () => {
 
     render(<Accounts />)
 
-    expect((await screen.findAllByText('当前目标')).length).toBeGreaterThan(0)
-    expect(screen.getAllByText('7天窗口').length).toBeGreaterThan(0)
-    expect(screen.getByText('目标 #2')).toBeTruthy()
+    await screen.findByTestId('account-card')
+    expect(screen.queryByText('当前目标')).toBeNull()
+    expect(screen.getAllByText('最近检查').length).toBeGreaterThan(0)
     expect(screen.getByText('ENTERPRISE_A_POOL')).toBeTruthy()
     expect(screen.getByText('$900.00')).toBeTruthy()
   })
