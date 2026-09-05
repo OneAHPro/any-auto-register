@@ -24,6 +24,7 @@ from api.chatgpt import router as chatgpt_router
 from api.sms_pool import router as sms_pool_router
 from api.automations import router as automations_router
 from api.codex2api_control import router as codex2api_control_router
+from api.codex_import import router as codex_import_router
 
 EXPECTED_CONDA_ENV = os.getenv("APP_CONDA_ENV", "any-auto-register")
 
@@ -131,6 +132,7 @@ app.include_router(chatgpt_router, prefix="/api")
 app.include_router(sms_pool_router, prefix="/api")
 app.include_router(automations_router, prefix="/api")
 app.include_router(codex2api_control_router, prefix="/api")
+app.include_router(codex_import_router, prefix="/api")
 
 
 @app.get("/api/solver/status")

@@ -788,6 +788,20 @@ class Codex2APITargetClient:
         finally:
             mime.close()
 
+    def import_agent_identity(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Import one Codex Agent Identity through its dedicated endpoint."""
+        auth_json = json.dumps(dict(payload), ensure_ascii=False, separators=(",", ":"))
+        request = {
+            "auth_json": auth_json,
+            "name": _text(payload.get("name") or payload.get("email")),
+        }
+        return self._request(
+            "POST",
+            "/api/admin/accounts/codex/agent-identity",
+            json_body=request,
+            redaction_secrets=_collect_secrets(payload),
+        )
+
     def test_account(self, remote_id: int) -> dict[str, Any]:
         try:
             result = self._request(

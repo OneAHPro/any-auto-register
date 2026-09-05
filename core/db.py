@@ -2,7 +2,7 @@
 from datetime import datetime, timezone
 import os
 from typing import Optional
-from sqlalchemy import delete, event, func, update
+from sqlalchemy import delete, event, func, update, UniqueConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
@@ -286,6 +286,22 @@ class Codex2APITargetModel(SQLModel, table=True):
     last_health_at: Optional[datetime] = None
     last_sync_at: Optional[datetime] = None
     last_error: str = ""
+    created_at: datetime = Field(default_factory=_utcnow)
+    updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class CodexInventorySnapshotModel(SQLModel, table=True):
+    """Credential-free durable snapshot of a remote Codex2API account."""
+    __tablename__ = "codex_inventory_snapshots"
+    __table_args__ = (UniqueConstraint("target_id", "remote_id", name="uq_codex_inventory_target_remote"),)
+    id: Optional[int] = Field(default=None, primary_key=True)
+    target_id: int = Field(index=True)
+    remote_id: int = Field(index=True)
+    summary_json: str = "{}"
+    fetched_at: datetime = Field(default_factory=_utcnow, index=True)
+    source_updated_at: str = ""
+    missing: bool = Field(default=False, index=True)
+    error: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 

@@ -77,11 +77,14 @@ def run_all_target_health() -> list[object]:
 def run_all_target_quota() -> list[object]:
     from services.codex2api_target_client import get_target_client
     from services.control_plane_workers import collect_customer_usage, collect_target_quota
+    from services.codex_inventory import materialize_inventory, sync_inventory
 
     results = []
     for target_id in _enabled_target_ids():
         try:
             client = get_target_client(target_id, engine)
+            sync_inventory(engine, target_id=target_id, clients={target_id: client}, refresh=True)
+            materialize_inventory(engine)
             results.append(
                 collect_target_quota(
                     engine,

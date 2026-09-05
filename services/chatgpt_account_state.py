@@ -58,6 +58,14 @@ def account_is_visible_in_default_list(account: Any) -> bool:
     """Hide incomplete ChatGPT rows while preserving every other platform."""
     if _lower_text(getattr(account, "platform", "")) != "chatgpt":
         return True
+    try:
+        extra = getattr(account, "extra", None)
+        if not isinstance(extra, dict):
+            extra = json.loads(getattr(account, "extra_json", "{}") or "{}")
+        if isinstance(extra, dict) and bool(extra.get("remote_only")):
+            return True
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
     if chatgpt_account_refresh_token(account):
         return True
     try:

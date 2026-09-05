@@ -276,3 +276,31 @@ def test_remote_reconcile_reuses_binding_left_by_deleted_local_account(monkeypat
     assert len(bindings) == 1
     assert bindings[0].identity_id == "old-local-identity"
     assert bindings[0].local_account_id == 0
+
+
+def test_legacy_bootstrap_orders_accounts_by_available_rate_limited_then_error_and_filters_plan(monkeypatch):
+    target_engine = make_engine()
+    rows = [
+        remote_row(remote_id=3, email="error@example.com", remote_status="error", plan_type="free"),
+        remote_row(remote_id=2, email="limited@example.com", remote_status="rate_limited", plan_type="pro"),
+        remote_row(remote_id=1, email="available@example.com", remote_status="active", plan_type="pro"),
+    ]
+    monkeypatch.setattr(
+        "services.chatgpt_codex2api_health.fetch_codex2api_quota_accounts",
+        lambda **kwargs: rows,
+    )
+
+    with Session(target_engine) as session:
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            subscription_plan="pro",
+            session=session,
+        )
+
+    assert [item["email"] for item in result["items"]] == [
+        "available@example.com",
+        "limited@example.com",
+    ]

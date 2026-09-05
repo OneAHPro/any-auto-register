@@ -5,6 +5,7 @@ import {
   Input,
   InputNumber,
   Select,
+  Segmented,
   Tag,
   Space,
   Modal,
@@ -37,6 +38,7 @@ import {
   ThunderboltOutlined,
 } from '@ant-design/icons'
 import { ChatGPTExistingAccountLoginModal } from '@/components/ChatGPTExistingAccountLoginModal'
+import { CodexAccountImportModal } from '@/components/CodexAccountImportModal'
 import {
   ChatGPTPhoneVerificationModal,
   type ChatGPTPhoneVerificationAccount,
@@ -77,7 +79,20 @@ function normalizeAccount(account: any) {
   const codex2apiSync = syncStatuses.codex2api && typeof syncStatuses.codex2api === 'object' ? syncStatuses.codex2api : {}
   const cliproxySync = syncStatuses.cliproxyapi && typeof syncStatuses.cliproxyapi === 'object' ? syncStatuses.cliproxyapi : {}
   const chatgptLocal = extra.chatgpt_local && typeof extra.chatgpt_local === 'object' ? extra.chatgpt_local : {}
-  return { ...account, extra, cpaSync, sub2apiSync, codex2apiSync, cliproxySync, chatgptLocal }
+  const remoteSnapshot = extra.codex_remote_snapshot && typeof extra.codex_remote_snapshot === 'object' ? extra.codex_remote_snapshot : {}
+  return {
+    ...account,
+    extra,
+    cpaSync,
+    sub2apiSync,
+    codex2apiSync,
+    cliproxySync,
+    chatgptLocal,
+    remote_only: Boolean(account.remote_only || extra.remote_only),
+    account_source: account.account_source || extra.account_source,
+    remote_id: account.remote_id || extra.remote_id || remoteSnapshot.remote_id,
+    remote_target_id: account.remote_target_id || extra.remote_target_id || remoteSnapshot.target_id,
+  }
 }
 
 interface Codex2APIDeleteResult {
@@ -684,6 +699,7 @@ export default function Accounts() {
   const [loading, setLoading] = useState(false)
   const [search, setSearch] = useState('')
   const [filterStatus, setFilterStatus] = useState('')
+  const [subscriptionPlan, setSubscriptionPlan] = useState('')
   const [createdAtStart, setCreatedAtStart] = useState('')
   const [createdAtEnd, setCreatedAtEnd] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
@@ -691,6 +707,8 @@ export default function Accounts() {
   const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
+  const [codexImportModalOpen, setCodexImportModalOpen] = useState(false)
+  const [accountLoadError, setAccountLoadError] = useState('')
   const [detailModalOpen, setDetailModalOpen] = useState(false)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
   const [controlQuota, setControlQuota] = useState<Record<string, AccountQuotaView>>({})
@@ -722,9 +740,7 @@ export default function Accounts() {
   const [reloginStartError, setReloginStartError] = useState('')
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
   const reloginRequestEpochRef = useRef(0)
-  const [cpaSyncLoading, setCpaSyncLoading] = useState<'pending' | 'selected' | ''>('')
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
-  const [codex2apiUploadLoading, setCodex2APIUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
   const [autoReloginStatus, setAutoReloginStatus] =
     useState<ChatGPTAutoReloginStatus | null>(null)
@@ -736,6 +752,7 @@ export default function Accounts() {
     reloginRequestEpochRef.current += 1
     autoReloginRunNowEpochRef.current += 1
     setCurrentPlatform(platform || 'chatgpt')
+    setSubscriptionPlan('')
     setSelectedRowKeys([])
     setReloginStartError('')
     setReloginTaskId(null)
@@ -799,41 +816,57 @@ export default function Accounts() {
     }
   }, [detailModalOpen, currentAccount, currentPlatform])
 
-  const load = useCallback(async (forceLive = false) => {
+  const load = useCallback(async () => {
     if (createdAtStart && createdAtEnd && new Date(createdAtStart).getTime() > new Date(createdAtEnd).getTime()) {
       message.warning('开始时间不能晚于结束时间')
-      setAccounts([])
-      setTotal(0)
       return
     }
-
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
       if (currentPlatform === 'chatgpt') {
         params.set('include_live', '1')
-        if (forceLive) params.set('refresh_live', '1')
+        params.set('refresh_live', '1')
       }
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
+      if (subscriptionPlan) params.set('subscription_plan', subscriptionPlan)
       if (createdAtStart) params.set('created_at_start', createdAtStart)
       if (createdAtEnd) params.set('created_at_end', createdAtEnd)
       const data = await apiFetch(`/accounts?${params}`)
-      setAccounts((data.items || []).map(normalizeAccount))
+      const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
+        const rank = (x: any) => {
+          const status = String(x.chatgpt_display?.remote_status || x.remote_status || x.status || x.health_status || '').toLowerCase()
+          return ['active', 'ready', 'available'].includes(status) ? 0 : status === 'rate_limited' ? 1 : 2
+        }
+        return rank(a) - rank(b)
+      })
+      setAccounts(ordered)
       setTotal(data.total)
-    } finally {
-      setLoading(false)
-    }
-  }, [currentPlatform, search, filterStatus, createdAtStart, createdAtEnd, page, pageSize])
+      setAccountLoadError('')
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : '加载账号列表失败'
+      setAccountLoadError(detail)
+      message.error(`刷新账号列表失败：${detail}`)
+    } finally { setLoading(false) }
+  }, [currentPlatform, search, filterStatus, subscriptionPlan, createdAtStart, createdAtEnd, page, pageSize])
+
+  const refreshAccounts = useCallback(async () => {
+    let syncError = ''
+    try { await apiFetch('/codex-import/sync', { method: 'POST' }) }
+    catch (error) { syncError = error instanceof Error ? error.message : '同步账号库存失败' }
+    await load()
+    if (syncError) setAccountLoadError(syncError)
+  }, [load])
 
   useEffect(() => {
-    void load(currentPlatform === 'chatgpt')
-  }, [load, currentPlatform])
+    void (currentPlatform === 'chatgpt' ? refreshAccounts() : load())
+  }, [load, refreshAccounts, currentPlatform])
 
   useEffect(() => {
     if (currentPlatform !== 'chatgpt') return
     const timer = window.setInterval(() => {
-      void load(true)
+      void load()
     }, 60_000)
     return () => window.clearInterval(timer)
   }, [load, currentPlatform])
@@ -1336,129 +1369,6 @@ export default function Accounts() {
     }
   }
 
-  const showCpaSyncResult = (title: string, result: any) => {
-    const lines = (result.items || [])
-      .flatMap((item: any) =>
-        (item.results || []).map((syncResult: any) => ({
-          email: item.email,
-          platform: item.platform,
-          ok: Boolean(syncResult.ok),
-          name: syncResult.name || 'CPA',
-          msg: syncResult.msg || '',
-        })),
-      )
-      .filter((item: any) => !item.ok)
-      .map((item: any) => `[${item.platform}] ${item.email || '-'} / ${item.name}: ${item.msg || '失败'}`)
-
-    if (lines.length === 0) return
-
-    Modal.info({
-      title,
-      width: 760,
-      content: (
-        <pre
-          style={{
-            margin: 0,
-            maxHeight: 360,
-            overflow: 'auto',
-            padding: 12,
-            borderRadius: 8,
-            background: 'rgba(127,127,127,0.08)',
-            fontSize: 12,
-            lineHeight: 1.5,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-          }}
-        >
-          {lines.join('\n')}
-        </pre>
-      ),
-    })
-  }
-
-  const showBatchActionResult = (title: string, result: any) => {
-    const lines = (result.items || [])
-      .filter((item: any) => !item.ok)
-      .map((item: any) => `[${item.id || '-'}] ${item.email || '-'}: ${item.message || '失败'}`)
-
-    if (lines.length === 0) return
-
-    Modal.info({
-      title,
-      width: 760,
-      content: (
-        <pre
-          style={{
-            margin: 0,
-            maxHeight: 360,
-            overflow: 'auto',
-            padding: 12,
-            borderRadius: 8,
-            background: 'rgba(127,127,127,0.08)',
-            fontSize: 12,
-            lineHeight: 1.5,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-          }}
-        >
-          {lines.join('\n')}
-        </pre>
-      ),
-    })
-  }
-
-  const handleCpaBackfill = async (mode: 'pending' | 'selected') => {
-    if (currentPlatform !== 'chatgpt') return
-
-    const body: Record<string, unknown> = {
-      platforms: ['chatgpt'],
-    }
-
-    if (mode === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-
-      if (accountIds.length === 0) {
-        message.warning('请先选择要上传的账号')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.pending_only = true
-      if (filterStatus) body.status = filterStatus
-      if (search) body.email = search
-    }
-
-    setCpaSyncLoading(mode)
-    try {
-      const result = await apiFetch('/integrations/backfill', {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
-
-      const actionLabel = mode === 'selected' ? '所选账号远端补传' : '远端未发现账号补传'
-      if (!result.total) {
-        message.info('没有可处理的账号')
-      } else if (!result.failed && !result.skipped) {
-        message.success(`${actionLabel}完成：成功 ${result.success} / ${result.total}`)
-      } else if (!result.failed) {
-        message.success(`${actionLabel}完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-      } else if (!result.success) {
-        message.error(`${actionLabel}失败：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-      } else {
-        message.warning(`${actionLabel}部分完成：成功 ${result.success}，跳过 ${result.skipped} / ${result.total}`)
-      }
-
-      showCpaSyncResult(`${actionLabel}结果`, result)
-      await load()
-    } catch (e: any) {
-      message.error(`CPA 上传失败: ${e.message}`)
-    } finally {
-      setCpaSyncLoading('')
-    }
-  }
-
   const handleBatchStatusSync = async (kind: 'probe' | 'remote', scope: 'selected' | 'all') => {
     if (currentPlatform !== 'chatgpt') return
 
@@ -1515,6 +1425,37 @@ export default function Accounts() {
     }
   }
 
+  const showBatchActionResult = (title: string, result: any) => {
+    const lines = (result.items || [])
+      .filter((item: any) => !item.ok)
+      .map((item: any) => `[${item.id || '-'}] ${item.email || '-'}: ${item.message || '失败'}`)
+
+    if (lines.length === 0) return
+
+    Modal.info({
+      title,
+      width: 760,
+      content: (
+        <pre
+          style={{
+            margin: 0,
+            maxHeight: 360,
+            overflow: 'auto',
+            padding: 12,
+            borderRadius: 8,
+            background: 'rgba(127,127,127,0.08)',
+            fontSize: 12,
+            lineHeight: 1.5,
+            whiteSpace: 'pre-wrap',
+            wordBreak: 'break-word',
+          }}
+        >
+          {lines.join('\n')}
+        </pre>
+      ),
+    })
+  }
+
   const handleBatchUploadCpa = async (scope: 'selected' | 'all') => {
     const toastKey = `batch-upload-cpa:${scope}`
     const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
@@ -1566,73 +1507,9 @@ export default function Accounts() {
     }
   }
 
-  const handleBatchUploadCodex2API = async (scope: 'selected' | 'all') => {
-    const toastKey = `batch-upload-codex2api:${scope}`
-    const scopeLabel = scope === 'selected' ? '所选账号' : '当前筛选账号'
-
-    const body: Record<string, unknown> = {
-      params: {},
-    }
-
-    if (scope === 'selected') {
-      const accountIds = Array.from(selectedRowKeys)
-        .map((value) => Number(value))
-        .filter((value) => Number.isInteger(value) && value > 0)
-
-      if (accountIds.length === 0) {
-        message.warning('请先选择要导入 Codex2API 的账号')
-        return
-      }
-      body.account_ids = accountIds
-    } else {
-      body.all_filtered = true
-      if (search) body.email = search
-      if (filterStatus) body.status = filterStatus
-      if (createdAtStart) body.created_at_start = createdAtStart
-      if (createdAtEnd) body.created_at_end = createdAtEnd
-    }
-
-    setCodex2APIUploadLoading(scope)
-    message.loading({ content: `${scopeLabel}导入 Codex2API 进行中...`, key: toastKey, duration: 0 })
-    try {
-      const result = await apiFetch(`/actions/${currentPlatform}/upload_codex2api/batch`, {
-        method: 'POST',
-        body: JSON.stringify(body),
-      })
-
-      if (!result.total) {
-        message.info({ content: '没有可处理的账号', key: toastKey })
-      } else if (!result.failed) {
-        message.success({ content: `${scopeLabel}导入 Codex2API 完成：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else if (!result.success) {
-        message.error({ content: `${scopeLabel}导入 Codex2API 失败：成功 ${result.success} / ${result.total}`, key: toastKey })
-      } else {
-        message.warning({ content: `${scopeLabel}导入 Codex2API 部分完成：成功 ${result.success} / ${result.total}`, key: toastKey })
-      }
-
-      showBatchActionResult(`${scopeLabel}导入 Codex2API 结果`, result)
-      await load()
-    } catch (error: unknown) {
-      const detail = error instanceof Error ? error.message : String(error || '请求失败')
-      message.error({ content: `导入 Codex2API 失败: ${detail}`, key: toastKey })
-    } finally {
-      setCodex2APIUploadLoading('')
-    }
-  }
-
   const getStatusSyncScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
 
-  const getBackfillScope = (): 'selected' | 'pending' => (selectedRowKeys.length > 0 ? 'selected' : 'pending')
-
   const getUploadCpaScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
-
-  const getUploadCodex2APIScope = (): 'selected' | 'all' => (selectedRowKeys.length > 0 ? 'selected' : 'all')
-
-  const backfillButtonLabel = () => {
-    const scope = getBackfillScope()
-    const count = scope === 'selected' ? selectedRowKeys.length : total
-    return scope === 'selected' ? `补传所选远端未发现 (${count})` : `补传远端未发现 (${count})`
-  }
 
   const uploadCpaButtonLabel = () => {
     const scope = getUploadCpaScope()
@@ -1640,15 +1517,8 @@ export default function Accounts() {
     return scope === 'selected' ? `导入所选 CPA (${count})` : `导入筛选 CPA (${count})`
   }
 
-  const uploadCodex2APIButtonLabel = () => {
-    const scope = getUploadCodex2APIScope()
-    const count = scope === 'selected' ? selectedRowKeys.length : total
-    return scope === 'selected' ? `导入所选 Codex2API (${count})` : `导入筛选 Codex2API (${count})`
-  }
-
   const isChatgptPlatform = currentPlatform === 'chatgpt'
   const hasUploadCpaAction = platformActions.some((item) => item?.id === 'upload_cpa')
-  const hasUploadCodex2APIAction = platformActions.some((item) => item?.id === 'upload_codex2api')
   const visibleAccountIds = accounts
     .filter((account) => !account?.remote_only)
     .map((account) => account?.id)
@@ -1730,6 +1600,7 @@ export default function Accounts() {
               { value: 'invalid', label: '已失效' },
             ]}
           />
+          {currentPlatform === 'chatgpt' && <Segmented aria-label="订阅计划" value={subscriptionPlan || 'all'} onChange={(value) => { setPage(1); setSubscriptionPlan(value === 'all' ? '' : String(value)) }} options={[{ value: 'all', label: '全部' }, { value: 'pro', label: 'Pro' }, { value: 'prolite', label: 'ProLite' }, { value: 'plus', label: 'Plus' }, { value: 'team', label: 'Team' }, { value: 'k12', label: 'K12' }, { value: 'free', label: 'Free' }]} /> }
           <DatePicker
             showTime
             allowClear
@@ -1814,46 +1685,8 @@ export default function Accounts() {
               </Button>
             </Popconfirm>
           )}
-          {currentPlatform === 'chatgpt' && (
-            <Popconfirm
-              title={
-                getBackfillScope() === 'selected'
-                  ? `确认补传所选 ${selectedRowKeys.length} 个账号中远端未发现的 auth-file？`
-                  : '确认补传当前筛选范围内远端未发现且本地状态有效的账号？'
-              }
-              onConfirm={() => handleCpaBackfill(getBackfillScope())}
-              okText="确认"
-              cancelText="取消"
-            >
-              <Button
-                loading={cpaSyncLoading === 'pending' || cpaSyncLoading === 'selected'}
-                icon={<UploadOutlined />}
-                disabled={getBackfillScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
-              >
-                {backfillButtonLabel()}
-              </Button>
-            </Popconfirm>
-          )}
-          {currentPlatform === 'chatgpt' && hasUploadCodex2APIAction && (
-            <Popconfirm
-              title={
-                getUploadCodex2APIScope() === 'selected'
-                  ? `确认导入所选 ${selectedRowKeys.length} 个账号到 Codex2API？`
-                  : `确认导入当前筛选范围内 ${total} 个账号到 Codex2API？`
-              }
-              onConfirm={() => handleBatchUploadCodex2API(getUploadCodex2APIScope())}
-              okText="确认"
-              cancelText="取消"
-            >
-              <Button
-                loading={codex2apiUploadLoading === 'selected' || codex2apiUploadLoading === 'all'}
-                icon={<UploadOutlined />}
-                disabled={getUploadCodex2APIScope() === 'selected' ? selectedRowKeys.length === 0 : total === 0}
-              >
-                {uploadCodex2APIButtonLabel()}
-              </Button>
-            </Popconfirm>
-          )}
+
+
           {currentPlatform !== 'chatgpt' && hasUploadCpaAction && (
             <Popconfirm
               title={
@@ -1943,11 +1776,10 @@ export default function Accounts() {
               <Button danger icon={<DeleteOutlined />}>删除 {selectedRowKeys.length} 个</Button>
             </Popconfirm>
           )}
-          <Button icon={<UploadOutlined />} onClick={() => setImportModalOpen(true)}>导入</Button>
+          <Button icon={<UploadOutlined />} onClick={() => setCodexImportModalOpen(true)}>导入</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
-          <Button icon={<PlusOutlined />} onClick={() => setAddModalOpen(true)}>新增</Button>
           <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void load(true) }} />
+          <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void refreshAccounts() }} />
         </Space>
       </div>
 
@@ -1961,6 +1793,8 @@ export default function Accounts() {
           style={{ marginBottom: 16 }}
         />
       ) : null}
+
+      {accountLoadError ? <Alert type="error" showIcon closable message={accountLoadError} style={{ marginBottom: 12 }} /> : null}
 
       <div className="account-card-list-shell" style={cardThemeStyle} data-testid="account-card-list">
         <div className="account-card-list-toolbar">
@@ -2150,6 +1984,13 @@ export default function Accounts() {
           </Form.Item>
         </Form>
       </Modal>
+
+      <CodexAccountImportModal
+        open={codexImportModalOpen}
+        onClose={() => setCodexImportModalOpen(false)}
+        onLegacyImport={() => { setCodexImportModalOpen(false); setImportModalOpen(true) }}
+        onCompleted={() => { void load() }}
+      />
 
       <Modal
         title="批量导入"
