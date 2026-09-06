@@ -527,16 +527,29 @@ code {
 }
 
 .account-summary__card--normal {
-  --account-summary-accent: #2f9e70;
+  --account-summary-accent: #4ade80;
 }
 
 .account-summary__card--scheduling,
 .account-summary__card--limited {
-  --account-summary-accent: #c17a14;
+  --account-summary-accent: #fbbf24;
 }
 
 .account-summary__card--abnormal {
-  --account-summary-accent: #c43b3b;
+  --account-summary-accent: #f87171;
+}
+
+html.light .account-summary__card--normal {
+  --account-summary-accent: #16794f;
+}
+
+html.light .account-summary__card--scheduling,
+html.light .account-summary__card--limited {
+  --account-summary-accent: #9a5b00;
+}
+
+html.light .account-summary__card--abnormal {
+  --account-summary-accent: #b42318;
 }
 
 .account-summary__card-head,
