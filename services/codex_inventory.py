@@ -381,6 +381,15 @@ def materialize_inventory(database_engine) -> dict[str, int]:
                 else str(getattr(account, "identity_id", "") or "").strip()
                 or f"codex2api:{target_id}:{remote_id}"
             )
+            if binding is None:
+                # A stable identity may keep its project binding while the
+                # provider rotates the numeric remote ID. Reuse that row
+                # instead of attempting a duplicate identity/target insert.
+                binding = session.exec(
+                    select(AccountTargetBindingModel)
+                    .where(AccountTargetBindingModel.identity_id == identity_id)
+                    .where(AccountTargetBindingModel.target_id == target_id)
+                ).first()
             if account is None and binding is not None and int(binding.local_account_id or 0) > 0:
                 account = session.get(AccountModel, int(binding.local_account_id))
             if account is None:
@@ -436,6 +445,7 @@ def materialize_inventory(database_engine) -> dict[str, int]:
             if binding is None:
                 binding = AccountTargetBindingModel(identity_id=identity_id, local_account_id=int(account.id or 0), target_id=target_id, remote_account_id=remote_id)
             binding.local_account_id = int(account.id or 0)
+            binding.remote_account_id = remote_id
             binding.remote_email = email.lower()
             binding.remote_status = str(row.get("remote_status") or row.get("status") or "")
             binding.enabled = bool(row.get("enabled", True)) and not bool(row.get("locked", False))

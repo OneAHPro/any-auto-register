@@ -108,6 +108,42 @@ def test_materialize_inventory_reuses_local_credentials_by_stable_chatgpt_id_wit
     assert not accounts[0].get_extra().get('remote_only')
     assert accounts[0].get_extra()['codex_remote_snapshot']['remote_id'] == 7
 
+def test_materialize_inventory_reuses_identity_binding_when_remote_id_rotates():
+    e = make_engine()
+    with Session(e) as session:
+        account = db.AccountModel(
+            platform='chatgpt',
+            email='rotated@example.com',
+            password='p',
+            identity_id='identity-rotated',
+            extra_json='{}',
+        )
+        session.add(account)
+        session.flush()
+        session.add(db.AccountTargetBindingModel(
+            identity_id='identity-rotated',
+            local_account_id=int(account.id or 0),
+            target_id=1,
+            remote_account_id=4,
+            remote_email='rotated@example.com',
+            sync_status='remote_missing',
+            enabled=False,
+        ))
+        session.commit()
+    sync_inventory(e, target_id=1, clients={1: Client([{
+        'id': 8,
+        'email': 'rotated@example.com',
+        'chatgpt_account_id': 'identity-rotated',
+        'status': 'active',
+    }])})
+    result = materialize_inventory(e)
+    assert result['created'] == 0
+    with Session(e) as session:
+        bindings = session.exec(select(db.AccountTargetBindingModel)).all()
+    assert len(bindings) == 1
+    assert bindings[0].remote_account_id == 8
+    assert bindings[0].enabled is True
+
 def test_malformed_empty_response_does_not_mark_existing_rows_missing():
     e=make_engine(); c=Client([{'id':8,'email':'keep@example.com'}]); sync_inventory(e,target_id=1,clients={1:c})
     c.rows=None
