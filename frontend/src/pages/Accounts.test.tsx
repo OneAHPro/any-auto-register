@@ -299,7 +299,7 @@ describe('Accounts ChatGPT staged login integration', () => {
       const accountCalls = vi.mocked(apiFetch).mock.calls
         .filter(([path]) => String(path).startsWith('/accounts?'))
       expect(accountCalls.length).toBeGreaterThanOrEqual(2)
-      expect(String(accountCalls.at(-1)?.[0])).not.toContain('refresh_live=1')
+      expect(String(accountCalls.at(-1)?.[0])).toContain('refresh_live=1')
     })
     expect(sync).toHaveBeenCalledTimes(1)
     expect(vi.mocked(apiFetch).mock.calls.length).toBeGreaterThan(refreshCallsBefore)

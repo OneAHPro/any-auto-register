@@ -298,7 +298,14 @@ def build_chatgpt_account_display(
         "match": match if remote is not None else None,
         "fetched_at": _now_iso(now),
         "live_updated_at": (
-            _text(remote.get("updated_at") or remote.get("quota_7d_updated_at"))
+            _text((quota or {}).get("captured_at"))
+            or _text(
+                remote.get("quota_5h_updated_at")
+                or remote.get("quota_7d_updated_at")
+                or remote.get("codex_5h_usage_updated_at")
+                or remote.get("codex_usage_updated_at")
+                or remote.get("updated_at")
+            )
             if remote is not None
             else None
         ),

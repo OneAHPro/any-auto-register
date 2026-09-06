@@ -985,7 +985,9 @@ export default function Accounts() {
         syncError = error instanceof Error ? error.message : '同步账号库存失败'
       }
     }
-    await load(Boolean(syncError))
+    // The sync endpoint refreshes the durable inventory, so the following
+    // list request must rebuild the live projection from that fresh data.
+    await load(true)
     if (syncError) setAccountLoadError(syncError)
   }, [currentPlatform, load])
 

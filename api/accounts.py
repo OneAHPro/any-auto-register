@@ -1022,6 +1022,20 @@ def list_accounts(
                     else None
                 )
                 if inventory_row is not None:
+                    # The durable inventory is the freshest projection for a
+                    # target/remote key.  Local account extras are retained as
+                    # a fallback for older rows, but must not shadow a newer
+                    # inventory summary during cached list requests.
+                    try:
+                        inventory_summary = json.loads(
+                            inventory_row.summary_json or "{}"
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        inventory_summary = {}
+                    if isinstance(inventory_summary, dict):
+                        row.update(inventory_summary)
+                    row["target_id"] = int(inventory_row.target_id)
+                    row["remote_id"] = int(inventory_row.remote_id)
                     row["_inventory_missing"] = bool(inventory_row.missing)
                     row["_inventory_error"] = str(inventory_row.error or "")
                     row["_inventory_stale"] = bool(inventory_row.error)

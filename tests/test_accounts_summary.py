@@ -1,4 +1,5 @@
 import json
+from datetime import datetime
 
 from sqlmodel import Session, SQLModel, create_engine
 from sqlalchemy.pool import StaticPool
@@ -740,6 +741,67 @@ def test_inventory_sync_failure_marks_existing_snapshot_as_unavailable(monkeypat
     item = result["items"][0]
     assert item["chatgpt_display"]["quota_status"] == "error"
     assert result["summary"]["errors"] == 1
+
+
+def test_cached_account_display_uses_latest_inventory_summary_over_local_snapshot():
+    engine = _live_test_engine()
+    account = AccountModel(
+        platform="chatgpt",
+        email="cached@example.com",
+        password="p",
+        status="registered",
+        identity_id="codex2api:1:42",
+        extra_json=json.dumps({
+            "account_type": "chatgpt_password",
+            "remote_target_id": 1,
+            "remote_id": 42,
+            "codex_remote_snapshot": _remote_row(
+                remote_id=42,
+                email="cached@example.com",
+                usage_percent_7d=60,
+                billed_7d=130.12,
+                usage_7d_requests=1848,
+                updated_at="2026-09-07T01:37:06+08:00",
+            ),
+        }),
+    )
+    latest = _remote_row(
+        remote_id=42,
+        email="cached@example.com",
+        usage_percent_7d=94,
+        billed_7d=143.33,
+        usage_7d_requests=2049,
+        updated_at="2026-09-07T04:07:13+08:00",
+        quota_7d_updated_at="2026-09-07T04:06:58+08:00",
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.add(
+            CodexInventorySnapshotModel(
+                target_id=1,
+                remote_id=42,
+                summary_json=json.dumps(latest),
+                source_updated_at=latest["updated_at"],
+                fetched_at=datetime.fromisoformat("2026-09-07T04:08:00+00:00"),
+                missing=False,
+                error="",
+            )
+        )
+        session.commit()
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            refresh_live=False,
+            session=session,
+        )
+
+    display = result["items"][0]["chatgpt_display"]
+    assert display["quota"]["usage_percent"] == 94
+    assert display["quota"]["request_count"] == 2049
+    assert display["quota"]["billed_usd"] == 143.33
+    assert display["live_updated_at"] == "2026-09-07T04:06:58+08:00"
 
 
 def test_missing_remote_only_rows_are_hidden_only_for_targets_with_complete_inventory():
