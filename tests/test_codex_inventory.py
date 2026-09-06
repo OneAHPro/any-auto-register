@@ -144,6 +144,21 @@ def test_materialize_inventory_reuses_identity_binding_when_remote_id_rotates():
     assert bindings[0].remote_account_id == 8
     assert bindings[0].enabled is True
 
+def test_materialize_inventory_keeps_duplicate_remote_emails_as_separate_accounts():
+    e = make_engine()
+    sync_inventory(e, target_id=1, clients={1: Client([
+        {'id': 11, 'email': 'shared@example.com', 'status': 'active'},
+        {'id': 12, 'email': 'shared@example.com', 'status': 'rate_limited'},
+    ])})
+    result = materialize_inventory(e)
+    assert result['created'] == 2
+    with Session(e) as session:
+        accounts = session.exec(select(db.AccountModel)).all()
+        bindings = session.exec(select(db.AccountTargetBindingModel)).all()
+    assert len(accounts) == 2
+    assert {a.get_extra()['remote_id'] for a in accounts} == {11, 12}
+    assert {int(b.remote_account_id) for b in bindings} == {11, 12}
+
 def test_malformed_empty_response_does_not_mark_existing_rows_missing():
     e=make_engine(); c=Client([{'id':8,'email':'keep@example.com'}]); sync_inventory(e,target_id=1,clients={1:c})
     c.rows=None

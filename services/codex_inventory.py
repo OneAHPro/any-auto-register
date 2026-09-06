@@ -148,7 +148,10 @@ def _row_stable_ids(row: Mapping[str, Any]) -> set[str]:
 
 def _account_stable_ids(account: AccountModel) -> set[str]:
     result: set[str] = set()
-    for value in (getattr(account, "user_id", ""),):
+    for value in (
+        getattr(account, "user_id", ""),
+        getattr(account, "identity_id", ""),
+    ):
         normalized = _stable_id(value)
         if normalized:
             result.add(normalized)
@@ -166,6 +169,23 @@ def _account_is_remote_only(account: AccountModel) -> bool:
     except Exception:
         extra = {}
     return isinstance(extra, Mapping) and bool(extra.get("remote_only"))
+
+
+def _account_remote_key(account: AccountModel) -> tuple[int, int] | None:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, Mapping):
+        return None
+    snapshot = extra.get("codex_remote_snapshot")
+    snapshot = snapshot if isinstance(snapshot, Mapping) else {}
+    try:
+        target_id = int(extra.get("remote_target_id") or snapshot.get("target_id") or 0)
+        remote_id = int(extra.get("remote_id") or snapshot.get("remote_id") or 0)
+    except (TypeError, ValueError):
+        return None
+    return (target_id, remote_id) if target_id > 0 and remote_id > 0 else None
 
 def _lock_for(target_id: int) -> threading.Lock:
     with _LOCKS_GUARD: return _LOCKS.setdefault(int(target_id), threading.Lock())
@@ -320,6 +340,20 @@ def materialize_inventory(database_engine) -> dict[str, int]:
         ).all()
         by_stable_id: dict[str, list[AccountModel]] = {}
         by_email: dict[str, list[AccountModel]] = {}
+        target_bindings = session.exec(
+            select(AccountTargetBindingModel)
+        ).all()
+        bound_account_ids: dict[tuple[int, int], set[int]] = {}
+        for existing_binding in target_bindings:
+            target_key = int(existing_binding.target_id or 0)
+            remote_key = int(existing_binding.remote_account_id or 0)
+            if target_key <= 0 or remote_key <= 0:
+                continue
+            identity_key = str(existing_binding.identity_id or "").strip()
+            local_key = int(existing_binding.local_account_id or 0)
+            if local_key > 0:
+                bound_account_ids.setdefault((local_key, target_key), set()).add(remote_key)
+        claimed_account_ids: set[tuple[int, int]] = set()
         for candidate in candidates:
             for stable_id in _account_stable_ids(candidate):
                 by_stable_id.setdefault(stable_id, []).append(candidate)
@@ -344,6 +378,8 @@ def materialize_inventory(database_engine) -> dict[str, int]:
                 account = session.get(AccountModel, int(binding.local_account_id))
                 if account is not None and str(account.platform or "").lower() != "chatgpt":
                     account = None
+                if account is not None:
+                    claimed_account_ids.add((target_id, int(account.id or 0)))
             row_stable_ids = _row_stable_ids(row)
             if account is None and row_stable_ids:
                 stable_matches = []
@@ -351,7 +387,11 @@ def materialize_inventory(database_engine) -> dict[str, int]:
                 for stable_id in row_stable_ids:
                     for candidate in by_stable_id.get(stable_id, []):
                         candidate_id = int(candidate.id or 0)
-                        if candidate_id > 0 and candidate_id not in seen_ids:
+                        if (
+                            candidate_id > 0
+                            and candidate_id not in seen_ids
+                            and (target_id, candidate_id) not in claimed_account_ids
+                        ):
                             seen_ids.add(candidate_id)
                             stable_matches.append(candidate)
                 credential_matches = [
@@ -364,14 +404,30 @@ def materialize_inventory(database_engine) -> dict[str, int]:
                 email_matches = by_email.get(_stable_id(email), [])
                 credential_email_matches = [
                     candidate for candidate in email_matches
-                    if not _account_is_remote_only(candidate)
+                    if (
+                        not _account_is_remote_only(candidate)
+                        and (target_id, int(candidate.id or 0)) not in claimed_account_ids
+                        and not bound_account_ids.get((int(candidate.id or 0), target_id), set())
+                        and (
+                            _account_remote_key(candidate) is None
+                            or _account_remote_key(candidate) == (target_id, remote_id)
+                        )
+                    )
                 ]
                 if len(credential_email_matches) == 1:
                     account = credential_email_matches[0]
                 elif len(credential_email_matches) == 0:
                     remote_email_matches = [
                         candidate for candidate in email_matches
-                        if _account_is_remote_only(candidate)
+                        if (
+                            _account_is_remote_only(candidate)
+                            and (target_id, int(candidate.id or 0)) not in claimed_account_ids
+                            and not bound_account_ids.get((int(candidate.id or 0), target_id), set())
+                            and (
+                                _account_remote_key(candidate) is None
+                                or _account_remote_key(candidate) == (target_id, remote_id)
+                            )
+                        )
                     ]
                     if len(remote_email_matches) == 1:
                         account = remote_email_matches[0]
@@ -426,6 +482,7 @@ def materialize_inventory(database_engine) -> dict[str, int]:
                 updated += 1
             if not str(account.identity_id or "").strip():
                 account.identity_id = identity_id
+            claimed_account_ids.add((target_id, int(account.id or 0)))
             if all(account is not candidate for candidate in candidates):
                 candidates.append(account)
                 for stable_id in _account_stable_ids(account):
