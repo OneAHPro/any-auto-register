@@ -13,6 +13,7 @@ from core.db import (
     get_session,
 )
 from core.mail_import_delimiters import split_mail_import_fields
+from core.applemail_pool import _looks_like_mfa_secret, _normalize_mfa_secret
 from services.chatgpt_account_state import account_is_visible_in_default_list
 from services.chatgpt_account_removal import remove_account
 from typing import Optional
@@ -661,7 +662,20 @@ def import_accounts(
             try:
                 json.loads(extra)
             except (json.JSONDecodeError, ValueError):
-                extra = "{}"
+                if (
+                    body.platform.strip().lower() == "chatgpt"
+                    and len(parts) == 3
+                    and _looks_like_mfa_secret(parts[2])
+                ):
+                    extra = json.dumps(
+                        {
+                            "account_type": "chatgpt_password_totp",
+                            "totp_secret": _normalize_mfa_secret(parts[2]),
+                        },
+                        ensure_ascii=False,
+                    )
+                else:
+                    extra = "{}"
         else:
             account_type = str(body.account_type or "").strip()
             if not account_type and body.platform.strip().lower() == "chatgpt":

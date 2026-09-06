@@ -1988,7 +1988,7 @@ export default function Accounts() {
         maskClosable={false}
       >
         <p style={{ marginBottom: 8, fontSize: 12, color: '#7a8ba3' }}>
-          每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email----password [JSON元数据]</code>；也兼容空格分隔。
+          每行格式: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email----password----TOTP秘钥</code> 或 <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 4px', borderRadius: 4 }}>email----password [JSON元数据]</code>；也兼容空格分隔。
         </p>
         <Input.TextArea
           value={importText}

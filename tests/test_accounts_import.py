@@ -87,6 +87,28 @@ class AccountImportTests(unittest.TestCase):
             account = session.exec(select(AccountModel)).one()
             self.assertEqual(account.password, "password with spaces")
 
+    def test_import_preserves_plain_three_part_totp_secret(self):
+        with Session(self.engine) as session:
+            response = import_accounts(
+                ImportRequest(
+                    platform="chatgpt",
+                    lines=[
+                        "user@gmail.com----ChatGPT-password----JBSWY3DPEHPK3PXP",
+                    ],
+                ),
+                session=session,
+            )
+
+            self.assertEqual(response, {"created": 1})
+            account = session.exec(select(AccountModel)).one()
+            self.assertEqual(
+                account.get_extra(),
+                {
+                    "account_type": "chatgpt_password_totp",
+                    "totp_secret": "JBSWY3DPEHPK3PXP",
+                },
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
