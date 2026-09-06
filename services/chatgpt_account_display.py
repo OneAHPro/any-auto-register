@@ -181,17 +181,17 @@ def _match_remote_row(
     return None, "none"
 
 
-def _remote_quota(row: Mapping[str, Any]) -> dict[str, Any] | None:
-    usage_percent = _finite_number(row.get("usage_percent_7d"))
+def _remote_quota_window(row: Mapping[str, Any], window: str) -> dict[str, Any] | None:
+    usage_percent = _finite_number(row.get(f"usage_percent_{window}"))
     if usage_percent is None or usage_percent < 0:
         return None
     usage_percent = min(100.0, usage_percent)
-    billed = _finite_number(row.get("billed_7d"))
-    if billed is None:
+    billed = _finite_number(row.get(f"billed_{window}"))
+    if billed is None and window == "7d":
         billed = _finite_number(row.get("display_billed_usd"))
-    request_count = _finite_number(row.get("usage_7d_requests"))
+    request_count = _finite_number(row.get(f"usage_{window}_requests"))
     if request_count is None:
-        detail = row.get("usage_7d_detail")
+        detail = row.get(f"usage_{window}_detail")
         if isinstance(detail, Mapping):
             request_count = _finite_number(detail.get("requests"))
     remote_id = row.get("remote_id") or row.get("id")
@@ -200,12 +200,16 @@ def _remote_quota(row: Mapping[str, Any]) -> dict[str, Any] | None:
     except (TypeError, ValueError):
         remote_id = None
     return {
-        "window": "7d",
+        "window": window,
         "usage_percent": usage_percent,
         "billed_usd": billed,
-        "reset_at": _text(row.get("reset_7d_at")) or None,
+        "reset_at": _text(
+            row.get(f"reset_{window}_at")
+            or row.get("codex_5h_reset_at" if window == "5h" else "codex_reset_at")
+        ) or None,
         "captured_at": _text(
-            row.get("quota_7d_updated_at")
+            row.get(f"quota_{window}_updated_at")
+            or row.get("codex_5h_usage_updated_at" if window == "5h" else "codex_usage_updated_at")
             or row.get("updated_at")
         ) or None,
         "request_count": int(request_count) if request_count is not None else None,
@@ -249,8 +253,16 @@ def build_chatgpt_account_display(
             "access_token_claim" if claims["plan_type"] else "local_probe"
         )
         active_until = _text(remote.get("subscription_expires_at")) or local["subscription_active_until"]
-        quota = _remote_quota(remote)
-        quota_status = "live" if quota is not None else "unavailable"
+        quota_windows = {
+            window: quota
+            for window in ("5h", "7d")
+            if (quota := _remote_quota_window(remote, window)) is not None
+        }
+        # Plus accounts are governed by the current five-hour window; keep
+        # the seven-day window as the default for other plans.
+        quota = quota_windows.get("5h") if _plan_text(remote.get("plan_type")) == "plus" else quota_windows.get("7d")
+        quota = quota or quota_windows.get("7d") or quota_windows.get("5h")
+        quota_status = "live" if quota_windows else "unavailable"
         remote_status = _text(remote.get("remote_status") or remote.get("status")).lower() or None
         remote_id = remote.get("remote_id") or remote.get("id")
     else:
@@ -260,6 +272,7 @@ def build_chatgpt_account_display(
         )
         active_until = local["subscription_active_until"]
         quota = None
+        quota_windows = {}
         quota_status = "error" if live_error else ("not_found" if live_available else "not_configured")
         remote_status = None
         remote_id = None
@@ -276,6 +289,7 @@ def build_chatgpt_account_display(
         ) or None,
         "workspace_name": _text(remote.get("workspace_name")) if remote is not None else None,
         "quota": quota,
+        "quota_windows": quota_windows,
         "quota_status": quota_status,
         "remote_status": remote_status,
         "remote_enabled": bool(remote.get("enabled", True)) if remote is not None else None,

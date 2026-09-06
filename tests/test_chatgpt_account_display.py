@@ -90,6 +90,39 @@ def test_live_projection_uses_display_billing_when_window_billing_is_missing():
     assert result["quota"]["billed_usd"] == 18.75
 
 
+def test_live_projection_includes_plus_five_hour_window():
+    account = _account(email="plus@example.com", plan="plus", account_id="acct-plus")
+    result = build_chatgpt_account_display_map(
+        [account],
+        [{
+            "email": "plus@example.com",
+            "chatgpt_account_id": "acct-plus",
+            "plan_type": "plus",
+            "usage_percent_5h": 16,
+            "billed_5h": 4.5,
+            "reset_5h_at": "2026-09-06T12:00:00Z",
+            "quota_5h_updated_at": "2026-09-06T04:00:00Z",
+            "usage_percent_7d": 48,
+            "billed_7d": 20,
+            "reset_7d_at": "2026-09-12T00:00:00Z",
+        }],
+    )[None]
+
+    assert result["quota"]["window"] == "5h"
+    assert result["quota_windows"]["5h"] == {
+        "window": "5h",
+        "usage_percent": 16.0,
+        "billed_usd": 4.5,
+        "reset_at": "2026-09-06T12:00:00Z",
+        "captured_at": "2026-09-06T04:00:00Z",
+        "request_count": None,
+        "remote_status": None,
+        "remote_id": None,
+        "source": "codex2api_live",
+    }
+    assert result["quota_windows"]["7d"]["usage_percent"] == 48.0
+
+
 def test_live_projection_uses_unique_account_id_when_email_changed():
     account = _account(email="renamed-local@example.com", plan="plus", account_id="acct-2")
     rows = [

@@ -324,4 +324,48 @@ describe('AccountCard', () => {
     expect(card.querySelector('.account-card__status-row')).toBeNull()
     expect(within(card).queryByText('剩余估算')).toBeNull()
   })
+
+  it('renders the five-hour window for Plus accounts when live data includes both', () => {
+    render(
+      <AccountCard
+        account={{
+          ...account,
+          chatgpt_display: {
+            plan_type: 'plus',
+            quota_status: 'live',
+            quota: {
+              window: '7d',
+              usage_percent: 48,
+              reset_at: '2026-09-12T00:00:00Z',
+            },
+            quota_windows: {
+              '5h': {
+                window: '5h',
+                usage_percent: 16,
+                reset_at: '2026-09-06T12:00:00Z',
+              },
+              '7d': {
+                window: '7d',
+                usage_percent: 48,
+                reset_at: '2026-09-12T00:00:00Z',
+              },
+            },
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getByText('5小时使用')).toBeTruthy()
+    expect(within(card).getByText('16%')).toBeTruthy()
+    expect(within(card).queryByText('7天使用')).toBeNull()
+    expect(within(card).queryByText('48%')).toBeNull()
+  })
 })

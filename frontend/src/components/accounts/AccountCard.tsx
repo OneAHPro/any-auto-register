@@ -296,9 +296,6 @@ export function AccountCard({
   const liveQuota = liveDisplay?.quota && typeof liveDisplay.quota === 'object'
     ? liveDisplay.quota
     : null
-  const legacyQuotaWindow = account?.quota?.['7d'] ? '7d' : account?.quota?.['monthly'] ? 'monthly' : ''
-  const quotaWindow = liveDisplay ? String(liveQuota?.window || '') : legacyQuotaWindow
-  const quota = liveDisplay ? (liveQuota || {}) : (legacyQuotaWindow ? account.quota[legacyQuotaWindow] : {})
   const accountStatus = statusMeta(account?.status)
   const subscriptionPlan = String(subscription.plan || '').trim().toLowerCase()
   const plan = planMeta(
@@ -310,6 +307,26 @@ export function AccountCard({
           || extra.subscription_plan
         : subscription.plan),
   )
+  const prefersFiveHour = plan.label === 'Plus'
+  const legacyQuotaWindow = prefersFiveHour && account?.quota?.['5h']
+    ? '5h'
+    : account?.quota?.['7d']
+      ? '7d'
+      : account?.quota?.['monthly']
+        ? 'monthly'
+        : ''
+  const liveQuotaWindows = liveDisplay?.quota_windows && typeof liveDisplay.quota_windows === 'object'
+    ? liveDisplay.quota_windows
+    : {}
+  const fiveHourQuota = prefersFiveHour
+    ? liveDisplay ? liveQuotaWindows['5h'] : account?.quota?.['5h']
+    : null
+  const quotaWindow = fiveHourQuota
+    ? '5h'
+    : liveDisplay
+      ? String(liveQuota?.window || '')
+      : legacyQuotaWindow
+  const quota = fiveHourQuota || (liveDisplay ? (liveQuota || {}) : (legacyQuotaWindow ? account.quota[legacyQuotaWindow] : {}))
   const email = String(account?.email || `账号 #${account?.id ?? '—'}`)
   const provider = remoteOnly
     ? 'Codex'
@@ -340,7 +357,9 @@ export function AccountCard({
     ? firstNumber(quota, [['usage_percent']])
     : firstNumber(quota, [['usage_percent']])
       ?? (!quotaWindow ? firstNumber(primaryWindow, [['used_percent'], ['usage_percent']]) : null)
-  const usageWindowTitle = quotaWindow === 'monthly'
+  const usageWindowTitle = quotaWindow === '5h'
+    ? '5小时使用'
+    : quotaWindow === 'monthly'
     ? '月度使用'
     : quotaWindow === '7d'
       ? '7天使用'
@@ -349,7 +368,9 @@ export function AccountCard({
         : usagePercent !== null
         ? '当前使用'
         : '7天使用'
-  const usageWindowLabel = quotaWindow === 'monthly'
+  const usageWindowLabel = quotaWindow === '5h'
+    ? '5小时窗口'
+    : quotaWindow === 'monthly'
     ? '月度窗口'
     : quotaWindow === '7d'
       ? '7天窗口'

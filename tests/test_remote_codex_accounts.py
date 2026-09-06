@@ -46,6 +46,10 @@ def remote_row(**overrides):
         "enabled": True,
         "locked": False,
         "usage_percent_7d": 42,
+        "usage_percent_5h": 18,
+        "billed_5h": 3.5,
+        "reset_5h_at": "2026-09-05T12:00:00+00:00",
+        "quota_5h_updated_at": "2026-09-05T06:59:00+00:00",
         "display_billed_usd": 18.75,
         "billed_7d": None,
         "usage_7d_requests": 1234,
@@ -83,6 +87,7 @@ def test_remote_only_accounts_are_listed_and_bound_for_scheduling(monkeypatch):
     assert "token" not in item
     assert item["chatgpt_display"]["plan_type"] == "pro"
     assert item["chatgpt_display"]["quota"]["billed_usd"] == 18.75
+    assert item["chatgpt_display"]["quota_windows"]["5h"]["usage_percent"] == 18.0
     assert item["quota"]["7d"]["usage_percent"] == 42
     assert item["assignment"]["pool_id"] == "PUBLIC_POOL"
 
