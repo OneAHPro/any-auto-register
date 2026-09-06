@@ -368,4 +368,83 @@ describe('AccountCard', () => {
     expect(within(card).queryByText('7天使用')).toBeNull()
     expect(within(card).queryByText('48%')).toBeNull()
   })
+
+  it('shows quota-limited live status variants as limited instead of a generic state', () => {
+    render(
+      <AccountCard
+        account={{
+          ...account,
+          chatgpt_display: {
+            plan_type: 'pro',
+            remote_status: 'rate_limited_5h',
+            quota_status: 'live',
+            quota: { window: '5h', usage_percent: 100 },
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getAllByText('限流中')).toHaveLength(2)
+  })
+
+  it('keeps a persisted invalid local account visibly invalid after a live refresh', () => {
+    render(
+      <AccountCard
+        account={{
+          ...account,
+          status: 'invalid',
+          chatgpt_display: {
+            plan_type: 'pro',
+            remote_status: 'active',
+            quota_status: 'live',
+            quota: { window: '7d', usage_percent: 10 },
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getAllByText('已失效')).toHaveLength(2)
+    expect(within(card).queryByText('可用')).toBeNull()
+  })
+
+  it('marks a live account missing from the remote inventory instead of showing it as available', () => {
+    render(
+      <AccountCard
+        account={{
+          ...account,
+          chatgpt_display: {
+            plan_type: 'pro',
+            quota_status: 'not_found',
+            remote_status: null,
+          },
+        }}
+        platform="chatgpt"
+        selected={false}
+        onSelect={vi.fn()}
+        onCopy={vi.fn()}
+        onOpenDetails={vi.fn()}
+        onDelete={vi.fn()}
+        moreAction={null}
+      />,
+    )
+
+    const card = screen.getByTestId('account-card')
+    expect(within(card).getAllByText('远端未发现')).toHaveLength(2)
+  })
 })

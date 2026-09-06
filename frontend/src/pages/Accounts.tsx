@@ -273,6 +273,96 @@ interface AccountQuotaView {
   fresh?: boolean
 }
 
+interface AccountOperationalSummary {
+  total: number
+  normal: number
+  scheduling: number
+  rate_limited: number
+  rate_limited_5h: number
+  rate_limited_7d: number
+  abnormal: number
+  auth_invalid: number
+  errors: number
+}
+
+function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): AccountOperationalSummary | null {
+  if (!value || typeof value !== 'object') return null
+  const source = value as Record<string, unknown>
+  const count = (key: keyof AccountOperationalSummary, fallback = 0) => {
+    const raw = source[key]
+    const parsed = Number(raw ?? fallback)
+    return Number.isFinite(parsed) ? Math.max(0, Math.trunc(parsed)) : fallback
+  }
+  const fallback = Number(fallbackTotal)
+  return {
+    total: count('total', Number.isFinite(fallback) ? Math.max(0, Math.trunc(fallback)) : 0),
+    normal: count('normal'),
+    scheduling: count('scheduling'),
+    rate_limited: count('rate_limited'),
+    rate_limited_5h: count('rate_limited_5h'),
+    rate_limited_7d: count('rate_limited_7d'),
+    abnormal: count('abnormal'),
+    auth_invalid: count('auth_invalid'),
+    errors: count('errors'),
+  }
+}
+
+function AccountOperationalSummaryView({ summary }: { summary: AccountOperationalSummary }) {
+  const cards = [
+    { tone: 'neutral', label: '总账号数量', badge: '全部', value: summary.total },
+    { tone: 'normal', label: '正常账号', badge: '正常', value: summary.normal },
+    { tone: 'scheduling', label: '调度中', badge: '调度中', value: summary.scheduling },
+    {
+      tone: 'limited',
+      label: '限流账号',
+      badge: '限流',
+      value: summary.rate_limited,
+      details: [
+        `5h：${summary.rate_limited_5h}`,
+        `7d：${summary.rate_limited_7d}`,
+      ],
+    },
+    {
+      tone: 'abnormal',
+      label: '异常账号',
+      badge: '异常',
+      value: summary.abnormal,
+      details: [
+        `授权失效：${summary.auth_invalid}`,
+        `错误：${summary.errors}`,
+      ],
+    },
+  ]
+
+  return (
+    <section className="account-summary" data-testid="account-summary" aria-label="账号状态汇总" aria-live="polite">
+      {cards.map((card) => (
+        <article
+          className={`account-summary__card account-summary__card--${card.tone}`}
+          key={card.label}
+          aria-label={`${card.label} ${card.value}`}
+        >
+          <div className="account-summary__card-head">
+            <span className="account-summary__label">{card.label}</span>
+            <span className="account-summary__badge">
+              <span className="account-summary__dot" aria-hidden="true" />
+              {card.badge}
+            </span>
+          </div>
+          <div className="account-summary__card-body">
+            <strong className="account-summary__value">{card.value}</strong>
+            {card.details ? (
+              <div className="account-summary__details">
+                {card.details.map((detail) => <span key={detail}>{detail}</span>)}
+              </div>
+            ) : null}
+          </div>
+        </article>
+      ))}
+    </section>
+  )
+}
+
 function authStateMeta(state?: string) {
   switch (state) {
     case 'access_token_valid':
@@ -693,6 +783,7 @@ export default function Accounts() {
   const [accounts, setAccounts] = useState<any[]>([])
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
+  const [accountSummary, setAccountSummary] = useState<AccountOperationalSummary | null>(null)
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)
   const [loading, setLoading] = useState(false)
@@ -751,6 +842,7 @@ export default function Accounts() {
     autoReloginRunNowEpochRef.current += 1
     setCurrentPlatform(platform || 'chatgpt')
     setSubscriptionPlan('')
+    setAccountSummary(null)
     setSelectedRowKeys([])
     setReloginStartError('')
     setReloginTaskId(null)
@@ -831,15 +923,21 @@ export default function Accounts() {
       const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
         const rank = (x: any) => {
           const status = String(x.chatgpt_display?.remote_status || x.remote_status || x.status || x.health_status || '').toLowerCase()
-          return ['active', 'ready', 'available'].includes(status) ? 0 : status === 'rate_limited' ? 1 : 2
+          return ['active', 'ready', 'available'].includes(status)
+            ? 0
+            : ['rate_limited', 'rate_limited_5h', 'rate_limited_7d', 'usage_exhausted', 'usage_limited', 'quota_paused'].includes(status)
+              ? 1
+              : 2
         }
         return rank(a) - rank(b)
       })
       setAccounts(ordered)
       setTotal(data.total)
+      setAccountSummary(normalizeAccountSummary(data.summary, data.total))
       setAccountLoadError('')
     } catch (error) {
       if (requestEpoch !== accountLoadEpochRef.current) return
+      setAccountSummary(null)
       const detail = error instanceof Error ? error.message : '加载账号列表失败'
       setAccountLoadError(detail)
       message.error(`刷新账号列表失败：${detail}`)
@@ -1782,6 +1880,9 @@ export default function Accounts() {
       {accountLoadError ? <Alert type="error" showIcon closable message={accountLoadError} style={{ marginBottom: 12 }} /> : null}
 
       <div className="account-card-list-shell" style={cardThemeStyle} data-testid="account-card-list">
+        {isChatgptPlatform && accountSummary ? (
+          <AccountOperationalSummaryView summary={accountSummary} />
+        ) : null}
         <div className="account-card-list-toolbar">
           <Checkbox
             checked={allVisibleSelected}

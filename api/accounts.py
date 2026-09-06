@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlmodel import Session, select, func
+from sqlalchemy import or_
 from pydantic import BaseModel
 from core.db import (
     AccountAssignmentModel,
@@ -16,7 +17,7 @@ from core.mail_import_delimiters import split_mail_import_fields
 from core.applemail_pool import _looks_like_mfa_secret, _normalize_mfa_secret
 from services.chatgpt_account_state import account_is_visible_in_default_list
 from services.chatgpt_account_removal import remove_account
-from typing import Optional
+from typing import Mapping, Optional
 from datetime import datetime, timezone
 import io, csv, json, logging
 from types import SimpleNamespace
@@ -177,6 +178,293 @@ def _empty_control_plane_summary(identity_id: str = "") -> dict[str, object]:
         "binding": None,
         "quota": {},
     }
+
+
+_SUMMARY_AUTH_INVALID_STATES = {
+    "invalid",
+    "unauthorized",
+    "auth_error",
+    "invalid_token",
+    "account_deactivated",
+    "account_deleted",
+    "access_token_invalidated",
+    "token_invalidated",
+    "auth_401",
+    "auth_deactivated",
+    "auth_403",
+    "codex_401",
+    "codex_deactivated",
+    "codex_403",
+    "remote_401",
+    "remote_deactivated",
+    "remote_403",
+    "auth_failed",
+}
+_SUMMARY_ERROR_STATES = {
+    "error",
+    "probe_failed",
+    "unknown",
+    "disabled",
+    "locked",
+    "missing_access_token",
+    "banned_like",
+    "expired",
+    "failed",
+    "quarantined",
+    "deleted",
+    "remote_missing",
+    "ambiguous",
+    "deferred",
+    "missing",
+    "not_found",
+    "payment_required",
+    "quota_exhausted",
+}
+_SUMMARY_SCHEDULING_STATES = {
+    "draining",
+    "planned",
+    "locking",
+    "uploading",
+    "target_disabled",
+    "verifying",
+    "assignment_committing",
+    "source_cleaning",
+    "target_enabling",
+    "migrating",
+    "pending",
+}
+_SUMMARY_RATE_LIMIT_STATES = {
+    "rate_limited",
+    "rate_limited_5h",
+    "rate_limited_7d",
+    "usage_exhausted",
+    "usage_limited",
+    "quota_paused",
+}
+
+
+def _summary_state(value: object) -> str:
+    return str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _summary_is_false(value: object) -> bool:
+    if isinstance(value, bool):
+        return not value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value == 0
+    return _summary_state(value) in {"0", "false", "no", "off", "disabled"}
+
+
+def _summary_is_true(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return value != 0
+    return _summary_state(value) in {"1", "true", "yes", "on", "locked"}
+
+
+def _account_operational_summary(
+    accounts: list[AccountModel],
+    remote_items: list[dict[str, object]],
+    live_display: dict[int | None, dict[str, object]],
+    assignment_states: Mapping[str, Mapping[str, object]] | None = None,
+) -> dict[str, int]:
+    """Summarize every filtered account, independent of pagination."""
+
+    result = {
+        "total": 0,
+        "normal": 0,
+        "scheduling": 0,
+        "rate_limited": 0,
+        "rate_limited_5h": 0,
+        "rate_limited_7d": 0,
+        "abnormal": 0,
+        "auth_invalid": 0,
+        "errors": 0,
+    }
+
+    def add_item(item: object, display: dict[str, object] | None = None) -> None:
+        display = display if isinstance(display, dict) else {}
+        if isinstance(item, AccountModel):
+            try:
+                extra = item.get_extra()
+            except Exception:
+                extra = {}
+            identity_id = str(item.identity_id or "").strip()
+            assignment = (assignment_states or {}).get(identity_id) if identity_id else None
+            if assignment is None and int(item.id or 0) > 0:
+                assignment = (assignment_states or {}).get(f"account:{int(item.id)}")
+            if assignment is None:
+                assignment = extra.get("assignment") if isinstance(extra, dict) else None
+            if not isinstance(assignment, dict):
+                assignment = {}
+            raw_quota = extra.get("quota") if isinstance(extra, dict) else None
+            persisted_status = _summary_state(item.status)
+            status_value = _summary_state(
+                display.get("remote_status")
+                or (extra.get("remote_status") if isinstance(extra, dict) else "")
+                or persisted_status
+                or ""
+            )
+            auth_state = _summary_state(
+                (extra.get("chatgpt_local", {}).get("auth", {}).get("state", ""))
+                if isinstance(extra, dict) and isinstance(extra.get("chatgpt_local"), dict)
+                else ""
+            )
+            codex_state = _summary_state(
+                (extra.get("chatgpt_local", {}).get("codex", {}).get("state", ""))
+                if isinstance(extra, dict) and isinstance(extra.get("chatgpt_local"), dict)
+                else ""
+            )
+            display_quota_status = _summary_state(display.get("quota_status"))
+            assignment_state = _summary_state(assignment.get("state"))
+            scheduling = bool(
+                assignment_state in _SUMMARY_SCHEDULING_STATES
+                or assignment.get("lease_owner")
+                or status_value == "scheduling"
+                or (isinstance(extra, dict) and extra.get("scheduling") is True)
+            )
+            remote_disabled = _summary_is_false(display.get("remote_enabled"))
+            remote_locked = _summary_is_true(display.get("remote_locked"))
+        else:
+            item_dict = item if isinstance(item, dict) else {}
+            extra = {}
+            identity_id = str(item_dict.get("identity_id") or "").strip()
+            assignment = (assignment_states or {}).get(identity_id) if identity_id else None
+            local_account_id = int(item_dict.get("local_account_id") or 0)
+            if assignment is None and local_account_id > 0:
+                assignment = (assignment_states or {}).get(f"account:{local_account_id}")
+            if assignment is None:
+                assignment = item_dict.get("assignment")
+            if not isinstance(assignment, dict):
+                assignment = {}
+            raw_quota = item_dict.get("quota")
+            persisted_status = _summary_state(
+                item_dict.get("remote_status") or item_dict.get("status")
+            )
+            status_value = _summary_state(
+                display.get("remote_status")
+                or item_dict.get("remote_status")
+                or item_dict.get("status")
+                or ""
+            )
+            auth_state = ""
+            codex_state = ""
+            display_quota_status = _summary_state(display.get("quota_status"))
+            assignment_state = _summary_state(assignment.get("state"))
+            scheduling = bool(
+                assignment_state in _SUMMARY_SCHEDULING_STATES
+                or assignment.get("lease_owner")
+                or status_value == "scheduling"
+            )
+            remote_disabled = (
+                _summary_is_false(display.get("remote_enabled"))
+                or _summary_is_false(item_dict.get("remote_enabled"))
+            )
+            remote_locked = (
+                _summary_is_true(display.get("remote_locked"))
+                or _summary_is_true(item_dict.get("remote_locked"))
+            )
+
+        result["total"] += 1
+        auth_invalid = (
+            status_value in _SUMMARY_AUTH_INVALID_STATES
+            or persisted_status in _SUMMARY_AUTH_INVALID_STATES
+            or auth_state in _SUMMARY_AUTH_INVALID_STATES
+            or codex_state in _SUMMARY_AUTH_INVALID_STATES
+        )
+        abnormal = (
+            auth_invalid
+            or status_value in _SUMMARY_ERROR_STATES
+            or persisted_status in _SUMMARY_ERROR_STATES
+            or auth_state in _SUMMARY_ERROR_STATES
+            or codex_state in _SUMMARY_ERROR_STATES
+            or display_quota_status in {"error", "not_found"}
+            or remote_disabled
+            or remote_locked
+        )
+        if abnormal:
+            result["abnormal"] += 1
+            result["auth_invalid" if auth_invalid else "errors"] += 1
+            return
+        if status_value in _SUMMARY_RATE_LIMIT_STATES:
+            result["rate_limited"] += 1
+            quota = display.get("quota") if isinstance(display.get("quota"), dict) else raw_quota
+            window = _summary_state((quota or {}).get("window")) if isinstance(quota, dict) else ""
+            if status_value.endswith("_5h"):
+                window = "5h"
+            elif status_value.endswith("_7d"):
+                window = "7d"
+            if not window and isinstance(raw_quota, dict):
+                if isinstance(raw_quota.get("5h"), dict) or "5h" in raw_quota:
+                    window = "5h"
+                elif isinstance(raw_quota.get("7d"), dict) or "7d" in raw_quota:
+                    window = "7d"
+            result["rate_limited_5h" if window == "5h" else "rate_limited_7d"] += 1
+            return
+        if scheduling:
+            result["scheduling"] += 1
+            return
+        result["normal"] += 1
+
+    for account in accounts:
+        add_item(account, live_display.get(account.id))
+    for item in remote_items:
+        display = item.get("chatgpt_display") if isinstance(item.get("chatgpt_display"), dict) else {}
+        add_item(item, display)
+    return result
+
+
+def _account_assignment_states(
+    accounts: list[AccountModel],
+    remote_items: list[dict[str, object]],
+    session: Session,
+) -> dict[str, dict[str, object]]:
+    """Load the latest assignment state for every filtered identity."""
+
+    identity_ids = {
+        str(account.identity_id or "").strip()
+        for account in accounts
+        if str(account.identity_id or "").strip()
+    }
+    local_account_ids = {
+        int(account.id)
+        for account in accounts
+        if account.id is not None and int(account.id) > 0
+    }
+    identity_ids.update(
+        str(item.get("identity_id") or "").strip()
+        for item in remote_items
+        if isinstance(item, dict) and str(item.get("identity_id") or "").strip()
+    )
+    if not identity_ids and not local_account_ids:
+        return {}
+
+    predicates = []
+    if identity_ids:
+        predicates.append(AccountAssignmentModel.identity_id.in_(identity_ids))
+    if local_account_ids:
+        predicates.append(AccountAssignmentModel.local_account_id.in_(local_account_ids))
+    assignments = session.exec(
+        select(AccountAssignmentModel)
+        .where(or_(*predicates))
+        .order_by(AccountAssignmentModel.updated_at.desc())
+    ).all()
+    result: dict[str, dict[str, object]] = {}
+    for assignment in assignments:
+        identity_id = str(assignment.identity_id or "").strip()
+        if not identity_id or identity_id in result:
+            identity_id = ""
+        assignment_data = {
+            "state": str(assignment.state or "").strip().lower(),
+            "lease_owner": str(assignment.lease_owner or "").strip(),
+        }
+        if identity_id:
+            result.setdefault(identity_id, assignment_data)
+        local_account_id = int(assignment.local_account_id or 0)
+        if local_account_id > 0:
+            result.setdefault(f"account:{local_account_id}", assignment_data)
+    return result
 
 
 def _account_control_plane_summaries(
@@ -554,6 +842,17 @@ def list_accounts(
     combined: list[tuple[str, object]] = [("local", account) for account in visible_accounts]
     combined.extend(("remote", item) for item in remote_items)
     total = len(combined)
+    assignment_states = _account_assignment_states(
+        visible_accounts,
+        remote_items,
+        session,
+    )
+    operational_summary = _account_operational_summary(
+        visible_accounts,
+        remote_items,
+        live_display,
+        assignment_states,
+    )
     page_size = max(1, min(int(page_size or 20), 200))
     page = max(1, int(page or 1))
     start = (page - 1) * page_size
@@ -583,6 +882,7 @@ def list_accounts(
         response_items.append(payload)
     return {
         "total": total,
+        "summary": operational_summary,
         "page": page,
         "items": response_items,
     }

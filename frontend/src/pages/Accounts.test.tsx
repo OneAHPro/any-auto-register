@@ -333,6 +333,57 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(screen.getByRole('button', { name: /登录$/ })).toBeTruthy()
   })
 
+  it('renders the full filtered account summary above the card list', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        return {
+          items: [eligibleAccount],
+          total: 30,
+          summary: {
+            total: 30,
+            normal: 5,
+            scheduling: 5,
+            rate_limited: 5,
+            rate_limited_5h: 1,
+            rate_limited_7d: 4,
+            abnormal: 20,
+            auth_invalid: 4,
+            errors: 16,
+          },
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    const summary = await screen.findByTestId('account-summary')
+    expect(within(summary).getByText('总账号数量')).toBeTruthy()
+    expect(within(summary).getByText('30')).toBeTruthy()
+    expect(within(summary).getByText('正常账号')).toBeTruthy()
+    expect(within(summary).getAllByText('调度中')).toHaveLength(2)
+    expect(within(summary).getByText('限流账号')).toBeTruthy()
+    expect(within(summary).getByText('异常账号')).toBeTruthy()
+    expect(within(summary).getByText('5h：1')).toBeTruthy()
+    expect(within(summary).getByText('7d：4')).toBeTruthy()
+    expect(within(summary).getByText('授权失效：4')).toBeTruthy()
+    expect(within(summary).getByText('错误：16')).toBeTruthy()
+  })
+
+  it('does not invent a summary when an older accounts response has no summary field', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 30 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    expect(screen.queryByTestId('account-summary')).toBeNull()
+  })
+
   it('documents dash-delimited email and password imports', async () => {
     const user = userEvent.setup()
     render(<Accounts />)

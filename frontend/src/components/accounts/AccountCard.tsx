@@ -70,6 +70,11 @@ const LIVE_STATUS_META: Record<string, Meta> = {
   active: { color: 'success', label: '可用' },
   ready: { color: 'success', label: '可用' },
   rate_limited: { color: 'warning', label: '限流中' },
+  rate_limited_5h: { color: 'warning', label: '限流中' },
+  rate_limited_7d: { color: 'warning', label: '限流中' },
+  usage_exhausted: { color: 'warning', label: '限流中' },
+  usage_limited: { color: 'warning', label: '限流中' },
+  quota_paused: { color: 'warning', label: '限流中' },
   error: { color: 'error', label: '异常' },
   invalid: { color: 'error', label: '已失效' },
   unauthorized: { color: 'error', label: '未授权' },
@@ -328,6 +333,7 @@ export function AccountCard({
       : legacyQuotaWindow
   const quota = fiveHourQuota || (liveDisplay ? (liveQuota || {}) : (legacyQuotaWindow ? account.quota[legacyQuotaWindow] : {}))
   const email = String(account?.email || `账号 #${account?.id ?? '—'}`)
+  const persistedStatusIsInvalid = String(account?.status || '').trim().toLowerCase() === 'invalid'
   const provider = remoteOnly
     ? 'Codex'
     : providerLabel(
@@ -341,9 +347,13 @@ export function AccountCard({
     )
   const issue = platform === 'chatgpt' ? getIssue(auth, codex) : null
   const displayStatus = platform === 'chatgpt'
-    ? liveDisplay
+    ? persistedStatusIsInvalid
+      ? accountStatus
+      : liveDisplay
       ? liveDisplay.quota_status === 'error'
         ? { color: 'warning', label: '实时不可用' }
+        : liveDisplay.quota_status === 'not_found'
+          ? { color: 'warning', label: '远端未发现' }
         : liveDisplay.remote_locked
           ? LIVE_STATUS_META.locked
           : liveDisplay.remote_enabled === false
