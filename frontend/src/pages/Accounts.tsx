@@ -285,6 +285,8 @@ interface AccountOperationalSummary {
   errors: number
 }
 
+type AccountOperationalFilter = '' | 'normal' | 'scheduling' | 'rate_limited' | 'abnormal'
+
 function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): AccountOperationalSummary | null {
   if (!value || typeof value !== 'object') return null
   const source = value as Record<string, unknown>
@@ -307,13 +309,22 @@ function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): Ac
   }
 }
 
-function AccountOperationalSummaryView({ summary }: { summary: AccountOperationalSummary }) {
+function AccountOperationalSummaryView({
+  summary,
+  activeFilter,
+  onSelectFilter,
+}: {
+  summary: AccountOperationalSummary
+  activeFilter: AccountOperationalFilter
+  onSelectFilter: (filter: AccountOperationalFilter) => void
+}) {
   const cards = [
-    { tone: 'neutral', label: '总账号数量', badge: '全部', value: summary.total },
-    { tone: 'normal', label: '正常账号', badge: '正常', value: summary.normal },
-    { tone: 'scheduling', label: '调度中', badge: '调度中', value: summary.scheduling },
+    { tone: 'neutral', filter: '' as const, label: '总账号数量', badge: '全部', value: summary.total },
+    { tone: 'normal', filter: 'normal' as const, label: '正常账号', badge: '正常', value: summary.normal },
+    { tone: 'scheduling', filter: 'scheduling' as const, label: '调度中', badge: '调度中', value: summary.scheduling },
     {
       tone: 'limited',
+      filter: 'rate_limited' as const,
       label: '限流账号',
       badge: '限流',
       value: summary.rate_limited,
@@ -324,6 +335,7 @@ function AccountOperationalSummaryView({ summary }: { summary: AccountOperationa
     },
     {
       tone: 'abnormal',
+      filter: 'abnormal' as const,
       label: '异常账号',
       badge: '异常',
       value: summary.abnormal,
@@ -337,10 +349,14 @@ function AccountOperationalSummaryView({ summary }: { summary: AccountOperationa
   return (
     <section className="account-summary" data-testid="account-summary" aria-label="账号状态汇总" aria-live="polite">
       {cards.map((card) => (
-        <article
-          className={`account-summary__card account-summary__card--${card.tone}`}
+        <button
+          className={`account-summary__card account-summary__card--${card.tone}${activeFilter === card.filter ? ' account-summary__card--active' : ''}`}
+          type="button"
           key={card.label}
           aria-label={`${card.label} ${card.value}`}
+          title={`点击筛选${card.label}`}
+          aria-pressed={activeFilter === card.filter}
+          onClick={() => onSelectFilter(card.filter)}
         >
           <div className="account-summary__card-head">
             <span className="account-summary__label">{card.label}</span>
@@ -357,7 +373,7 @@ function AccountOperationalSummaryView({ summary }: { summary: AccountOperationa
               </div>
             ) : null}
           </div>
-        </article>
+        </button>
       ))}
     </section>
   )
@@ -784,6 +800,7 @@ export default function Accounts() {
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
   const [accountSummary, setAccountSummary] = useState<AccountOperationalSummary | null>(null)
+  const [operationalFilter, setOperationalFilter] = useState<AccountOperationalFilter>('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)
   const [loading, setLoading] = useState(false)
@@ -836,13 +853,23 @@ export default function Accounts() {
   const [autoReloginNow, setAutoReloginNow] = useState(() => Date.now())
   const [autoReloginRunNowLoading, setAutoReloginRunNowLoading] = useState(false)
   const autoReloginRunNowEpochRef = useRef(0)
+  const refreshOnNextLoadRef = useRef<string | null>(
+    (platform || 'chatgpt') === 'chatgpt' ? 'chatgpt' : null,
+  )
+  const refreshSeedPlatformRef = useRef<string | null>(null)
 
   useEffect(() => {
+    const nextPlatform = platform || 'chatgpt'
     reloginRequestEpochRef.current += 1
     autoReloginRunNowEpochRef.current += 1
-    setCurrentPlatform(platform || 'chatgpt')
+    if (refreshSeedPlatformRef.current !== nextPlatform) {
+      refreshOnNextLoadRef.current = nextPlatform === 'chatgpt' ? nextPlatform : null
+      refreshSeedPlatformRef.current = nextPlatform
+    }
+    setCurrentPlatform(nextPlatform)
     setSubscriptionPlan('')
     setAccountSummary(null)
+    setOperationalFilter('')
     setSelectedRowKeys([])
     setReloginStartError('')
     setReloginTaskId(null)
@@ -918,6 +945,7 @@ export default function Accounts() {
       if (search) params.set('email', search)
       if (filterStatus) params.set('status', filterStatus)
       if (subscriptionPlan) params.set('subscription_plan', subscriptionPlan)
+      if (operationalFilter) params.set('operational_status', operationalFilter)
       const data = await apiFetch(`/accounts?${params}`)
       if (requestEpoch !== accountLoadEpochRef.current) return
       const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
@@ -925,7 +953,7 @@ export default function Accounts() {
           const status = String(x.chatgpt_display?.remote_status || x.remote_status || x.status || x.health_status || '').toLowerCase()
           return ['active', 'ready', 'available'].includes(status)
             ? 0
-            : ['rate_limited', 'rate_limited_5h', 'rate_limited_7d', 'usage_exhausted', 'usage_limited', 'quota_paused'].includes(status)
+            : ['rate_limited', 'rate_limited_5h', 'rate_limited_7d', 'usage_exhausted', 'usage_limited', 'quota_paused', 'quota_exhausted', 'payment_required'].includes(status)
               ? 1
               : 2
         }
@@ -944,19 +972,35 @@ export default function Accounts() {
     } finally {
       if (requestEpoch === accountLoadEpochRef.current) setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus, subscriptionPlan, page, pageSize])
+  }, [currentPlatform, search, filterStatus, subscriptionPlan, operationalFilter, page, pageSize])
 
   const refreshAccounts = useCallback(async () => {
     let syncError = ''
-    try { await apiFetch('/codex-import/sync', { method: 'POST' }) }
-    catch (error) { syncError = error instanceof Error ? error.message : '同步账号库存失败' }
-    await load(true)
+    if (currentPlatform === 'chatgpt') {
+      try {
+        // The explicit refresh action keeps the existing full control-plane
+        // sync (usage probe, quota ledger, and assignment reconciliation).
+        await apiFetch('/codex-import/sync', { method: 'POST' })
+      } catch (error) {
+        syncError = error instanceof Error ? error.message : '同步账号库存失败'
+      }
+    }
+    await load(Boolean(syncError))
     if (syncError) setAccountLoadError(syncError)
-  }, [load])
+  }, [currentPlatform, load])
+
+  const lastLoadEffectRef = useRef<typeof load | null>(null)
 
   useEffect(() => {
-    void load()
-  }, [load])
+    // React StrictMode replays mount effects in development. The callback
+    // identity changes whenever a real list dependency changes, so this keeps
+    // the replay from issuing a cache-backed request after the live one.
+    if (lastLoadEffectRef.current === load) return
+    lastLoadEffectRef.current = load
+    const shouldRefresh = refreshOnNextLoadRef.current === currentPlatform
+    if (shouldRefresh) refreshOnNextLoadRef.current = null
+    void load(shouldRefresh)
+  }, [currentPlatform, load])
 
   useEffect(() => {
     if (currentPlatform !== 'chatgpt') return
@@ -1881,7 +1925,14 @@ export default function Accounts() {
 
       <div className="account-card-list-shell" style={cardThemeStyle} data-testid="account-card-list">
         {isChatgptPlatform && accountSummary ? (
-          <AccountOperationalSummaryView summary={accountSummary} />
+          <AccountOperationalSummaryView
+            summary={accountSummary}
+            activeFilter={operationalFilter}
+            onSelectFilter={(filter) => {
+              setPage(1)
+              setOperationalFilter(filter)
+            }}
+          />
         ) : null}
         <div className="account-card-list-toolbar">
           <Checkbox

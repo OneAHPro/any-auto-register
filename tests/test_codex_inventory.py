@@ -37,6 +37,26 @@ def test_successful_full_list_marks_absent_rows_missing_but_failure_keeps_them()
     assert result['errors']==1
     row=read_inventory(e)[0]; assert row['_inventory_missing'] is True and 'offline' in row['_inventory_error']
 
+def test_missing_remote_only_rows_are_removed_from_active_scheduling():
+    e = make_engine()
+    client = Client([{'id': 9, 'email': 'gone@example.com', 'status': 'active'}])
+    sync_inventory(e, target_id=1, clients={1: client})
+    materialize_inventory(e)
+    with Session(e) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+        assert binding.enabled is True
+        assert assignment.state == 'active'
+    client.rows = []
+    sync_inventory(e, target_id=1, clients={1: client})
+    with Session(e) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+    assert binding.enabled is False
+    assert binding.sync_status == 'remote_missing'
+    assert binding.remote_status == 'remote_missing'
+    assert assignment.state == 'standby'
+
 def test_snapshots_are_isolated_by_target_and_idempotent():
     e=make_engine(); c1=Client([{'id':4,'email':'same@example.com'}]); c2=Client([{'id':4,'email':'same@example.com','plan_type':'pro'}])
     sync_inventory(e,target_id=1,clients={1:c1}); sync_inventory(e,target_id=2,clients={2:c2}); sync_inventory(e,target_id=2,clients={2:c2})
@@ -58,6 +78,35 @@ def test_materialize_inventory_creates_local_rows_for_local_only_account_listing
         account = session.exec(select(db.AccountModel)).one()
     assert account.email == 'local@example.com'
     assert account.get_extra()['remote_only'] is True
+
+def test_materialize_inventory_reuses_local_credentials_by_stable_chatgpt_id_without_email():
+    e = make_engine()
+    with Session(e) as session:
+        session.add(db.AccountModel(
+            platform='chatgpt',
+            email='local-credential@example.com',
+            password='p',
+            user_id='acct-x',
+            extra_json=json.dumps({
+                'account_type': 'chatgpt_password',
+                'chatgpt_local': {'account_id': 'acct-x'},
+            }),
+        ))
+        session.commit()
+    sync_inventory(e, target_id=1, clients={1: Client([{
+        'id': 7,
+        'email': '',
+        'name': 'managed-account-7',
+        'chatgpt_account_id': 'acct-x',
+        'status': 'active',
+    }])})
+    result = materialize_inventory(e)
+    assert result['created'] == 0
+    with Session(e) as session:
+        accounts = session.exec(select(db.AccountModel)).all()
+    assert len(accounts) == 1
+    assert not accounts[0].get_extra().get('remote_only')
+    assert accounts[0].get_extra()['codex_remote_snapshot']['remote_id'] == 7
 
 def test_malformed_empty_response_does_not_mark_existing_rows_missing():
     e=make_engine(); c=Client([{'id':8,'email':'keep@example.com'}]); sync_inventory(e,target_id=1,clients={1:c})

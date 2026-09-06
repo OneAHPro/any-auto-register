@@ -506,8 +506,8 @@ code {
 .account-summary {
   display: grid;
   grid-template-columns: repeat(5, minmax(0, 1fr));
-  gap: 12px;
-  margin-bottom: 18px;
+  gap: 6px;
+  margin-bottom: 10px;
 }
 
 .account-summary__card {
@@ -515,15 +515,20 @@ code {
   --account-summary-tint: color-mix(in srgb, var(--account-summary-accent) 9%, var(--account-card-surface));
   display: flex;
   min-width: 0;
-  min-height: 126px;
+  min-height: 76px;
   flex-direction: column;
-  gap: 18px;
-  padding: 16px 18px 14px;
+  gap: 7px;
+  padding: 8px 10px 7px;
   color: var(--account-card-ink);
   background: var(--account-summary-tint);
   border: 1px solid var(--account-card-border);
   border-radius: 16px;
-  box-shadow: 0 7px 18px color-mix(in srgb, var(--account-card-ink) 8%, transparent);
+  box-shadow: 0 4px 12px color-mix(in srgb, var(--account-card-ink) 7%, transparent);
+  appearance: none;
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+  transition: border-color 160ms ease, box-shadow 160ms ease, transform 160ms ease;
 }
 
 .account-summary__card--normal {
@@ -537,6 +542,18 @@ code {
 
 .account-summary__card--abnormal {
   --account-summary-accent: #f87171;
+}
+
+.account-summary__card:hover,
+.account-summary__card--active {
+  border-color: color-mix(in srgb, var(--account-summary-accent) 58%, var(--account-card-border));
+  box-shadow: 0 10px 22px color-mix(in srgb, var(--account-summary-accent) 16%, transparent);
+  transform: translateY(-1px);
+}
+
+.account-summary__card:focus-visible {
+  outline: 2px solid var(--account-summary-accent);
+  outline-offset: 3px;
 }
 
 html.light .account-summary__card--normal {
@@ -565,7 +582,7 @@ html.light .account-summary__card--abnormal {
   min-width: 0;
   overflow: hidden;
   color: var(--account-card-muted);
-  font-size: 14px;
+  font-size: 11px;
   font-weight: 600;
   line-height: 1.35;
   text-overflow: ellipsis;
@@ -576,19 +593,19 @@ html.light .account-summary__card--abnormal {
   display: inline-flex;
   flex: 0 0 auto;
   align-items: center;
-  gap: 6px;
-  padding: 5px 10px;
+  gap: 5px;
+  padding: 3px 7px;
   color: var(--account-summary-accent);
   background: color-mix(in srgb, var(--account-summary-accent) 11%, var(--account-card-surface));
   border-radius: 999px;
-  font-size: 12px;
+  font-size: 10px;
   font-weight: 600;
   line-height: 1.2;
 }
 
 .account-summary__dot {
-  width: 7px;
-  height: 7px;
+  width: 6px;
+  height: 6px;
   flex: 0 0 auto;
   background: currentColor;
   border-radius: 50%;
@@ -602,7 +619,7 @@ html.light .account-summary__card--abnormal {
 .account-summary__value {
   color: var(--account-card-ink);
   font-family: var(--font-family-tdesign);
-  font-size: 42px;
+  font-size: 28px;
   font-weight: 650;
   letter-spacing: -0.04em;
   line-height: 0.95;
@@ -612,10 +629,10 @@ html.light .account-summary__card--abnormal {
   display: flex;
   flex-direction: column;
   align-items: flex-end;
-  gap: 4px;
+  gap: 2px;
   color: var(--account-card-muted);
   font-family: var(--font-family-mono);
-  font-size: 12px;
+  font-size: 11px;
   line-height: 1.25;
   white-space: nowrap;
 }
@@ -1170,8 +1187,8 @@ html.light .account-summary__card--abnormal {
   }
 
   .account-summary__card {
-    min-height: 112px;
-    padding: 14px;
+    min-height: 84px;
+    padding: 9px 10px;
   }
 
   .account-summary__label {
@@ -1179,7 +1196,7 @@ html.light .account-summary__card--abnormal {
   }
 
   .account-summary__value {
-    font-size: 36px;
+    font-size: 28px;
   }
 
   .account-card-list > tbody { grid-template-columns: minmax(0, 1fr); }
@@ -1224,6 +1241,13 @@ html.light .account-summary__card--abnormal {
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .account-summary__card,
+  .account-summary__card:hover,
+  .account-summary__card--active {
+    transition: none;
+    transform: none;
+  }
+
   .account-card,
   .account-card:hover,
   .account-card--selected {

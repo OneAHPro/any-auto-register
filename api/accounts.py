@@ -233,6 +233,12 @@ _SUMMARY_SCHEDULING_STATES = {
     "migrating",
     "pending",
 }
+_SUMMARY_ASSIGNMENT_STATES = {
+    "active",
+    "draining",
+    "standby",
+    *_SUMMARY_SCHEDULING_STATES,
+}
 _SUMMARY_RATE_LIMIT_STATES = {
     "rate_limited",
     "rate_limited_5h",
@@ -261,6 +267,17 @@ def _summary_is_true(value: object) -> bool:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return value != 0
     return _summary_state(value) in {"1", "true", "yes", "on", "locked"}
+
+
+def _inventory_snapshot_is_stale(snapshot: object) -> bool:
+    """Treat an inventory error marker as stale even when the flag is textual."""
+
+    if not isinstance(snapshot, dict):
+        return False
+    return bool(
+        _summary_is_true(snapshot.get("_inventory_stale"))
+        or str(snapshot.get("_inventory_error") or "").strip()
+    )
 
 
 def _account_operational_summary(
@@ -298,11 +315,20 @@ def _account_operational_summary(
                 assignment = extra.get("assignment") if isinstance(extra, dict) else None
             if not isinstance(assignment, dict):
                 assignment = {}
-            raw_quota = extra.get("quota") if isinstance(extra, dict) else None
+            snapshot = extra.get("codex_remote_snapshot") if isinstance(extra, dict) else None
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            raw_quota = (
+                extra.get("quota")
+                if isinstance(extra, dict) and isinstance(extra.get("quota"), dict)
+                else snapshot.get("quota")
+            )
+            inventory_stale = _inventory_snapshot_is_stale(snapshot)
             persisted_status = _summary_state(item.status)
             status_value = _summary_state(
                 display.get("remote_status")
                 or (extra.get("remote_status") if isinstance(extra, dict) else "")
+                or snapshot.get("remote_status")
+                or snapshot.get("status")
                 or persisted_status
                 or ""
             )
@@ -339,6 +365,7 @@ def _account_operational_summary(
             if not isinstance(assignment, dict):
                 assignment = {}
             raw_quota = item_dict.get("quota")
+            inventory_stale = _inventory_snapshot_is_stale(item_dict)
             persisted_status = _summary_state(
                 item_dict.get("remote_status") or item_dict.get("status")
             )
@@ -380,6 +407,7 @@ def _account_operational_summary(
             or auth_state in _SUMMARY_ERROR_STATES
             or codex_state in _SUMMARY_ERROR_STATES
             or display_quota_status in {"error", "not_found"}
+            or inventory_stale
             or remote_disabled
             or remote_locked
         )
@@ -415,6 +443,41 @@ def _account_operational_summary(
     return result
 
 
+def _account_operational_bucket(
+    item: object,
+    display: dict[str, object] | None = None,
+    assignment_states: Mapping[str, Mapping[str, object]] | None = None,
+) -> str:
+    """Return the mutually-exclusive bucket used by summary-card filters."""
+
+    display = display if isinstance(display, dict) else {}
+    if isinstance(item, AccountModel):
+        one = _account_operational_summary(
+            [item],
+            [],
+            {item.id: display},
+            assignment_states,
+        )
+    elif isinstance(item, dict):
+        one = _account_operational_summary(
+            [],
+            [item],
+            {None: display},
+            assignment_states,
+        )
+    else:
+        return "errors"
+    if one["auth_invalid"]:
+        return "auth_invalid"
+    if one["errors"]:
+        return "errors"
+    if one["rate_limited"]:
+        return "rate_limited"
+    if one["scheduling"]:
+        return "scheduling"
+    return "normal"
+
+
 def _account_assignment_states(
     accounts: list[AccountModel],
     remote_items: list[dict[str, object]],
@@ -448,6 +511,11 @@ def _account_assignment_states(
     assignments = session.exec(
         select(AccountAssignmentModel)
         .where(or_(*predicates))
+        .where(
+            AccountAssignmentModel.state.in_(
+                _SUMMARY_ASSIGNMENT_STATES
+            )
+        )
         .order_by(AccountAssignmentModel.updated_at.desc())
     ).all()
     result: dict[str, dict[str, object]] = {}
@@ -465,6 +533,113 @@ def _account_assignment_states(
         if local_account_id > 0:
             result.setdefault(f"account:{local_account_id}", assignment_data)
     return result
+
+
+def _snapshot_key_from_extra(extra: object) -> tuple[int, int] | None:
+    if not isinstance(extra, dict):
+        return None
+    snapshot = extra.get("codex_remote_snapshot")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    try:
+        target_id = int(
+            extra.get("remote_target_id")
+            or snapshot.get("target_id")
+            or snapshot.get("remote_target_id")
+            or 0
+        )
+        remote_id = int(
+            extra.get("remote_id")
+            or snapshot.get("remote_id")
+            or snapshot.get("id")
+            or 0
+        )
+    except (TypeError, ValueError):
+        return None
+    if target_id <= 0 or remote_id <= 0:
+        return None
+    return target_id, remote_id
+
+
+def _account_snapshot_key(account: AccountModel) -> tuple[int, int] | None:
+    """Return the target/remote key for any account with a remote snapshot."""
+
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    return _snapshot_key_from_extra(extra)
+
+
+def _remote_snapshot_key(account: AccountModel) -> tuple[int, int] | None:
+    """Return the target/remote key for a credential-free remote row."""
+
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict) or not bool(extra.get("remote_only")):
+        return None
+    return _snapshot_key_from_extra(extra)
+
+
+def _inventory_state(
+    session: Session,
+) -> tuple[dict[tuple[int, int], CodexInventorySnapshotModel], set[int]]:
+    """Return target-scoped inventory rows and targets with a complete sync."""
+
+    try:
+        rows = session.exec(select(CodexInventorySnapshotModel)).all()
+    except Exception:
+        return {}, set()
+    by_key: dict[tuple[int, int], CodexInventorySnapshotModel] = {}
+    grouped: dict[int, list[CodexInventorySnapshotModel]] = {}
+    for row in rows:
+        try:
+            key = (int(row.target_id), int(row.remote_id))
+        except (TypeError, ValueError):
+            continue
+        if key[0] <= 0 or key[1] <= 0:
+            continue
+        by_key[key] = row
+        grouped.setdefault(key[0], []).append(row)
+    complete_targets = {
+        target_id
+        for target_id, target_rows in grouped.items()
+        if target_rows and all(not str(row.error or "").strip() for row in target_rows)
+    }
+    return by_key, complete_targets
+
+
+def _hide_missing_remote_only_accounts(
+    accounts: list[AccountModel],
+    session: Session,
+    inventory_by_key: dict[tuple[int, int], CodexInventorySnapshotModel] | None = None,
+    complete_targets: set[int] | None = None,
+) -> list[AccountModel]:
+    """Drop remote-only rows removed by the latest complete inventory sync.
+
+    Local credential-backed rows stay visible even when their remote binding is
+    temporarily absent.  A remote-only row has no local credential to fall
+    back to, so a successful inventory snapshot is authoritative for it.
+    """
+
+    remote_accounts = [account for account in accounts if _remote_snapshot_key(account)]
+    if not remote_accounts:
+        return accounts
+    if inventory_by_key is None or complete_targets is None:
+        inventory_by_key, complete_targets = _inventory_state(session)
+    if not inventory_by_key or not complete_targets:
+        return accounts
+    return [
+        account
+        for account in accounts
+        if (key := _remote_snapshot_key(account)) is None
+        or key[0] not in complete_targets
+        or (
+            (row := inventory_by_key.get(key)) is not None
+            and not bool(row.missing)
+        )
+    ]
 
 
 def _account_control_plane_summaries(
@@ -488,7 +663,7 @@ def _account_control_plane_summaries(
     assignments = session.exec(
         select(AccountAssignmentModel)
         .where(AccountAssignmentModel.identity_id.in_(identity_ids))
-        .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
+        .where(AccountAssignmentModel.state.in_(_SUMMARY_ASSIGNMENT_STATES))
         .order_by(AccountAssignmentModel.updated_at.desc())
     ).all()
     assignment_by_identity: dict[str, AccountAssignmentModel] = {}
@@ -677,32 +852,71 @@ def list_accounts(
     include_live: bool = False,
     refresh_live: bool = False,
     subscription_plan: Optional[str] = None,
+    operational_status: Optional[str] = None,
     session: Session = Depends(get_session),
 ):
-    q = select(AccountModel)
-    if platform:
-        q = q.where(AccountModel.platform == platform)
-    if status:
-        q = q.where(AccountModel.status == status)
-    if email:
-        q = q.where(AccountModel.email.contains(email))
-    if created_at_start:
-        q = q.where(AccountModel.created_at >= created_at_start)
-    if created_at_end:
-        q = q.where(AccountModel.created_at <= created_at_end)
-    visible_accounts = [
-        account
-        for account in session.exec(q).all()
-        if account_is_visible_in_default_list(account)
-    ]
+    def load_visible_accounts() -> list[AccountModel]:
+        query = select(AccountModel)
+        if platform:
+            query = query.where(AccountModel.platform == platform)
+        if status:
+            query = query.where(AccountModel.status == status)
+        if email:
+            query = query.where(AccountModel.email.contains(email))
+        if created_at_start:
+            query = query.where(AccountModel.created_at >= created_at_start)
+        if created_at_end:
+            query = query.where(AccountModel.created_at <= created_at_end)
+        return [
+            account
+            for account in session.exec(query).all()
+            if account_is_visible_in_default_list(account)
+        ]
+
+    visible_accounts = load_visible_accounts()
     live_rows: list[dict[str, object]] | None = None
     live_error = ""
     live_display: dict[int | None, dict[str, object]] = {}
     remote_items: list[dict[str, object]] = []
-    # ChatGPT list data is served from the local inventory/account projection.
-    # Remote calls happen only through the explicit inventory sync endpoint.
+    inventory_by_key: dict[tuple[int, int], CodexInventorySnapshotModel] = {}
+    complete_inventory_targets: set[int] = set()
+    # ``refresh_live`` is the explicit live-refresh boundary used by the page
+    # on first load, the periodic poll, and the manual refresh action.  Keep
+    # the regular list request cache-backed, but make the live path reconcile
+    # the remote inventory before reading its local projections.
     if include_live and str(platform or "").strip().lower() == "chatgpt":
         from services.chatgpt_account_display import build_chatgpt_account_display
+
+        if refresh_live:
+            try:
+                from services.codex_inventory import materialize_inventory, sync_inventory
+
+                inventory_result = sync_inventory(
+                    session.get_bind(),
+                    refresh=False,
+                )
+                materialize_inventory(session.get_bind())
+                session.expire_all()
+                inventory_by_key, complete_inventory_targets = _inventory_state(session)
+                visible_accounts = _hide_missing_remote_only_accounts(
+                    load_visible_accounts(),
+                    session,
+                    inventory_by_key,
+                    complete_inventory_targets,
+                )
+                targets = int(inventory_result.get("targets") or 0)
+                errors = int(inventory_result.get("errors") or 0)
+                if targets > 0 and errors > 0:
+                    live_error = (
+                        "inventory_sync_failed"
+                        if errors >= targets
+                        else "inventory_sync_partial_failure"
+                    )
+            except Exception as exc:
+                live_error = type(exc).__name__
+                logger.warning("刷新 Codex2API 账号库存失败: %s", live_error)
+                session.expire_all()
+                visible_accounts = load_visible_accounts()
 
         # Transitional compatibility for local rows created before the
         # inventory table existed. Once the explicit sync endpoint has run,
@@ -724,7 +938,15 @@ def list_accounts(
                 live_error = type(exc).__name__
                 logger.warning("读取旧账号实时兼容数据失败: %s", live_error)
 
-        inventory_exists = session.exec(select(CodexInventorySnapshotModel)).first() is not None
+        inventory_by_key, complete_inventory_targets = _inventory_state(session)
+        inventory_exists = bool(inventory_by_key)
+        if inventory_exists:
+            visible_accounts = _hide_missing_remote_only_accounts(
+                visible_accounts,
+                session,
+                inventory_by_key,
+                complete_inventory_targets,
+            )
         if live_rows and not inventory_exists:
             from services.control_plane_workers import reconcile_target_bindings
             from services.chatgpt_account_display import build_chatgpt_account_display
@@ -793,12 +1015,48 @@ def list_accounts(
                 row = dict(snapshot)
                 row.setdefault("target_id", extra.get("remote_target_id"))
                 row.setdefault("remote_id", extra.get("remote_id"))
-                live_rows = (live_rows or []) + [row]
-                live_display[account.id] = build_chatgpt_account_display(
-                    account,
-                    [row],
-                    live_available=True,
+                snapshot_key = _account_snapshot_key(account)
+                inventory_row = (
+                    inventory_by_key.get(snapshot_key)
+                    if snapshot_key is not None
+                    else None
                 )
+                if inventory_row is not None:
+                    row["_inventory_missing"] = bool(inventory_row.missing)
+                    row["_inventory_error"] = str(inventory_row.error or "")
+                    row["_inventory_stale"] = bool(inventory_row.error)
+                snapshot_stale = _inventory_snapshot_is_stale(row)
+                snapshot_missing = bool(
+                    snapshot_key is not None
+                    and snapshot_key[0] in complete_inventory_targets
+                    and (
+                        inventory_row is None
+                        or bool(inventory_row.missing)
+                    )
+                    and not snapshot_stale
+                )
+                if snapshot_missing:
+                    live_display[account.id] = build_chatgpt_account_display(
+                        account,
+                        [],
+                        live_available=True,
+                    )
+                elif snapshot_stale:
+                    live_display[account.id] = build_chatgpt_account_display(
+                        account,
+                        [],
+                        live_available=False,
+                        live_error=(
+                            str(row.get("_inventory_error") or "inventory_sync_failed")
+                        ),
+                    )
+                else:
+                    live_rows = (live_rows or []) + [row]
+                    live_display[account.id] = build_chatgpt_account_display(
+                        account,
+                        [row],
+                        live_available=True,
+                    )
             else:
                 matching = []
                 email_value = str(account.email or "").strip().lower()
@@ -841,7 +1099,6 @@ def list_accounts(
 
     combined: list[tuple[str, object]] = [("local", account) for account in visible_accounts]
     combined.extend(("remote", item) for item in remote_items)
-    total = len(combined)
     assignment_states = _account_assignment_states(
         visible_accounts,
         remote_items,
@@ -853,6 +1110,26 @@ def list_accounts(
         live_display,
         assignment_states,
     )
+    requested_operational_status = _summary_state(operational_status)
+    if requested_operational_status in {"all", "any"}:
+        requested_operational_status = ""
+    if requested_operational_status in {"abnormal", "auth_invalid", "errors", "normal", "scheduling", "rate_limited"}:
+        filtered_combined: list[tuple[str, object]] = []
+        for kind, item in combined:
+            if kind == "local":
+                local_item = item  # type: ignore[assignment]
+                display = live_display.get(local_item.id, {})
+            else:
+                remote_item = item  # type: ignore[assignment]
+                display = remote_item.get("chatgpt_display") if isinstance(remote_item.get("chatgpt_display"), dict) else {}
+            bucket = _account_operational_bucket(item, display, assignment_states)
+            matches = bucket == requested_operational_status
+            if requested_operational_status == "abnormal":
+                matches = bucket in {"auth_invalid", "errors"}
+            if matches:
+                filtered_combined.append((kind, item))
+        combined = filtered_combined
+    total = len(combined)
     page_size = max(1, min(int(page_size or 20), 200))
     page = max(1, int(page or 1))
     start = (page - 1) * page_size

@@ -35,6 +35,25 @@ _ALLOWED = {
     "has_5h_window", "quota_placeholder", "_remote_email_missing", "source_updated_at",
 }
 _SECRET_MARKERS = ("token", "password", "secret", "cookie", "credential", "private_key", "admin_key", "api_key", "bearer")
+_STABLE_ACCOUNT_KEYS = {
+    "account_id",
+    "chatgpt_account_id",
+    "user_id",
+}
+_ASSIGNMENT_STATES = {
+    "active",
+    "draining",
+    "planned",
+    "locking",
+    "uploading",
+    "target_disabled",
+    "verifying",
+    "assignment_committing",
+    "source_cleaning",
+    "target_enabling",
+    "migrating",
+    "pending",
+}
 
 def _is_secret(k: Any) -> bool:
     n = str(k or "").strip().lower().replace("-", "_")
@@ -55,9 +74,20 @@ def _summary(raw: Mapping[str, Any]) -> dict[str, Any]:
         k = str(key)
         if k in _ALLOWED and not _is_secret(k):
             result[k] = _clean(value, key=k)
-    rid = raw.get("remote_id") or raw.get("remote_account_id") or raw.get("account_id") or raw.get("id")
-    try: rid = int(rid)
-    except (TypeError, ValueError): rid = 0
+    rid = 0
+    for candidate in (
+        raw.get("remote_id"),
+        raw.get("remote_account_id"),
+        raw.get("id"),
+        raw.get("account_id"),
+    ):
+        try:
+            parsed = int(candidate or 0)
+        except (TypeError, ValueError):
+            continue
+        if parsed > 0:
+            rid = parsed
+            break
     if rid > 0: result["remote_id"] = rid
     if "email" in result: result["email"] = str(result["email"] or "").strip()
     # Normalize common upstream aliases into the display-facing names used by
@@ -84,6 +114,58 @@ def _source_timestamp(summary: Mapping[str, Any]) -> str:
     for k in ("source_updated_at", "quota_7d_updated_at", "updated_at", "created_at"):
         if summary.get(k): return str(summary[k])
     return ""
+
+
+def _stable_id(value: Any) -> str:
+    return str(value or "").strip().casefold()
+
+
+def _collect_stable_ids(value: Any, result: set[str]) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            normalized_key = str(key or "").strip().lower().replace("-", "_")
+            if normalized_key in _STABLE_ACCOUNT_KEYS:
+                if isinstance(child, (str, int)) and not isinstance(child, bool):
+                    normalized = _stable_id(child)
+                    if normalized:
+                        result.add(normalized)
+                elif isinstance(child, (list, tuple, set)):
+                    for item in child:
+                        normalized = _stable_id(item)
+                        if normalized:
+                            result.add(normalized)
+            _collect_stable_ids(child, result)
+    elif isinstance(value, (list, tuple, set)):
+        for item in value:
+            _collect_stable_ids(item, result)
+
+
+def _row_stable_ids(row: Mapping[str, Any]) -> set[str]:
+    result: set[str] = set()
+    _collect_stable_ids(row, result)
+    return result
+
+
+def _account_stable_ids(account: AccountModel) -> set[str]:
+    result: set[str] = set()
+    for value in (getattr(account, "user_id", ""),):
+        normalized = _stable_id(value)
+        if normalized:
+            result.add(normalized)
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    _collect_stable_ids(extra, result)
+    return result
+
+
+def _account_is_remote_only(account: AccountModel) -> bool:
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    return isinstance(extra, Mapping) and bool(extra.get("remote_only"))
 
 def _lock_for(target_id: int) -> threading.Lock:
     with _LOCKS_GUARD: return _LOCKS.setdefault(int(target_id), threading.Lock())
@@ -172,6 +254,38 @@ def sync_inventory(database_engine, target_id=None, refresh=False, clients=None)
                 for row in existing:
                     if int(row.remote_id) not in seen:
                         row.missing=True; row.error=""; row.updated_at=datetime.now(timezone.utc); session.add(row); counts["missing"] += 1
+                missing_remote_ids = {
+                    int(row.remote_id)
+                    for row in existing
+                    if bool(row.missing) and int(row.remote_id or 0) > 0
+                }
+                if missing_remote_ids:
+                    missing_bindings = session.exec(
+                        select(AccountTargetBindingModel)
+                        .where(AccountTargetBindingModel.target_id == tid)
+                        .where(AccountTargetBindingModel.remote_account_id.in_(missing_remote_ids))
+                    ).all()
+                    for binding in missing_bindings:
+                        binding.enabled = False
+                        binding.sync_status = "remote_missing"
+                        binding.remote_status = "remote_missing"
+                        binding.last_error = "目标节点未找到账号"
+                        binding.updated_at = datetime.now(timezone.utc)
+                        session.add(binding)
+                        assignments = session.exec(
+                            select(AccountAssignmentModel)
+                            .where(AccountAssignmentModel.identity_id == str(binding.identity_id))
+                            .where(
+                                AccountAssignmentModel.state.in_(
+                                    _ASSIGNMENT_STATES
+                                )
+                            )
+                        ).all()
+                        for assignment in assignments:
+                            assignment.state = "standby"
+                            assignment.lease_reason = "remote_account_missing"
+                            assignment.updated_at = datetime.now(timezone.utc)
+                            session.add(assignment)
                 session.commit()
     return counts
 
@@ -201,6 +315,17 @@ def materialize_inventory(database_engine) -> dict[str, int]:
     created = 0
     updated = 0
     with Session(database_engine) as session:
+        candidates = session.exec(
+            select(AccountModel).where(AccountModel.platform == "chatgpt")
+        ).all()
+        by_stable_id: dict[str, list[AccountModel]] = {}
+        by_email: dict[str, list[AccountModel]] = {}
+        for candidate in candidates:
+            for stable_id in _account_stable_ids(candidate):
+                by_stable_id.setdefault(stable_id, []).append(candidate)
+            email_key = _stable_id(candidate.email)
+            if email_key:
+                by_email.setdefault(email_key, []).append(candidate)
         for row in rows:
             target_id = int(row.get("target_id") or 0)
             remote_id = int(row.get("remote_id") or 0)
@@ -209,14 +334,53 @@ def materialize_inventory(database_engine) -> dict[str, int]:
             email = str(row.get("email") or row.get("name") or f"remote-account-{remote_id}").strip()
             target = session.get(Codex2APITargetModel, target_id)
             pool_id = str(target.default_pool_id if target is not None else "PUBLIC_POOL")
-            candidates = session.exec(select(AccountModel).where(AccountModel.platform == "chatgpt")).all()
-            account = next((item for item in candidates if str(item.email or "").strip().lower() == email.lower() and item.extra_json.find('"remote_only": true') < 0), None)
             binding = session.exec(
                 select(AccountTargetBindingModel)
                 .where(AccountTargetBindingModel.target_id == target_id)
                 .where(AccountTargetBindingModel.remote_account_id == remote_id)
             ).first()
-            identity_id = str(binding.identity_id) if binding is not None else f"codex2api:{target_id}:{remote_id}"
+            account = None
+            if binding is not None and int(binding.local_account_id or 0) > 0:
+                account = session.get(AccountModel, int(binding.local_account_id))
+                if account is not None and str(account.platform or "").lower() != "chatgpt":
+                    account = None
+            row_stable_ids = _row_stable_ids(row)
+            if account is None and row_stable_ids:
+                stable_matches = []
+                seen_ids: set[int] = set()
+                for stable_id in row_stable_ids:
+                    for candidate in by_stable_id.get(stable_id, []):
+                        candidate_id = int(candidate.id or 0)
+                        if candidate_id > 0 and candidate_id not in seen_ids:
+                            seen_ids.add(candidate_id)
+                            stable_matches.append(candidate)
+                credential_matches = [
+                    candidate for candidate in stable_matches
+                    if not _account_is_remote_only(candidate)
+                ]
+                if len(credential_matches) == 1:
+                    account = credential_matches[0]
+            if account is None:
+                email_matches = by_email.get(_stable_id(email), [])
+                credential_email_matches = [
+                    candidate for candidate in email_matches
+                    if not _account_is_remote_only(candidate)
+                ]
+                if len(credential_email_matches) == 1:
+                    account = credential_email_matches[0]
+                elif len(credential_email_matches) == 0:
+                    remote_email_matches = [
+                        candidate for candidate in email_matches
+                        if _account_is_remote_only(candidate)
+                    ]
+                    if len(remote_email_matches) == 1:
+                        account = remote_email_matches[0]
+            identity_id = (
+                str(binding.identity_id)
+                if binding is not None
+                else str(getattr(account, "identity_id", "") or "").strip()
+                or f"codex2api:{target_id}:{remote_id}"
+            )
             if account is None and binding is not None and int(binding.local_account_id or 0) > 0:
                 account = session.get(AccountModel, int(binding.local_account_id))
             if account is None:
@@ -242,12 +406,24 @@ def materialize_inventory(database_engine) -> dict[str, int]:
             else:
                 extra = account.get_extra() if hasattr(account, "get_extra") else {}
                 extra["codex_remote_snapshot"] = dict(row)
-                extra.setdefault("account_source", "codex2api")
+                extra["remote_target_id"] = target_id
+                extra["remote_id"] = remote_id
+                if extra.get("remote_only"):
+                    extra["account_source"] = "codex2api"
                 account.set_extra(extra)
                 remote_status = str(row.get("remote_status") or row.get("status") or "").strip().lower()
                 if extra.get("remote_only"):
                     account.status = "invalid" if remote_status in {"unauthorized", "auth_error", "invalid", "token_invalidated"} else "registered"
                 updated += 1
+            if not str(account.identity_id or "").strip():
+                account.identity_id = identity_id
+            if all(account is not candidate for candidate in candidates):
+                candidates.append(account)
+                for stable_id in _account_stable_ids(account):
+                    by_stable_id.setdefault(stable_id, []).append(account)
+                email_key = _stable_id(account.email)
+                if email_key:
+                    by_email.setdefault(email_key, []).append(account)
             identity = session.get(AccountIdentityModel, identity_id)
             if identity is None:
                 identity = AccountIdentityModel(id=identity_id, platform="chatgpt", canonical_email=email.lower(), current_account_id=int(account.id or 0))
@@ -267,17 +443,23 @@ def materialize_inventory(database_engine) -> dict[str, int]:
             binding.last_sync_at = datetime.now(timezone.utc)
             binding.updated_at = datetime.now(timezone.utc)
             session.add(binding)
-            assignment = session.exec(select(AccountAssignmentModel).where(AccountAssignmentModel.identity_id == identity_id).where(AccountAssignmentModel.state.in_(["active", "standby"]))).first()
+            assignment = session.exec(
+                select(AccountAssignmentModel)
+                .where(AccountAssignmentModel.identity_id == identity_id)
+                .where(AccountAssignmentModel.state.in_(_ASSIGNMENT_STATES))
+                .order_by(AccountAssignmentModel.updated_at.desc())
+            ).first()
             if _schedulable(row):
                 if assignment is None:
                     assignment = AccountAssignmentModel(identity_id=identity_id, local_account_id=int(account.id or 0), pool_id=pool_id, target_id=target_id, state="active", lease_reason="inventory_materialize", lease_started_at=datetime.now(timezone.utc), assignment_version=1)
                 else:
                     assignment.local_account_id = int(account.id or 0)
                     assignment.target_id = target_id
-                    assignment.state = "active"
+                    if assignment.state in {"active", "standby"}:
+                        assignment.state = "active"
                     assignment.updated_at = datetime.now(timezone.utc)
                 session.add(assignment)
-            elif assignment is not None:
+            elif assignment is not None and assignment.state in {"active", "draining"}:
                 assignment.state = "standby"
                 assignment.lease_reason = "remote_not_schedulable"
                 session.add(assignment)

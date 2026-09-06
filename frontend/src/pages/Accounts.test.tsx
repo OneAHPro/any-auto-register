@@ -1,5 +1,6 @@
 // @vitest-environment jsdom
 
+import { StrictMode } from 'react'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { cleanup, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
@@ -170,14 +171,12 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(await screen.findByLabelText('正在加载账号')).toBeTruthy()
     expect(screen.queryByText('暂无账号')).toBeNull()
     expect(sync).not.toHaveBeenCalled()
-    resolveAccounts({ items: [eligibleAccount], total: 1 })
+    resolveAccounts({ items: [eligibleAccount], total: 1, summary: { total: 1, normal: 1 } })
   })
 
-  it('loads a subscription filter without synchronizing the remote inventory', async () => {
-    const sync = vi.fn(async () => ({ status: 'completed' }))
+  it('loads a subscription filter without issuing a second client-side inventory sync', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
-      if (path === '/codex-import/sync') return sync()
-      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1, summary: { total: 1, normal: 1 } }
       if (path.startsWith('/actions/')) return { actions: [] }
       throw new Error(`unexpected path: ${path}`)
     })
@@ -187,8 +186,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     await screen.findByText('eligible@example.com')
     const initialAccountRequest = vi.mocked(apiFetch).mock.calls
       .find(([path]) => String(path).startsWith('/accounts?'))
-    expect(String(initialAccountRequest?.[0])).not.toContain('refresh_live=1')
-    const syncCallsBeforeFilter = sync.mock.calls.length
+    expect(String(initialAccountRequest?.[0])).toContain('refresh_live=1')
     await user.click(screen.getByText('Pro', { selector: '.ant-segmented-item-label' }))
 
     await waitFor(() => {
@@ -196,7 +194,26 @@ describe('Accounts ChatGPT staged login integration', () => {
         .filter(([path]) => String(path).startsWith('/accounts?'))
       expect(String(requests.at(-1)?.[0])).toContain('subscription_plan=pro')
     })
-    expect(sync).toHaveBeenCalledTimes(syncCallsBeforeFilter)
+  })
+
+  it('keeps the initial live refresh single-shot under StrictMode effect replay', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1, summary: { total: 1, normal: 1 } }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    render(
+      <StrictMode>
+        <Accounts />
+      </StrictMode>,
+    )
+
+    await screen.findByText('eligible@example.com')
+    const accountRequests = vi.mocked(apiFetch).mock.calls
+      .map(([path]) => String(path))
+      .filter((path) => path.startsWith('/accounts?'))
+    expect(accountRequests.filter((path) => path.includes('refresh_live=1'))).toHaveLength(1)
   })
 
   it('ignores an older list response after a subscription filter changes', async () => {
@@ -243,7 +260,9 @@ describe('Accounts ChatGPT staged login integration', () => {
   })
 
   it('renders Codex2API-only accounts and requests a fresh remote quota on refresh', async () => {
+    const sync = vi.fn(async () => ({ status: 'completed' }))
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path === '/codex-import/sync') return sync()
       if (path.startsWith('/accounts?')) {
         return {
           items: [{
@@ -280,8 +299,9 @@ describe('Accounts ChatGPT staged login integration', () => {
       const accountCalls = vi.mocked(apiFetch).mock.calls
         .filter(([path]) => String(path).startsWith('/accounts?'))
       expect(accountCalls.length).toBeGreaterThanOrEqual(2)
-      expect(String(accountCalls.at(-1)?.[0])).toContain('refresh_live=1')
+      expect(String(accountCalls.at(-1)?.[0])).not.toContain('refresh_live=1')
     })
+    expect(sync).toHaveBeenCalledTimes(1)
     expect(vi.mocked(apiFetch).mock.calls.length).toBeGreaterThan(refreshCallsBefore)
   })
 
@@ -369,6 +389,46 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(within(summary).getByText('7d：4')).toBeTruthy()
     expect(within(summary).getByText('授权失效：4')).toBeTruthy()
     expect(within(summary).getByText('错误：16')).toBeTruthy()
+  })
+
+  it('filters the account list when a summary card is selected', async () => {
+    const normalAccount = { ...eligibleAccount, email: 'normal@example.com' }
+    const limitedAccount = { ...eligibleAccount, id: 21, email: 'limited@example.com' }
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) {
+        const filtered = path.includes('operational_status=rate_limited')
+        return {
+          items: [filtered ? limitedAccount : normalAccount],
+          total: filtered ? 1 : 2,
+          summary: {
+            total: 2,
+            normal: 1,
+            scheduling: 0,
+            rate_limited: 1,
+            rate_limited_5h: 1,
+            rate_limited_7d: 0,
+            abnormal: 0,
+            auth_invalid: 0,
+            errors: 0,
+          },
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+
+    await screen.findByTestId('account-summary')
+    await user.click(within(screen.getByTestId('account-summary')).getByText('限流账号'))
+
+    await waitFor(() => {
+      const requests = vi.mocked(apiFetch).mock.calls
+        .filter(([path]) => String(path).startsWith('/accounts?'))
+      expect(String(requests.at(-1)?.[0])).toContain('operational_status=rate_limited')
+    })
+    expect(await screen.findByText('limited@example.com')).toBeTruthy()
+    expect(screen.queryByText('normal@example.com')).toBeNull()
   })
 
   it('does not invent a summary when an older accounts response has no summary field', async () => {
@@ -494,7 +554,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     [{ enabled: true, state: 'idle', eligible_accounts: 0 }, 'no accounts'],
   ])('disables immediate execution while automation is %s', async (status) => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
-      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1, summary: { total: 1, normal: 1 } }
       if (path.startsWith('/actions/')) return { actions: [] }
       if (path === '/automations/chatgpt-relogin') return status
       throw new Error(`unexpected path: ${path}`)

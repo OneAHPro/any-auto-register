@@ -1,8 +1,21 @@
+import json
+
 from sqlmodel import Session, SQLModel, create_engine
 from sqlalchemy.pool import StaticPool
+from unittest.mock import Mock
 
-from api.accounts import _account_operational_summary, list_accounts
-from core.db import AccountAssignmentModel, AccountModel, init_account_pool_schema
+from api.accounts import (
+    _account_operational_summary,
+    _hide_missing_remote_only_accounts,
+    list_accounts,
+)
+from core.db import (
+    AccountAssignmentModel,
+    AccountModel,
+    Codex2APITargetModel,
+    CodexInventorySnapshotModel,
+    init_account_pool_schema,
+)
 
 
 def _live_test_engine():
@@ -33,6 +46,16 @@ def _remote_row(**overrides):
     }
     row.update(overrides)
     return row
+
+
+class _InventoryClient:
+    def __init__(self, rows):
+        self.rows = rows
+        self.calls = 0
+
+    def list_accounts(self):
+        self.calls += 1
+        return self.rows
 
 
 def test_account_list_includes_full_filtered_operational_summary():
@@ -110,6 +133,34 @@ def test_account_summary_uses_control_plane_assignments_and_expired_statuses():
     assert result["summary"]["scheduling"] == 1
     assert result["summary"]["abnormal"] == 1
     assert result["summary"]["errors"] == 1
+
+
+def test_account_summary_includes_planned_assignment_states_as_scheduling():
+    engine = _live_test_engine()
+    account = AccountModel(
+        platform="chatgpt",
+        email="planned@example.com",
+        password="p",
+        status="registered",
+        identity_id="identity-planned",
+        extra_json='{"account_type":"chatgpt_password"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.add(
+            AccountAssignmentModel(
+                identity_id="identity-planned",
+                local_account_id=0,
+                pool_id="PUBLIC_POOL",
+                target_id=1,
+                state="planned",
+            )
+        )
+        session.commit()
+        result = list_accounts(platform="chatgpt", page=1, page_size=20, session=session)
+
+    assert result["summary"]["scheduling"] == 1
+    assert result["summary"]["normal"] == 0
 
 
 def test_account_summary_marks_disabled_remote_rows_as_errors():
@@ -207,6 +258,54 @@ def test_account_summary_groups_all_quota_limit_status_variants():
         assert result["normal"] == 0
         assert result["rate_limited"] == 1
         assert result[f"rate_limited_{expected_window}"] == 1
+
+
+def test_account_summary_reads_persisted_remote_snapshot_without_live_display():
+    account = AccountModel(
+        platform="chatgpt",
+        email="snapshot-limit@example.com",
+        password="",
+        status="registered",
+        extra_json=json.dumps({
+            "account_type": "chatgpt_password",
+            "remote_only": True,
+            "remote_target_id": 1,
+            "remote_id": 77,
+            "codex_remote_snapshot": {
+                "remote_status": "rate_limited_5h",
+                "usage_percent_5h": 100,
+            },
+        }),
+    )
+    result = _account_operational_summary([account], [], {})
+
+    assert result["normal"] == 0
+    assert result["rate_limited"] == 1
+    assert result["rate_limited_5h"] == 1
+
+
+def test_account_summary_marks_a_stale_inventory_snapshot_as_an_error():
+    account = AccountModel(
+        platform="chatgpt",
+        email="stale-snapshot@example.com",
+        password="",
+        status="registered",
+        extra_json=json.dumps({
+            "remote_only": True,
+            "remote_target_id": 1,
+            "remote_id": 77,
+            "codex_remote_snapshot": {
+                "remote_status": "active",
+                "_inventory_stale": True,
+                "_inventory_error": "target unavailable",
+            },
+        }),
+    )
+    result = _account_operational_summary([account], [], {})
+
+    assert result["normal"] == 0
+    assert result["abnormal"] == 1
+    assert result["errors"] == 1
 
 
 def test_account_summary_keeps_persisted_invalid_status_when_live_probe_is_active():
@@ -414,3 +513,296 @@ def test_list_accounts_summary_marks_unmatched_live_account_as_error(monkeypatch
     assert local_item["chatgpt_display"]["quota_status"] == "not_found"
     assert result["summary"]["abnormal"] == 1
     assert result["summary"]["errors"] == 1
+
+
+def test_refresh_live_syncs_inventory_before_rendering_the_account_list(monkeypatch):
+    engine = _live_test_engine()
+    initial = AccountModel(
+        platform="chatgpt",
+        email="initial@example.com",
+        password="p",
+        status="registered",
+        extra_json='{"account_type":"chatgpt_password","codex_remote_snapshot":{"email":"initial@example.com","remote_status":"active","plan_type":"pro"}}',
+    )
+    sync = Mock(return_value={"targets": 1, "errors": 0})
+    materialize = Mock()
+
+    def materialize_after_sync(database_engine):
+        with Session(database_engine) as session:
+            session.add(
+                AccountModel(
+                    platform="chatgpt",
+                    email="new@example.com",
+                    password="",
+                    status="registered",
+                    extra_json='{"account_source":"codex2api","remote_only":true,"codex_remote_snapshot":{"email":"new@example.com","remote_status":"active","plan_type":"pro"}}',
+                )
+            )
+            session.commit()
+        return {"created": 1, "updated": 0, "total": 1}
+
+    materialize.side_effect = materialize_after_sync
+    monkeypatch.setattr("services.codex_inventory.sync_inventory", sync)
+    monkeypatch.setattr("services.codex_inventory.materialize_inventory", materialize)
+    with Session(engine) as session:
+        session.add(initial)
+        session.commit()
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            refresh_live=True,
+            session=session,
+        )
+
+    assert sync.call_count == 1
+    assert materialize.call_count == 1
+    assert {item["email"] for item in result["items"]} == {"initial@example.com", "new@example.com"}
+
+
+def test_refresh_live_reconciles_new_remote_rows_and_hides_missing_remote_only_rows(monkeypatch):
+    engine = _live_test_engine()
+    client = _InventoryClient([
+        _remote_row(remote_id=2, email="current@example.com", remote_status="active"),
+    ])
+    stale = AccountModel(
+        platform="chatgpt",
+        email="stale@example.com",
+        password="",
+        status="registered",
+        identity_id="codex2api:1:1",
+        extra_json=json.dumps({
+            "account_source": "codex2api",
+            "remote_only": True,
+            "remote_target_id": 1,
+            "remote_id": 1,
+            "codex_remote_snapshot": _remote_row(remote_id=1, email="stale@example.com"),
+        }),
+    )
+    with Session(engine) as session:
+        session.add(
+            Codex2APITargetModel(
+                id=1,
+                name="default",
+                base_url="https://codex2api.example",
+                admin_key_ref="test-key",
+                enabled=True,
+            )
+        )
+        session.add(stale)
+        session.commit()
+
+    monkeypatch.setattr("services.codex2api_target_client.get_target_client", lambda *_args: client)
+    with Session(engine) as session:
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            refresh_live=True,
+            session=session,
+        )
+
+    assert client.calls == 1
+    assert {item["email"] for item in result["items"]} == {"current@example.com"}
+    assert result["summary"]["total"] == 1
+
+
+def test_cached_requests_keep_missing_remote_only_rows_hidden_after_a_refresh(monkeypatch):
+    engine = _live_test_engine()
+    client = _InventoryClient([_remote_row(remote_id=2, email="current@example.com")])
+    stale = AccountModel(
+        platform="chatgpt",
+        email="stale-cached@example.com",
+        password="",
+        status="registered",
+        identity_id="codex2api:1:1",
+        extra_json=json.dumps({
+            "account_source": "codex2api",
+            "remote_only": True,
+            "remote_target_id": 1,
+            "remote_id": 1,
+            "codex_remote_snapshot": _remote_row(remote_id=1, email="stale-cached@example.com"),
+        }),
+    )
+    with Session(engine) as session:
+        session.add(Codex2APITargetModel(
+            id=1,
+            name="default",
+            base_url="https://codex2api.example",
+            admin_key_ref="test-key",
+            enabled=True,
+        ))
+        session.add(stale)
+        session.commit()
+    monkeypatch.setattr("services.codex2api_target_client.get_target_client", lambda *_args: client)
+    with Session(engine) as session:
+        list_accounts(platform="chatgpt", include_live=True, refresh_live=True, session=session)
+    with Session(engine) as session:
+        cached = list_accounts(platform="chatgpt", include_live=True, refresh_live=False, session=session)
+
+    assert {item["email"] for item in cached["items"]} == {"current@example.com"}
+
+
+def test_missing_local_snapshot_is_reported_as_not_found_after_a_complete_sync(monkeypatch):
+    engine = _live_test_engine()
+    local = AccountModel(
+        platform="chatgpt",
+        email="gone-local@example.com",
+        password="p",
+        status="registered",
+        extra_json=json.dumps({
+            "account_type": "chatgpt_password",
+            "remote_target_id": 1,
+            "remote_id": 1,
+            "codex_remote_snapshot": {
+                "remote_status": "active",
+                "email": "gone-local@example.com",
+            },
+        }),
+    )
+    client = _InventoryClient([_remote_row(remote_id=2, email="current@example.com")])
+    with Session(engine) as session:
+        session.add(Codex2APITargetModel(
+            id=1,
+            name="default",
+            base_url="https://codex2api.example",
+            admin_key_ref="test-key",
+            enabled=True,
+        ))
+        session.add(local)
+        session.commit()
+    monkeypatch.setattr("services.codex2api_target_client.get_target_client", lambda *_args: client)
+    with Session(engine) as session:
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            refresh_live=True,
+            session=session,
+        )
+
+    old = next(item for item in result["items"] if item["email"] == "gone-local@example.com")
+    assert old["chatgpt_display"]["quota_status"] == "not_found"
+    assert result["summary"]["errors"] == 1
+
+
+def test_inventory_sync_failure_marks_existing_snapshot_as_unavailable(monkeypatch):
+    engine = _live_test_engine()
+    local = AccountModel(
+        platform="chatgpt",
+        email="stale-local@example.com",
+        password="p",
+        status="registered",
+        extra_json=json.dumps({
+            "account_type": "chatgpt_password",
+            "remote_target_id": 1,
+            "remote_id": 1,
+            "codex_remote_snapshot": {
+                "remote_status": "active",
+                "email": "stale-local@example.com",
+            },
+        }),
+    )
+    with Session(engine) as session:
+        session.add(Codex2APITargetModel(
+            id=1,
+            name="default",
+            base_url="https://codex2api.example",
+            admin_key_ref="test-key",
+            enabled=True,
+        ))
+        session.add(local)
+        session.commit()
+    class FailingClient:
+        def list_accounts(self):
+            raise RuntimeError("offline")
+
+    monkeypatch.setattr("services.codex2api_target_client.get_target_client", lambda *_args: FailingClient())
+    from services.codex_inventory import sync_inventory
+    sync_inventory(
+        engine,
+        target_id=1,
+        clients={1: _InventoryClient([_remote_row(remote_id=1, email="stale-local@example.com")])},
+    )
+    with Session(engine) as session:
+        result = list_accounts(
+            platform="chatgpt",
+            page=1,
+            page_size=20,
+            include_live=True,
+            refresh_live=True,
+            session=session,
+        )
+
+    item = result["items"][0]
+    assert item["chatgpt_display"]["quota_status"] == "error"
+    assert result["summary"]["errors"] == 1
+
+
+def test_missing_remote_only_rows_are_hidden_only_for_targets_with_complete_inventory():
+    engine = _live_test_engine()
+    target_one_row = CodexInventorySnapshotModel(
+        target_id=1,
+        remote_id=10,
+        summary_json=json.dumps({"email": "current@example.com"}),
+        missing=False,
+        error="",
+    )
+    target_two_account = AccountModel(
+        platform="chatgpt",
+        email="target-two@example.com",
+        password="",
+        status="registered",
+        extra_json=json.dumps({
+            "remote_only": True,
+            "remote_target_id": 2,
+            "remote_id": 20,
+            "codex_remote_snapshot": {"remote_status": "active"},
+        }),
+    )
+    with Session(engine) as session:
+        session.add(target_one_row)
+        session.add(target_two_account)
+        session.commit()
+        visible = _hide_missing_remote_only_accounts([target_two_account], session)
+
+    assert [account.email for account in visible] == ["target-two@example.com"]
+
+
+def test_operational_filter_changes_items_but_keeps_global_summary_counts():
+    engine = _live_test_engine()
+    rows = [
+        AccountModel(
+            platform="chatgpt",
+            email="normal-filter@example.com",
+            password="p",
+            status="registered",
+            extra_json='{"account_type":"chatgpt_password"}',
+        ),
+        AccountModel(
+            platform="chatgpt",
+            email="invalid-filter@example.com",
+            password="p",
+            status="invalid",
+            extra_json='{"account_type":"chatgpt_password"}',
+        ),
+    ]
+    with Session(engine) as session:
+        session.add_all(rows)
+        session.commit()
+        result = list_accounts(
+            platform="chatgpt",
+            operational_status="normal",
+            page=1,
+            page_size=20,
+            session=session,
+        )
+
+    assert [item["email"] for item in result["items"]] == ["normal-filter@example.com"]
+    assert result["total"] == 1
+    assert result["summary"]["total"] == 2
+    assert result["summary"]["normal"] == 1
+    assert result["summary"]["abnormal"] == 1
