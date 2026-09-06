@@ -153,6 +153,59 @@ describe('Accounts ChatGPT staged login integration', () => {
     cleanup()
   })
 
+  it('updates only the saved cost on a managed account and preserves the live quota', async () => {
+    const managed = { ...eligibleAccount, remote_only: true, chatgpt_display: { plan_type: 'pro', remote_status: 'active', quota_status: 'live', billing: { billed_usd: 18.75, scope: 'all' }, quota: { window: '7d', usage_percent: 42, billed_usd: 5 } } }
+    vi.mocked(apiFetch).mockImplementation(async (path, options) => {
+      if (path.startsWith('/accounts?')) return { items: [managed, completedAccount], total: 2 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts/17' && options?.method === 'PATCH') return { ...managed, extra_json: JSON.stringify({ purchase_cost_cny: '8.50' }) }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+    const costButton = await screen.findByRole('button', { name: '设置 eligible@example.com 的账号成本' })
+    await user.click(costButton)
+    const dialog = screen.getByRole('dialog', { name: '设置账号成本' })
+    await user.type(within(dialog).getByRole('spinbutton', { name: '购入成本（元）' }), '8.50')
+    await user.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(costButton.textContent).toContain('¥8.50'))
+    expect(screen.getByText('42%')).toBeTruthy()
+    expect(screen.getByText('$18.75')).toBeTruthy()
+    expect(screen.getByText('¥0.4533/$')).toBeTruthy()
+    expect(screen.getByRole('button', { name: '设置 complete@example.com 的账号成本' }).textContent).toContain('未设置')
+    expect(accountRequestCount()).toBe(1)
+    expect(vi.mocked(apiFetch).mock.calls.find(([path, options]) => path === '/accounts/17' && options?.method === 'PATCH')?.[1]?.body).toBe(JSON.stringify({ purchase_cost_cny: '8.5' }))
+  })
+
+  it('preserves a saved cost when an older list request finishes after the save', async () => {
+    let resolveOldList!: (value: unknown) => void
+    let requests = 0
+    vi.mocked(apiFetch).mockImplementation(async (path, options) => {
+      if (path.startsWith('/accounts?')) {
+        requests += 1
+        if (requests === 1) return { items: [eligibleAccount], total: 1 }
+        return new Promise((resolve) => { resolveOldList = resolve })
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/codex-import/sync') return {}
+      if (path === '/accounts/17' && options?.method === 'PATCH') return {}
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+    await screen.findByRole('button', { name: '设置 eligible@example.com 的账号成本' })
+    await user.click(screen.getByRole('button', { name: '刷新账号列表' }))
+    await waitFor(() => expect(resolveOldList).toBeTypeOf('function'))
+    await user.click(screen.getByRole('button', { name: '设置 eligible@example.com 的账号成本' }))
+    const dialog = screen.getByRole('dialog', { name: '设置账号成本' })
+    await user.type(within(dialog).getByRole('spinbutton', { name: '购入成本（元）' }), '15')
+    await user.click(within(dialog).getByRole('button', { name: /^保\s*存$/ }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '设置 eligible@example.com 的账号成本' }).textContent).toContain('¥15.00'))
+    resolveOldList({ items: [{ ...eligibleAccount, extra_json: JSON.stringify({ purchase_cost_cny: '3.00' }) }], total: 1 })
+    await waitFor(() => expect(screen.queryByText('正在刷新账号列表…')).toBeNull())
+    expect(screen.getByRole('button', { name: '设置 eligible@example.com 的账号成本' }).textContent).toContain('¥15.00')
+  })
+
   it('keeps the account list in a loading state while the first list request is pending', async () => {
     let resolveAccounts!: (value: Record<string, unknown>) => void
     const pendingAccounts = new Promise<Record<string, unknown>>((resolve) => {
@@ -679,11 +732,11 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(within(card).getByText('Business Pro Lite')).toBeTruthy()
     expect(within(card).getByText('36%')).toBeTruthy()
     expect(within(card).getByText('1,639')).toBeTruthy()
-    expect(within(card).getByText('$144.07')).toBeTruthy()
+    expect(within(card).queryByText('$144.07')).toBeNull()
     expect(within(card).queryByText('剩余估算')).toBeNull()
   })
 
-  it('renders pool assignment and continuous seven-day quota', async () => {
+  it('renders pool assignment and leaves price unset when no purchase cost exists', async () => {
     vi.mocked(apiFetch).mockImplementation(async (path: string) => {
       if (path.startsWith('/accounts?')) {
         return {
@@ -717,7 +770,10 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(screen.queryByText('当前目标')).toBeNull()
     expect(screen.getAllByText('最近检查').length).toBeGreaterThan(0)
     expect(screen.getByText('ENTERPRISE_A_POOL')).toBeTruthy()
-    expect(screen.getByText('$900.00')).toBeTruthy()
+    expect(screen.queryByText('$900.00')).toBeNull()
+    const quota = screen.getByRole('region', { name: '7天使用' })
+    expect(within(quota).getByText('价格')).toBeTruthy()
+    expect(within(quota).getByText('未设置')).toBeTruthy()
   })
 
   it('constrains long refresh-token previews inside their table cell', async () => {

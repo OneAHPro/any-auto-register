@@ -18,6 +18,100 @@ class FakeResponse:
         return self.payload
 
 
+@pytest.mark.parametrize("billed", [0, 12.3456789])
+def test_account_usage_all_reads_exact_account_and_all_time_total(monkeypatch, billed):
+    from services import codex2api_target_client as module
+
+    calls = []
+
+    def fake_get(url, **kwargs):
+        calls.append((url, kwargs))
+        return FakeResponse({
+            "account_id": 77,
+            "period_days": 0,
+            "total_account_billed": billed,
+            "total_user_billed": 999,
+            "billed_7d": 456,
+            "admin_key": "admin-secret",
+        })
+
+    monkeypatch.setattr(module.cffi_requests, "get", fake_get)
+    client = module.Codex2APITargetClient(module.TargetConfig(
+        id=2, base_url="https://node-b", admin_key="admin-secret",
+    ))
+
+    result = client.account_usage_all(77)
+
+    assert result["total_account_billed"] == billed
+    assert "admin_key" not in result
+    assert len(calls) == 1
+    assert calls[0][0] == "https://node-b/api/admin/accounts/77/usage?days=0"
+    assert calls[0][1]["timeout"] == 10
+    assert calls[0][1]["headers"]["X-Admin-Key"] == "admin-secret"
+
+
+@pytest.mark.parametrize("payload", [
+    None,
+    [],
+    {},
+    {"billed_7d": 123, "total_user_billed": 456},
+    *({"total_account_billed": value} for value in (
+        None, True, False, "12.5", -1, float("nan"), float("inf"), float("-inf"), 10 ** 400,
+    )),
+    *({"total_account_billed": 1, "account_id": value} for value in (
+        78, "78", True, None, 77.1,
+    )),
+    *({"total_account_billed": 1, "period_days": value} for value in (
+        7, 30, "0", False, None,
+    )),
+])
+def test_account_usage_all_rejects_invalid_or_mismatched_usage(monkeypatch, payload):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(module.cffi_requests, "get", lambda *args, **kwargs: FakeResponse(payload))
+    client = module.Codex2APITargetClient(module.TargetConfig(
+        id=1, base_url="https://node", admin_key="secret",
+    ))
+
+    with pytest.raises(module.Codex2APITargetError):
+        client.account_usage_all(77)
+
+
+@pytest.mark.parametrize("identity", [{}, {"account_id": "77"}])
+def test_account_usage_all_accepts_optional_or_matching_string_account_id(monkeypatch, identity):
+    from services import codex2api_target_client as module
+
+    monkeypatch.setattr(module.cffi_requests, "get", lambda *args, **kwargs: FakeResponse({
+        **identity, "total_account_billed": 1,
+    }))
+    client = module.Codex2APITargetClient(module.TargetConfig(
+        id=1, base_url="https://node", admin_key="secret",
+    ))
+
+    assert client.account_usage_all(77)["total_account_billed"] == 1
+
+
+def test_account_usage_all_isolates_http_error_without_fallback(monkeypatch):
+    from services import codex2api_target_client as module
+
+    calls = []
+
+    def failed_get(url, **kwargs):
+        calls.append(url)
+        return FakeResponse({"message": "admin-secret failed"}, status_code=503)
+
+    monkeypatch.setattr(module.cffi_requests, "get", failed_get)
+    client = module.Codex2APITargetClient(module.TargetConfig(
+        id=1, base_url="https://node", admin_key="admin-secret",
+    ))
+
+    with pytest.raises(module.Codex2APITargetError) as exc_info:
+        client.account_usage_all(77)
+
+    assert "admin-secret" not in str(exc_info.value)
+    assert calls == ["https://node/api/admin/accounts/77/usage?days=0"]
+
+
 def test_client_lists_accounts_with_target_credentials(monkeypatch):
     from services import codex2api_target_client as module
 

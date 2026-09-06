@@ -55,6 +55,8 @@ class AccountModel(SQLModel, table=True):
     trial_end_time: int = 0
     cashier_url: str = ""
     extra_json: str = "{}"   # JSON 存储平台自定义字段
+    # Operator-managed purchase cost, isolated from credential snapshot writes.
+    purchase_cost_cents: Optional[int] = None
     # Stable control-plane identity.  Empty keeps rows created by older
     # releases compatible until the startup reconciliation fills it.
     identity_id: str = Field(default="", index=True)
@@ -1253,6 +1255,10 @@ def init_account_pool_schema(database_engine=None) -> None:
             if "identity_id" not in account_columns:
                 conn.exec_driver_sql(
                     "ALTER TABLE accounts ADD COLUMN identity_id TEXT DEFAULT ''"
+                )
+            if "purchase_cost_cents" not in account_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN purchase_cost_cents INTEGER"
                 )
             conn.exec_driver_sql(
                 "UPDATE accounts SET identity_id = '' WHERE identity_id IS NULL"

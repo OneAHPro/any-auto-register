@@ -851,7 +851,7 @@ html.light .account-summary__card--abnormal {
 }
 
 .account-card__identity-grid--compact {
-  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(max-content, 1fr);
 }
 
 .account-card__identity-item {
@@ -865,6 +865,47 @@ html.light .account-summary__card--abnormal {
   min-width: 0;
   color: var(--account-card-ink);
   font-size: 12px;
+}
+
+.account-card__cost-button {
+  align-items: flex-start;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.account-card__cost-button:not(:disabled):hover .account-card__cost-value {
+  color: var(--account-card-primary, #4f46e5);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.account-card__cost-button:focus-visible {
+  outline: 2px solid var(--account-card-primary, #4f46e5);
+  outline-offset: 4px;
+}
+
+.account-card__cost-button:disabled {
+  cursor: default;
+}
+
+.account-card__cost-value {
+  max-width: 100%;
+  color: var(--account-card-ink);
+  font-family: var(--font-family-mono);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.account-card__cost-value--empty {
+  color: var(--account-card-subtle);
+  font-family: inherit;
 }
 
 .account-card__field-label {
@@ -1070,6 +1111,24 @@ html.light .account-summary__card--abnormal {
   font-variant-numeric: tabular-nums;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.account-card__quota--chatgpt .account-card__metrics-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  text-align: center;
+}
+
+.account-card__quota--chatgpt .account-card__metric {
+  align-items: center;
+}
+
+.account-card__quota--chatgpt .account-card__metric-value {
+  max-width: 100%;
+  overflow: visible;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  white-space: normal;
 }
 
 .account-card__metric-value--accent {

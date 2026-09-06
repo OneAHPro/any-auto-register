@@ -296,6 +296,7 @@ def build_chatgpt_account_display(
         "remote_locked": bool(remote.get("locked", False)) if remote is not None else None,
         "remote_id": remote_id,
         "match": match if remote is not None else None,
+        "target_id": remote.get("target_id") if remote is not None else None,
         "fetched_at": _now_iso(now),
         "live_updated_at": (
             _text((quota or {}).get("captured_at"))

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
 from dataclasses import dataclass, replace
 from typing import Any, Mapping
@@ -730,6 +731,35 @@ class Codex2APITargetClient:
         if not isinstance(rows, list):
             raise Codex2APITargetError("Codex2API 账号清单格式无效", endpoint="accounts")
         return [dict(row) for row in rows if isinstance(row, Mapping)]
+
+    def account_usage_all(self, remote_id: int) -> dict[str, Any]:
+        """Read the account modal's all-time, account-billed USD total."""
+
+        account_id = int(remote_id)
+        path = f"/api/admin/accounts/{account_id}/usage?days=0"
+        payload = self._request("GET", path, timeout=10)
+        if not isinstance(payload, Mapping):
+            raise Codex2APITargetError("Codex2API 账号用量格式无效", endpoint=path)
+        if "account_id" in payload and str(payload["account_id"]) != str(account_id):
+            raise Codex2APITargetError("Codex2API 账号用量 ID 不匹配", endpoint=path)
+        if "period_days" in payload:
+            period_days = payload["period_days"]
+            if (
+                isinstance(period_days, bool)
+                or not isinstance(period_days, (int, float))
+                or period_days != 0
+            ):
+                raise Codex2APITargetError("Codex2API 账号用量范围不是全部", endpoint=path)
+        billed = payload.get("total_account_billed")
+        if isinstance(billed, bool) or not isinstance(billed, (int, float)):
+            raise Codex2APITargetError("Codex2API 全部账号计费金额无效", endpoint=path)
+        try:
+            billed = float(billed)
+        except (OverflowError, ValueError):
+            raise Codex2APITargetError("Codex2API 全部账号计费金额无效", endpoint=path) from None
+        if not math.isfinite(billed) or billed < 0:
+            raise Codex2APITargetError("Codex2API 全部账号计费金额无效", endpoint=path)
+        return {**payload, "total_account_billed": billed}
 
     def trigger_usage_probe(self) -> dict[str, Any]:
         return self._request("POST", "/api/admin/accounts/usage/probe")

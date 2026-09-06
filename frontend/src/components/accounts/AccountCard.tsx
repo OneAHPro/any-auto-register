@@ -40,6 +40,7 @@ export interface AccountCardProps {
   onCopy: (value: string) => void
   onOpenDetails: (account: any) => void
   onDelete: (id: number) => void
+  onEditCost?: (account: any) => void
   onPhoneVerification?: (account: any) => void
   canPhoneVerification?: boolean
   moreAction?: ReactNode
@@ -177,6 +178,18 @@ function formatCny(value: unknown): string {
   return Number.isFinite(parsed) ? `¥${parsed.toFixed(2)}` : '—'
 }
 
+function formatUnitPrice(cost: unknown, billed: unknown): string {
+  if (cost === undefined || cost === null || cost === '') return '未设置'
+  const amount = Number(cost)
+  if (!Number.isFinite(amount) || amount < 0) return '未设置'
+  if (billed === undefined || billed === null || billed === '') return '暂无计费'
+  const billedUsd = Number(billed)
+  if (!Number.isFinite(billedUsd) || billedUsd <= 0) return '暂无计费'
+  const price = amount / billedUsd
+  if (price > 0 && price < 0.0001) return '<¥0.0001/$'
+  return `¥${price.toFixed(4)}/$`
+}
+
 function formatDate(value: unknown, withTime = false): string {
   if (!value) return '—'
   const numeric = typeof value === 'number' || /^\d+(?:\.\d+)?$/.test(String(value))
@@ -249,10 +262,10 @@ function getIssue(auth: any, codex: any): { message: string; type: 'error' | 'wa
   }
 }
 
-function Metric({ label, value, accent = false }: { label: string; value: string; accent?: boolean }) {
+function Metric({ label, value, accent = false, tooltip }: { label: string; value: string; accent?: boolean; tooltip?: string }) {
   return (
     <div className="account-card__metric">
-      <span className="account-card__metric-label">{label}</span>
+      <span className="account-card__metric-label">{tooltip ? <Tooltip title={tooltip}><span>{label}</span></Tooltip> : label}</span>
       <strong className={accent ? 'account-card__metric-value account-card__metric-value--accent' : 'account-card__metric-value'}>
         {value}
       </strong>
@@ -295,6 +308,7 @@ export function AccountCard({
   onCopy,
   onOpenDetails,
   onDelete,
+  onEditCost,
   onPhoneVerification,
   canPhoneVerification = false,
   moreAction,
@@ -403,12 +417,7 @@ export function AccountCard({
         ? '当前窗口'
         : '7天窗口'
   const usagePercentDisplay = usagePercent === null ? null : clampPercent(usagePercent)
-  const billed = liveDisplay
-    ? firstValue(quota, [['billed_usd']])
-    : firstValue(quota, [['continuous_billed_usd'], ['billed_usd']])
-  const remaining = liveDisplay
-    ? undefined
-    : firstValue(quota, [['continuous_remaining_usd'], ['remaining_usd']])
+  const billed = firstValue(liveDisplay, [['billing', 'billed_usd']])
   const requestCount = liveDisplay
     ? firstNumber(quota, [['request_count']])
     : firstNumber(account, [
@@ -418,6 +427,11 @@ export function AccountCard({
       ['extra', 'usage_detail', 'request_count'],
       ['extra', 'usage_detail', 'requests'],
     ]) ?? firstNumber(codexPayload, [['requests'], ['request_count'], ['rate_limit', 'primary_window', 'requests']])
+  const cost = extra.purchase_cost_cny
+  const purchaseCostLabel = cost === undefined || cost === null || cost === ''
+    ? '未设置'
+    : formatCny(cost)
+  const canEditCost = Number.isSafeInteger(Number(account?.id)) && Number(account?.id) > 0 && Boolean(onEditCost)
   const actualPrice = firstValue(account, [
     ['actual_price'],
     ['extra', 'actual_price'],
@@ -528,8 +542,21 @@ export function AccountCard({
         </div>
         <div className="account-card__identity-item">
           <span className="account-card__field-label"><LoginOutlined />登录方式</span>
-          <Text>{provider}</Text>
+          <Text ellipsis={{ tooltip: provider }}>{provider}</Text>
         </div>
+        <Tooltip title={Number(account?.id) <= 0 ? '请先刷新账号列表，完成同步入库后设置成本' : '点击设置购入成本'}>
+          <button
+            type="button"
+            className="account-card__identity-item account-card__cost-button"
+            aria-label={`设置 ${email} 的账号成本`}
+            disabled={!canEditCost}
+            onClick={(event) => { event.stopPropagation(); onEditCost?.(account) }}
+            onDoubleClick={(event) => event.stopPropagation()}
+          >
+            <span className="account-card__field-label"><DollarOutlined />账号成本</span>
+            <span className={`account-card__cost-value${purchaseCostLabel === '未设置' ? ' account-card__cost-value--empty' : ''}`}>{purchaseCostLabel}</span>
+          </button>
+        </Tooltip>
       </div>
 
       {issue ? (
@@ -559,7 +586,7 @@ export function AccountCard({
       ) : null}
 
       {platform === 'chatgpt' ? (
-        <section className="account-card__quota" aria-label={usageWindowTitle}>
+        <section className="account-card__quota account-card__quota--chatgpt" aria-label={usageWindowTitle}>
           <div className="account-card__section-heading">
             <span><ClockCircleOutlined />{usageWindowTitle}</span>
             <span className="account-card__window-label">{usageWindowLabel}</span>
@@ -586,13 +613,13 @@ export function AccountCard({
             <div className="account-card__quota-empty">{quotaEmptyLabel}</div>
           )}
           <div className="account-card__metrics-grid">
-            <Metric label="请求数" value={formatNumber(requestCount)} />
-            <Metric label="已计费" value={formatMoney(billed)} />
-            {liveDisplay ? (
-              <Metric label="状态" value={displayStatus.label} accent />
-            ) : (
-              <Metric label="剩余估算" value={formatMoney(remaining)} accent />
-            )}
+            <Metric label="请求数" value={formatNumber(requestCount)} tooltip={`${usageWindowLabel}内的请求数`} />
+            <Metric label="已计费" value={formatMoney(billed)} tooltip="Codex2API 全部时间累计费用" />
+            <Metric
+              label="价格"
+              value={formatUnitPrice(cost, billed)}
+              tooltip="购入成本 ÷ 已计费（美元），每 1 美元计费折合的人民币成本"
+            />
           </div>
         </section>
       ) : (

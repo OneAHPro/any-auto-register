@@ -45,6 +45,7 @@ import {
 import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { AccountCard } from '@/components/accounts/AccountCard'
+import { AccountCostModal, type AccountCostAccount } from '@/components/accounts/AccountCostModal'
 import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { canStartChatGPTPhoneVerification } from '@/lib/chatgptStagedLogin'
 import { parseBooleanConfigValue } from '@/lib/configValueParsers'
@@ -92,6 +93,11 @@ function normalizeAccount(account: any) {
     remote_id: account.remote_id || extra.remote_id || remoteSnapshot.remote_id,
     remote_target_id: account.remote_target_id || extra.remote_target_id || remoteSnapshot.target_id,
   }
+}
+
+function withPurchaseCost(account: any, cost: string | null) {
+  const extra = { ...(account.extra || parseExtraJson(account.extra_json)), purchase_cost_cny: cost }
+  return { ...account, extra, extra_json: JSON.stringify(extra) }
 }
 
 interface Codex2APIDeleteResult {
@@ -815,6 +821,7 @@ export default function Accounts() {
   const [codexImportModalOpen, setCodexImportModalOpen] = useState(false)
   const [accountLoadError, setAccountLoadError] = useState('')
   const [detailModalOpen, setDetailModalOpen] = useState(false)
+  const [costAccount, setCostAccount] = useState<AccountCostAccount | null>(null)
   const [currentAccount, setCurrentAccount] = useState<any>(null)
   const [controlQuota, setControlQuota] = useState<Record<string, AccountQuotaView>>({})
   const [quotaHistory, setQuotaHistory] = useState<AccountQuotaView[]>([])
@@ -845,6 +852,8 @@ export default function Accounts() {
   const [reloginStartError, setReloginStartError] = useState('')
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
   const accountLoadEpochRef = useRef(0)
+  const costSaveEpochRef = useRef(0)
+  const savedAccountCostsRef = useRef(new Map<number, { epoch: number; cost: string | null }>())
   const reloginRequestEpochRef = useRef(0)
   const [cpaUploadLoading, setCpaUploadLoading] = useState<'all' | 'selected' | ''>('')
   const [statusSyncLoading, setStatusSyncLoading] = useState<'probe_selected' | 'probe_all' | 'remote_selected' | 'remote_all' | ''>('')
@@ -871,6 +880,7 @@ export default function Accounts() {
     setAccountSummary(null)
     setOperationalFilter('')
     setSelectedRowKeys([])
+    setCostAccount(null)
     setReloginStartError('')
     setReloginTaskId(null)
     setReloginTaskMode('relogin')
@@ -935,6 +945,7 @@ export default function Accounts() {
 
   const load = useCallback(async (forceLive = false) => {
     const requestEpoch = ++accountLoadEpochRef.current
+    const costEpoch = costSaveEpochRef.current
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
@@ -948,7 +959,12 @@ export default function Accounts() {
       if (operationalFilter) params.set('operational_status', operationalFilter)
       const data = await apiFetch(`/accounts?${params}`)
       if (requestEpoch !== accountLoadEpochRef.current) return
-      const ordered = (data.items || []).map(normalizeAccount).sort((a: any, b: any) => {
+      const ordered = (data.items || []).map(normalizeAccount).map((account: any) => {
+        // A list request started before a cost save may still carry the old
+        // metadata. Preserve the newer edit while accepting its other fields.
+        const saved = savedAccountCostsRef.current.get(Number(account.id))
+        return saved && saved.epoch > costEpoch ? withPurchaseCost(account, saved.cost) : account
+      }).sort((a: any, b: any) => {
         const rank = (x: any) => {
           const status = String(x.chatgpt_display?.remote_status || x.remote_status || x.status || x.health_status || '').toLowerCase()
           return ['active', 'ready', 'available'].includes(status)
@@ -1446,6 +1462,15 @@ export default function Accounts() {
     } finally {
       setRegisterLoading(false)
     }
+  }
+
+  const handleCostSaved = (id: number, cost: string | null) => {
+    const epoch = ++costSaveEpochRef.current
+    savedAccountCostsRef.current.set(id, { epoch, cost })
+    setAccounts((items) => items.map((account) => Number(account.id) === id ? withPurchaseCost(account, cost) : account))
+    setCurrentAccount((account: any) => account && Number(account.id) === id ? withPurchaseCost(account, cost) : account)
+    setCostAccount(null)
+    message.success('账号成本已保存')
   }
 
   const handleDetailSave = async () => {
@@ -1984,6 +2009,7 @@ export default function Accounts() {
                         setDetailModalOpen(true)
                       }}
                       onDelete={handleDelete}
+                      onEditCost={setCostAccount}
                       onPhoneVerification={setPhoneVerificationAccount}
                       canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
                       moreAction={platformActions.length && !record.remote_only
@@ -2151,6 +2177,15 @@ export default function Accounts() {
           style={{ fontFamily: 'monospace' }}
         />
       </Modal>
+
+      {costAccount ? (
+        <AccountCostModal
+          key={costAccount.id}
+          account={costAccount}
+          onCancel={() => setCostAccount(null)}
+          onSaved={handleCostSaved}
+        />
+      ) : null}
 
       <Modal
         title="账号详情"

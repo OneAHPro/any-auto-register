@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlmodel import Session, select, func
 from sqlalchemy import or_
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from core.db import (
     AccountAssignmentModel,
     AccountModel,
@@ -19,6 +19,7 @@ from services.chatgpt_account_state import account_is_visible_in_default_list
 from services.chatgpt_account_removal import remove_account
 from typing import Mapping, Optional
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 import io, csv, json, logging
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
@@ -798,16 +799,23 @@ def _account_for_response(
     control_plane_summary: dict[str, object] | None = None,
 ) -> dict:
     payload = account.model_dump()
+    purchase_cost_cents = payload.pop("purchase_cost_cents", None)
     if not include_credentials:
         payload.pop("password", None)
         payload.pop("token", None)
         cashier_url = str(payload.get("cashier_url") or "")
         if cashier_url:
             payload["cashier_url"] = _scrub_nested_extra(cashier_url, "cashier_url")
-    payload["extra_json"] = _sanitize_account_extra_for_api(
+    extra = json.loads(_sanitize_account_extra_for_api(
         str(payload.get("extra_json") or "{}"),
         strip_credentials=not include_credentials,
-    )
+    ))
+    # Keep the public JSON protocol while sourcing cost only from its own
+    # column. Stale credential metadata must never restore a cleared cost.
+    extra.pop("purchase_cost_cny", None)
+    if purchase_cost_cents is not None:
+        extra["purchase_cost_cny"] = format(Decimal(purchase_cost_cents) / 100, ".2f")
+    payload["extra_json"] = json.dumps(extra, ensure_ascii=False)
     if control_plane_summary is not None:
         payload.update(control_plane_summary)
     elif session is not None:
@@ -828,6 +836,25 @@ class AccountUpdate(BaseModel):
     status: Optional[str] = None
     token: Optional[str] = None
     cashier_url: Optional[str] = None
+    purchase_cost_cny: Optional[Decimal] = None
+
+    @field_validator("purchase_cost_cny", mode="before")
+    @classmethod
+    def validate_purchase_cost_cny(cls, value):
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+            raise ValueError("账号成本必须是金额")
+        try:
+            amount = Decimal(str(value))
+        except InvalidOperation as exc:
+            raise ValueError("账号成本必须是有效金额") from exc
+        if not amount.is_finite() or amount < 0 or amount > Decimal("999999999.99"):
+            raise ValueError("账号成本须在 0 至 999999999.99 元之间")
+        normalized = amount.quantize(Decimal("0.01"))
+        if amount != normalized:
+            raise ValueError("账号成本最多保留两位小数")
+        return normalized if normalized else Decimal("0.00")
 
 
 class ImportRequest(BaseModel):
@@ -1171,6 +1198,40 @@ def list_accounts(
                 {"plan_type": None, "plan_source": "none", "quota": None, "quota_status": "not_configured"},
             )
         response_items.append(payload)
+    if include_live and str(platform or "").strip().lower() == "chatgpt":
+        # All-time charges come from the same account-usage endpoint as the
+        # provider's "All" tab, separately from reset-aligned quota windows.
+        # Fetch only the visible page and key by node/remote ID, never email.
+        billing_keys = []
+        display_by_key: dict[tuple[int, int], list[dict]] = {}
+        for payload in response_items:
+            display = payload.get("chatgpt_display") or {}
+            display["billing"] = {
+                "scope": "all", "billed_usd": None,
+                "source": "codex2api", "status": "error", "fetched_at": None,
+            }
+            try:
+                key = (int(display.get("target_id") or 0), int(display.get("remote_id") or 0))
+            except (TypeError, ValueError):
+                continue
+            if key[0] <= 0 or key[1] <= 0:
+                continue
+            if key not in display_by_key:
+                billing_keys.append(key)
+            display_by_key.setdefault(key, []).append(display)
+        if billing_keys:
+            try:
+                from services.codex_account_billing import fetch_account_billing_summaries
+
+                billing = fetch_account_billing_summaries(
+                    session.get_bind(), billing_keys, refresh=bool(refresh_live),
+                )
+                for key, displays in display_by_key.items():
+                    if key in billing:
+                        for display in displays:
+                            display["billing"] = dict(billing[key])
+            except Exception as exc:
+                logger.warning("读取账号累计费用失败: %s", type(exc).__name__)
     return {
         "total": total,
         "summary": operational_summary,
@@ -1392,6 +1453,10 @@ def update_account(account_id: int, body: AccountUpdate,
         acc.token = body.token
     if body.cashier_url is not None:
         acc.cashier_url = body.cashier_url
+    if "purchase_cost_cny" in body.model_fields_set:
+        acc.purchase_cost_cents = (
+            None if body.purchase_cost_cny is None else int(body.purchase_cost_cny * 100)
+        )
     acc.updated_at = datetime.now(timezone.utc)
     session.add(acc)
     session.commit()

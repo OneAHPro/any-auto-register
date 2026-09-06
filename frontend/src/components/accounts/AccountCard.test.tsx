@@ -88,11 +88,80 @@ describe('AccountCard', () => {
     expect(within(card).getByText('Team pool')).toBeTruthy()
     expect(within(card).getByText('7天使用')).toBeTruthy()
     expect(within(card).getByText('12%')).toBeTruthy()
-    expect(within(card).getByText('$98.34')).toBeTruthy()
-    expect(within(card).getByText('$721.66')).toBeTruthy()
+    expect(within(card).queryByText('$98.34')).toBeNull()
+    expect(within(card).getByText('价格')).toBeTruthy()
     expect(within(card).getByText('有效期至')).toBeTruthy()
     expect(within(card).getByRole('button', { name: '详情' })).toBeTruthy()
     expect(within(card).getByRole('button', { name: '删除' })).toBeTruthy()
+  })
+
+  it.each([
+    [undefined, '未设置'],
+    ['12.50', '¥12.50'],
+    [0, '¥0.00'],
+    ['999999999.99', '¥999999999.99'],
+  ])('shows purchase cost %s independently from the actual price', (cost, expected) => {
+    render(<AccountCard account={{ ...account, extra: { ...account.extra, purchase_cost_cny: cost, actual_price: 99 } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} onEditCost={vi.fn()} />)
+    const item = screen.getByRole('button', { name: '设置 operator@example.com 的账号成本' })
+    expect(item.textContent).toContain('账号成本')
+    expect(item.textContent).toContain(expected)
+    expect(screen.getByText('¥99.00')).toBeTruthy()
+  })
+
+  it.each([
+    ['20.00', 100, '¥0.2000/$'],
+    [0, 100, '¥0.0000/$'],
+    ['0.01', 1000, '<¥0.0001/$'],
+    [undefined, 100, '未设置'],
+    ['20.00', 0, '暂无计费'],
+    ['20.00', -1, '暂无计费'],
+    ['20.00', undefined, '暂无计费'],
+    ['20.00', 'invalid', '暂无计费'],
+  ])('shows live unit price for cost %s and billing %s', (cost, billed, expected) => {
+    render(<AccountCard account={{ ...account, extra: { ...account.extra, purchase_cost_cny: cost }, chatgpt_display: { remote_status: 'active', quota_status: 'live', billing: { scope: 'all', billed_usd: billed }, quota: { window: '7d', billed_usd: 987 } } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} onEditCost={vi.fn()} />)
+    const quota = screen.getByRole('region', { name: '7天使用' })
+    expect(within(quota).getByText('价格')).toBeTruthy()
+    expect(within(quota).getByText(expected)).toBeTruthy()
+    expect(within(quota).queryByText('状态')).toBeNull()
+    expect(within(quota).queryByText('可用')).toBeNull()
+  })
+
+  it('does not substitute legacy window billing for missing all-time billing', () => {
+    render(<AccountCard account={{ ...account, extra: { ...account.extra, purchase_cost_cny: '20.00' }, quota: { '7d': { continuous_billed_usd: 100, billed_usd: 40 } } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    const quota = screen.getByRole('region', { name: '7天使用' })
+    expect(within(quota).queryByText('$100.00')).toBeNull()
+    expect(within(quota).queryByText('$40.00')).toBeNull()
+    expect(within(quota).getByText('暂无计费')).toBeTruthy()
+    expect(within(quota).queryByText('剩余估算')).toBeNull()
+  })
+
+  it('keeps all-time billing empty when a live account has only a quota-window cost', () => {
+    render(<AccountCard account={{ ...account, extra: { ...account.extra, purchase_cost_cny: '20.00' }, chatgpt_display: { quota_status: 'live', quota: { window: '7d', billed_usd: 100, request_count: 123 } } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    const quota = screen.getByRole('region', { name: '7天使用' })
+    expect(within(quota).getByText('123')).toBeTruthy()
+    expect(within(quota).queryByText('$100.00')).toBeNull()
+    expect(within(quota).getByText('暂无计费')).toBeTruthy()
+  })
+
+  it('edits cost from a managed account without opening card details on a double click', () => {
+    const onEditCost = vi.fn()
+    const onOpenDetails = vi.fn()
+    const managed = { ...account, remote_only: true }
+    render(<AccountCard account={managed} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={onOpenDetails} onDelete={vi.fn()} onEditCost={onEditCost} />)
+    const button = screen.getByRole('button', { name: '设置 operator@example.com 的账号成本' })
+    fireEvent.click(button)
+    fireEvent.doubleClick(button)
+    expect(onEditCost).toHaveBeenCalledWith(managed)
+    expect(onOpenDetails).not.toHaveBeenCalled()
+  })
+
+  it('does not send a temporary negative account id to the cost editor', () => {
+    const onEditCost = vi.fn()
+    render(<AccountCard account={{ ...account, id: -42, remote_only: true }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} onEditCost={onEditCost} />)
+    const button = screen.getByRole('button', { name: '设置 operator@example.com 的账号成本' }) as HTMLButtonElement
+    expect(button.disabled).toBe(true)
+    fireEvent.click(button)
+    expect(onEditCost).not.toHaveBeenCalled()
   })
 
   it('renders a remote Codex2API account with live billing and no local credential actions', () => {
@@ -114,6 +183,7 @@ describe('AccountCard', () => {
             remote_status: 'active',
             quota_status: 'live',
             live_updated_at: '2026-09-05T06:59:00Z',
+            billing: { billed_usd: 18.75, scope: 'all' },
             quota: {
               window: '7d',
               usage_percent: 42,
@@ -293,6 +363,7 @@ describe('AccountCard', () => {
             plan_type: 'self_serve_business_prolite',
             plan_source: 'codex2api_live',
             subscription_active_until: '2026-10-04T01:56:53Z',
+            billing: { billed_usd: 98.34, scope: 'all' },
             quota_status: 'live',
             quota: {
               window: '7d',
@@ -392,7 +463,7 @@ describe('AccountCard', () => {
     )
 
     const card = screen.getByTestId('account-card')
-    expect(within(card).getAllByText('限流中')).toHaveLength(2)
+    expect(within(card).getAllByText('限流中')).toHaveLength(1)
   })
 
   it('keeps a persisted invalid local account visibly invalid after a live refresh', () => {
@@ -419,7 +490,7 @@ describe('AccountCard', () => {
     )
 
     const card = screen.getByTestId('account-card')
-    expect(within(card).getAllByText('已失效')).toHaveLength(2)
+    expect(within(card).getAllByText('已失效')).toHaveLength(1)
     expect(within(card).queryByText('可用')).toBeNull()
   })
 
@@ -445,6 +516,6 @@ describe('AccountCard', () => {
     )
 
     const card = screen.getByTestId('account-card')
-    expect(within(card).getAllByText('远端未发现')).toHaveLength(2)
+    expect(within(card).getAllByText('远端未发现')).toHaveLength(1)
   })
 })
