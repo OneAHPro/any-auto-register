@@ -1,5 +1,5 @@
 import { useEffect, useState, type Key } from 'react'
-import { Card, Table, Button, Input, Tag, Space, Popconfirm, message, Modal } from 'antd'
+import { Table, Button, Input, Tag, Space, Popconfirm, message, Modal } from 'antd'
 import {
   PlusOutlined,
   DeleteOutlined,
@@ -10,6 +10,8 @@ import {
   SwapLeftOutlined,
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './management-workspace.css'
 
 export default function Proxies() {
   const [proxies, setProxies] = useState<any[]>([])
@@ -120,7 +122,7 @@ export default function Proxies() {
       title: '代理地址',
       dataIndex: 'url',
       key: 'url',
-      render: (text: string) => <span style={{ fontFamily: 'monospace', fontSize: 12 }}>{text}</span>,
+      render: (text: string) => <span style={{ fontFamily: 'var(--font-family-mono)', fontSize: 12 }}>{text}</span>,
     },
     {
       title: '地区',
@@ -157,6 +159,7 @@ export default function Proxies() {
           <Button
             type="text"
             size="small"
+            aria-label={record.is_active ? '禁用代理' : '启用代理'}
             icon={record.is_active ? <SwapLeftOutlined /> : <SwapRightOutlined />}
             onClick={() => toggle(record.id)}
           />
@@ -167,7 +170,7 @@ export default function Proxies() {
             cancelText="取消"
             okButtonProps={{ danger: true }}
           >
-            <Button type="text" size="small" danger icon={<DeleteOutlined />} />
+            <Button type="text" size="small" danger aria-label="删除代理" icon={<DeleteOutlined />} />
           </Popconfirm>
         </Space>
       ),
@@ -175,23 +178,17 @@ export default function Proxies() {
   ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-        <div>
-          <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>代理管理</h1>
-          <p style={{ color: '#7a8ba3', marginTop: 4 }}>共 {proxies.length} 个代理</p>
-        </div>
-        <Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>
-          检测全部
-        </Button>
-      </div>
+    <div className="console-page management-workspace">
+      <ConsolePageHeader title="代理管理" description="管理登录与恢复任务使用的网络出口。"
+        actions={<Button icon={<ReloadOutlined spin={checking} />} onClick={check} loading={checking}>检测全部</Button>} />
+      <section className="console-panel management-form-section" aria-labelledby="proxy-add-heading">
+        <div className="console-section-heading"><h2 id="proxy-add-heading">添加代理</h2><span>每行一个地址，支持批量添加</span></div>
 
-      <Card title="添加代理（每行一个）">
         <Space direction="vertical" style={{ width: '100%' }}>
           <Input.TextArea
             value={newProxy}
             onChange={(e) => setNewProxy(e.target.value)}
-            placeholder="http://user:pass@host:port"
+            aria-label="代理地址" placeholder="http://user:pass@host:port"
             rows={3}
             style={{ fontFamily: 'monospace' }}
           />
@@ -199,7 +196,7 @@ export default function Proxies() {
             <Input
               value={region}
               onChange={(e) => setRegion(e.target.value)}
-              placeholder="地区标签 (如 US, SG)"
+              aria-label="代理地区" placeholder="地区标签 (如 US, SG)"
               style={{ width: 200 }}
             />
             <Button type="primary" icon={<PlusOutlined />} onClick={add}>
@@ -207,9 +204,10 @@ export default function Proxies() {
             </Button>
           </Space>
         </Space>
-      </Card>
+      </section>
 
-      <Card>
+      <section className="console-panel management-table-section" aria-label="代理列表">
+        <div className="console-section-heading"><h2>代理列表</h2><span>{proxies.length} 个网络出口</span></div>
         <div style={{ marginBottom: 12, display: 'flex', justifyContent: 'space-between' }}>
           <div style={{ color: '#7a8ba3' }}>
             已选中 {selectedRowKeys.length} 条
@@ -237,8 +235,9 @@ export default function Proxies() {
             onChange: (keys) => setSelectedRowKeys(keys),
           }}
           pagination={false}
+          scroll={{ x: 760 }}
         />
-      </Card>
+      </section>
     </div>
   )
 }

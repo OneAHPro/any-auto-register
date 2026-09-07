@@ -6,6 +6,7 @@ from sqlalchemy import delete, event, func, update, UniqueConstraint
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
+from core.purchase_cost_models import PurchaseBatchModel, PurchaseCostRecordModel
 
 
 def _utcnow():
@@ -811,6 +812,11 @@ def cleanup_chatgpt_account_dependents(
     if normalized_id <= 0:
         raise ValueError("ChatGPT account id must be positive")
     now = _utcnow()
+    session.exec(
+        update(PurchaseCostRecordModel)
+        .where(PurchaseCostRecordModel.account_id == normalized_id)
+        .values(account_id=None)
+    )
     session.exec(
         delete(ChatGPTMfaOperationModel).where(
             ChatGPTMfaOperationModel.account_id == normalized_id
@@ -1635,6 +1641,11 @@ def init_db():
     from services.pool_scheduler import ensure_default_pools
 
     reconcile_existing_accounts(engine)
+    from services.account_purchase_costs import ensure_legacy_purchase_costs
+
+    with Session(engine) as session:
+        ensure_legacy_purchase_costs(session)
+        session.commit()
     ensure_default_target(engine)
     ensure_default_pools(engine)
     from core.sms_pool import SmsPoolService

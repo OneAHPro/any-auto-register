@@ -1,0 +1,531 @@
+/* Account workspace: independent cards, shared typography, one surface per account. */
+.accounts-workspace {
+  min-width: 0;
+}
+
+.accounts-workspace .account-summary {
+  gap: 0;
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  background: var(--console-surface);
+}
+
+.accounts-workspace .account-summary__card {
+  min-height: 116px;
+  padding: 18px 20px;
+  gap: 16px;
+  background: transparent;
+  border: 0;
+  border-right: 1px solid var(--console-border);
+  border-radius: 0;
+  box-shadow: none;
+  transform: none;
+  transition: background-color 160ms ease;
+}
+
+.accounts-workspace .account-summary__card:last-child {
+  border-right: 0;
+}
+
+.accounts-workspace .account-summary__card:hover,
+.accounts-workspace .account-summary__card--active {
+  background: var(--console-accent-soft);
+  box-shadow: inset 0 -2px 0 var(--console-accent);
+  transform: none;
+}
+
+.accounts-workspace .account-summary__card:focus-visible {
+  outline: 2px solid var(--console-accent);
+  outline-offset: -3px;
+}
+
+.accounts-workspace .account-summary__card-head {
+  gap: 6px;
+}
+
+.accounts-workspace .account-summary__label {
+  color: var(--console-muted);
+}
+
+.accounts-workspace .account-summary__badge {
+  padding: 0;
+  background: transparent;
+}
+
+.accounts-workspace .account-summary__details {
+  gap: 4px;
+}
+
+.accounts-workspace .accounts-toolbar {
+  padding: 0;
+  overflow: hidden;
+}
+
+.accounts-workspace .accounts-toolbar__filter-row,
+.accounts-workspace .accounts-toolbar__actions {
+  padding: 16px 20px;
+  margin: 0;
+  border: 0;
+}
+
+.accounts-workspace .accounts-toolbar__filters {
+  width: 100%;
+  row-gap: 12px !important;
+}
+
+.accounts-workspace .accounts-toolbar__search {
+  width: 240px;
+}
+
+.accounts-workspace .accounts-toolbar__filters .ant-segmented {
+  max-width: 100%;
+}
+
+.accounts-workspace .accounts-toolbar__filters .ant-segmented-group {
+  flex-wrap: wrap;
+}
+
+.accounts-workspace .accounts-toolbar__automation,
+.accounts-workspace .accounts-toolbar__batch-heading {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  padding: 0 20px 16px;
+  min-width: 0;
+}
+
+.accounts-workspace .accounts-toolbar__automation .ant-typography {
+  font-size: 12px;
+}
+
+.accounts-workspace .accounts-toolbar__batch-heading {
+  padding: 12px 20px 0;
+  border-top: 1px solid var(--console-border);
+}
+
+.accounts-workspace .accounts-toolbar__batch-heading > span:first-child {
+  font-weight: 600;
+}
+
+.accounts-workspace .accounts-toolbar__batch-heading .ant-typography {
+  font-size: 12px;
+}
+
+.accounts-workspace .account-card-list-shell {
+  --account-card-surface: var(--console-surface);
+  --account-card-elevated: var(--console-surface);
+  --account-card-fill: var(--console-surface-alt);
+  --account-card-border: var(--console-border);
+  --account-card-ink: var(--console-text);
+  --account-card-muted: var(--console-muted);
+  --account-card-subtle: var(--console-muted);
+  --account-card-primary: var(--console-accent);
+  padding: 0;
+  container-type: inline-size;
+  container-name: accounts-grid;
+}
+
+.accounts-workspace .account-card-list-toolbar {
+  min-height: 44px;
+  margin: 0 0 16px;
+  padding: 0 0 12px;
+  border-bottom: 1px solid var(--console-border);
+  background: transparent;
+}
+
+.accounts-workspace .accounts-list-context {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.accounts-workspace .accounts-list-context > .ant-typography {
+  font-size: 12px;
+}
+
+.accounts-workspace .accounts-records,
+.accounts-workspace .account-card-skeleton-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  gap: 16px;
+}
+
+.accounts-workspace .accounts-records > [role="listitem"] {
+  display: flex;
+  min-width: 0;
+}
+
+.accounts-workspace .account-card {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  gap: 16px;
+  padding: 20px;
+  border: 1px solid var(--console-border);
+  border-radius: 10px;
+  background: var(--console-surface);
+  box-shadow: none;
+  transform: none;
+  transition: border-color 160ms ease, background-color 160ms ease;
+}
+
+.accounts-workspace .account-card:hover {
+  border-color: color-mix(in srgb, var(--console-accent) 48%, var(--console-border));
+  background: var(--console-surface);
+  box-shadow: none;
+  transform: none;
+}
+
+.accounts-workspace .account-card--selected,
+.accounts-workspace .account-card--selected:hover {
+  border-color: var(--console-accent);
+  background: var(--console-accent-soft);
+  box-shadow: inset 0 0 0 1px var(--console-accent);
+  transform: none;
+}
+
+@container accounts-grid (min-width: 696px) {
+  .accounts-workspace .accounts-records,
+  .accounts-workspace .account-card-skeleton-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@container accounts-grid (min-width: 1052px) {
+  .accounts-workspace .accounts-records,
+  .accounts-workspace .account-card-skeleton-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.accounts-workspace .account-card:focus-visible {
+  outline: 2px solid var(--console-accent);
+  outline-offset: -3px;
+}
+
+.accounts-workspace .account-card__lead {
+  min-width: 0;
+}
+
+.accounts-workspace .account-card__header {
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 10px;
+  padding: 0;
+}
+
+.accounts-workspace .account-card__header-actions {
+  grid-column: auto;
+}
+
+.accounts-workspace .account-card__record-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 2px;
+  color: var(--console-muted);
+  font-size: 11px;
+}
+
+.accounts-workspace .account-card__record-meta > span:first-child {
+  font-variant-numeric: tabular-nums;
+}
+
+.accounts-workspace .account-card__tag-row {
+  gap: 4px;
+  margin-top: 8px;
+}
+
+.accounts-workspace .account-card__identity-grid {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(max-content, 1fr);
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.accounts-workspace .account-card__identity-item {
+  gap: 5px;
+}
+
+.accounts-workspace .account-card__field-label .anticon,
+.accounts-workspace .account-card__section-heading .anticon,
+.accounts-workspace .account-card__commercial-row .anticon,
+.accounts-workspace .account-card__created .anticon {
+  color: var(--console-muted);
+}
+
+.accounts-workspace .account-card__quota,
+.accounts-workspace .account-card__commercial {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+
+.accounts-workspace .account-card__quota {
+  padding: 16px 0;
+  border-top: 1px solid var(--console-border);
+  border-bottom: 1px solid var(--console-border);
+}
+
+.accounts-workspace .account-card__section-heading {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+  gap: 4px 8px;
+}
+
+.accounts-workspace .account-card__section-heading > .ant-typography {
+  flex-basis: 100%;
+  white-space: normal;
+}
+
+.accounts-workspace .account-card__window-label {
+  display: none;
+}
+
+.accounts-workspace .account-card__quota-headline {
+  margin-top: 12px;
+}
+
+.accounts-workspace .account-card__quota-headline strong {
+  color: var(--console-text);
+}
+
+.accounts-workspace .account-card__metrics-grid {
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.accounts-workspace .account-card__quota--chatgpt .account-card__metrics-grid {
+  display: flex;
+  flex-wrap: wrap;
+  text-align: left;
+}
+
+.accounts-workspace .account-card__quota--chatgpt .account-card__metric {
+  align-items: flex-start;
+  flex: 1 1 60px;
+  min-width: max-content;
+}
+
+.accounts-workspace .account-card__quota--chatgpt .account-card__metric-value {
+  overflow-wrap: normal;
+  white-space: nowrap;
+  word-break: normal;
+}
+
+.accounts-workspace .account-card__commercial {
+  gap: 8px;
+}
+
+.accounts-workspace .account-card__commercial-row {
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+}
+
+.accounts-workspace .account-card__commercial-row > span,
+.accounts-workspace .account-card__commercial-row > strong {
+  white-space: nowrap;
+}
+
+.accounts-workspace .account-card__footer {
+  gap: 8px;
+  margin-top: auto;
+  padding-top: 12px;
+  border-top: 1px solid var(--console-border);
+}
+
+.accounts-workspace .account-card__created {
+  flex-basis: 100%;
+}
+
+.accounts-workspace .account-card__actions {
+  margin: 0;
+}
+
+.accounts-workspace .account-card__actions .ant-btn {
+  min-height: 32px;
+  padding-inline: 6px;
+}
+
+.accounts-workspace .account-card__issue,
+.accounts-workspace .account-card__credentials {
+  grid-column: 1 / -1;
+  margin: 0;
+}
+
+.accounts-workspace .account-card__issue {
+  border-radius: 4px;
+}
+
+.accounts-workspace .account-card__issue .ant-alert-message {
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+
+.accounts-workspace .account-card__credentials {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 8px;
+  padding-top: 12px;
+  border-top: 1px solid var(--console-border);
+}
+
+.accounts-workspace .account-card-pagination {
+  flex-wrap: wrap;
+  margin: 0;
+  padding: 20px 0 0;
+  border: 0;
+}
+
+.accounts-workspace .account-card-list-loading {
+  display: flex;
+  margin: 0;
+  padding: 12px 20px;
+}
+
+.accounts-workspace .account-card-skeleton {
+  min-height: 400px;
+  padding: 20px;
+  border: 1px solid var(--console-border);
+  border-radius: 10px;
+}
+
+.accounts-workspace .account-card-list-shell > .ant-empty {
+  margin: 56px 20px;
+}
+
+@media (max-width: 1200px) {
+  .accounts-workspace .account-summary {
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+  }
+
+  .accounts-workspace .account-summary__card {
+    padding: 16px;
+  }
+
+  .accounts-workspace .account-summary__badge {
+    display: none;
+  }
+
+  .accounts-workspace .account-summary__card-body {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .accounts-workspace .account-summary__details {
+    align-items: flex-start;
+  }
+
+
+}
+
+@media (max-width: 680px) {
+  .accounts-workspace .account-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .accounts-workspace .account-summary__card {
+    min-height: 106px;
+    padding: 16px;
+    border-bottom: 1px solid var(--console-border);
+  }
+
+  .accounts-workspace .account-summary__card:first-child {
+    grid-column: 1 / -1;
+    min-height: 78px;
+    flex-direction: row;
+    align-items: center;
+  }
+
+  .accounts-workspace .account-summary__card:first-child .account-summary__card-body {
+    flex: 0 0 auto;
+    width: max-content;
+    margin-left: auto;
+    white-space: nowrap;
+  }
+
+  .accounts-workspace .account-summary__card:first-child .account-summary__card-head {
+    flex: 1;
+  }
+
+  .accounts-workspace .account-summary__card:nth-child(odd) {
+    border-right: 0;
+  }
+
+  .accounts-workspace .account-summary__card:nth-last-child(-n + 2) {
+    border-bottom: 0;
+  }
+
+  .accounts-workspace .accounts-toolbar__filter-row,
+  .accounts-workspace .accounts-toolbar__actions {
+    padding: 16px;
+  }
+
+  .accounts-workspace .accounts-toolbar__automation,
+  .accounts-workspace .accounts-toolbar__batch-heading {
+    padding-inline: 16px;
+  }
+
+  .accounts-workspace .accounts-toolbar__filters > .ant-space-item {
+    max-width: 100%;
+  }
+
+  .accounts-workspace .accounts-toolbar__filters > .ant-space-item:first-child {
+    flex: 1 1 100%;
+  }
+
+  .accounts-workspace .accounts-toolbar__filters .ant-input-search {
+    width: 100% !important;
+  }
+
+  .accounts-workspace .account-card-list-toolbar {
+    align-items: center;
+    flex-direction: row;
+    flex-wrap: wrap;
+    padding: 0 0 12px;
+  }
+
+  .accounts-workspace .account-card {
+    padding: 20px 16px;
+  }
+
+  .accounts-workspace .account-card__actions {
+    width: 100%;
+  }
+
+  .accounts-workspace .account-card__actions .ant-btn,
+  .accounts-workspace .account-card__cost-button,
+  .accounts-workspace .account-card__icon-button {
+    min-height: 40px;
+  }
+
+  .accounts-workspace .account-card__icon-button {
+    min-width: 40px;
+  }
+
+  .accounts-workspace .account-card__credentials {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .accounts-workspace .account-card-pagination {
+    justify-content: flex-start;
+    padding: 20px 0 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .accounts-workspace .account-card,
+  .accounts-workspace .account-summary__card {
+    transition: none;
+  }
+}

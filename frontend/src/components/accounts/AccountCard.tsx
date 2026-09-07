@@ -1,10 +1,8 @@
-import type { Key, KeyboardEvent, ReactNode } from 'react'
+import { useId, useState, type Key, type KeyboardEvent, type ReactNode } from 'react'
 import {
   Alert,
-  Avatar,
   Button,
   Checkbox,
-  Divider,
   Popconfirm,
   Progress,
   Space,
@@ -24,7 +22,6 @@ import {
   KeyOutlined,
   LinkOutlined,
   LoginOutlined,
-  MailOutlined,
   SyncOutlined,
   TeamOutlined,
   WarningOutlined,
@@ -313,6 +310,8 @@ export function AccountCard({
   canPhoneVerification = false,
   moreAction,
 }: AccountCardProps) {
+  const [credentialsOpen, setCredentialsOpen] = useState(false)
+  const credentialsId = useId()
   const extra = parseExtra(account)
   const remoteOnly = account?.remote_only === true || account?.account_source === 'codex2api'
   const local = account?.chatgptLocal || extra.chatgpt_local || {}
@@ -494,69 +493,43 @@ export function AccountCard({
       data-testid="account-card"
       data-account-id={account?.id}
       tabIndex={0}
-      aria-label={`${maskEmail(email)}，按回车查看详情`}
+      aria-label={`${maskEmail(email)}，账号 #${account?.id ?? '—'}，按回车查看详情`}
       onDoubleClick={openDetails}
       onKeyDown={handleCardKeyDown}
     >
-      <header className="account-card__header">
-        <Checkbox
-          checked={selected}
-          disabled={remoteOnly}
-          aria-label={`选择 ${email}`}
-          onChange={(event) => onSelect(account?.id, event.target.checked)}
-        />
-        <Avatar className="account-card__avatar" shape="square" icon={<MailOutlined />}>
-          {email.slice(0, 1).toUpperCase()}
-        </Avatar>
-        <div className="account-card__identity">
-          <div className="account-card__email-row">
-            <Tooltip title="复制邮箱">
-              <Text className="account-card__email" ellipsis={{ tooltip: false }}>{maskEmail(email)}</Text>
-            </Tooltip>
-            <span className="account-card__email-accessible" aria-hidden="true">{email}</span>
-            <Tooltip title="复制邮箱">
-              <Button
-                type="text"
-                size="small"
-                className="account-card__icon-button"
-                aria-label="复制邮箱"
-                icon={<CopyOutlined />}
-                onClick={() => onCopy(email)}
-              />
-            </Tooltip>
+      <div className="account-card__lead">
+        <header className="account-card__header">
+          <Checkbox
+            checked={selected}
+            disabled={remoteOnly}
+            aria-label={`选择 ${email}`}
+            onChange={(event) => onSelect(account?.id, event.target.checked)}
+          />
+          <div className="account-card__identity">
+            <div className="account-card__email-row">
+              <Tooltip title="复制邮箱">
+                <Text className="account-card__email" ellipsis={{ tooltip: false }}>{maskEmail(email)}</Text>
+              </Tooltip>
+              <span className="account-card__email-accessible" aria-hidden="true">{email}</span>
+              <Tooltip title="复制邮箱">
+                <Button
+                  type="text"
+                  size="small"
+                  className="account-card__icon-button"
+                  aria-label="复制邮箱"
+                  icon={<CopyOutlined />}
+                  onClick={() => onCopy(email)}
+                />
+              </Tooltip>
+            </div>
+            <div className="account-card__record-meta"><span>#{account?.id ?? '—'}</span><span>{remoteOnly ? '远端托管' : '本地账号'}</span></div>
+            <div className="account-card__tag-row">
+              <Tag color={displayStatus.color}>{displayStatus.label}</Tag>
+              {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
+            </div>
           </div>
-          <div className="account-card__tag-row">
-            <Tag color={displayStatus.color}>{displayStatus.label}</Tag>
-            {platform === 'chatgpt' ? <Tag color={plan.color}>{plan.label}</Tag> : null}
-          </div>
-        </div>
-        <div className="account-card__header-actions">{moreAction}</div>
-      </header>
-
-      <div className="account-card__identity-grid account-card__identity-grid--compact">
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><TeamOutlined />号池</span>
-          <Text ellipsis={{ tooltip: assignment.pool_name || assignment.pool_id || '未分配号池' }}>
-            {assignment.pool_name || assignment.pool_id || '未分配号池'}
-          </Text>
-        </div>
-        <div className="account-card__identity-item">
-          <span className="account-card__field-label"><LoginOutlined />登录方式</span>
-          <Text ellipsis={{ tooltip: provider }}>{provider}</Text>
-        </div>
-        <Tooltip title={Number(account?.id) <= 0 ? '请先刷新账号列表，完成同步入库后设置成本' : '点击设置购入成本'}>
-          <button
-            type="button"
-            className="account-card__identity-item account-card__cost-button"
-            aria-label={`设置 ${email} 的账号成本`}
-            disabled={!canEditCost}
-            onClick={(event) => { event.stopPropagation(); onEditCost?.(account) }}
-            onDoubleClick={(event) => event.stopPropagation()}
-          >
-            <span className="account-card__field-label"><DollarOutlined />账号成本</span>
-            <span className={`account-card__cost-value${purchaseCostLabel === '未设置' ? ' account-card__cost-value--empty' : ''}`}>{purchaseCostLabel}</span>
-          </button>
-        </Tooltip>
+          <div className="account-card__header-actions">{moreAction}</div>
+        </header>
       </div>
 
       {issue ? (
@@ -568,21 +541,6 @@ export function AccountCard({
           message={issue.message}
           action={<Button type="link" size="small" onClick={() => onOpenDetails(account)}>查看详情</Button>}
         />
-      ) : null}
-
-      {!remoteOnly ? (
-        <div className="account-card__credentials">
-          <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
-          <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
-        </div>
-      ) : null}
-
-      {note ? (
-        <div className="account-card__note">
-          <FileTextOutlined />
-          <span className="account-card__note-label">备注</span>
-          <Text ellipsis={{ tooltip: note }}>{note}</Text>
-        </div>
       ) : null}
 
       {platform === 'chatgpt' ? (
@@ -604,7 +562,7 @@ export function AccountCard({
               <Progress
                 percent={usagePercentDisplay}
                 showInfo={false}
-                strokeColor={usagePercentDisplay >= 80 ? '#f97373' : '#32c36c'}
+                strokeColor={usagePercentDisplay >= 80 ? 'var(--ant-color-warning, #d89614)' : 'var(--console-accent, #4f46e5)'}
                 trailColor="var(--account-card-progress-trail)"
                 size={{ height: 8 }}
               />
@@ -634,6 +592,41 @@ export function AccountCard({
         </section>
       )}
 
+      <div className="account-card__identity-grid account-card__identity-grid--compact">
+        <div className="account-card__identity-item">
+          <span className="account-card__field-label"><TeamOutlined />号池</span>
+          <Text ellipsis={{ tooltip: assignment.pool_name || assignment.pool_id || '未分配号池' }}>
+            {assignment.pool_name || assignment.pool_id || '未分配号池'}
+          </Text>
+        </div>
+        <div className="account-card__identity-item">
+          <span className="account-card__field-label"><LoginOutlined />登录方式</span>
+          <Text ellipsis={{ tooltip: provider }}>{provider}</Text>
+        </div>
+        <Tooltip title={Number(account?.id) <= 0 ? '请先刷新账号列表，完成同步入库后设置成本' : '点击设置购入成本'}>
+          <button
+            type="button"
+            className="account-card__identity-item account-card__cost-button"
+            aria-label={`设置 ${email} 的账号成本`}
+            disabled={!canEditCost}
+            onClick={(event) => { event.stopPropagation(); onEditCost?.(account) }}
+            onDoubleClick={(event) => event.stopPropagation()}
+          >
+            <span className="account-card__field-label"><DollarOutlined />账号成本</span>
+            <span className={`account-card__cost-value${purchaseCostLabel === '未设置' ? ' account-card__cost-value--empty' : ''}`}>{purchaseCostLabel}</span>
+          </button>
+        </Tooltip>
+      </div>
+
+      {note ? (
+        <div className="account-card__note">
+          <FileTextOutlined />
+          <span className="account-card__note-label">备注</span>
+          <Text ellipsis={{ tooltip: note }}>{note}</Text>
+        </div>
+      ) : null}
+
+
       <section className="account-card__commercial" aria-label="有效期与检查">
         <div className="account-card__commercial-row">
           <span><CalendarOutlined />有效期{validityDays !== null ? ` ${validityDays}天` : '至'}</span>
@@ -657,11 +650,28 @@ export function AccountCard({
         </div>
       </section>
 
-      <Divider className="account-card__divider" />
+      {credentialsOpen && !remoteOnly ? (
+        <div className="account-card__credentials" id={credentialsId} aria-label="账号登录凭据">
+          <SecretLine label="密码" value={password} onCopy={onCopy} icon={<KeyOutlined />} />
+          <SecretLine label="Refresh Token" value={refreshToken} onCopy={onCopy} icon={<SyncOutlined />} />
+        </div>
+      ) : null}
 
       <footer className="account-card__footer">
         <span className="account-card__created"><CalendarOutlined />{createdAt}</span>
-        <Space size={2} className="account-card__actions">
+        <Space size={2} className="account-card__actions" wrap>
+          {!remoteOnly && (password || refreshToken) ? (
+            <Button
+              aria-label="登录凭据"
+              aria-expanded={credentialsOpen}
+              aria-controls={credentialsId}
+              type="text"
+              size="small"
+              icon={<KeyOutlined />}
+              onClick={(event) => { event.stopPropagation(); setCredentialsOpen((open) => !open) }}
+              onDoubleClick={(event) => event.stopPropagation()}
+            >凭据</Button>
+          ) : null}
           {canPhoneVerification && onPhoneVerification ? (
             <Button aria-label="接码" type="text" size="small" icon={<LoginOutlined />} onClick={() => onPhoneVerification(account)}>
               接码

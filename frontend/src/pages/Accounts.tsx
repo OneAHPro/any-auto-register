@@ -42,16 +42,13 @@ import {
   ChatGPTPhoneVerificationModal,
   type ChatGPTPhoneVerificationAccount,
 } from '@/components/ChatGPTPhoneVerificationModal'
-import { ChatGPTRegistrationModeSwitch } from '@/components/ChatGPTRegistrationModeSwitch'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
 import { AccountCard } from '@/components/accounts/AccountCard'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import '@/components/accounts/account-workspace.css'
 import { AccountCostModal, type AccountCostAccount } from '@/components/accounts/AccountCostModal'
-import { usePersistentChatGPTRegistrationMode } from '@/hooks/usePersistentChatGPTRegistrationMode'
 import { canStartChatGPTPhoneVerification } from '@/lib/chatgptStagedLogin'
-import { parseBooleanConfigValue } from '@/lib/configValueParsers'
-import { buildChatGPTRegistrationRequestAdapter } from '@/lib/chatgptRegistrationRequestAdapter'
 import { apiFetch } from '@/lib/utils'
-import { normalizeExecutorForPlatform } from '@/lib/platformExecutorOptions'
 import {
   formatAutoReloginCountdown,
   type ChatGPTAutoReloginStatus,
@@ -815,7 +812,6 @@ export default function Accounts() {
   const [subscriptionPlan, setSubscriptionPlan] = useState('')
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
-  const [registerModalOpen, setRegisterModalOpen] = useState(false)
   const [addModalOpen, setAddModalOpen] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [codexImportModalOpen, setCodexImportModalOpen] = useState(false)
@@ -835,16 +831,11 @@ export default function Accounts() {
   const [phoneVerificationAccount, setPhoneVerificationAccount] =
     useState<ChatGPTPhoneVerificationAccount | null>(null)
 
-  const [registerForm] = Form.useForm()
   const [addForm] = Form.useForm()
   const [detailForm] = Form.useForm()
   const [assignmentForm] = Form.useForm()
-  const { mode: chatgptRegistrationMode, setMode: setChatgptRegistrationMode } =
-    usePersistentChatGPTRegistrationMode()
   const [importText, setImportText] = useState('')
   const [importLoading, setImportLoading] = useState(false)
-  const [taskId, setTaskId] = useState<string | null>(null)
-  const [registerLoading, setRegisterLoading] = useState(false)
   const [reloginTaskId, setReloginTaskId] = useState<string | null>(null)
   const [reloginTaskMode, setReloginTaskMode] = useState<'relogin' | 'mfa'>('relogin')
   const [reloginLoading, setReloginLoading] = useState(false)
@@ -1373,97 +1364,6 @@ export default function Accounts() {
     }
   }
 
-  const handleRegister = async () => {
-    const values = await registerForm.validateFields()
-    setRegisterLoading(true)
-    try {
-      const cfg = await apiFetch('/config')
-      const executorType = normalizeExecutorForPlatform(currentPlatform, cfg.default_executor)
-      const registerExtra = {
-        mail_provider: cfg.mail_provider || 'luckmail',
-        applemail_base_url: cfg.applemail_base_url,
-        applemail_pool_dir: cfg.applemail_pool_dir,
-        applemail_pool_file: cfg.applemail_pool_file,
-        applemail_mailboxes: cfg.applemail_mailboxes,
-        laoudo_auth: cfg.laoudo_auth,
-        laoudo_email: cfg.laoudo_email,
-        laoudo_account_id: cfg.laoudo_account_id,
-        gptmail_base_url: cfg.gptmail_base_url,
-        gptmail_api_key: cfg.gptmail_api_key,
-        gptmail_domain: cfg.gptmail_domain,
-        maliapi_base_url: cfg.maliapi_base_url,
-        maliapi_api_key: cfg.maliapi_api_key,
-        maliapi_domain: cfg.maliapi_domain,
-        maliapi_auto_domain_strategy: cfg.maliapi_auto_domain_strategy,
-        yescaptcha_key: cfg.yescaptcha_key,
-        moemail_api_url: cfg.moemail_api_url,
-        moemail_api_key: cfg.moemail_api_key,
-        skymail_api_base: cfg.skymail_api_base,
-        skymail_token: cfg.skymail_token,
-        skymail_domain: cfg.skymail_domain,
-        cloudmail_api_base: cfg.cloudmail_api_base,
-        cloudmail_admin_email: cfg.cloudmail_admin_email,
-        cloudmail_admin_password: cfg.cloudmail_admin_password,
-        cloudmail_domain: cfg.cloudmail_domain,
-        cloudmail_subdomain: cfg.cloudmail_subdomain,
-        cloudmail_timeout: cfg.cloudmail_timeout,
-        duckmail_address: cfg.duckmail_address,
-        duckmail_password: cfg.duckmail_password,
-        duckmail_api_url: cfg.duckmail_api_url,
-        duckmail_provider_url: cfg.duckmail_provider_url,
-        duckmail_bearer: cfg.duckmail_bearer,
-        freemail_api_url: cfg.freemail_api_url,
-        freemail_admin_token: cfg.freemail_admin_token,
-        freemail_username: cfg.freemail_username,
-        freemail_password: cfg.freemail_password,
-        freemail_domain: cfg.freemail_domain,
-        cfworker_api_url: cfg.cfworker_api_url,
-        cfworker_admin_token: cfg.cfworker_admin_token,
-        cfworker_custom_auth: cfg.cfworker_custom_auth,
-        cfworker_domain: cfg.cfworker_domain,
-        cfworker_subdomain: cfg.cfworker_subdomain,
-        cfworker_random_subdomain: parseBooleanConfigValue(cfg.cfworker_random_subdomain),
-        cfworker_random_name_subdomain: parseBooleanConfigValue(cfg.cfworker_random_name_subdomain),
-        cfworker_fingerprint: cfg.cfworker_fingerprint,
-        smstome_cookie: cfg.smstome_cookie,
-        smstome_country_slugs: cfg.smstome_country_slugs,
-        smstome_phone_attempts: cfg.smstome_phone_attempts,
-        smstome_otp_timeout_seconds: cfg.smstome_otp_timeout_seconds,
-        smstome_poll_interval_seconds: cfg.smstome_poll_interval_seconds,
-        smstome_sync_max_pages_per_country: cfg.smstome_sync_max_pages_per_country,
-        luckmail_base_url: cfg.luckmail_base_url,
-        luckmail_api_key: cfg.luckmail_api_key,
-        luckmail_email_type: cfg.luckmail_email_type,
-        luckmail_domain: cfg.luckmail_domain,
-      }
-      const chatgptRegistrationRequestAdapter =
-        buildChatGPTRegistrationRequestAdapter(
-          currentPlatform,
-          chatgptRegistrationMode,
-        )
-      const adaptedRegisterExtra = chatgptRegistrationRequestAdapter
-        ? chatgptRegistrationRequestAdapter.extendExtra(registerExtra)
-        : registerExtra
-
-      const res = await apiFetch('/tasks/register', {
-        method: 'POST',
-        body: JSON.stringify({
-          platform: currentPlatform,
-          count: values.count,
-          concurrency: values.concurrency,
-          register_delay_seconds: values.register_delay_seconds || 0,
-          executor_type: executorType,
-          captcha_solver: cfg.default_captcha_solver || 'yescaptcha',
-          proxy: null,
-          extra: adaptedRegisterExtra,
-        }),
-      })
-      setTaskId(res.task_id)
-    } finally {
-      setRegisterLoading(false)
-    }
-  }
-
   const handleCostSaved = (id: number, cost: string | null) => {
     const epoch = ++costSaveEpochRef.current
     savedAccountCostsRef.current.set(id, { epoch, cost })
@@ -1744,30 +1644,57 @@ export default function Accounts() {
   ]
 
   return (
-    <div>
-      <div className="accounts-toolbar" style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap', gap: 8 }}>
-        <Space className="accounts-toolbar__filters" wrap>
-          <Input.Search
-            placeholder="搜索邮箱..."
-            allowClear
-            onSearch={(v) => { setPage(1); setSearch(v) }}
-            style={{ width: 200 }}
-          />
-          <Select
-            placeholder="状态筛选"
-            allowClear
-            style={{ width: 120 }}
-            onChange={(v) => { setPage(1); setFilterStatus(v) }}
-            options={[
-              { value: 'registered', label: '已注册' },
-              { value: 'trial', label: '试用中' },
-              { value: 'subscribed', label: '已订阅' },
-              { value: 'expired', label: '已过期' },
-              { value: 'invalid', label: '已失效' },
-            ]}
-          />
-          {currentPlatform === 'chatgpt' && <Segmented aria-label="订阅计划" value={subscriptionPlan || 'all'} onChange={(value) => { setPage(1); setSubscriptionPlan(value === 'all' ? '' : String(value)) }} options={[{ value: 'all', label: '全部' }, { value: 'pro', label: 'Pro' }, { value: 'prolite', label: 'ProLite' }, { value: 'plus', label: 'Plus' }, { value: 'team', label: 'Team' }, { value: 'k12', label: 'K12' }, { value: 'free', label: 'Free' }]} /> }
-          <Text type="secondary">{total} 个账号</Text>
+    <div className="console-page accounts-workspace" style={cardThemeStyle}>
+      <ConsolePageHeader
+        title="账号池"
+        description="检查状态、额度与购入成本，按需补充账号或处理异常。"
+        actions={(
+          <Space wrap size={8}>
+            <Button href="/supply" aria-label="补充账号" type="primary" icon={<PlusOutlined />}>补充账号</Button>
+            <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void refreshAccounts() }}>刷新</Button>
+          </Space>
+        )}
+      />
+      {isChatgptPlatform && accountSummary ? (
+        <AccountOperationalSummaryView
+          summary={accountSummary}
+          activeFilter={operationalFilter}
+          onSelectFilter={(filter) => {
+            setPage(1)
+            setOperationalFilter(filter)
+          }}
+        />
+      ) : null}
+
+      <section className="console-panel accounts-toolbar" aria-label="账号筛选与批量操作">
+        <div className="console-toolbar accounts-toolbar__filter-row">
+          <Space className="accounts-toolbar__filters" wrap>
+            <Input.Search
+              aria-label="搜索账号邮箱"
+              placeholder="搜索邮箱..."
+              allowClear
+              onSearch={(v) => { setPage(1); setSearch(v) }}
+              className="accounts-toolbar__search"
+            />
+            <Select
+              aria-label="账号状态筛选"
+              placeholder="状态筛选"
+              allowClear
+              style={{ width: 120 }}
+              onChange={(v) => { setPage(1); setFilterStatus(v) }}
+              options={[
+                { value: 'registered', label: '已注册' },
+                { value: 'trial', label: '试用中' },
+                { value: 'subscribed', label: '已订阅' },
+                { value: 'expired', label: '已过期' },
+                { value: 'invalid', label: '已失效' },
+              ]}
+            />
+            {currentPlatform === 'chatgpt' && <Segmented aria-label="订阅计划" value={subscriptionPlan || 'all'} onChange={(value) => { setPage(1); setSubscriptionPlan(value === 'all' ? '' : String(value)) }} options={[{ value: 'all', label: '全部' }, { value: 'pro', label: 'Pro' }, { value: 'prolite', label: 'ProLite' }, { value: 'plus', label: 'Plus' }, { value: 'team', label: 'Team' }, { value: 'k12', label: 'K12' }, { value: 'free', label: 'Free' }]} /> }
+          </Space>
+        </div>
+        <div className="accounts-toolbar__automation">
+          <Text>{total} 个账号</Text>
           {currentPlatform === 'chatgpt' && (
             <Text type="secondary">
               下次执行：{formatAutoReloginCountdown(autoReloginStatus, autoReloginNow)}
@@ -1793,8 +1720,9 @@ export default function Accounts() {
           {selectedRowKeys.length > 0 && (
             <Text type="success">已选 {selectedRowKeys.length} 个</Text>
           )}
-        </Space>
-        <Space className="accounts-toolbar__actions" wrap>
+        </div>
+        <div className="accounts-toolbar__batch-heading"><span>账号操作</span><Text type="secondary">批量操作范围以所选账号或当前筛选为准</Text></div>
+        <Space className="console-toolbar accounts-toolbar__actions" wrap>
           {currentPlatform === 'chatgpt' && (
             <Button icon={<LoginOutlined />} onClick={() => setExistingAccountLoginModalOpen(true)}>
               登录
@@ -1932,10 +1860,8 @@ export default function Accounts() {
           )}
           <Button icon={<UploadOutlined />} onClick={() => setCodexImportModalOpen(true)}>导入</Button>
           <Button icon={<DownloadOutlined />} onClick={exportCsv} disabled={accounts.length === 0}>导出</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={() => setRegisterModalOpen(true)}>注册</Button>
-          <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void refreshAccounts() }} />
         </Space>
-      </div>
+      </section>
 
       {reloginStartError ? (
         <Alert
@@ -1950,17 +1876,7 @@ export default function Accounts() {
 
       {accountLoadError ? <Alert type="error" showIcon closable message={accountLoadError} style={{ marginBottom: 12 }} /> : null}
 
-      <div className="account-card-list-shell" style={cardThemeStyle} data-testid="account-card-list">
-        {isChatgptPlatform && accountSummary ? (
-          <AccountOperationalSummaryView
-            summary={accountSummary}
-            activeFilter={operationalFilter}
-            onSelectFilter={(filter) => {
-              setPage(1)
-              setOperationalFilter(filter)
-            }}
-          />
-        ) : null}
+      <div className="account-card-list-shell" data-testid="account-card-list">
         <div className="account-card-list-toolbar">
           <Checkbox
             checked={allVisibleSelected}
@@ -1970,7 +1886,10 @@ export default function Accounts() {
           >
             全选当前页
           </Checkbox>
-          <Text type="secondary">每个账号一张卡片，双击卡片可打开详情</Text>
+          <div className="accounts-list-context">
+            <Text type="secondary">当前页 {accounts.length} 条记录</Text>
+            {selectedRowKeys.length > 0 ? <Button type="link" size="small" onClick={() => setSelectedRowKeys([])}>清空选择</Button> : null}
+          </div>
         </div>
 
         {loading && accounts.length > 0 ? (
@@ -1988,41 +1907,34 @@ export default function Accounts() {
             ))}
           </div>
         ) : accounts.length > 0 ? (
-          <table className="account-card-list" aria-label="账号列表" data-testid="account-card-grid">
-            <thead className="account-card-list__head">
-              <tr>
-                <th className="ant-table-cell-fix-left" scope="col">邮箱</th>
-              </tr>
-            </thead>
-            <tbody>
-              {accounts.map((record) => (
-                <tr key={record.id}>
-                  <td>
-                    <AccountCard
-                      account={record}
-                      platform={currentPlatform}
-                      selected={selectedIdSet.has(String(record.id))}
-                      onSelect={handleCardSelection}
-                      onCopy={copyText}
-                      onOpenDetails={(account) => {
-                        setCurrentAccount(account)
-                        setDetailModalOpen(true)
-                      }}
-                      onDelete={handleDelete}
-                      onEditCost={setCostAccount}
-                      onPhoneVerification={setPhoneVerificationAccount}
-                      canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
-                      moreAction={platformActions.length && !record.remote_only
-                        ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
-                        : null}
-                    />
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+          <div className="accounts-records" role="list" aria-label="账号列表" data-testid="account-card-grid">
+            {accounts.map((record) => (
+              <div key={record.id} role="listitem" data-account-row>
+                <AccountCard
+                  account={record}
+                  platform={currentPlatform}
+                  selected={selectedIdSet.has(String(record.id))}
+                  onSelect={handleCardSelection}
+                  onCopy={copyText}
+                  onOpenDetails={(account) => {
+                    setCurrentAccount(account)
+                    setDetailModalOpen(true)
+                  }}
+                  onDelete={handleDelete}
+                  onEditCost={setCostAccount}
+                  onPhoneVerification={setPhoneVerificationAccount}
+                  canPhoneVerification={isChatgptPlatform && canStartChatGPTPhoneVerification(record)}
+                  moreAction={platformActions.length && !record.remote_only
+                    ? <ActionMenu acc={record} onRefresh={load} actions={platformActions} />
+                    : null}
+                />
+              </div>
+            ))}
+          </div>
         ) : (
-          <Empty description="暂无账号" image={Empty.PRESENTED_IMAGE_SIMPLE} />
+          <Empty description={search || filterStatus || subscriptionPlan || operationalFilter ? '没有符合筛选条件的账号' : '暂无账号'} image={Empty.PRESENTED_IMAGE_SIMPLE}>
+            <Button href="/supply">前往补充账号</Button>
+          </Empty>
         )}
 
         {accounts.length > 0 ? (
@@ -2077,44 +1989,6 @@ export default function Accounts() {
           />
         </Modal>
       ) : null}
-
-      <Modal
-        title={`注册 ${currentPlatform}`}
-        open={registerModalOpen}
-        onCancel={() => { setRegisterModalOpen(false); setTaskId(null); registerForm.resetFields(); }}
-        footer={null}
-        width={500}
-        maskClosable={false}
-      >
-        {!taskId ? (
-          <Form form={registerForm} layout="vertical" onFinish={handleRegister}>
-            <Form.Item name="count" label="注册数量" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} />
-            </Form.Item>
-            <Form.Item name="concurrency" label="并发数" initialValue={1} rules={[{ required: true }]}>
-              <Input type="number" min={1} />
-            </Form.Item>
-            <Form.Item name="register_delay_seconds" label="每个注册延迟(秒)" initialValue={0}>
-              <InputNumber min={0} precision={1} step={0.5} style={{ width: '100%' }} placeholder="0 = 不延迟" />
-            </Form.Item>
-            {currentPlatform === 'chatgpt' && (
-              <Form.Item label="ChatGPT Token 方案">
-                <ChatGPTRegistrationModeSwitch
-                  mode={chatgptRegistrationMode}
-                  onChange={setChatgptRegistrationMode}
-                />
-              </Form.Item>
-            )}
-            <Form.Item>
-              <Button type="primary" htmlType="submit" block loading={registerLoading}>
-                开始注册
-              </Button>
-            </Form.Item>
-          </Form>
-        ) : (
-          <TaskLogPanel taskId={taskId} onDone={() => { load(); }} />
-        )}
-      </Modal>
 
       <Modal
         title="手动新增账号"

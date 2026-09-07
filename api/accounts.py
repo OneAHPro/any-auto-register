@@ -1454,9 +1454,13 @@ def update_account(account_id: int, body: AccountUpdate,
     if body.cashier_url is not None:
         acc.cashier_url = body.cashier_url
     if "purchase_cost_cny" in body.model_fields_set:
-        acc.purchase_cost_cents = (
-            None if body.purchase_cost_cny is None else int(body.purchase_cost_cny * 100)
-        )
+        cost_cents = None if body.purchase_cost_cny is None else int(body.purchase_cost_cny * 100)
+        if acc.platform == "chatgpt":
+            from services.account_purchase_costs import update_account_purchase_cost
+
+            update_account_purchase_cost(session, acc, cost_cents)
+        else:
+            acc.purchase_cost_cents = cost_cents
     acc.updated_at = datetime.now(timezone.utc)
     session.add(acc)
     session.commit()

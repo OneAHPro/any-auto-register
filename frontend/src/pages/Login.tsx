@@ -1,8 +1,9 @@
-import { useState } from 'react'
-import { App, Card, ConfigProvider, Form, Input, Button, Typography } from 'antd'
-import { LockOutlined, SafetyCertificateOutlined, UserOutlined } from '@ant-design/icons'
+import { useEffect, useState } from 'react'
+import { App, ConfigProvider, Form, Input, Button } from 'antd'
+import { LockOutlined, SafetyCertificateOutlined, AppstoreOutlined } from '@ant-design/icons'
 import { setToken } from '@/lib/utils'
-import { darkTheme } from '@/theme'
+import { darkTheme, lightTheme } from '@/theme'
+import './operations-workspace.css'
 
 type Step = 'password' | '2fa'
 
@@ -29,8 +30,8 @@ function LoginContent() {
         setToken(data.access_token)
         window.location.href = '/'
       }
-    } catch (e: any) {
-      message.error(e.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '请求失败，请重试')
     } finally {
       setLoading(false)
     }
@@ -48,114 +49,48 @@ function LoginContent() {
       if (!res.ok) throw new Error(data.detail || '验证失败')
       setToken(data.access_token)
       window.location.href = '/'
-    } catch (e: any) {
-      message.error(e.message)
+    } catch (error) {
+      message.error(error instanceof Error ? error.message : '请求失败，请重试')
     } finally {
       setLoading(false)
     }
   }
 
-  const cardStyle: React.CSSProperties = {
-    width: 380,
-    boxShadow: '0 8px 32px rgba(0,0,0,0.18)',
-    borderRadius: 12,
-  }
-
-  const wrapStyle: React.CSSProperties = {
-    minHeight: '100vh',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    background: 'linear-gradient(135deg, #0f172a 0%, #1e293b 100%)',
-  }
-
-  if (step === '2fa') {
-    return (
-      <div style={wrapStyle}>
-        <Card
-          style={cardStyle}
-          title={
-            <div style={{ textAlign: 'center', padding: '8px 0' }}>
-              <SafetyCertificateOutlined style={{ fontSize: 28, color: '#6366f1', marginBottom: 8, display: 'block' }} />
-              <div style={{ fontSize: 18, fontWeight: 700 }}>双因素验证</div>
-              <Typography.Text type="secondary" style={{ fontSize: 13, fontWeight: 400 }}>
-                请输入验证器 App 中的 6 位验证码
-              </Typography.Text>
-            </div>
-          }
-        >
-          <Form layout="vertical" onFinish={handleTotp} requiredMark={false}>
-            <Form.Item
-              name="code"
-              label="验证码"
-              rules={[
-                { required: true, message: '请输入验证码' },
-                { len: 6, message: '验证码为 6 位数字' },
-              ]}
-            >
-              <Input
-                prefix={<SafetyCertificateOutlined />}
-                placeholder="000000"
-                size="large"
-                maxLength={6}
-                style={{ letterSpacing: 6, textAlign: 'center' }}
-              />
-            </Form.Item>
-            <Form.Item style={{ marginBottom: 0, marginTop: 8 }}>
-              <Button type="primary" htmlType="submit" block size="large" loading={loading}>
-                验证并登录
-              </Button>
-            </Form.Item>
-            <div style={{ textAlign: 'center', marginTop: 12 }}>
-              <Button type="link" size="small" onClick={() => setStep('password')}>
-                返回密码登录
-              </Button>
-            </div>
-          </Form>
-        </Card>
-      </div>
-    )
-  }
-
   return (
-    <div style={wrapStyle}>
-      <Card
-        style={cardStyle}
-        title={
-          <div style={{ textAlign: 'center', padding: '8px 0', background: 'transparent' }}>
-            <UserOutlined style={{ fontSize: 28, color: '#6366f1', marginBottom: 8, display: 'block' }} />
-            <div style={{ fontSize: 18, fontWeight: 700 }}>Account Manager</div>
-            <Typography.Text type="secondary" style={{ fontSize: 13, fontWeight: 400 }}>
-              请输入密码登录
-            </Typography.Text>
-          </div>
-        }
-      >
-        <Form layout="vertical" onFinish={handleLogin} requiredMark={false}>
-          <Form.Item
-            name="password"
-            label="密码"
-            rules={[{ required: true, message: '请输入密码' }]}
-          >
-            <Input.Password prefix={<LockOutlined />} placeholder="请输入访问密码" size="large" />
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0, marginTop: 8 }}>
-            <Button type="primary" htmlType="submit" block size="large" loading={loading}>
-              登录
-            </Button>
-          </Form.Item>
-        </Form>
-      </Card>
-    </div>
+    <main className="console-login">
+      <div className="console-login-workspace">
+        <div className="console-login-intro">
+          <div className="console-login-brand"><AppstoreOutlined /><span>Codex2API 运营中控台</span></div>
+          <p>管理已有账号，查看实例状态，跟进每一次补号与调度。</p>
+          <div className="console-login-scope"><span>账号池</span><span>实例管理</span><span>任务记录</span></div>
+        </div>
+        <section className="console-login-form" aria-labelledby="login-heading">
+          <header><h1 id="login-heading">{step === '2fa' ? '双因素验证' : '登录中控台'}</h1><p>{step === '2fa' ? '请输入验证器 App 中的 6 位验证码。' : '使用访问密码进入运营工作台。'}</p></header>
+          {step === '2fa' ? (
+            <Form key="totp" name="totp" layout="vertical" onFinish={handleTotp} requiredMark={false}>
+              <Form.Item name="code" label="验证码" rules={[{ required: true, message: '请输入验证码' }, { pattern: /^\d{6}$/, message: '验证码为 6 位数字' }]}>
+                <Input prefix={<SafetyCertificateOutlined />} placeholder="000000" maxLength={6} inputMode="numeric" autoComplete="one-time-code" autoFocus className="console-login-code" />
+              </Form.Item>
+              <Button type="primary" htmlType="submit" block loading={loading}>验证并登录</Button>
+              <Button type="link" className="console-login-back" onClick={() => { setStep('password'); setTempToken('') }}>返回密码登录</Button>
+            </Form>
+          ) : (
+            <Form key="password" name="password" layout="vertical" onFinish={handleLogin} requiredMark={false}>
+              <Form.Item name="password" label="密码" rules={[{ required: true, message: '请输入密码' }]}>
+                <Input.Password prefix={<LockOutlined />} placeholder="请输入访问密码" autoComplete="current-password" autoFocus />
+              </Form.Item>
+              <Button type="primary" htmlType="submit" block loading={loading}>登录</Button>
+            </Form>
+          )}
+          <p className="console-login-note"><LockOutlined />登录信息仅用于此中控台的访问验证</p>
+        </section>
+      </div>
+    </main>
   )
 }
 
 export default function Login() {
-  return (
-    <ConfigProvider theme={darkTheme}>
-      <App>
-        <LoginContent />
-      </App>
-    </ConfigProvider>
-  )
+  const [isLight] = useState(() => localStorage.getItem('theme') === 'light')
+  useEffect(() => { document.documentElement.classList.toggle('light', isLight) }, [isLight])
+  return <ConfigProvider theme={isLight ? lightTheme : darkTheme}><App><LoginContent /></App></ConfigProvider>
 }

@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Mapping
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlmodel import Session, select
 
 from core.db import (
@@ -43,11 +45,26 @@ class CodexImportRequest(BaseModel):
     target_id: int | None = None
     format: str = "txt"
     files: list[ImportFile] = Field(min_length=1, max_length=1000)
+    purchase_cost_cny: Decimal | None = None
+    purchase_batch_key: UUID | None = None
+
+    @field_validator("purchase_cost_cny", mode="before")
+    @classmethod
+    def validate_purchase_cost(cls, value):
+        from services.account_purchase_costs import validate_purchase_cost_cny
+        return validate_purchase_cost_cny(value)
+
+    @model_validator(mode="after")
+    def validate_purchase_batch(self):
+        if self.purchase_cost_cny is not None and self.purchase_batch_key is None:
+            raise ValueError("填写购号成本时需要批次请求标识")
+        return self
 
 
 @dataclass
 class _ImportJob:
     id: str
+    request_fingerprint: str = ""
     status: str = "queued"
     total: int = 0
     processed: int = 0
@@ -201,6 +218,8 @@ def _credential_identity(row: Mapping[str, Any]) -> str:
 
 
 def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -> None:
+    from services.account_purchase_costs import create_purchase_batch, bind_purchase_slot
+
     try:
         job.status = "running"
         files = {item.name: item.content for item in request.files}
@@ -215,6 +234,15 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
         with Session(database_engine) as session:
             pool = _ensure_pool(session, request.pool_id)
             target = _target_for_pool(session, str(pool.id), request.target_id)
+            purchase_batch = None
+            if request.purchase_cost_cny is not None:
+                purchase_batch = create_purchase_batch(
+                    session, int(request.purchase_cost_cny * 100), len(rows),
+                    "json_import", str(request.purchase_batch_key),
+                )
+                # The expense already happened: later target/credential failures
+                # must not roll it back or discard unprocessed paid slots.
+                session.commit()
             client = None
             if target is not None:
                 from services.codex2api_target_client import get_target_client
@@ -253,6 +281,9 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
                         # email; the stable ChatGPT account ID is authoritative.
                         existing = None
                 if existing is not None:
+                    if purchase_batch is not None:
+                        bind_purchase_slot(session, purchase_batch.id, index - 1, existing)
+                        session.commit()
                     job.duplicate += 1
                     job.processed += 1
                     item_result.update({"status": "duplicate", "email": email})
@@ -274,6 +305,8 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
                 session.add(account)
                 session.flush()
                 _identity_and_assignment(session, account, pool, target)
+                if purchase_batch is not None:
+                    bind_purchase_slot(session, purchase_batch.id, index - 1, account)
                 session.commit()
                 if client is not None:
                     payload = _credential_payload({**row, "email": email, "name": email})
@@ -370,8 +403,15 @@ def start_import(body: CodexImportRequest, session: Session = Depends(get_sessio
     ensure_default_pools(session.get_bind())
     pool = _ensure_pool(session, body.pool_id)
     _target_for_pool(session, str(pool.id), body.target_id)
-    job = _ImportJob(id=f"codex-import-{uuid4().hex}")
+    job_id = f"codex-import-{body.purchase_batch_key.hex}" if body.purchase_cost_cny is not None else f"codex-import-{uuid4().hex}"
+    fingerprint = hashlib.sha256(body.model_dump_json().encode()).hexdigest()
     with _LOCK:
+        existing = _JOBS.get(job_id)
+        if existing is not None:
+            if existing.request_fingerprint != fingerprint:
+                raise HTTPException(409, "购号请求标识已用于其他导入内容")
+            return {"job_id": existing.id, "status": existing.status}
+        job = _ImportJob(id=job_id, request_fingerprint=fingerprint)
         _JOBS[job.id] = job
     _EXECUTOR.submit(_import_job, job, body, session.get_bind())
     return {"job_id": job.id, "status": job.status}

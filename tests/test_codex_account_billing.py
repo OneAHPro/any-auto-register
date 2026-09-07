@@ -363,3 +363,145 @@ def test_billing_repeated_refresh_eventually_fetches_accounts_cancelled_in_earli
         clock[0] += 61
 
     assert sorted(requested) == list(range(1, 13))
+
+
+def test_usage_details_reuse_each_fresh_key_while_fetching_missing_keys(monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine("sqlite://")
+    clock = [100.0]
+    calls = []
+
+    def usage(remote_id):
+        calls.append(remote_id)
+        if remote_id == 9:
+            raise RuntimeError("private-upstream-error")
+        return {"total_account_billed": remote_id, "today": {"date": "2026-09-07", "account_billed": 0, "requests": 0}}
+
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(account_usage_all=usage))
+    first = module.fetch_account_usage_details(engine, [(1, 7)])
+    clock[0] = 130.0
+    second = module.fetch_account_usage_details(engine, [(1, 7), (1, 8), (1, 9)])
+    assert second[(1, 7)] == first[(1, 7)]
+    assert second[(1, 8)]["total_billed_usd"] == "8"
+    assert second[(1, 9)] is None
+    assert calls.count(7) == 1
+    assert calls.count(8) == 1
+
+    clock[0] = 159.9
+    module.fetch_account_usage_details(engine, [(1, 7), (1, 8)])
+    assert calls.count(7) == 1
+    clock[0] = 160.0
+    module.fetch_account_usage_details(engine, [(1, 7), (1, 8)])
+    assert calls.count(7) == 2
+    assert calls.count(8) == 1
+
+
+def test_usage_details_manual_refresh_keeps_fresh_fallback_and_marks_failed_reads(monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine("sqlite://")
+    clock = [100.0]
+    fail = [False]
+    calls = []
+
+    def usage(remote_id):
+        calls.append(remote_id)
+        if fail[0]:
+            raise RuntimeError("private-response")
+        return {"total_account_billed": 12.5}
+
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(account_usage_all=usage))
+    original = module.fetch_account_usage_details(engine, [(1, 7)])[(1, 7)]
+    fail[0] = True
+    clock[0] = 120.0
+    refreshed = module.fetch_account_usage_details(engine, [(1, 7), (1, 9)], refresh=True)
+    assert refreshed[(1, 7)] == {**original, "refresh_error": True}
+    assert refreshed[(1, 9)] is None
+    assert calls == [7, 7, 9]
+    # A failed forced read neither renews the original timestamp nor poisons it.
+    cached = module.fetch_account_usage_details(engine, [(1, 7)])[(1, 7)]
+    assert cached == original
+    clock[0] = 160.0
+    assert module.fetch_account_usage_details(engine, [(1, 7)])[(1, 7)] is None
+
+
+def test_usage_details_sanitize_daily_account_bills_and_return_independent_snapshots(monkeypatch):
+    import json
+    from services import codex_account_billing as module
+
+    engine = create_engine("sqlite://")
+    payload = {
+        "total_account_billed": "12.2500", "total_user_billed": 999999,
+        "email": "private-email", "token": "private-token",
+        "today": {"date": "2026-09-07", "account_billed": "1.2500", "user_billed": 9999, "requests": 3, "secret": "private-today"},
+        "history": [
+            {"date": "2026-09-06", "account_billed": 0, "user_billed": 88, "requests": 0, "secret": "private-history"},
+            {"date": "2026-02-30", "account_billed": 10, "requests": 3},
+            {"date": "2026-09-05", "account_billed": "NaN", "requests": True},
+            {"date": "2026-09-04", "user_billed": 88, "requests": -1},
+            "private-row",
+        ],
+    }
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(account_usage_all=lambda _: payload))
+    result = module.fetch_account_usage_details(engine, [(1, 7)])[(1, 7)]
+    assert result == {
+        "total_billed_usd": "12.2500", "today_date": "2026-09-07", "today_billed_usd": "1.2500", "today_requests": 3,
+        "fetched_at": result["fetched_at"],
+        "history": [
+            {"date": "2026-09-06", "account_billed": "0", "requests": 0},
+            {"date": "2026-09-05", "account_billed": None, "requests": None},
+            {"date": "2026-09-04", "account_billed": None, "requests": None},
+        ],
+    }
+    assert "private" not in json.dumps(result)
+    assert "user_billed" not in json.dumps(result)
+    result["history"][0]["account_billed"] = "100000"
+    cached = module.fetch_account_usage_details(engine, [(1, 7)])[(1, 7)]
+    assert cached["history"][0]["account_billed"] == "0"
+
+
+def test_usage_details_progressively_cover_accounts_across_multiple_deadlines(monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine("sqlite://")
+    clock = [100.0]
+    keys = [(1, remote_id) for remote_id in range(1, 13)]
+    requested = []
+    monkeypatch.setattr(module, "_FETCH_DEADLINE_SECONDS", 0.05)
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+
+    for round_index in range(3):
+        release = Event()
+        four_started = Event()
+        round_requests = []
+        guard = Lock()
+
+        def usage(remote_id):
+            with guard:
+                requested.append(remote_id)
+                round_requests.append(remote_id)
+                if len(round_requests) == 4:
+                    four_started.set()
+            assert release.wait(timeout=2)
+            return {"total_account_billed": remote_id, "today": {"date": "2026-09-07", "account_billed": 0, "requests": 0}}
+
+        monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(account_usage_all=usage))
+        with ThreadPoolExecutor(max_workers=4) as executor, ThreadPoolExecutor(max_workers=1) as callers:
+            monkeypatch.setattr(module, "_EXECUTOR", executor)
+            response = callers.submit(module.fetch_account_usage_details, engine, keys)
+            try:
+                assert four_started.wait(timeout=0.5)
+                result = response.result(timeout=0.5)
+                assert len(result) == 12
+                assert sum(value is not None for value in result.values()) == round_index * 4
+            finally:
+                release.set()
+        clock[0] += 15
+
+    result = module.fetch_account_usage_details(engine, keys)
+    assert all(value is not None for value in result.values())
+    assert sorted(requested) == list(range(1, 13))
+    assert all(value["today_date"] == "2026-09-07" for value in result.values())

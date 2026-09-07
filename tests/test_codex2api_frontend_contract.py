@@ -19,9 +19,9 @@ class Codex2APIFrontendContractTests(unittest.TestCase):
 
         settings_source = (ROOT / "frontend/src/pages/Settings.tsx").read_text()
         self.assertIn("key: 'codex2api'", settings_source)
-        self.assertIn("label: 'Codex2API'", settings_source)
+        self.assertIn("label: '连接与联动'", settings_source)
         self.assertLess(
-            settings_source.index("key: 'chatgpt'"),
+            settings_source.index("key: 'recovery'"),
             settings_source.index("key: 'codex2api'"),
         )
         self.assertIn(

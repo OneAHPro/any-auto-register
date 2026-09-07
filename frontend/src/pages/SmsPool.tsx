@@ -2,7 +2,6 @@ import { useCallback, useEffect, useState } from 'react'
 import {
   Alert,
   Button,
-  Card,
   Input,
   Select,
   Space,
@@ -21,6 +20,8 @@ import {
 
 import LeadBeeApiSettingsCard from '@/components/LeadBeeApiSettingsCard'
 import { apiFetch } from '@/lib/utils'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './management-workspace.css'
 
 
 const DEFAULT_SMS_BASE_URL = 'https://sms.leadbee.cn/smsbox'
@@ -191,37 +192,21 @@ export default function SmsPool() {
   ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <div
-        style={{
-          display: 'flex',
-          justifyContent: 'space-between',
-          alignItems: 'flex-start',
-          gap: 16,
-          flexWrap: 'wrap',
-        }}
-      >
-        <div>
-          <Typography.Title level={2} style={{ margin: 0, fontSize: 24 }}>
-            SMS接码
-          </Typography.Title>
-          <Typography.Paragraph type="secondary" style={{ margin: '4px 0 0' }}>
-            管理 LeadBee API 接码与备用卡密池，登录任务可按所选模式自动取号。
-          </Typography.Paragraph>
-        </div>
-        <Space wrap>
-          <Tag color="success" icon={<InboxOutlined />}>可用 {stats.unused}</Tag>
-          <Tag color="processing">使用中 {stats.reserved}</Tag>
-          <Tag color="warning">待回收 {stats.active}</Tag>
-          <Tag icon={<SafetyCertificateOutlined />}>已使用 {stats.used}</Tag>
-          <Tag>总计 {stats.total}</Tag>
-          <Button icon={<ReloadOutlined />} loading={loading} onClick={() => load()}>刷新</Button>
-        </Space>
+    <div className="console-page management-workspace management-sms">
+      <ConsolePageHeader title="SMS接码" description="为已有账号登录提供自动接码，并管理备用卡密。"
+        actions={<Button icon={<ReloadOutlined />} loading={loading} onClick={() => load()}>刷新</Button>} />
+      <div className="console-toolbar management-resource-summary">
+        <Tag color="success" icon={<InboxOutlined />}>可用 {stats.unused}</Tag>
+        <Tag color="processing">使用中 {stats.reserved}</Tag>
+        <Tag color="warning">待回收 {stats.active}</Tag>
+        <Tag icon={<SafetyCertificateOutlined />}>已使用 {stats.used}</Tag>
+        <Tag>总计 {stats.total}</Tag>
       </div>
-
+      <div className="management-sms-setup">
       <LeadBeeApiSettingsCard />
 
-      <Card title="导入接码卡密">
+      <section className="console-panel management-form-section" aria-labelledby="sms-import-heading">
+        <div className="console-section-heading"><h2 id="sms-import-heading">导入接码卡密</h2><span>作为登录任务的备用接码资源</span></div>
         <Space direction="vertical" size={12} style={{ width: '100%' }}>
           <Alert
             type="info"
@@ -252,11 +237,11 @@ export default function SmsPool() {
             导入卡密
           </Button>
         </Space>
-      </Card>
+      </section>
+      </div>
 
-      <Card
-        title="卡密列表"
-        extra={(
+      <section className="console-panel management-table-section" aria-labelledby="sms-list-heading">
+        <div className="console-section-heading"><h2 id="sms-list-heading">卡密列表</h2>
           <Select
             aria-label="状态筛选"
             value={status}
@@ -273,8 +258,7 @@ export default function SmsPool() {
               { value: 'used', label: '已使用' },
             ]}
           />
-        )}
-      >
+        </div>
         <Table
           rowKey="id"
           columns={columns}
@@ -291,7 +275,7 @@ export default function SmsPool() {
             onChange: setPage,
           }}
         />
-      </Card>
+      </section>
     </div>
   )
 }

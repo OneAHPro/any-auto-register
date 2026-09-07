@@ -210,7 +210,8 @@ describe('Settings ChatGPT automatic relogin config', () => {
 
     render(<Settings />)
 
-    const loadingStatus = screen.getByRole('status')
+    const loadingStatus = screen.getByText('正在加载配置…')
+    expect(loadingStatus.getAttribute('role')).toBe('status')
     expect(loadingStatus.textContent).toContain('正在加载配置')
     const saveButton = screen.getByRole('button', { name: /保存配置/ }) as HTMLButtonElement
     expect(saveButton.disabled).toBe(true)
@@ -317,13 +318,15 @@ describe('Settings ChatGPT automatic relogin config', () => {
     expect(screen.queryByText('注册设置')).toBeNull()
   })
 
-  it('keeps global settings tabs focused on global configuration', async () => {
+  it('keeps settings focused on existing-account operations', async () => {
     const user = userEvent.setup()
     render(<Settings />)
 
-    expect(await screen.findByText('注册设置')).toBeTruthy()
-    expect(screen.queryByText('Codex2API')).toBeNull()
-    await user.click(screen.getByText('邮箱服务'))
+    expect(await screen.findByRole('tab', { name: '恢复与通知' })).toBeTruthy()
+    for (const name of ['注册设置', 'ChatGPT', 'Grok', 'Kiro', '贡献', '插件', 'CLIProxyAPI']) {
+      expect(screen.queryByRole('tab', { name })).toBeNull()
+    }
+    await user.click(screen.getByRole('tab', { name: '邮箱取码' }))
     expect(screen.queryByRole('button', { name: '确认导入' })).toBeNull()
   })
 
@@ -332,11 +335,80 @@ describe('Settings ChatGPT automatic relogin config', () => {
     const user = userEvent.setup()
     render(<Settings />)
 
-    await user.click(await screen.findByText('ChatGPT'))
+    await user.click(await screen.findByRole('tab', { name: '恢复与通知' }))
 
     expect(screen.queryByText('LeadBee Open API')).toBeNull()
     expect(screen.queryByLabelText('LeadBee API Key')).toBeNull()
     expect(screen.queryByLabelText('LeadBee API Secret')).toBeNull()
     expect(screen.queryByLabelText('LeadBee 产品 ID')).toBeNull()
+  })
+
+  it('does not rewrite hidden integration values while saving visible settings', async () => {
+    configResponse = {
+      ...configResponse,
+      cpa_enabled: '1',
+      sub2api_enabled: '1',
+      contribution_enabled: '1',
+      custom_contribution_token: 'existing-hidden-value',
+      grok2api_url: 'https://existing.example.com',
+      cfworker_domain: 'existing.example.com',
+    }
+    const user = userEvent.setup()
+    render(<Settings />)
+    const saveButton = screen.getByRole('button', { name: /保存配置/ })
+    await waitFor(() => expect((saveButton as HTMLButtonElement).disabled).toBe(false))
+    await user.click(saveButton)
+    await waitFor(() => {
+      const call = vi.mocked(apiFetch).mock.calls.find(([path, options]) => path === '/config' && options?.method === 'PUT')
+      expect(call).toBeTruthy()
+      const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+      for (const key of ['cpa_enabled', 'sub2api_enabled', 'contribution_enabled', 'custom_contribution_token', 'grok2api_url', 'cfworker_domain']) {
+        expect(payload.data).not.toHaveProperty(key)
+      }
+    })
+  })
+
+  it('keeps the configured AppleMail fields reachable without a registered source selector', async () => {
+    configResponse = {
+      ...configResponse,
+      mail_provider: 'applemail',
+      applemail_pool_dir: 'purchased-mail',
+      applemail_pool_file: 'batch.json',
+    }
+    const user = userEvent.setup()
+    render(<Settings />)
+    await waitFor(() => expect((screen.getByRole('button', { name: /保存配置/ }) as HTMLButtonElement).disabled).toBe(false))
+    await user.click(screen.getByRole('tab', { name: '邮箱取码' }))
+    const directory = await screen.findByLabelText('邮箱池目录') as HTMLInputElement
+    expect(directory.value).toBe('purchased-mail')
+    expect((screen.getByLabelText('当前邮箱池文件（可选）') as HTMLInputElement).value).toBe('batch.json')
+    expect(screen.queryByLabelText('微软收信方式')).toBeNull()
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+    await waitFor(() => {
+      const call = vi.mocked(apiFetch).mock.calls.find(([path, options]) => path === '/config' && options?.method === 'PUT')
+      const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+      expect(payload.data).toMatchObject({ mail_provider: 'applemail', applemail_pool_dir: 'purchased-mail' })
+    })
+  })
+
+  it('saves edited SMTP values after their fields unmount on another settings tab', async () => {
+    const user = userEvent.setup()
+    render(<Settings />)
+    const host = await screen.findByLabelText('SMTP 服务器地址')
+    await waitFor(() => expect((host as HTMLInputElement).value).toBe('smtp.example.com'))
+    await user.clear(host)
+    await user.type(host, 'smtp.updated.example.com')
+    const port = screen.getByLabelText('SMTP 端口')
+    await user.clear(port)
+    await user.type(port, '465')
+    await user.click(screen.getByRole('tab', { name: '运行配置' }))
+    expect(screen.queryByLabelText('SMTP 服务器地址')).toBeNull()
+    await user.click(screen.getByRole('button', { name: /保存配置/ }))
+    await waitFor(() => {
+      const call = vi.mocked(apiFetch).mock.calls.find(([path, options]) => path === '/config' && options?.method === 'PUT')
+      const payload = JSON.parse(String(call?.[1]?.body || '{}'))
+      expect(payload.data).toMatchObject({ smtp_host: 'smtp.updated.example.com', smtp_port: 465 })
+      expect(payload.data).not.toHaveProperty('bark_enabled')
+    })
   })
 })

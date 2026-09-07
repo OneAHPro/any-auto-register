@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, Modal, QRCode, Switch, Alert } from 'antd'
+import { App, Card, Form, Input, Select, Button, message, Tabs, Space, Tag, Typography, QRCode, Switch, Alert } from 'antd'
 import {
   SaveOutlined,
   EyeOutlined,
@@ -17,6 +17,8 @@ import { parseBooleanConfigValue } from '@/lib/configValueParsers'
 import MailImportPanel from '@/components/settings/MailImportPanel'
 import ChatGPTAutoReloginSection from '@/components/settings/ChatGPTAutoReloginSection'
 import { apiFetch } from '@/lib/utils'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './management-workspace.css'
 
 function resolveEffectiveMailProvider(mailProvider: string, mailImportSource: string) {
   if (mailProvider !== 'mail_import') return mailProvider
@@ -64,41 +66,63 @@ const SELECT_FIELDS: Record<string, { label: string; value: string }[]> = {
     { label: '微软邮箱 - IMAP', value: 'ms_imap' },
     { label: '自建邮箱', value: 'self_built' },
   ],
-  cpa_cleanup_enabled: [
-    { label: '关闭', value: '0' },
-    { label: '开启', value: '1' },
-  ],
-  codex_proxy_upload_type: [
-    { label: 'AT（Access Token，推荐）', value: 'at' },
-    { label: 'RT（Refresh Token）', value: 'rt' },
-  ],
-  external_apps_update_mode: [
-    { label: 'latest semver tag（推荐）', value: 'tag' },
-    { label: '分支 HEAD', value: 'branch' },
-  ],
+
 }
 
 const TAB_ITEMS = [
+  { key: 'recovery', label: '恢复与通知', icon: <SyncOutlined />, sections: [] },
   {
-    key: 'register',
-    label: '注册设置',
+    key: 'codex2api',
+    label: '连接与联动',
     icon: <ApiOutlined />,
     sections: [
       {
-        title: '默认注册方式',
-        desc: '控制注册任务如何执行',
-        fields: [{ key: 'default_executor', label: '执行器类型', type: 'select' }],
+        title: '默认连接',
+        desc: '已有账号登录后使用的默认上传连接；多个实例在实例管理中维护',
+        fields: [
+          { key: 'codex2api_enabled', label: '启用自动上传', type: 'boolean' },
+          { key: 'codex2api_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:8080' },
+          { key: 'codex2api_admin_key', label: 'Admin Key', secret: true },
+        ],
+      },
+      {
+        title: '删除联动',
+        fields: [
+          {
+            key: 'codex2api_delete_on_account_remove_enabled',
+            label: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
+            type: 'boolean',
+            help: '自动清理、单个删除和批量删除均生效；远端删除失败时保留本地账号。',
+          },
+        ],
+      },
+      {
+        title: '账号池观测与计划',
+        desc: '定时采集目标健康度和额度，只生成预览计划；扩容、缩容均需在调度页人工确认。',
+        fields: [
+          {
+            key: 'codex2api_scheduler_enabled',
+            label: '启用额度采集与预览计划',
+            type: 'boolean',
+            help: '启用后不会自动迁移账号。',
+          },
+          { key: 'codex2api_scheduler_interval_minutes', label: '计划周期（分钟）', placeholder: '15' },
+          { key: 'codex2api_scheduler_min_lease_hours', label: '最小租约（小时）', placeholder: '6' },
+          { key: 'codex2api_scheduler_scale_up_threshold_usd', label: '扩容安全余量（美元）', placeholder: '0.00' },
+          { key: 'codex2api_scheduler_scale_down_utilization_percent', label: '缩容利用率阈值（%）', placeholder: '60' },
+          { key: 'codex2api_scheduler_quota_freshness_minutes', label: '额度有效期（分钟）', placeholder: '15' },
+        ],
       },
     ],
   },
   {
     key: 'mailbox',
-    label: '邮箱服务',
+    label: '邮箱取码',
     icon: <MailOutlined />,
     sections: [
       {
         title: '默认邮箱服务',
-        desc: '选择注册时使用的邮箱类型',
+        desc: '选择已有账号登录时的收件来源',
         fields: [
           { key: 'mail_provider', label: '邮箱服务', type: 'select' },
           { key: 'mailbox_otp_timeout_seconds', label: '邮箱验证码等待秒数', placeholder: '例如 60 / 90 / 120' },
@@ -126,7 +150,7 @@ const TAB_ITEMS = [
       },
       {
         title: 'MoeMail',
-        desc: '自动注册账号并生成临时邮箱',
+        desc: 'MoeMail 邮箱服务连接',
         fields: [
           { key: 'moemail_api_url', label: 'API URL', placeholder: 'https://sall.cc' },
           { key: 'moemail_api_key', label: 'API Key', secret: true },
@@ -242,206 +266,18 @@ const TAB_ITEMS = [
     ],
   },
   {
-    key: 'captcha',
-    label: '验证码',
-    icon: <SafetyOutlined />,
+    key: 'runtime', label: '运行配置', icon: <ApiOutlined />,
     sections: [
-      {
-        title: '验证码服务',
-        desc: '用于绕过注册页面的人机验证',
-        fields: [
-          { key: 'default_captcha_solver', label: '默认服务', type: 'select' },
-          { key: 'yescaptcha_key', label: 'YesCaptcha Key', secret: true },
-        ],
-      },
+      { title: '登录执行方式', desc: '选择已有账号登录使用的运行方式。', fields: [
+        { key: 'default_executor', label: '执行器类型', type: 'select' },
+      ] },
+      { title: '人机验证', desc: '登录流程遇到验证时使用的服务。', fields: [
+        { key: 'default_captcha_solver', label: '默认服务', type: 'select' },
+        { key: 'yescaptcha_key', label: 'YesCaptcha Key', secret: true },
+      ] },
     ],
   },
-  {
-    key: 'chatgpt',
-    label: 'ChatGPT',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: 'CPA 面板',
-        desc: '注册完成后自动上传到 CPA 管理平台',
-        fields: [
-          { key: 'cpa_enabled', label: '启用自动上传', type: 'boolean' },
-          { key: 'cpa_api_url', label: 'API URL', placeholder: 'https://your-cpa.example.com' },
-          { key: 'cpa_api_key', label: 'API Key', secret: true },
-        ],
-      },
-      {
-        title: 'Sub2API 面板',
-        desc: '注册完成后自动上传到 Sub2API 管理后台',
-        fields: [
-          { key: 'sub2api_enabled', label: '启用自动上传', type: 'boolean' },
-          { key: 'sub2api_api_url', label: 'API URL', placeholder: 'https://your-sub2api.example.com' },
-          { key: 'sub2api_api_key', label: 'API Key', secret: true },
-          { key: 'sub2api_group_ids', label: '分组 ID', placeholder: '多个分组用英文逗号分隔，例如 2,4,8' },
-        ],
-      },
-      {
-        title: 'CPA 自动维护',
-        desc: '定时删除 status=error 的凭证，剩余数量低于阈值时自动按现有配置补注册 ChatGPT',
-        fields: [
-          { key: 'cpa_cleanup_enabled', label: '自动维护', type: 'select' },
-          { key: 'cpa_cleanup_interval_minutes', label: '检查间隔（分钟）', placeholder: '60' },
-          { key: 'cpa_cleanup_threshold', label: '最低凭证阈值', placeholder: '5' },
-          { key: 'cpa_cleanup_concurrency', label: '补注册并发数', placeholder: '1' },
-          { key: 'cpa_cleanup_register_delay_seconds', label: '每个注册延迟（秒）', placeholder: '0' },
-        ],
-      },
-      {
-        title: 'Team Manager',
-        desc: '上传到自建 Team Manager 系统',
-        fields: [
-          { key: 'team_manager_url', label: 'API URL', placeholder: 'https://your-tm.example.com' },
-          { key: 'team_manager_key', label: 'API Key', secret: true },
-        ],
-      },
-      {
-        title: 'CodexProxy',
-        desc: '注册完成后自动上传到 CodexProxy 管理平台',
-        fields: [
-          { key: 'codex_proxy_url', label: 'API URL', placeholder: 'https://your-codex-proxy.example.com' },
-          { key: 'codex_proxy_key', label: 'Admin Key', secret: true },
-          { key: 'codex_proxy_upload_type', label: '上传类型' },
-        ],
-      },
-      {
-        title: 'SMSToMe 手机验证',
-        desc: 'ChatGPT add_phone 阶段自动取号并轮询短信验证码',
-        fields: [
-          { key: 'smstome_cookie', label: 'SMSToMe Cookie', secret: true },
-          { key: 'smstome_country_slugs', label: '国家列表', placeholder: 'united-kingdom,poland' },
-          { key: 'smstome_phone_attempts', label: '手机号尝试次数', placeholder: '3' },
-          { key: 'smstome_otp_timeout_seconds', label: '短信等待秒数', placeholder: '45' },
-          { key: 'smstome_poll_interval_seconds', label: '轮询间隔秒数', placeholder: '5' },
-          { key: 'smstome_sync_max_pages_per_country', label: '每国同步页数', placeholder: '5' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'codex2api',
-    label: 'Codex2API',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: '管理面板',
-        desc: '注册完成后自动上传到配置的 Codex2API 管理后台',
-        fields: [
-          { key: 'codex2api_enabled', label: '启用自动上传', type: 'boolean' },
-          { key: 'codex2api_api_url', label: 'API URL', placeholder: 'http://127.0.0.1:8080' },
-          { key: 'codex2api_admin_key', label: 'Admin Key', secret: true },
-        ],
-      },
-      {
-        title: '删除联动',
-        fields: [
-          {
-            key: 'codex2api_delete_on_account_remove_enabled',
-            label: '删除本地 ChatGPT 账号时，同步删除 Codex2API 认证',
-            type: 'boolean',
-            help: '自动清理、单个删除和批量删除均生效；远端删除失败时保留本地账号。',
-          },
-        ],
-      },
-      {
-        title: '账号池观测与计划',
-        desc: '定时采集目标健康度和额度，只生成预览计划；扩容、缩容均需在调度页人工确认。',
-        fields: [
-          {
-            key: 'codex2api_scheduler_enabled',
-            label: '启用额度采集与预览计划',
-            type: 'boolean',
-            help: '启用后不会自动迁移账号。',
-          },
-          { key: 'codex2api_scheduler_interval_minutes', label: '计划周期（分钟）', placeholder: '15' },
-          { key: 'codex2api_scheduler_min_lease_hours', label: '最小租约（小时）', placeholder: '6' },
-          { key: 'codex2api_scheduler_scale_up_threshold_usd', label: '扩容安全余量（美元）', placeholder: '0.00' },
-          { key: 'codex2api_scheduler_scale_down_utilization_percent', label: '缩容利用率阈值（%）', placeholder: '60' },
-          { key: 'codex2api_scheduler_quota_freshness_minutes', label: '额度有效期（分钟）', placeholder: '15' },
-          { key: 'account_monthly_rent_cny', label: '账号月租（元）', placeholder: '1080.00' },
-          { key: 'customer_price_per_usd', label: '客户每美元用量单价（元）', placeholder: '0.20' },
-          { key: 'bandwidth_price_per_mbps_cny', label: '带宽单价（元/Mbps）', placeholder: '30.00' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'cliproxyapi',
-    label: 'CLIProxyAPI',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: '管理面板',
-        desc: '用于 CLIProxyAPI 管理页登录',
-        fields: [
-          { key: 'cliproxyapi_base_url', label: 'API URL', placeholder: 'http://127.0.0.1:8317' },
-          { key: 'cliproxyapi_management_key', label: '管理口令', secret: true, placeholder: '默认 cliproxyapi' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'grok',
-    label: 'Grok',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: 'grok2api',
-        desc: '注册成功后自动导入到 grok2api 管理后台',
-        fields: [
-          { key: 'grok2api_url', label: 'API URL', placeholder: 'http://127.0.0.1:7860' },
-          { key: 'grok2api_app_key', label: 'App Key', secret: true },
-          { key: 'grok2api_pool', label: 'Token Pool', placeholder: 'ssoBasic 或 ssoSuper' },
-          { key: 'grok2api_quota', label: 'Quota（可选）', placeholder: '留空按池默认值' },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'kiro',
-    label: 'Kiro',
-    icon: <ApiOutlined />,
-    sections: [
-      {
-        title: 'Kiro Account Manager',
-        desc: '注册成功后自动写入 kiro-account-manager 的 accounts.json',
-        fields: [
-          {
-            key: 'kiro_manager_path',
-            label: 'accounts.json 路径（可选）',
-            placeholder: '留空则自动使用系统默认路径',
-          },
-          {
-            key: 'kiro_manager_exe',
-            label: 'Kiro Manager 可执行文件（可选）',
-            placeholder: '未安装 Rust 时可填写已安装的 KiroAccountManager.exe',
-          },
-        ],
-      },
-    ],
-  },
-  {
-    key: 'contribution',
-    label: '贡献',
-    icon: <PlusOutlined />,
-    sections: [],
-  },
-  {
-    key: 'integrations',
-    label: '插件',
-    icon: <ApiOutlined />,
-    sections: [],
-  },
-  {
-    key: 'security',
-    label: '安全',
-    icon: <LockOutlined />,
-    sections: [],
-  },
+  { key: 'security', label: '登录保护', icon: <SafetyOutlined />, sections: [] },
 ]
 
 interface FieldConfig {
@@ -519,15 +355,6 @@ function splitMailboxSections(sections: SectionConfig[], mailProvider: string) {
   }
 }
 
-function formatResultText(data: unknown) {
-  if (typeof data === 'string') return data
-  try {
-    return JSON.stringify(data, null, 2)
-  } catch {
-    return String(data)
-  }
-}
-
 function normalizeDomainList(input: unknown): string[] {
   const items = Array.isArray(input) ? input : []
   const seen = new Set<string>()
@@ -565,12 +392,6 @@ function parseStoredDomainList(value: unknown): string[] {
   )
 }
 
-function resolveFeatureEnabledConfig(value: unknown, fallbackEnabled: boolean): boolean {
-  const normalized = String(value ?? '').trim()
-  if (!normalized) return fallbackEnabled
-  return parseBooleanConfigValue(normalized)
-}
-
 function normalizeBoundedInteger(value: unknown, fallback: number, min: number, max: number): number {
   const normalized = String(value ?? '').trim()
   if (!normalized) return fallback
@@ -604,55 +425,9 @@ function errorDetail(error: unknown, fallback: string): string {
   return fallback
 }
 
-const CONTRIBUTION_REDEEM_OPTIONS = [10, 100, 1000]
-
 function asRecord(value: unknown): Record<string, unknown> | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null
   return value as Record<string, unknown>
-}
-
-function pickRecord(value: Record<string, unknown> | null, keys: string[]): Record<string, unknown> | null {
-  if (!value) return null
-  for (const key of keys) {
-    const record = asRecord(value[key])
-    if (record) return record
-  }
-  return null
-}
-
-function pickString(value: Record<string, unknown> | null, keys: string[]): string {
-  if (!value) return ''
-  for (const key of keys) {
-    const text = String(value[key] ?? '').trim()
-    if (text) return text
-  }
-  return ''
-}
-
-function pickNumber(value: Record<string, unknown> | null, keys: string[]): number | null {
-  if (!value) return null
-  for (const key of keys) {
-    const raw = value[key]
-    if (typeof raw === 'number' && Number.isFinite(raw)) return raw
-    if (typeof raw === 'string') {
-      const parsed = Number.parseFloat(raw)
-      if (Number.isFinite(parsed)) return parsed
-    }
-  }
-  return null
-}
-
-function formatDisplayNumber(value: number | null, digits = 0): string {
-  if (value === null || !Number.isFinite(value)) return '-'
-  return value.toLocaleString('zh-CN', {
-    minimumFractionDigits: digits,
-    maximumFractionDigits: digits,
-  })
-}
-
-function formatDisplayPercent(value: number | null): string {
-  if (value === null || !Number.isFinite(value)) return '-'
-  return `${value.toFixed(2)}%`
 }
 
 function ConfigField({ field }: { field: FieldConfig }) {
@@ -661,7 +436,7 @@ function ConfigField({ field }: { field: FieldConfig }) {
   const isBooleanField = field.type === 'boolean'
   const helpText = field.help || (
     field.key === 'default_executor'
-      ? '仅对支持的平台生效；ChatGPT、Cursor、Grok、Kiro、Tavily 支持浏览器模式，OpenBlockLabs 仅支持纯协议。'
+      ? '用于已有 ChatGPT 账号登录。协议模式适合常规批量任务，浏览器模式用于需要交互的登录。'
       : field.key === 'email_domain_rule_enabled'
       ? '仅 CF Worker 生效：开启后会校验域名级数，以及域名至少包含 2 个字母和 2 个数字。'
       : field.key === 'email_domain_level_count'
@@ -698,11 +473,10 @@ function ConfigField({ field }: { field: FieldConfig }) {
 
 function ConfigSection({ section }: { section: SectionConfig }) {
   return (
-    <Card title={section.title} extra={section.desc && <span style={{ fontSize: 12, color: '#7a8ba3' }}>{section.desc}</span>} style={{ marginBottom: 16 }}>
-      {section.fields.map((field) => (
-        <ConfigField key={field.key} field={field} />
-      ))}
-    </Card>
+    <section className="console-panel management-setting-section">
+      <div className="management-setting-intro"><h2>{section.title}</h2>{section.desc && <p>{section.desc}</p>}</div>
+      <div className="management-setting-fields">{section.fields.map((field) => <ConfigField key={field.key} field={field} />)}</div>
+    </section>
   )
 }
 
@@ -727,7 +501,7 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
   return (
     <Card
       title="CF Worker 域名池"
-      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>注册时会从已启用域名中随机选择一个</span>}
+      extra={<span style={{ fontSize: 12, color: '#7a8ba3' }}>维护当前邮箱服务使用的域名范围</span>}
       style={{ marginBottom: 16 }}
     >
       <Form.List name="cfworker_domains">
@@ -829,7 +603,7 @@ function CFWorkerDomainPoolSection({ form }: { form: any }) {
         )}
       </div>
       <Typography.Text type="secondary" style={{ display: 'block', marginTop: 12 }}>
-        仅已启用域名会参与注册；点击已启用标签可直接移除。
+        点击已启用标签可将域名移出当前范围。
       </Typography.Text>
     </Card>
   )
@@ -887,689 +661,6 @@ function SolverStatus() {
         </Button>
       </div>
     </Card>
-  )
-}
-
-function IntegrationsPanel() {
-  const [items, setItems] = useState<any[]>([])
-  const [loading, setLoading] = useState(false)
-  const [busy, setBusy] = useState('')
-  const [updateMode, setUpdateMode] = useState<'tag' | 'branch'>('tag')
-  const [resultModal, setResultModal] = useState({
-    open: false,
-    title: '',
-    ok: true,
-    content: '',
-  })
-
-  const showResultModal = (title: string, data: unknown, ok = true) => {
-    setResultModal({
-      open: true,
-      title,
-      ok,
-      content: formatResultText(data),
-    })
-  }
-
-  const load = async () => {
-    setLoading(true)
-    try {
-      const [d, cfg] = await Promise.all([
-        apiFetch('/integrations/services'),
-        apiFetch('/config'),
-      ])
-      setItems(d.items || [])
-      const mode = String(cfg?.external_apps_update_mode || 'tag').trim().toLowerCase()
-      setUpdateMode(mode === 'branch' ? 'branch' : 'tag')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  useEffect(() => {
-    load()
-    const timer = window.setInterval(load, 5000)
-    return () => window.clearInterval(timer)
-  }, [])
-
-  const doAction = async (key: string, request: Promise<any>) => {
-    setBusy(key)
-    try {
-      const result = await request
-      await load()
-      message.success('操作完成')
-      showResultModal('操作结果', result, true)
-    } catch (e: any) {
-      message.error(e?.message || '操作失败')
-      showResultModal('操作结果', e?.message || e || '操作失败', false)
-      await load()
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const backfill = async (platforms: string[], label: string, busyKey: string) => {
-    setBusy(busyKey)
-    try {
-      const d = await apiFetch('/integrations/backfill', {
-        method: 'POST',
-        body: JSON.stringify({ platforms }),
-      })
-      message.success(`${label} 回填完成：成功 ${d.success} / ${d.total}`)
-      showResultModal(`${label} 回填结果`, d, true)
-    } catch (e: any) {
-      message.error(e?.message || `${label} 回填失败`)
-      showResultModal(`${label} 回填结果`, e?.message || e || `${label} 回填失败`, false)
-    } finally {
-      setBusy('')
-    }
-  }
-
-  const updateInstallMode = async (nextMode: 'tag' | 'branch') => {
-    setBusy('update-mode')
-    try {
-      await apiFetch('/config', {
-        method: 'PUT',
-        body: JSON.stringify({ data: { external_apps_update_mode: nextMode } }),
-      })
-      setUpdateMode(nextMode)
-      message.success(nextMode === 'tag' ? '已切换到 tag 模式' : '已切换到分支模式')
-    } catch (e: any) {
-      message.error(e?.message || '切换失败')
-    } finally {
-      setBusy('')
-    }
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Modal
-        open={resultModal.open}
-        title={resultModal.title}
-        onCancel={() => setResultModal((v) => ({ ...v, open: false }))}
-        onOk={() => setResultModal((v) => ({ ...v, open: false }))}
-        okText="确定"
-        cancelText="取消"
-        width={760}
-      >
-        <Typography.Paragraph style={{ marginBottom: 8, color: resultModal.ok ? '#10b981' : '#ef4444' }}>
-          {resultModal.ok ? '操作已完成。' : '操作失败。'}
-        </Typography.Paragraph>
-        <pre
-          style={{
-            margin: 0,
-            maxHeight: 420,
-            overflow: 'auto',
-            padding: 12,
-            borderRadius: 8,
-            background: 'rgba(127,127,127,0.08)',
-            fontSize: 12,
-            lineHeight: 1.5,
-            whiteSpace: 'pre-wrap',
-            wordBreak: 'break-word',
-          }}
-        >
-          {resultModal.content}
-        </pre>
-      </Modal>
-
-      <Card title="安装/更新策略">
-        <Space wrap align="center">
-          <Select
-            style={{ width: 320 }}
-            value={updateMode}
-            options={SELECT_FIELDS.external_apps_update_mode}
-            onChange={(value) => setUpdateMode(value as 'tag' | 'branch')}
-          />
-          <Button
-            type="primary"
-            loading={busy === 'update-mode'}
-            onClick={() => updateInstallMode(updateMode)}
-          >
-            保存策略
-          </Button>
-        </Space>
-      </Card>
-
-      <Card title="批量操作">
-        <Space wrap>
-          <Button loading={busy === 'start-all'} onClick={() => doAction('start-all', apiFetch('/integrations/services/start-all', { method: 'POST' }))}>
-            启动全部（已安装）
-          </Button>
-          <Button loading={busy === 'stop-all'} onClick={() => doAction('stop-all', apiFetch('/integrations/services/stop-all', { method: 'POST' }))}>
-            停止全部
-          </Button>
-          <Button loading={loading} onClick={load}>
-            刷新状态
-          </Button>
-        </Space>
-      </Card>
-
-      {items.map((item) => (
-        <Card key={item.name} title={item.label}>
-          <Space direction="vertical" style={{ width: '100%' }}>
-            <div>
-              状态：
-              <Tag color={item.running ? 'green' : 'default'} style={{ marginLeft: 8 }}>
-                {item.running ? '运行中' : '未运行'}
-              </Tag>
-              <Tag color={item.repo_exists ? 'blue' : 'orange'} style={{ marginLeft: 8 }}>
-                {item.repo_exists ? '已安装' : '未安装'}
-              </Tag>
-              {item.pid ? <span style={{ marginLeft: 8 }}>PID: {item.pid}</span> : null}
-            </div>
-            <div>插件目录：<Typography.Text copyable>{item.repo_path}</Typography.Text></div>
-            {item.url ? <div>地址：<Typography.Text copyable>{item.url}</Typography.Text></div> : null}
-            {item.management_url ? <div>管理页：<Typography.Text copyable>{item.management_url}</Typography.Text></div> : null}
-            {item.management_key ? <div>登录口令：<Typography.Text copyable>{item.management_key}</Typography.Text></div> : null}
-            <div>日志：<Typography.Text copyable>{item.log_path}</Typography.Text></div>
-            {item.last_error ? <div style={{ color: '#ef4444' }}>最近错误：{item.last_error}</div> : null}
-            <Space wrap>
-              {item.management_url ? (
-                <Button onClick={() => window.open(item.management_url, '_blank')}>
-                  打开管理页
-                </Button>
-              ) : null}
-              {!item.repo_exists ? (
-                <Button
-                  type="primary"
-                  loading={busy === `install-${item.name}`}
-                  onClick={() => doAction(`install-${item.name}`, apiFetch(`/integrations/services/${item.name}/install`, { method: 'POST' }))}
-                >
-                  安装最新版
-                </Button>
-              ) : (
-                <Button
-                  loading={busy === `install-${item.name}`}
-                  onClick={() => doAction(`install-${item.name}`, apiFetch(`/integrations/services/${item.name}/install`, { method: 'POST' }))}
-                >
-                  更新到最新版
-                </Button>
-              )}
-              <Button
-                loading={busy === `start-${item.name}`}
-                disabled={!item.repo_exists}
-                onClick={() => doAction(`start-${item.name}`, apiFetch(`/integrations/services/${item.name}/start`, { method: 'POST' }))}
-              >
-                启动
-              </Button>
-              <Button
-                loading={busy === `stop-${item.name}`}
-                onClick={() => doAction(`stop-${item.name}`, apiFetch(`/integrations/services/${item.name}/stop`, { method: 'POST' }))}
-              >
-                停止
-              </Button>
-              <Button
-                danger
-                loading={busy === `uninstall-${item.name}`}
-                disabled={!item.repo_exists}
-                onClick={() => {
-                  const ok = window.confirm(`确认卸载 ${item.label}？\n会停止服务并删除本地插件目录。`)
-                  if (!ok) return
-                  doAction(
-                    `uninstall-${item.name}`,
-                    apiFetch(`/integrations/services/${item.name}/uninstall`, { method: 'POST' }),
-                  )
-                }}
-              >
-                卸载
-              </Button>
-              {item.name === 'grok2api' ? (
-                <Button
-                  loading={busy === 'backfill-grok'}
-                  onClick={() => backfill(['grok'], 'Grok', 'backfill-grok')}
-                >
-                  回填现有 Grok 账号
-                </Button>
-              ) : null}
-              {item.name === 'kiro-manager' ? (
-                <Button
-                  loading={busy === 'backfill-kiro'}
-                  onClick={() => backfill(['kiro'], 'Kiro', 'backfill-kiro')}
-                >
-                  回填现有 Kiro 账号
-                </Button>
-              ) : null}
-            </Space>
-          </Space>
-        </Card>
-      ))}
-    </div>
-  )
-}
-
-function ContributionPanel({
-  form,
-  onSave,
-  saving,
-  saved,
-  saveDisabled,
-}: {
-  form: any
-  onSave: () => Promise<void>
-  saving: boolean
-  saved: boolean
-  saveDisabled: boolean
-}) {
-  const [loadingStats, setLoadingStats] = useState(false)
-  const [redeeming, setRedeeming] = useState(false)
-  const [creatingKey, setCreatingKey] = useState(false)
-  const [redeemAmount, setRedeemAmount] = useState<number>(CONTRIBUTION_REDEEM_OPTIONS[0])
-  const [statsResponse, setStatsResponse] = useState<Record<string, unknown> | null>(null)
-  const [redeemResponse, setRedeemResponse] = useState<Record<string, unknown> | null>(null)
-  const [statsError, setStatsError] = useState('')
-  const [bindingCustom, setBindingCustom] = useState(false)
-  const [customEmail, setCustomEmail] = useState('')
-  const [customStatsResponse, setCustomStatsResponse] = useState<Record<string, unknown> | null>(null)
-  const [customBalanceResponse, setCustomBalanceResponse] = useState<Record<string, unknown> | null>(null)
-  const [loadingCustomStats, setLoadingCustomStats] = useState(false)
-
-  const contributionEnabled = Form.useWatch('contribution_enabled', form)
-  const contributionMode = String(Form.useWatch('contribution_mode', form) || 'codex').trim()
-  const contributionServerUrl = String(Form.useWatch('contribution_server_url', form) || '').trim()
-  const contributionKey = String(Form.useWatch('contribution_key', form) || '').trim()
-  const customContributionUrl = String(Form.useWatch('custom_contribution_url', form) || '').trim()
-  const customContributionToken = String(Form.useWatch('custom_contribution_token', form) || '').trim()
-
-  const isCustomMode = contributionMode === 'custom'
-
-  const rawData = asRecord(statsResponse?.['data'])
-  const serverInfo = pickRecord(rawData, ['server_info', 'server', 'server_stats', 'stats']) || rawData
-  const keyInfo = pickRecord(rawData, ['key_info', 'keyInfo', 'public_key_info', 'quota']) || rawData
-
-  const keyFromStats = pickString(keyInfo, ['key', 'public_key', 'api_key']) || contributionKey
-  const keyBalance =
-    pickNumber(keyInfo, ['balance_usd', 'balance', 'current_balance', 'remaining_balance_usd']) ??
-    pickNumber(rawData, ['balance_usd', 'balance', 'current_balance'])
-  const keySource = pickString(keyInfo, ['source', 'key_source', 'origin']) || '-'
-  const boundAccounts =
-    pickNumber(keyInfo, ['bound_account_count', 'bind_account_count', 'bound_accounts', 'account_count']) ??
-    (Array.isArray(keyInfo?.['accounts']) ? keyInfo['accounts'].length : null)
-  const settlementAmount =
-    pickNumber(keyInfo, ['settlement_amount_usd', 'settlement_amount', 'settled_amount_usd']) ??
-    pickNumber(rawData, ['settlement_amount_usd', 'settlement_amount'])
-  const serverQuotaAccountCount = pickNumber(serverInfo, ['quota_account_count'])
-  const serverQuotaTotal = pickNumber(serverInfo, ['quota_total'])
-  const serverQuotaUsed = pickNumber(serverInfo, ['quota_used'])
-  const serverQuotaRemaining = pickNumber(serverInfo, ['quota_remaining'])
-  const serverQuotaUsedPercent = pickNumber(serverInfo, ['quota_used_percent'])
-  const serverQuotaRemainingPercent = pickNumber(serverInfo, ['quota_remaining_percent'])
-  const serverQuotaRemainingAccounts = pickNumber(serverInfo, ['quota_remaining_accounts'])
-  const redeemData = asRecord(redeemResponse?.['data']) || asRecord(redeemResponse)
-  const redeemCode = pickString(redeemData, ['code', 'redeem_code', 'voucher_code'])
-  const redeemedAmountUSD = pickNumber(redeemData, ['redeemed_amount_usd', 'redeemed_amount', 'amount_usd'])
-  const redeemSuccessText =
-    redeemResponse
-      ? `提现成功！额度：${redeemedAmountUSD !== null ? formatDisplayNumber(redeemedAmountUSD, 2) : '-'} 兑换码：${redeemCode || '-'}`
-      : ''
-
-  const fetchStats = async (silent = false, keyOverride?: string) => {
-    if (!contributionEnabled) {
-      if (!silent) message.warning('请先开启贡献功能')
-      return
-    }
-    if (!contributionServerUrl) {
-      if (!silent) message.error('请先填写服务器地址')
-      return
-    }
-
-    setLoadingStats(true)
-    setStatsError('')
-    try {
-      const data = await apiFetch('/contribution/quota-stats', {
-        method: 'POST',
-        body: JSON.stringify({
-          server_url: contributionServerUrl,
-          key: keyOverride ?? contributionKey,
-        }),
-      })
-      setStatsResponse(asRecord(data))
-      if (!silent) {
-        message.success('额度信息已刷新')
-      }
-    } catch (e: any) {
-      const detail = String(e?.message || '获取额度信息失败')
-      setStatsError(detail)
-      if (!silent) {
-        message.error(detail)
-      }
-    } finally {
-      setLoadingStats(false)
-    }
-  }
-
-  const doRedeem = async () => {
-    if (!contributionEnabled) {
-      message.warning('请先开启贡献功能')
-      return
-    }
-    if (!contributionServerUrl) {
-      message.error('请先填写服务器地址')
-      return
-    }
-    if (!contributionKey) {
-      message.error('请先填写 API Key')
-      return
-    }
-
-    const confirmed = window.confirm(`确认提现吗？\n将按 ${redeemAmount} 发起提现请求`)
-    if (!confirmed) return
-
-    setRedeeming(true)
-    try {
-      const data = await apiFetch('/contribution/redeem', {
-        method: 'POST',
-        body: JSON.stringify({
-          server_url: contributionServerUrl,
-          key: contributionKey,
-          amount_usd: redeemAmount,
-        }),
-      })
-      const result = asRecord(data)
-      const payload = asRecord(result?.['data']) || result
-      const code = pickString(payload, ['code', 'redeem_code', 'voucher_code'])
-      const amount = pickNumber(payload, ['redeemed_amount_usd', 'redeemed_amount', 'amount_usd'])
-      setRedeemResponse(result)
-      if (amount !== null || code) {
-        message.success(`提现成功！额度：${amount !== null ? formatDisplayNumber(amount, 2) : '-'} 兑换码：${code || '-'}`)
-      } else {
-        message.success('提现成功')
-      }
-      await fetchStats(true)
-    } catch (e: any) {
-      const detail = String(e?.message || '提现失败')
-      setRedeemResponse({ ok: false, error: detail })
-      message.error(detail)
-    } finally {
-      setRedeeming(false)
-    }
-  }
-
-  const doGenerateKey = async () => {
-    if (!contributionServerUrl) {
-      message.error('请先填写服务器地址')
-      return
-    }
-    setCreatingKey(true)
-    try {
-      const result = await apiFetch('/contribution/generate-key', {
-        method: 'POST',
-        body: JSON.stringify({
-          server_url: contributionServerUrl,
-        }),
-      })
-      const payload = asRecord(asRecord(result)?.data)
-      const generated = pickString(payload, ['key', 'api_key', 'public_key'])
-      if (!generated) {
-        throw new Error('服务端未返回可用 key')
-      }
-      form.setFieldValue('contribution_key', generated)
-      message.success('已新建并填充 API Key，请点击保存配置')
-      if (contributionEnabled) {
-        await fetchStats(true, generated)
-      }
-    } catch (e: any) {
-      message.error(String(e?.message || '请求新建 key 失败'))
-    } finally {
-      setCreatingKey(false)
-    }
-  }
-
-  const doBindCustom = async () => {
-    if (!customEmail.trim()) {
-      message.error('请输入邮箱')
-      return
-    }
-    if (!customContributionUrl) {
-      message.error('请先填写自定义服务器地址')
-      return
-    }
-    setBindingCustom(true)
-    try {
-      const data = await apiFetch('/contribution/custom/bind', {
-        method: 'POST',
-        body: JSON.stringify({
-          email: customEmail.trim(),
-          server_url: customContributionUrl,
-        }),
-      })
-      const token = pickString(asRecord(data), ['token'])
-      if (token) {
-        form.setFieldValue('custom_contribution_token', token)
-        message.success('绑定成功！token 已自动填充，请点击保存配置')
-        setCustomEmail('')
-      } else {
-        message.success('绑定成功')
-      }
-    } catch (e: any) {
-      message.error(String(e?.message || '绑定失败'))
-    } finally {
-      setBindingCustom(false)
-    }
-  }
-
-  const fetchCustomStats = async () => {
-    if (!contributionEnabled) {
-      message.warning('请先开启贡献功能')
-      return
-    }
-    if (!customContributionUrl) {
-      message.error('请先填写自定义服务器地址')
-      return
-    }
-    if (!customContributionToken) {
-      message.error('请先绑定邮箱获取 token')
-      return
-    }
-    setLoadingCustomStats(true)
-    try {
-      const [status, balance] = await Promise.all([
-        apiFetch(`/contribution/custom/status?server_url=${encodeURIComponent(customContributionUrl)}&token=${encodeURIComponent(customContributionToken)}`),
-        apiFetch(`/contribution/custom/balance?server_url=${encodeURIComponent(customContributionUrl)}&token=${encodeURIComponent(customContributionToken)}`),
-      ])
-      setCustomStatsResponse(asRecord(status))
-      setCustomBalanceResponse(asRecord(balance))
-      message.success('信息已刷新')
-    } catch (e: any) {
-      message.error(String(e?.message || '获取信息失败'))
-    } finally {
-      setLoadingCustomStats(false)
-    }
-  }
-
-  return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
-      <Card title="配置">
-        <Alert
-          type="warning"
-          showIcon
-          banner
-          style={{ marginBottom: 12 }}
-          message="开启贡献模式后，注册成功账号将只上传到贡献服务器"
-          description={(
-            <>
-              <div>CPA / CodexProxy / Sub2API 自动上传会被停用，避免重复上报。</div>
-              <div>目前该功能在xem中转站测试中 有兴趣可以进群了解</div>
-              <div>中转站https://ai.xem8k5.top/ 群号634758974</div>
-            </>
-          )}
-        />
-        <Form.Item name="contribution_enabled" label="是否开启" valuePropName="checked">
-          <Switch checkedChildren="开启" unCheckedChildren="关闭" />
-        </Form.Item>
-        <Form.Item name="contribution_mode" label="贡献模式">
-          <Select>
-            <Select.Option value="codex">Codex2API（xem中转站）</Select.Option>
-            <Select.Option value="custom">自定义贡献系统</Select.Option>
-          </Select>
-        </Form.Item>
-
-        {!isCustomMode ? (
-          <>
-            <Form.Item
-              name="contribution_server_url"
-              label="服务器地址"
-              rules={[{ required: true, message: '请输入服务器地址' }]}
-            >
-              <Input placeholder="http://new.xem8k5.top:7317/" />
-            </Form.Item>
-            <Form.Item name="contribution_key" label="API Key">
-              <Input
-                placeholder="留空可点击右侧按钮自动创建"
-                addonAfter={(
-                  <Button
-                    type="link"
-                    size="small"
-                    loading={creatingKey}
-                    onClick={() => { void doGenerateKey() }}
-                    style={{ paddingInline: 0 }}
-                  >
-                    没有key?请求新建
-                  </Button>
-                )}
-              />
-            </Form.Item>
-          </>
-        ) : (
-          <>
-            <Form.Item
-              name="custom_contribution_url"
-              label="自定义服务器地址"
-              rules={[{ required: true, message: '请输入服务器地址' }]}
-            >
-              <Input placeholder="http://127.0.0.1:5000" />
-            </Form.Item>
-            <Form.Item label="绑定邮箱">
-              <Space.Compact style={{ width: '100%' }}>
-                <Input
-                  placeholder="输入邮箱以绑定账号"
-                  value={customEmail}
-                  onChange={(e) => setCustomEmail(e.target.value)}
-                  onPressEnter={() => { void doBindCustom() }}
-                />
-                <Button type="primary" loading={bindingCustom} onClick={() => { void doBindCustom() }}>
-                  绑定
-                </Button>
-              </Space.Compact>
-            </Form.Item>
-            <Form.Item name="custom_contribution_token" label="Token">
-              <Input.TextArea placeholder="绑定邮箱后自动填充" rows={3} />
-            </Form.Item>
-          </>
-        )}
-
-        <Button type="primary" icon={<SaveOutlined />} onClick={onSave} loading={saving} disabled={saveDisabled} block>
-          {saved ? '已保存 ✓' : '保存配置'}
-        </Button>
-      </Card>
-
-      {!isCustomMode ? (
-        <>
-          <Card
-            title="信息"
-            extra={(
-              <Button loading={loadingStats} onClick={() => { void fetchStats() }}>
-                刷新信息
-              </Button>
-            )}
-          >
-            {!contributionEnabled ? (
-              <Alert type="info" showIcon message="贡献功能已关闭，开启后可获取服务器与 key 信息。" />
-            ) : (
-              <Space direction="vertical" style={{ width: '100%' }} size={12}>
-                {statsError ? <Alert type="error" showIcon message={statsError} /> : null}
-                <div>
-                  <Typography.Text strong>服务器信息</Typography.Text>
-                  <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
-                    <Tag color="blue">账号数: {formatDisplayNumber(serverQuotaAccountCount)}</Tag>
-                    <Tag color="geekblue">总额度: {formatDisplayNumber(serverQuotaTotal)}</Tag>
-                    <Tag color="volcano">已用额度: {formatDisplayNumber(serverQuotaUsed)}</Tag>
-                    <Tag color="green">剩余额度: {formatDisplayNumber(serverQuotaRemaining)}</Tag>
-                    <Tag color="orange">已用占比: {formatDisplayPercent(serverQuotaUsedPercent)}</Tag>
-                    <Tag color="cyan">剩余占比: {formatDisplayPercent(serverQuotaRemainingPercent)}</Tag>
-                    <Tag color="purple">折算账号数: {formatDisplayNumber(serverQuotaRemainingAccounts, 2)}</Tag>
-                  </div>
-                </div>
-                <div>
-                  <Typography.Text strong>API Key</Typography.Text>
-                  <Space style={{ marginLeft: 8 }}>
-                    <Typography.Text copyable={keyFromStats ? { text: keyFromStats } : undefined}>
-                      {keyFromStats || '-'}
-                    </Typography.Text>
-                  </Space>
-                </div>
-                <div>
-                  <Typography.Text strong>key 信息</Typography.Text>
-                  <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 8 }}>
-                    <Tag color="blue">余额: {keyBalance ?? '-'}</Tag>
-                    <Tag color="geekblue">来源: {keySource}</Tag>
-                    <Tag color="cyan">绑定账号数: {boundAccounts ?? '-'}</Tag>
-                    <Tag color="purple">结算金额: {settlementAmount ?? '-'}</Tag>
-                  </div>
-                </div>
-              </Space>
-            )}
-          </Card>
-
-          <Card title="提现">
-            <Space direction="vertical" style={{ width: '100%' }}>
-              <Typography.Text>key 当前额度：{keyBalance ?? '-'}</Typography.Text>
-              <Form.Item label="提现金额" style={{ marginBottom: 0 }}>
-                <Select
-                  value={redeemAmount}
-                  onChange={setRedeemAmount}
-                  style={{ width: 240 }}
-                  options={CONTRIBUTION_REDEEM_OPTIONS.map((amount) => ({ label: String(amount), value: amount }))}
-                />
-              </Form.Item>
-              <Button type="primary" danger onClick={() => { void doRedeem() }} loading={redeeming}>
-                提现确认
-              </Button>
-              {redeemResponse ? (
-                <Alert
-                  type={redeemResponse.ok === false ? 'error' : 'success'}
-                  showIcon
-                  message={redeemResponse.ok === false ? `提现失败：${String(redeemResponse.error || '-')}` : redeemSuccessText}
-                  description={<pre style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{formatResultText(redeemResponse)}</pre>}
-                />
-              ) : null}
-            </Space>
-          </Card>
-        </>
-      ) : (
-        <Card
-          title="信息"
-          extra={(
-            <Button loading={loadingCustomStats} onClick={() => { void fetchCustomStats() }}>
-              刷新信息
-            </Button>
-          )}
-        >
-          {!contributionEnabled ? (
-            <Alert type="info" showIcon message="贡献功能已关闭，开启后可获取信息。" />
-          ) : !customContributionToken ? (
-            <Alert type="warning" showIcon message="请先绑定邮箱获取 token" />
-          ) : (
-            <Space direction="vertical" style={{ width: '100%' }} size={12}>
-              <div>
-                <Typography.Text strong>余额信息</Typography.Text>
-                <div style={{ marginTop: 8 }}>
-                  <Tag color="blue">余额: {pickNumber(asRecord(customBalanceResponse), ['balance']) ?? '-'}</Tag>
-                </div>
-              </div>
-              <div>
-                <Typography.Text strong>贡献记录</Typography.Text>
-                <div style={{ marginTop: 8 }}>
-                  <Tag color="green">成功: {pickNumber(asRecord(customStatsResponse), ['success_count']) ?? '-'}</Tag>
-                  <Tag color="orange">待处理: {pickNumber(asRecord(customStatsResponse), ['pending_count']) ?? '-'}</Tag>
-                  <Tag color="red">失败: {pickNumber(asRecord(customStatsResponse), ['failed_count']) ?? '-'}</Tag>
-                </div>
-              </div>
-            </Space>
-          )}
-        </Card>
-      )}
-    </div>
   )
 }
 
@@ -1793,7 +884,7 @@ function SecurityPanel() {
                   <QRCode value={totpUri} size={180} />
                   <div style={{ flex: 1 }}>
                     <Typography.Text type="secondary" style={{ fontSize: 12 }}>无法扫码？手动输入密钥：</Typography.Text>
-                    <Typography.Paragraph copyable style={{ fontFamily: 'monospace', fontSize: 13, marginTop: 4 }}>
+                    <Typography.Paragraph copyable style={{ fontFamily: 'var(--font-family-mono)', fontSize: 13, marginTop: 4 }}>
                       {totpSecret}
                     </Typography.Paragraph>
                   </div>
@@ -1826,15 +917,13 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
   const [saveError, setSaveError] = useState('')
   const [configLoadState, setConfigLoadState] = useState<'loading' | 'ready' | 'error'>('loading')
   const [configLoadError, setConfigLoadError] = useState('')
-  const [activeTab, setActiveTab] = useState('register')
+  const [activeTab, setActiveTab] = useState('recovery')
   const effectiveTab = page === 'codex2api' ? 'codex2api' : page === 'mail-import' ? 'mail-import' : activeTab
-  const currentMailProviderRaw = String(Form.useWatch('mail_provider', form) || '')
-  const currentMailImportSource = String(Form.useWatch('mail_import_source', form) || 'microsoft')
+  const currentMailProviderRaw = String(Form.useWatch('mail_provider', { form, preserve: true }) || '')
+  const currentMailImportSource = String(Form.useWatch('mail_import_source', { form, preserve: true }) || 'microsoft')
   const currentMailProvider = resolveEffectiveMailProvider(currentMailProviderRaw, currentMailImportSource)
-  const showFloatingSaveButton = page === 'settings' && (effectiveTab === 'mailbox' || effectiveTab === 'chatgpt')
-  const contentPaneRef = useRef<HTMLDivElement | null>(null)
   const configLoadRequestIdRef = useRef(0)
-  const [floatingSaveBounds, setFloatingSaveBounds] = useState<{ left: number; width: number } | null>(null)
+  const configBaselineRef = useRef<Record<string, unknown>>({})
 
   const loadConfig = useCallback(async () => {
     const requestId = ++configLoadRequestIdRef.current
@@ -1871,29 +960,9 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       if (!data.luckmail_base_url) {
         data.luckmail_base_url = 'https://mails.luckyous.com/'
       }
-      if (!String(data.contribution_enabled ?? '').trim()) {
-        data.contribution_enabled = false
-      }
-      if (!data.contribution_server_url) {
-        data.contribution_server_url = 'http://new.xem8k5.top:7317/'
-      }
-      if (!data.contribution_mode) {
-        data.contribution_mode = 'codex'
-      }
-      if (!data.custom_contribution_url) {
-        data.custom_contribution_url = 'http://127.0.0.1:5000'
-      }
       if (!data.cloudmail_timeout) {
         data.cloudmail_timeout = 30
       }
-      data.cpa_enabled = resolveFeatureEnabledConfig(
-        data.cpa_enabled,
-        Boolean(String(data.cpa_api_url ?? '').trim()),
-      )
-      data.sub2api_enabled = resolveFeatureEnabledConfig(
-        data.sub2api_enabled,
-        Boolean(String(data.sub2api_api_url ?? '').trim() && String(data.sub2api_api_key ?? '').trim()),
-      )
       data.codex2api_enabled = parseBooleanConfigValue(data.codex2api_enabled)
       data.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
         data.codex2api_delete_on_account_remove_enabled,
@@ -1938,13 +1007,13 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       data.cfworker_enabled_domains = parseStoredDomainList(data.cfworker_enabled_domains)
       data.cfworker_random_subdomain = parseBooleanConfigValue(data.cfworker_random_subdomain)
       data.cfworker_random_name_subdomain = parseBooleanConfigValue(data.cfworker_random_name_subdomain)
-      data.contribution_enabled = parseBooleanConfigValue(data.contribution_enabled)
       data.email_domain_rule_enabled = parseBooleanConfigValue(data.email_domain_rule_enabled)
       if (!String(data.email_domain_level_count ?? '').trim()) {
         data.email_domain_level_count = 2
       }
       data.mail_import_source = configMailProvider === 'applemail' ? 'applemail' : 'microsoft'
       data.mail_provider = isMailImportProvider ? 'mail_import' : configMailProvider
+      configBaselineRef.current = structuredClone(data)
       form.setFieldsValue(data)
       setConfigLoadState('ready')
     } catch (error: unknown) {
@@ -1962,52 +1031,22 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
     }
   }, [loadConfig])
 
-  useEffect(() => {
-    if (!showFloatingSaveButton) {
-      setFloatingSaveBounds(null)
-      return
-    }
-
-    const element = contentPaneRef.current
-    if (!element) return
-
-    const updateBounds = () => {
-      const rect = element.getBoundingClientRect()
-      setFloatingSaveBounds({
-        left: rect.left,
-        width: rect.width,
-      })
-    }
-
-    updateBounds()
-
-    const observer =
-      typeof ResizeObserver !== 'undefined'
-        ? new ResizeObserver(() => updateBounds())
-        : null
-
-    observer?.observe(element)
-    window.addEventListener('resize', updateBounds)
-
-    return () => {
-      observer?.disconnect()
-      window.removeEventListener('resize', updateBounds)
-    }
-  }, [showFloatingSaveButton, effectiveTab])
-
   const save = async () => {
     if (configLoadState !== 'ready') return
     setSaving(true)
     setSaved(false)
     setSaveError('')
     try {
-      const values = form.getFieldsValue(true)
+      const values = { ...form.getFieldsValue(true) }
+      const changedKeys = supportedFieldKeys.filter(
+        key => JSON.stringify(values[key]) !== JSON.stringify(configBaselineRef.current[key]),
+      )
       values.mail_provider = resolveEffectiveMailProvider(values.mail_provider, values.mail_import_source)
       delete values.mail_import_source
       const domains = normalizeDomainList(values.cfworker_domains)
       const enabledDomains = normalizeDomainList(values.cfworker_enabled_domains).filter((domain) => domains.includes(domain))
 
-      if (domains.length > 0 && enabledDomains.length === 0) {
+      if (values.mail_provider === 'cfworker' && domains.length > 0 && enabledDomains.length === 0) {
         setActiveTab('mailbox')
         message.error('CF Worker 至少需要启用一个域名')
         return
@@ -2018,8 +1057,6 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       if (domains.length > 0) {
         values.cfworker_domain = ''
       }
-      values.cpa_enabled = parseBooleanConfigValue(values.cpa_enabled)
-      values.sub2api_enabled = parseBooleanConfigValue(values.sub2api_enabled)
       values.codex2api_enabled = parseBooleanConfigValue(values.codex2api_enabled)
       values.codex2api_delete_on_account_remove_enabled = parseBooleanConfigValue(
         values.codex2api_delete_on_account_remove_enabled,
@@ -2060,7 +1097,6 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
       values.bark_enabled = parseBooleanConfigValue(values.bark_enabled)
       values.cfworker_random_subdomain = parseBooleanConfigValue(values.cfworker_random_subdomain)
       values.cfworker_random_name_subdomain = parseBooleanConfigValue(values.cfworker_random_name_subdomain)
-      values.contribution_enabled = parseBooleanConfigValue(values.contribution_enabled)
       values.email_domain_rule_enabled = parseBooleanConfigValue(values.email_domain_rule_enabled)
       const rawDomainLevelCount = Number.parseInt(String(values.email_domain_level_count ?? '').trim(), 10)
       if (values.mail_provider === 'cfworker' && values.email_domain_rule_enabled) {
@@ -2075,12 +1111,18 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
           ? String(rawDomainLevelCount)
           : '2'
 
-      await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data: values }) })
+      // Only visible or explicitly edited fields participate in this update.
+      // The backend merges this subset, preserving removed integrations and other providers.
+      const editableKeys = new Set([
+        ...visibleFieldKeys,
+        ...changedKeys,
+      ])
+      if (editableKeys.has('mail_import_source')) editableKeys.add('mail_provider')
+      const data = Object.fromEntries(Object.entries(values).filter(([key]) => editableKeys.has(key)))
+      await apiFetch('/config', { method: 'PUT', body: JSON.stringify({ data }) })
       form.setFieldsValue({
         mail_provider: values.mail_provider === 'microsoft' || values.mail_provider === 'applemail' ? 'mail_import' : values.mail_provider,
         mail_import_source: values.mail_provider === 'applemail' ? 'applemail' : 'microsoft',
-        cpa_enabled: values.cpa_enabled,
-        sub2api_enabled: values.sub2api_enabled,
         codex2api_enabled: values.codex2api_enabled,
         codex2api_delete_on_account_remove_enabled: values.codex2api_delete_on_account_remove_enabled,
         chatgpt_auto_relogin_enabled: values.chatgpt_auto_relogin_enabled,
@@ -2099,13 +1141,13 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
         cfworker_domain: domains.length > 0 ? '' : values.cfworker_domain,
         cfworker_random_subdomain: values.cfworker_random_subdomain,
         cfworker_random_name_subdomain: values.cfworker_random_name_subdomain,
-        contribution_enabled: values.contribution_enabled,
-        contribution_mode: values.contribution_mode,
-        custom_contribution_url: values.custom_contribution_url,
-        custom_contribution_token: values.custom_contribution_token,
         email_domain_rule_enabled: values.email_domain_rule_enabled,
         email_domain_level_count: values.email_domain_level_count,
       })
+      const savedFormValues = form.getFieldsValue(true)
+      for (const key of editableKeys) {
+        configBaselineRef.current[key] = structuredClone(savedFormValues[key])
+      }
       message.success('保存成功')
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
@@ -2123,163 +1165,61 @@ export default function Settings({ page = 'settings' }: SettingsProps) {
     effectiveTab === 'mailbox'
       ? splitMailboxSections(currentTab.sections, currentMailProvider)
       : { defaultSection: null, selectedSection: null, remainingSections: currentTab.sections }
-  const floatingSaveWidth = floatingSaveBounds ? Math.max(floatingSaveBounds.width, 0) : 0
-  const floatingSaveLeft =
-    floatingSaveBounds && floatingSaveWidth > 0
-      ? floatingSaveBounds.left + (floatingSaveBounds.width - floatingSaveWidth) / 2
-      : 0
+  const automationKeys = [
+    'chatgpt_auto_relogin_enabled', 'chatgpt_auto_relogin_interval_minutes', 'chatgpt_auto_relogin_concurrency',
+    'chatgpt_auto_relogin_alert_threshold', 'chatgpt_auto_relogin_quota_alert_threshold_usd',
+    'smtp_host', 'smtp_port', 'smtp_username', 'smtp_password', 'smtp_sender_email', 'smtp_recipient_email',
+    'smtp_use_ssl', 'smtp_force_auth_login', 'bark_enabled', 'bark_endpoint',
+  ]
+  const mailboxExtraKeys = ['mail_import_source', 'cfworker_domains', 'cfworker_enabled_domains', 'cfworker_domain']
+  const supportedFieldKeys = [...TAB_ITEMS.flatMap(tab => tab.sections.flatMap(section => section.fields.map(field => field.key))), ...automationKeys, ...mailboxExtraKeys]
+  const visibleFieldKeys = page === 'mail-import'
+    ? ['mail_provider', 'mail_import_source', 'applemail_pool_dir', 'applemail_pool_file']
+    : effectiveTab === 'recovery'
+      ? automationKeys
+      : effectiveTab === 'mailbox'
+        ? [
+          ...[mailboxSections.defaultSection, mailboxSections.selectedSection].flatMap(section => section?.fields.map(field => field.key) || []),
+          'mail_import_source',
+          ...(currentMailProvider === 'cfworker' ? mailboxExtraKeys : []),
+        ]
+        : [
+          ...currentTab.sections.flatMap(section => section.fields.map(field => field.key)),
+          ...(page === 'codex2api' ? automationKeys : []),
+        ]
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 16, paddingBottom: showFloatingSaveButton ? 96 : 0 }}>
-      {showFloatingSaveButton && floatingSaveBounds && floatingSaveWidth > 0 ? (
-        <div
-          style={{
-            position: 'fixed',
-            left: floatingSaveLeft,
-            bottom: 24,
-            zIndex: 1000,
-            width: floatingSaveWidth,
-            pointerEvents: 'none',
-          }}
-        >
-          <div
-            style={{
-              width: '100%',
-              padding: 0,
-              borderRadius: 0,
-              border: 'none',
-              background: 'transparent',
-              boxShadow: 'none',
-              backdropFilter: 'none',
-              pointerEvents: 'auto',
-            }}
-          >
-            <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
-              {saved ? '已保存 ✓' : '保存配置'}
-            </Button>
-          </div>
-        </div>
-      ) : null}
-      <div>
-        <h1 style={{ fontSize: 24, fontWeight: 'bold', margin: 0 }}>
-          {page === 'codex2api' ? 'Codex2API' : page === 'mail-import' ? '邮箱导入' : '全局配置'}
-        </h1>
-        <p style={{ color: '#7a8ba3', marginTop: 4 }}>
-          {page === 'codex2api'
-            ? '管理自动上传、删除联动、鉴权巡检与告警通知'
-            : page === 'mail-import'
-              ? '导入并管理 Outlook、Hotmail、MailAPI URL 与 iCloud 邮箱池'
-              : '配置将持久化保存，注册任务自动使用'}
-        </p>
-      </div>
-
-      {configLoadState === 'loading' ? (
-        <Typography.Text role="status" aria-live="polite">
-          正在加载配置…
-        </Typography.Text>
-      ) : null}
-      {configLoadState === 'error' ? (
-        <Alert
-          role="alert"
-          aria-live="assertive"
-          type="error"
-          showIcon
-          message="配置加载失败"
-          description={configLoadError}
-          action={<Button onClick={() => { void loadConfig() }}>重试加载</Button>}
-        />
-      ) : null}
-      {saveError ? (
-        <Alert
-          role="alert"
-          aria-live="assertive"
-          type="error"
-          showIcon
-          message="保存配置失败"
-          description={saveError}
-          closable
-          onClose={() => setSaveError('')}
-        />
-      ) : null}
-      {saved ? (
-        <Typography.Text role="status" aria-live="polite">
-          配置已保存。
-        </Typography.Text>
-      ) : null}
-
-      <div style={{ display: 'flex', gap: page === 'settings' ? 24 : 0 }}>
-        {page === 'settings' ? (
-          <div style={{ width: 200 }}>
-            <Tabs
-              tabPosition="left"
-              activeKey={activeTab}
-              onChange={setActiveTab}
-              items={TAB_ITEMS.filter((tab) => tab.key !== 'codex2api').map((t) => ({
-                key: t.key,
-                label: (
-                  <span>
-                    {t.icon}
-                    <span style={{ marginLeft: 8 }}>{t.label}</span>
-                  </span>
-                ),
-              }))}
-            />
-          </div>
-        ) : null}
-
-        <div ref={contentPaneRef} style={{ flex: 1 }}>
-          {page === 'mail-import' ? (
-            <Form form={form} layout="vertical">
-              <MailImportPanel form={form} />
-              <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
-                {saved ? '已保存 ✓' : '保存配置'}
-              </Button>
-            </Form>
-          ) : effectiveTab === 'integrations' ? (
-            <IntegrationsPanel />
-          ) : effectiveTab === 'security' ? (
-            <SecurityPanel />
+    <div className="console-page management-workspace management-settings">
+      <ConsolePageHeader
+        title={page === 'codex2api' ? 'Codex2API' : page === 'mail-import' ? '邮箱导入' : '设置'}
+        description={page === 'mail-import' ? '维护已有账号的邮箱登录资料与收件来源。' : '管理账号恢复、告警通知和运行连接。'}
+        actions={effectiveTab !== 'security' ? <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled}>{saved ? '已保存 ✓' : '保存配置'}</Button> : undefined}
+      />
+      {configLoadState === 'loading' && <Typography.Text role="status" aria-live="polite">正在加载配置…</Typography.Text>}
+      {configLoadState === 'error' && <Alert type="error" showIcon message="配置加载失败" description={configLoadError} action={<Button onClick={() => { void loadConfig() }}>重试加载</Button>} />}
+      {saveError && <Alert type="error" showIcon message={saveError} />}
+      {saved && <Typography.Text role="status" aria-live="polite">配置已保存。</Typography.Text>}
+      {page === 'settings' && <Tabs className="management-settings-tabs" activeKey={activeTab} onChange={setActiveTab}
+        items={TAB_ITEMS.map(tab => ({ key: tab.key, label: tab.label }))} />}
+      {effectiveTab === 'security' ? <SecurityPanel /> : (
+        <Form form={form} layout="vertical" className="management-settings-form">
+          {page === 'mail-import' ? <MailImportPanel form={form} /> : effectiveTab === 'recovery' ? (
+            <div className="management-recovery"><ChatGPTAutoReloginSection /></div>
+          ) : effectiveTab === 'mailbox' ? (
+            <>
+              {mailboxSections.defaultSection && <ConfigSection section={mailboxSections.defaultSection} />}
+              {mailboxSections.selectedSection && <ConfigSection section={mailboxSections.selectedSection} />}
+              {currentMailProvider === 'cfworker' && <CFWorkerDomainPoolSection form={form} />}
+            </>
           ) : (
-            <Form form={form} layout="vertical">
-              {effectiveTab === 'contribution' ? (
-                <ContributionPanel form={form} onSave={save} saving={saving} saved={saved} saveDisabled={saveDisabled} />
-              ) : (
-                <>
-                  {effectiveTab === 'captcha' ? <SolverStatus /> : null}
-                  {effectiveTab === 'mailbox' ? (
-                    <>
-                      {mailboxSections.defaultSection ? (
-                        <ConfigSection key={mailboxSections.defaultSection.title} section={mailboxSections.defaultSection} />
-                      ) : null}
-                      {mailboxSections.selectedSection ? (
-                        <ConfigSection key={`${mailboxSections.selectedSection.title}-selected`} section={mailboxSections.selectedSection} />
-                      ) : null}
-                      {currentMailProviderRaw === 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
-                      {mailboxSections.remainingSections.map((section) => (
-                        <ConfigSection key={section.title} section={section} />
-                      ))}
-                      {currentMailProviderRaw !== 'cfworker' ? <CFWorkerDomainPoolSection form={form} /> : null}
-                    </>
-                  ) : (
-                    <>
-                      {currentTab.sections.map((section) => (
-                        <ConfigSection key={section.title} section={section} />
-                      ))}
-                      {effectiveTab === 'codex2api' ? <ChatGPTAutoReloginSection /> : null}
-                    </>
-                  )}
-                  {showFloatingSaveButton ? <div style={{ height: 8 }} /> : null}
-                  {!showFloatingSaveButton ? (
-                    <Button type="primary" icon={<SaveOutlined />} onClick={save} loading={saving} disabled={saveDisabled} block>
-                    {saved ? '已保存 ✓' : '保存配置'}
-                    </Button>
-                  ) : null}
-                </>
-              )}
-            </Form>
+            <>
+              {currentTab.sections.map(section => <ConfigSection key={section.title} section={section} />)}
+              {effectiveTab === 'runtime' && <SolverStatus />}
+              {page === 'codex2api' && <div className="management-recovery"><ChatGPTAutoReloginSection /></div>}
+            </>
           )}
-        </div>
-      </div>
+        </Form>
+      )}
     </div>
   )
 }

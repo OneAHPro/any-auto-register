@@ -100,8 +100,8 @@ describe('ChatGPTAutoReloginSection', () => {
     expect(screen.getByLabelText('Bark 推送地址')).toBeTruthy()
     expect(screen.getByRole('button', { name: '发送测试 Bark 通知' })).toBeTruthy()
     expect(screen.getByText(/critical \+ call=1/)).toBeTruthy()
-    expect(screen.getByText(/主动触发 Codex2API 的 wham-only 轻量鉴权探针/)).toBeTruthy()
-    expect(screen.getByText(/正常与限流账号不会刷新本地 RT/)).toBeTruthy()
+    expect(screen.getByText('定期检查授权，按需刷新凭据、重登与同步；前台登录任务优先。')).toBeTruthy()
+    expect(screen.queryByText(/wham-only/)).toBeNull()
   })
 
   it('sends a test email with the current unsaved SMTP form values', async () => {

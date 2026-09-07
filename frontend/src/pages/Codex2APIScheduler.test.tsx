@@ -106,4 +106,12 @@ describe('Codex2API scheduler console', () => {
       })
     })
   })
+
+  it('does not present absent usage signals as measured zeroes or fresh quota', async () => {
+    render(<Codex2APIScheduler />)
+    await screen.findByText('account@example.com')
+    expect(screen.queryByText('$0.00')).toBeNull()
+    expect(screen.queryByText('额度数据可用')).toBeNull()
+    expect(screen.getAllByText('待采集').length).toBeGreaterThan(0)
+  })
 })

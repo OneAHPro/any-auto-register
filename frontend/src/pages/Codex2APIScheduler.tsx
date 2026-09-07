@@ -2,7 +2,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import {
   Alert,
   Button,
-  Card,
   Col,
   Empty,
   Modal,
@@ -18,15 +17,15 @@ import {
 import {
   ArrowRightOutlined,
   CheckOutlined,
-  ClockCircleOutlined,
   ReloadOutlined,
-  SafetyOutlined,
   ThunderboltOutlined,
 } from '@ant-design/icons'
 
 import { apiFetch } from '@/lib/utils'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './management-workspace.css'
 
-const { Paragraph, Text, Title } = Typography
+const { Text } = Typography
 
 interface PlanAction {
   identity_id: string
@@ -342,55 +341,37 @@ export default function Codex2APIScheduler() {
   }, [run])
 
   return (
-    <div className="control-plane-page page-enter">
-      <section className="control-plane-heading">
-        <div>
-          <Text className="control-plane-eyebrow">CAPACITY DESK</Text>
-          <Title level={2} style={{ margin: '4px 0 6px' }}>号池调度</Title>
-          <Paragraph type="secondary" style={{ margin: 0, maxWidth: 760 }}>
-            系统只提出扩缩容建议。每次执行前都会重新读取最新计划，并要求人工再次确认。
-          </Paragraph>
-        </div>
-        <Space wrap>
-          <Select
-            allowClear
-            value={selectedPool || undefined}
-            placeholder="全部号池"
-            style={{ minWidth: 210 }}
-            onChange={value => setSelectedPool(value || '')}
-            options={pools.map(pool => ({ value: pool.id, label: `${pool.name} · ${pool.id}` }))}
-          />
+    <div className="console-page management-workspace">
+      <ConsolePageHeader
+        title="号池调度"
+        description="根据实例用量与可用额度检查账号分配。当前按计划执行，每次调整由你确认。"
+        actions={<Space wrap>
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load}>刷新</Button>
-          <Button type="primary" icon={<ThunderboltOutlined />} loading={generating} onClick={generatePlan}>
-            生成预览计划
-          </Button>
-        </Space>
-      </section>
-
-      <Alert
-        type="info"
-        showIcon
-        icon={<SafetyOutlined />}
-        message="扩容和缩容均由人工确认"
-        description="生成计划不会修改 Codex2API。只有点击“执行计划”并在确认窗口再次确认后，迁移才会入队。"
-        style={{ marginBottom: 16 }}
+          <Button type="primary" icon={<ThunderboltOutlined />} loading={generating} onClick={generatePlan}>生成预览计划</Button>
+        </Space>}
       />
+      <div className="console-toolbar management-scheduler-toolbar">
+        <Select aria-label="筛选号池" allowClear value={selectedPool || undefined} placeholder="全部号池"
+          onChange={value => setSelectedPool(value || '')}
+          options={pools.map(pool => ({ value: pool.id, label: pool.name }))} />
+        <Text type="secondary">扩容和缩容均由人工确认</Text>
+      </div>
 
       {run ? (
         <>
-          <Card className="scheduler-plan-card" styles={{ body: { padding: 0 } }}>
-            <div className="scheduler-plan-strip">
+          <section className="console-panel management-plan" aria-label="当前调度计划">
+            <div className="management-plan-heading">
               <div>
                 <Text type="secondary">当前计划</Text>
-                <Title level={3}>{run.plan.pool_id || '未指定号池'}</Title>
+                <h2>{pools.find(pool => pool.id === run.plan.pool_id)?.name || run.plan.pool_id || '未指定号池'}</h2>
               </div>
-              <div className="scheduler-capacity-path" aria-label="账号规模变化">
+              <div className="management-capacity-path" aria-label="账号规模变化">
                 <span>当前 {run.plan.current_count}</span>
                 <ArrowRightOutlined />
                 <strong>建议 {run.plan.desired_count}</strong>
                 <Tag color={actionDirection === '保持现状' ? 'default' : 'blue'}>{actionDirection}</Tag>
               </div>
-              <div className="scheduler-plan-actions">
+              <div className="management-plan-actions">
                 <Tag color={runStatus(run.status).color}>{runStatus(run.status).label}</Tag>
                 <Button
                   type="primary"
@@ -403,23 +384,23 @@ export default function Codex2APIScheduler() {
               </div>
             </div>
 
-            <Row gutter={0} className="scheduler-signal-grid">
+            <Row gutter={0} className="management-signals">
               <Col xs={24} md={8}>
-                <div className="scheduler-signal">
+                <div className="management-signal">
                   <Text type="secondary">预测七日用量</Text>
-                  <strong>${Number(run.plan.input?.forecast_7d_usd || 0).toFixed(2)}</strong>
-                  <span>安全单号额度 ${Number(run.plan.input?.safe_7d_quota || 0).toFixed(2)}</span>
+                  <strong>{run.plan.input?.forecast_7d_usd == null ? '待采集' : `$${Number(run.plan.input.forecast_7d_usd).toFixed(2)}`}</strong>
+                  <span>单号参考额度 {run.plan.input?.safe_7d_quota == null ? '待采集' : `$${Number(run.plan.input.safe_7d_quota).toFixed(2)}`}</span>
                 </div>
               </Col>
               <Col xs={24} md={8}>
-                <div className="scheduler-signal">
+                <div className="management-signal">
                   <Text type="secondary">容量利用率</Text>
                   <strong>{utilization === null ? '待采集' : `${utilization}%`}</strong>
-                  <span>{run.plan.input?.quota_fresh === false ? '额度数据过期' : '额度数据可用'}</span>
+                  <span>{run.plan.input?.quota_fresh == null ? '额度新鲜度待确认' : run.plan.input.quota_fresh ? '额度数据可用' : '额度数据过期'}</span>
                 </div>
               </Col>
               <Col xs={24} md={8}>
-                <div className="scheduler-signal">
+                <div className="management-signal">
                   <Text type="secondary">成本与毛利</Text>
                   {run.plan.cost_estimated && run.plan.desired_costs ? (
                     <>
@@ -429,13 +410,13 @@ export default function Codex2APIScheduler() {
                   ) : (
                     <>
                       <strong>成本未估算</strong>
-                      <span>{run.plan.cost_note || '客户用量或带宽数据尚不完整'}</span>
+                      <span>{run.plan.cost_note || '当前计划未提供成本数据'}</span>
                     </>
                   )}
                 </div>
               </Col>
             </Row>
-          </Card>
+          </section>
 
           {run.plan.blockers.length ? (
             <Alert
@@ -447,7 +428,8 @@ export default function Codex2APIScheduler() {
             />
           ) : null}
 
-          <Card title={`计划动作 · ${run.plan.actions.length}`} className="control-plane-table-card" styles={{ body: { padding: 0 } }}>
+          <section className="console-panel management-table-section" aria-labelledby="plan-actions-heading">
+            <div className="console-section-heading"><h2 id="plan-actions-heading">计划动作</h2><span>{run.plan.actions.length} 个账号调整</span></div>
             <Table<PlanAction>
               rowKey={item => `${item.identity_id}:${item.action}`}
               columns={actionColumns}
@@ -456,13 +438,14 @@ export default function Codex2APIScheduler() {
               scroll={{ x: 760 }}
               locale={{ emptyText: '本轮无需调整账号' }}
             />
-          </Card>
+          </section>
         </>
       ) : (
-        <Card><Empty description="尚未生成调度计划" /></Card>
+        <section className="console-panel management-empty"><Empty description="尚未生成调度计划" /></section>
       )}
 
-      <Card title={<Space><ClockCircleOutlined />运行记录</Space>} className="control-plane-table-card" styles={{ body: { padding: 0 } }}>
+      <section className="console-panel management-table-section" aria-labelledby="scheduler-history-heading">
+        <div className="console-section-heading"><h2 id="scheduler-history-heading">运行记录</h2><span>追踪每次计划与执行结果</span></div>
         <Table<SchedulerRun>
           rowKey="id"
           columns={historyColumns}
@@ -471,7 +454,7 @@ export default function Codex2APIScheduler() {
           pagination={{ pageSize: 10, hideOnSinglePage: true }}
           scroll={{ x: 620 }}
         />
-      </Card>
+      </section>
 
       <Modal
         title="请确认后执行"

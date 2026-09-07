@@ -215,6 +215,36 @@ describe('AccountCard', () => {
     expect((within(card).getByRole('checkbox') as HTMLInputElement).disabled).toBe(true)
   })
 
+  it('loads credential controls only on request and keeps copy actions scoped to the account', () => {
+    const onCopy = vi.fn()
+    const onOpenDetails = vi.fn()
+    render(<AccountCard account={{ ...account, extra: { ...account.extra, refresh_token: 'refresh-secret' } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={onCopy} onOpenDetails={onOpenDetails} onDelete={vi.fn()} />)
+
+    expect(screen.queryByRole('button', { name: '复制密码' })).toBeNull()
+    expect(screen.queryByRole('button', { name: '复制Refresh Token' })).toBeNull()
+    const toggle = screen.getByRole('button', { name: '登录凭据' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    fireEvent.click(screen.getByRole('button', { name: '复制Refresh Token' }))
+    expect(onCopy).toHaveBeenCalledWith('refresh-secret')
+    expect(onOpenDetails).not.toHaveBeenCalled()
+    fireEvent.click(toggle)
+    expect(screen.queryByRole('button', { name: '复制密码' })).toBeNull()
+  })
+
+  it('identifies duplicate-email records by account id while retaining independent selection', () => {
+    const onSelect = vi.fn()
+    for (const id of [42, 43]) {
+      render(<AccountCard account={{ ...account, id }} platform="chatgpt" selected={false} onSelect={onSelect} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    }
+    const records = screen.getAllByTestId('account-card')
+    expect(within(records[0]).getByText('#42')).toBeTruthy()
+    expect(within(records[1]).getByText('#43')).toBeTruthy()
+    fireEvent.click(within(records[1]).getByRole('checkbox'))
+    expect(onSelect).toHaveBeenCalledWith(43, true)
+  })
+
   it('emits selection and copy actions without opening details', () => {
     const onSelect = vi.fn()
     const onCopy = vi.fn()

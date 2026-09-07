@@ -1,0 +1,109 @@
+.management-workspace { min-width: 0; }
+.management-workspace .console-panel { overflow: hidden; }
+.management-summary {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  margin: 0;
+  border: 1px solid var(--console-border);
+  border-radius: 8px;
+  background: var(--console-surface);
+}
+.management-summary > div { padding: 20px 24px; }
+.management-summary > div + div { border-left: 1px solid var(--console-border); }
+.management-summary dt { color: var(--console-muted); font-size: 12px; }
+.management-summary dd { margin: 8px 0 0; color: var(--console-text); font-size: 28px; font-weight: 600; line-height: 1.25; }
+.management-workspace .console-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  padding: 20px 24px;
+  border-bottom: 1px solid var(--console-border);
+}
+.management-workspace .console-section-heading h2,
+.management-setting-intro h2 { margin: 0; color: var(--console-text); font-size: 16px; font-weight: 600; }
+.management-workspace .console-section-heading > span { color: var(--console-muted); font-size: 12px; }
+.management-table-section { padding: 0; }
+.management-table-section > .ant-table-wrapper { min-width: 0; }
+.management-instance-identity { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.management-instance-name { display: flex; align-items: flex-start; gap: 8px; }
+.management-instance-name .target-status-dot { flex-shrink: 0; margin-top: 7px; }
+.management-instance-name .ant-typography { min-width: 0; overflow-wrap: anywhere; }
+.management-table-section .ant-table-pagination { padding: 0 20px; }
+.management-table-section > div:not(.ant-table-wrapper):not(.console-section-heading) { padding: 16px 24px; margin-bottom: 0 !important; }
+.management-form-section > .ant-space { padding: 20px 24px; }
+.management-form-section .ant-space-item { min-width: 0; }
+.management-form-section textarea { font-family: var(--font-family-mono); }
+.management-pool-list { display: flex; flex-direction: column; }
+.management-pool-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 18px 24px; }
+.management-pool-row + .management-pool-row { border-top: 1px solid var(--console-border); }
+.management-pool-row > div:first-child { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.management-pool-row > div:first-child > .ant-typography:last-child { font-family: var(--font-family-mono); font-size: 12px; overflow-wrap: anywhere; }
+.management-pool-section > .ant-typography { display: block; padding: 24px; }
+.management-scheduler-toolbar { justify-content: space-between; }
+.management-scheduler-toolbar > .ant-select { width: 240px; max-width: 100%; }
+.management-plan { padding: 0; }
+.management-plan-heading { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 20px; padding: 24px; }
+.management-plan-heading h2 { margin: 6px 0 0; font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+.management-capacity-path, .management-plan-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.management-capacity-path > span, .management-capacity-path > strong { white-space: nowrap; }
+.management-capacity-path > strong { color: var(--console-accent); }
+.management-signals { border-top: 1px solid var(--console-border); }
+.management-signal { height: 100%; padding: 20px 24px; display: flex; flex-direction: column; gap: 8px; }
+.management-signals > div + div .management-signal { border-left: 1px solid var(--console-border); }
+.management-signal > strong { font-size: 24px; font-weight: 600; line-height: 1.3; }
+.management-signal > span { color: var(--console-muted); font-size: 12px; }
+.management-empty { padding: 36px 24px; }
+.management-resource-summary { flex-wrap: wrap; }
+.management-resource-summary .ant-tag { margin: 0; }
+.management-sms-setup { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr); gap: 24px; align-items: start; }
+.management-workspace .ant-card { background: var(--console-surface); border: 1px solid var(--console-border); box-shadow: none; border-radius: 8px; }
+.management-workspace .ant-card-head { min-height: 64px; padding: 16px 24px; border-bottom: 1px solid var(--console-border); }
+.management-workspace .ant-card-head-title { font-size: 16px; white-space: normal; }
+.management-workspace .ant-card-extra { color: var(--console-muted); font-size: 12px; }
+.management-workspace .ant-card-body { padding: 24px; }
+.management-workspace .ant-card-body > .ant-card { box-shadow: none; }
+.management-settings-tabs > .ant-tabs-nav { margin-bottom: 0; }
+.management-settings-form { display: flex; flex-direction: column; gap: 24px; }
+.management-setting-section { display: grid; grid-template-columns: minmax(200px, .7fr) minmax(0, 1.3fr); padding: 24px; gap: 32px; }
+.management-setting-intro p { color: var(--console-muted); font-size: 12px; line-height: 1.7; margin: 8px 0 0; max-width: 320px; }
+.management-setting-fields { min-width: 0; }
+.management-setting-fields > .ant-form-item:last-child { margin-bottom: 0; }
+.management-recovery .ant-card { margin-bottom: 0 !important; }
+.management-recovery .ant-card-body { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px 24px; }
+.management-recovery .ant-card-body::before, .management-recovery .ant-card-body::after { display: none; }
+.management-recovery .ant-card-body > .ant-form-item { margin: 0; min-width: 0; }
+.management-recovery .ant-card-body > :not(.ant-form-item) { grid-column: 1 / -1; }
+.management-recovery .ant-card-body > .ant-btn { justify-self: start; }
+.management-recovery .ant-card-body > .ant-divider { margin: 16px 0 4px; }
+.management-recovery .ant-card-body > .ant-typography { margin: 0; }
+.management-recovery .ant-card-body > [role="status"] { margin-top: 8px; min-width: 0; overflow-x: auto; }
+.management-recovery .ant-descriptions-item-content { overflow-wrap: anywhere; }
+.management-settings .ant-form-item-extra { font-size: 12px; line-height: 1.6; padding-top: 6px; }
+.management-settings .ant-form-item-label > label { height: auto; white-space: normal; }
+.management-workspace .ant-table-cell code { font-family: var(--font-family-mono); }
+.management-dialog .ant-modal-body { padding-top: 16px; }
+.management-dialog .ant-form-item-extra { font-size: 12px; }
+
+@media (max-width: 1100px) {
+  .management-sms-setup { grid-template-columns: minmax(0, 1fr); }
+  .management-setting-section { grid-template-columns: minmax(170px, .6fr) minmax(0, 1.4fr); gap: 24px; }
+}
+@media (max-width: 767px) {
+  .management-summary > div { padding: 16px; }
+  .management-pool-row { align-items: flex-start; flex-direction: column; }
+  .management-plan-heading { align-items: flex-start; flex-direction: column; padding: 20px; }
+  .management-plan-actions { justify-content: space-between; width: 100%; }
+  .management-signals > div + div .management-signal { border-left: 0; border-top: 1px solid var(--console-border); }
+  .management-setting-section { grid-template-columns: minmax(0, 1fr); gap: 20px; padding: 20px; }
+  .management-setting-intro p { max-width: none; }
+  .management-recovery .ant-card-body { grid-template-columns: minmax(0, 1fr); }
+  .management-workspace .console-section-heading, .management-workspace .ant-card-head { padding: 16px 20px; }
+  .management-workspace .ant-card-head-wrapper { gap: 12px; flex-wrap: wrap; }
+  .management-workspace .ant-card-body, .management-form-section > .ant-space { padding: 20px; }
+  .management-workspace .ant-btn { min-height: 36px; }
+  .management-workspace .ant-btn-icon-only { min-width: 36px; }
+  .management-recovery .ant-descriptions-item-label { min-width: 96px; }
+  .management-dialog .ant-form-item-label > label { height: auto; }
+}

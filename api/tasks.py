@@ -1,12 +1,13 @@
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field, StrictBool, StrictInt
+from pydantic import BaseModel, Field, StrictBool, StrictInt, field_validator, model_validator
 from sqlalchemy import case, func, inspect, update
 from sqlmodel import Session, select
 from typing import Optional
 from contextlib import ExitStack
 from copy import deepcopy
 from datetime import datetime, timezone
+from decimal import Decimal
 from weakref import WeakKeyDictionary
 import math
 import os
@@ -275,6 +276,26 @@ class RegisterTaskRequest(BaseModel):
     executor_type: str = "protocol"
     captcha_solver: str = "yescaptcha"
     extra: dict = Field(default_factory=dict)
+    purchase_cost_cny: Optional[Decimal] = None
+    purchase_batch_key: Optional[uuid.UUID] = None
+
+    @field_validator("purchase_cost_cny", mode="before")
+    @classmethod
+    def validate_purchase_cost(cls, value):
+        from services.account_purchase_costs import validate_purchase_cost_cny
+        return validate_purchase_cost_cny(value)
+
+    @model_validator(mode="after")
+    def validate_purchase_batch(self):
+        if self.purchase_cost_cny is not None:
+            login_only = str(self.extra.get("chatgpt_existing_account_login_only", "")).lower() in {"true", "1", "yes", "on"}
+            if self.platform.strip().lower() != "chatgpt" or not login_only:
+                raise ValueError("购号成本仅用于已有 ChatGPT 账号登录")
+            if self.purchase_batch_key is None:
+                raise ValueError("填写购号成本时需要批次请求标识")
+            if not 1 <= self.count <= 100_000:
+                raise ValueError("购号批次人数须在 1 至 100000 之间")
+        return self
 
 
 class ChatGPTReloginTaskRequest(BaseModel):
@@ -1566,6 +1587,25 @@ def _enqueue_prepared_register_task(
     meta: dict | None = None,
 ) -> str:
     task_id = f"task_{uuid.uuid4().hex}"
+    if prepared.purchase_cost_cny is not None:
+        from services.account_purchase_costs import create_purchase_batch
+
+        if source != "manual":
+            raise HTTPException(400, "恢复和重试任务沿用原购号批次")
+        task_id = f"task_purchase_{prepared.purchase_batch_key.hex}"
+        with Session(engine) as session:
+            try:
+                batch = create_purchase_batch(
+                    session, int(prepared.purchase_cost_cny * 100), prepared.count,
+                    "task_login", str(prepared.purchase_batch_key),
+                )
+            except ValueError as exc:
+                raise HTTPException(409, str(exc)) from exc
+            meta = {**(meta or {}), "purchase_batch_id": batch.id}
+            existing = session.get(TaskRunModel, task_id)
+            session.commit()
+            if existing is not None:
+                return task_id
     provider_plan = _normalize_chatgpt_mail_provider_plan(
         prepared.extra.get(CHATGPT_MAIL_PROVIDER_PLAN_KEY)
     )
@@ -4583,6 +4623,42 @@ def _run_register(task_id: str, req: RegisterTaskRequest):
                 _release_chatgpt_mail_provider_reservations(task_id)
 
 
+def _bind_saved_login_purchase(task_id: str, req: RegisterTaskRequest, slot_index: int, saved_account) -> None:
+    """Bind a successful login (including a retry) to its original paid slot."""
+    from services.account_purchase_costs import bind_purchase_slot
+
+    snapshot = _task_store.snapshot_if_present(task_id) or {}
+    batch_id = str((snapshot.get("meta") or {}).get("purchase_batch_id") or "")
+    retry_bindings = req.extra.get(CHATGPT_RETRY_BINDINGS_KEY) or []
+    if not batch_id and req.purchase_cost_cny is None and not retry_bindings:
+        return
+    with Session(engine) as session:
+        if not batch_id:
+            run = session.get(TaskRunModel, task_id)
+            batch_id = str((_json_loads(run.meta_json, {}) if run else {}).get("purchase_batch_id") or "")
+        retry_id = int(retry_bindings[slot_index].get("id") or 0) if retry_bindings and slot_index < len(retry_bindings) else 0
+        visited = set()
+        while not batch_id and retry_id and retry_id not in visited:
+            visited.add(retry_id)
+            binding = session.get(ChatGPTAttemptBindingModel, retry_id)
+            if binding is None:
+                break
+            run = session.get(TaskRunModel, binding.task_id)
+            batch_id = str((_json_loads(run.meta_json, {}) if run else {}).get("purchase_batch_id") or "")
+            if batch_id:
+                slot_index = binding.attempt_index
+                break
+            retry_id = binding.parent_binding_id
+        if not batch_id:
+            return
+        account = session.get(AccountModel, int(saved_account.id))
+        if account is None:
+            raise RuntimeError("账号已删除，购号支出保留在原批次")
+        bind_purchase_slot(session, batch_id, slot_index, account)
+        session.commit()
+        saved_account.purchase_cost_cents = account.purchase_cost_cents
+
+
 def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     from core.registry import get
     from core.base_platform import RegisterConfig
@@ -4612,6 +4688,8 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
     external_sync_threads: list[threading.Thread] = []
     external_sync_threads_lock = threading.Lock()
     start_gate_lock = threading.Lock()
+    attempt_admission = threading.Condition()
+    next_admission_index = 0
     next_start_time = time.time()
     action_name, success_action_name = _task_action_terms(req)
 
@@ -4840,6 +4918,25 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 raise RuntimeError("LeadBee API 订单绑定保存失败，未启动接码")
             return row
 
+        def _start_attempt_in_order(index: int) -> int:
+            nonlocal next_admission_index
+            if req.platform != "chatgpt":
+                control.checkpoint()
+                return control.start_attempt()
+            # Extra workers let mailbox waits yield their active slots. They
+            # must still enter those slots in input order: a later thread can
+            # otherwise consume card two before card one at concurrency=1.
+            with attempt_admission:
+                while index != next_admission_index:
+                    control.checkpoint(consume_skip=False)
+                    attempt_admission.wait(timeout=0.1)
+                try:
+                    control.checkpoint()
+                    return control.start_attempt()
+                finally:
+                    next_admission_index += 1
+                    attempt_admission.notify_all()
+
         def _do_one(i: int):
             nonlocal next_start_time, free_skipped_count
             _proxy = None
@@ -4960,8 +5057,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                 return context or None
 
             try:
-                control.checkpoint()
-                attempt_id = control.start_attempt()
+                attempt_id = _start_attempt_in_order(i)
                 control.checkpoint(attempt_id=attempt_id)
                 if current_email and not _ensure_account_email_fence(
                     current_email
@@ -5175,6 +5271,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         raise RuntimeError(
                             "ChatGPT 账号保存后身份已变化，已停止后续认证写入"
                         )
+                    _bind_saved_login_purchase(task_id, req, i, saved_account)
                 # The mailbox claim is intentionally bound only after the
                 # ChatGPT row has a stable local id.  This closes the window
                 # where a successful first login could leave the receiver

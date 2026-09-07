@@ -3,16 +3,18 @@ import {
   Alert,
   Badge,
   Button,
-  Card,
   Drawer,
   Empty,
   message,
   Popconfirm,
   Progress,
   Space,
+  Skeleton,
+  theme,
   Tag,
   Typography,
 } from 'antd'
+import type { BadgeProps } from 'antd'
 import {
   DeleteOutlined,
   FileTextOutlined,
@@ -21,8 +23,10 @@ import {
 } from '@ant-design/icons'
 import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from '@/components/TaskLogPanel'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './operations-workspace.css'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 const TASK_SUMMARY_REQUEST_TIMEOUT_MS = 15_000
 
 interface TaskSnapshot {
@@ -77,7 +81,7 @@ const SOURCE_LABELS: Record<string, string> = {
   schedule: '调度',
 }
 
-const STATUS_CONFIG: Record<string, { color: string; label: string; icon?: React.ReactNode }> = {
+const STATUS_CONFIG: Record<string, { color: NonNullable<BadgeProps['status']>; label: string; icon?: React.ReactNode }> = {
   pending: { color: 'default', label: '等待中', icon: <LoadingOutlined /> },
   running: { color: 'processing', label: '运行中', icon: <LoadingOutlined /> },
   done: { color: 'success', label: '已完成' },
@@ -123,6 +127,7 @@ function formatRemainingQuota(value: unknown): string | null {
 }
 
 export default function RunningTasks() {
+  const { token } = theme.useToken()
   const [tasks, setTasks] = useState<TaskSnapshot[]>([])
   const [loading, setLoading] = useState(false)
   const [loadFailed, setLoadFailed] = useState(false)
@@ -194,7 +199,9 @@ export default function RunningTasks() {
 
   const isActive = (t: TaskSnapshot) => t.status === 'running' || t.status === 'pending'
   const activeTasks = tasks.filter(isActive)
-  const finishedTasks = tasks.filter((t) => !isActive(t))
+  const needsAttention = (task: TaskSnapshot) => !isActive(task) && (task.status === 'failed' || task.status === 'stopped' || task.error_count > 0)
+  const attentionTasks = tasks.filter(needsAttention)
+  const finishedTasks = tasks.filter(task => !isActive(task) && !needsAttention(task))
 
   const handleDelete = async (taskId: string) => {
     try {
@@ -209,7 +216,7 @@ export default function RunningTasks() {
   }
 
   const renderTask = (task: TaskSnapshot) => {
-    const cfg = STATUS_CONFIG[task.status] || { color: 'default', label: task.status }
+    const cfg = STATUS_CONFIG[task.status] || { color: 'default' as const, label: task.status }
     const failed = Math.max(0, Math.floor(Number(task.error_count) || 0))
     const totalRaw = Number(task.total)
     const doneRaw = Number(task.registered)
@@ -259,77 +266,75 @@ export default function RunningTasks() {
       : formatDuration(task.created_at, task.updated_at)
 
     return (
-      <Card
-        key={task.id}
-        className="running-task-card"
-        size="small"
-        style={{ marginBottom: 12 }}
-        styles={{ body: { padding: 'clamp(12px, 2.5vw, 16px)' } }}
-      >
+      <article key={task.id} className="running-task-card operations-task-row">
         <div className="running-task-card__layout">
           {/* Probe quota + platform */}
           <div className="running-task-card__identity">
-            <Space direction="vertical" size={2}>
+            <Space direction="vertical" size={8}>
+              <Space size={4} wrap>
+                <Tag color="blue" style={{ margin: 0 }}>
+                  {PLATFORM_LABELS[task.platform] || task.platform}
+                </Tag>
+                <Text type="secondary" style={{ fontSize: 12 }}>
+                  {isAutomaticAuthentication
+                    ? '自动认证'
+                    : SOURCE_LABELS[task.source] || task.source || '-'}
+                </Text>
+              </Space>
+              <Text type="secondary" style={{ fontSize: 12 }}>
+                {toUnixSeconds(task.created_at) === null ? '未记录开始时间' : new Date(toUnixSeconds(task.created_at)! * 1000).toLocaleString('zh-CN')}
+              </Text>
               {isAutomaticAuthentication ? (
                 isActive(task) || quotaPostProcessing ? (
-                  <Text type="secondary" style={{ fontSize: 11 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
                     本次探针额度统计中
                   </Text>
                 ) : task.status === 'done' && totalRemainingQuota ? (
                   <div className="running-task-card__quota">
                     {currentRemainingQuota ? (
                       <>
-                        <Text type="secondary" style={{ fontSize: 11 }}>
+                        <Text type="secondary" style={{ fontSize: 12 }}>
                           {showCurrentPartial
                             ? currentDataCount > 0 && currentTotalCount > 0
                               ? `当前窗口可估算部分（${currentDataCount}/${currentTotalCount}）`
                               : '当前窗口可估算部分'
                             : '当前剩余可用额度'}
                         </Text>
-                        <Text strong style={{ fontSize: 13, color: '#10b981' }}>
+                        <Text strong style={{ fontSize: 14, color: token.colorSuccess }}>
                           {currentRemainingQuota}
                         </Text>
                       </>
                     ) : (
-                      <Text type="secondary" style={{ fontSize: 11 }}>
+                      <Text type="secondary" style={{ fontSize: 12 }}>
                         当前窗口额度刷新中
                       </Text>
                     )}
-                    <Text type="secondary" style={{ fontSize: 11 }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
                       {totalWindowFresh ? '总计剩余可用额度' : '总计额度刷新中（暂用探针快照）'}
                     </Text>
-                    <Text strong style={{ fontSize: 13, color: '#10b981' }}>
+                    <Text strong style={{ fontSize: 14, color: token.colorSuccess }}>
                       {totalRemainingQuota}
                     </Text>
                   </div>
                 ) : (
-                  <Text type="secondary" style={{ fontSize: 11 }}>
+                  <Text type="secondary" style={{ fontSize: 12 }}>
                     本次探针额度未生成
                   </Text>
                 )
               ) : null}
-              <Space size={4} wrap>
-                <Tag color="blue" style={{ margin: 0 }}>
-                  {PLATFORM_LABELS[task.platform] || task.platform}
-                </Tag>
-                <Text type="secondary" style={{ fontSize: 11 }}>
-                  {isAutomaticAuthentication
-                    ? '自动认证'
-                    : SOURCE_LABELS[task.source] || task.source || '-'}
-                </Text>
-              </Space>
+
             </Space>
           </div>
 
           {/* Status */}
           <div className="running-task-card__status">
-            <Badge status={cfg.color as any} text={cfg.label} />
+            <Badge status={cfg.color} text={cfg.label} />
           </div>
 
           {/* Duration */}
           <div className="running-task-card__duration">
             <Text type="secondary" style={{ fontSize: 12 }}>
-              ⏱ {duration}
+              耗时 {duration}
             </Text>
           </div>
 
@@ -354,16 +359,16 @@ export default function RunningTasks() {
                 className="running-task-card__stats"
                 style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}
               >
-                <Text style={{ fontSize: 11, color: '#10b981', whiteSpace: 'nowrap' }}>
+                <Text style={{ fontSize: 12, color: token.colorSuccess, whiteSpace: 'nowrap' }}>
                   ✓ 成功 {success}
                 </Text>
                 {failed > 0 && (
-                  <Text style={{ fontSize: 11, color: '#dc2626', whiteSpace: 'nowrap' }}>
+                  <Text style={{ fontSize: 12, color: token.colorError, whiteSpace: 'nowrap' }}>
                     ✗ 失败 {failed}
                   </Text>
                 )}
                 {skipped > 0 && (
-                  <Text style={{ fontSize: 11, color: '#d97706', whiteSpace: 'nowrap' }}>
+                  <Text style={{ fontSize: 12, color: token.colorWarning, whiteSpace: 'nowrap' }}>
                     → 跳过 {skipped}
                   </Text>
                 )}
@@ -408,7 +413,6 @@ export default function RunningTasks() {
           <div className="running-task-card__actions">
             <Space wrap>
               <Button
-                size="small"
                 icon={<FileTextOutlined />}
                 onClick={() => setLogTaskId(task.id)}
               >
@@ -422,7 +426,7 @@ export default function RunningTasks() {
                   okButtonProps={{ danger: true }}
                   onConfirm={() => handleDelete(task.id)}
                 >
-                  <Button size="small" danger icon={<DeleteOutlined />}>
+                  <Button danger icon={<DeleteOutlined />}>
                     删除
                   </Button>
                 </Popconfirm>
@@ -430,66 +434,29 @@ export default function RunningTasks() {
             </Space>
           </div>
         </div>
-      </Card>
+      </article>
     )
   }
 
   return (
-    <div className="running-tasks-page">
-      <div
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
-          marginBottom: 16,
-        }}
-      >
-        <Title level={4} style={{ margin: 0 }}>
-          任务运行
-        </Title>
-        <Button icon={<ReloadOutlined />} loading={loading} onClick={load}>
-          刷新
-        </Button>
-      </div>
-
-      {loadFailed && (
-        <Alert
-          type="warning"
-          showIcon
-          message="任务列表加载失败，正在自动重试"
-          style={{ marginBottom: 16 }}
-        />
-      )}
-
-      {/* Active tasks */}
-      {activeTasks.length > 0 && (
-        <div style={{ marginBottom: 24 }}>
-          <Text
-            strong
-            style={{ display: 'block', marginBottom: 8, fontSize: 13, color: '#6366f1' }}
-          >
-            进行中 ({activeTasks.length})
-          </Text>
-          {activeTasks.map(renderTask)}
-        </div>
-      )}
-
-      {/* Finished tasks */}
-      {finishedTasks.length > 0 && (
-        <div>
-          <Text
-            strong
-            style={{ display: 'block', marginBottom: 8, fontSize: 13, color: '#6b7280' }}
-          >
-            已完成 ({finishedTasks.length})
-          </Text>
-          {finishedTasks.map(renderTask)}
-        </div>
-      )}
-
-      {tasks.length === 0 && !loading && !loadFailed && (
-        <Empty description="暂无任务记录" style={{ marginTop: 60 }} />
-      )}
+    <div className="console-page operations-page running-tasks-page">
+      <ConsolePageHeader
+        title="任务运行"
+        description="先处理执行异常，再查看任务进度与日志。"
+        actions={<><Button href="/history">账号记录</Button><Button icon={<ReloadOutlined />} loading={loading} onClick={() => void load()}>刷新任务</Button></>}
+      />
+      <div className="operations-task-summary"><span>共 {tasks.length} 个保留任务</span><span>每 2.5 秒自动更新</span></div>
+      {loadFailed && <Alert type="warning" showIcon message="任务列表加载失败，正在自动重试" />}
+      {loading && tasks.length === 0 && !loadFailed && <section className="console-panel"><Skeleton active paragraph={{ rows: 4 }} /></section>}
+      {[
+        { title: '执行中', items: activeTasks, description: '进度与耗时自动更新' },
+        { title: '需要处理', items: attentionTasks, description: '查看日志了解原因，失败账号可在日志中恢复' },
+        { title: '已结束', items: finishedTasks, description: '保留的历史任务与执行结果' },
+      ].map(group => group.items.length > 0 && <section key={group.title} className="console-panel operations-task-section" aria-label={group.title}>
+        <div className="operations-section-top"><h2 className="console-section-heading">{group.title} · {group.items.length}</h2><span className="operations-helper">{group.description}</span></div>
+        {group.items.map(renderTask)}
+      </section>)}
+      {tasks.length === 0 && !loading && !loadFailed && <section className="console-panel operations-empty"><Empty description="暂无任务记录" /><p className="operations-helper">补充已有账号后，任务进度与日志会显示在这里。</p><Button href="/supply">补充账号</Button></section>}
 
       {/* Log drawer */}
       <Drawer

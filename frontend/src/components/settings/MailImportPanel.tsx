@@ -10,6 +10,7 @@ type MailImportFormProviderType = MailImportProviderType | 'mail_import'
 
 interface MailImportPanelProps {
   form: FormInstance
+  compact?: boolean
 }
 
 interface MailImportProviderDescriptor {
@@ -212,7 +213,7 @@ function buildResultMessage(result: MailImportResult) {
   return `导入完成：成功 ${result.summary.success} / 失败 ${result.summary.failed}`
 }
 
-export default function MailImportPanel({ form }: MailImportPanelProps) {
+export default function MailImportPanel({ form, compact = false }: MailImportPanelProps) {
   const { message } = App.useApp()
   const watchOptions = { form, preserve: true }
   const currentMailProvider = String(Form.useWatch('mail_provider', watchOptions) || '') as MailImportFormProviderType
@@ -742,15 +743,15 @@ export default function MailImportPanel({ form }: MailImportPanelProps) {
 
   return (
     <Card
-      title={<Space><span>邮箱导入</span><Tag color="geekblue">统一兼容导入</Tag></Space>}
+      title={compact ? undefined : <Space><span>邮箱导入</span><Tag color="geekblue">统一兼容导入</Tag></Space>}
       style={{ marginBottom: 16 }}
     >
       <Space direction="vertical" style={{ width: '100%' }} size={12}>
-        <Typography.Text strong>
+        {!compact && <Typography.Text strong>
           粘贴后自动识别所有支持格式，字段支持完整的 --- 或 ---- 分隔符。
-        </Typography.Text>
+        </Typography.Text>}
         <Typography.Text type="secondary">
-          Microsoft OAuth、MailAPI URL、Google 联邦、密码 + TOTP、密码 + 接码地址和 AppleMail 统一从这里导入；下方同时显示两个邮箱池的全部账号。
+          {compact ? '每行一个账号，字段用 --- 或 ---- 分隔。粘贴后自动识别，确认结果再导入。' : 'Microsoft OAuth、MailAPI URL、Google 联邦、密码 + TOTP、密码 + 接码地址和 AppleMail 统一从这里导入；下方同时显示两个邮箱池的全部账号。'}
         </Typography.Text>
 
         {supportsFilename ? (

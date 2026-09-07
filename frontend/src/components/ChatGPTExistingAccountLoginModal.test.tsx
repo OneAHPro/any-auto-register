@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { cleanup, render, screen } from '@testing-library/react'
+import { cleanup, render, screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -79,6 +79,63 @@ describe('ChatGPTExistingAccountLoginModal', () => {
   })
 
   afterEach(() => cleanup())
+
+  it.each([['', undefined], ['0', '0.00'], ['12.5', '12.50']])('sends batch purchase cost %s separately from login count', async (input, expected) => {
+    const user = userEvent.setup()
+    renderModal()
+    await screen.findByText('可用邮箱 5 个')
+    const cost = screen.getByRole('textbox', { name: '本批购号总成本（元）' })
+    if (input) await user.type(cost, input)
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    await screen.findByText('任务 login-task-1')
+    const payload = taskPayload()
+    expect(payload.count).toBe(5)
+    if (expected === undefined) {
+      expect(payload).not.toHaveProperty('purchase_cost_cny')
+      expect(payload).not.toHaveProperty('purchase_batch_key')
+    } else {
+      expect(payload.purchase_cost_cny).toBe(expected)
+      expect(payload.purchase_batch_key).toMatch(/^[0-9a-f-]{36}$/i)
+    }
+    expect(payload.extra).not.toHaveProperty('purchase_cost_cny')
+  })
+
+  it('keeps the purchase batch key stable on retry and creates a new key for a new login form', async () => {
+    const original = vi.mocked(apiFetch).getMockImplementation()!
+    let attempts = 0
+    vi.mocked(apiFetch).mockImplementation(async (path, options) => {
+      if (path === '/tasks/register' && attempts++ === 0) throw new Error('network interruption')
+      return original(path, options)
+    })
+    const user = userEvent.setup()
+    const view = renderModal()
+    await screen.findByText('可用邮箱 5 个')
+    await user.type(screen.getByRole('textbox', { name: '本批购号总成本（元）' }), '10')
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    await waitFor(() => expect(attempts).toBe(1))
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    await screen.findByText('任务 login-task-1')
+    const firstTwo = vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/tasks/register').map(([, options]) => JSON.parse(String(options?.body)))
+    expect(firstTwo[1].purchase_batch_key).toBe(firstTwo[0].purchase_batch_key)
+    view.rerender(<ChatGPTExistingAccountLoginModal open={false} onClose={() => {}} onDone={() => {}} />)
+    view.rerender(<ChatGPTExistingAccountLoginModal open onClose={() => {}} onDone={() => {}} />)
+    await screen.findByText('可用邮箱 5 个')
+    await user.type(screen.getByRole('textbox', { name: '本批购号总成本（元）' }), '20')
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    await screen.findByText('任务 login-task-1')
+    const last = vi.mocked(apiFetch).mock.calls.filter(([path]) => path === '/tasks/register').at(-1)
+    expect(JSON.parse(String(last?.[1]?.body)).purchase_batch_key).not.toBe(firstTwo[0].purchase_batch_key)
+  })
+
+  it.each(['-1', '1.001'])('rejects an invalid batch purchase cost %s before starting login', async (input) => {
+    const user = userEvent.setup()
+    renderModal()
+    await screen.findByText('可用邮箱 5 个')
+    await user.type(screen.getByRole('textbox', { name: '本批购号总成本（元）' }), input)
+    await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
+    expect(await screen.findByText('请输入非负金额，最多保留两位小数')).toBeTruthy()
+    expect(vi.mocked(apiFetch).mock.calls.some(([path]) => path === '/tasks/register')).toBe(false)
+  })
 
   it('defaults to the card pool when API is not configured', async () => {
     const user = userEvent.setup()

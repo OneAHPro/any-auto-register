@@ -177,7 +177,7 @@ export default function ChatGPTAutoReloginSection() {
       </Form.Item>
 
       <Typography.Paragraph type="secondary">
-        每轮主动触发 Codex2API 的 wham-only 轻量鉴权探针，正常与限流账号不会刷新本地 RT。发现 401 后先让 Codex2API 用自身 RT 自刷新；仍明确鉴权失效时才获取验证码完整登录并覆盖同步。前台新增邮箱、注册、登录和接码任务优先执行。
+        定期检查授权，按需刷新凭据、重登与同步；前台登录任务优先。
       </Typography.Paragraph>
 
       <Divider orientation="left">告警通知</Divider>

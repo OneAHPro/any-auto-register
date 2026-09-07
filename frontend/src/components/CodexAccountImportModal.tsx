@@ -20,6 +20,14 @@ const choices: Array<{ format: CodexImportFormat; title: string; description: st
   { format: 'auto', title: '粘贴 Session JSON', description: '粘贴后自动识别格式' },
 ]
 
+function normalizePurchaseCost(value: string | undefined): string | undefined {
+  const text = String(value ?? '').trim()
+  if (!text) return undefined
+  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error('请输入非负金额，最多保留两位小数')
+  const [whole, fraction = ''] = text.split('.')
+  return `${whole.replace(/^0+(?=\d)/, '')}.${fraction.padEnd(2, '0')}`
+}
+
 function readFile(file: File): Promise<ImportFile> {
   return file.text().then(content => ({ name: file.name, content }))
 }
@@ -38,6 +46,8 @@ function CodexAccountImportModalContent({ open, onClose, onLegacyImport, onCompl
   const [format, setFormat] = useState<CodexImportFormat>('txt')
   const [files, setFiles] = useState<ImportFile[]>([])
   const [paste, setPaste] = useState('')
+  const [purchaseCost, setPurchaseCost] = useState('')
+  const [purchaseBatchKey, setPurchaseBatchKey] = useState(() => crypto.randomUUID())
   const [optionsError, setOptionsError] = useState('')
   const [submitError, setSubmitError] = useState('')
   const [job, setJob] = useState<Job | null>(null)
@@ -90,9 +100,13 @@ function CodexAccountImportModalContent({ open, onClose, onLegacyImport, onCompl
     const payloadFiles = format === 'auto' && paste.trim() ? [{ name: 'session.json', content: paste }] : files
     if (format === 'auto' && !payloadFiles.length) { setSubmitError('请选择文件或粘贴 Session JSON'); return }
     if (format !== 'auto' && !files.length) { setSubmitError('请先选择文件'); return }
+    let cost: string | undefined
+    try { cost = normalizePurchaseCost(purchaseCost) }
+    catch (error) { setSubmitError(error instanceof Error ? error.message : '购号总成本格式无效'); return }
     setSubmitting(true)
     try {
-      const response = await apiFetch('/codex-import', { method: 'POST', body: JSON.stringify({ pool_id: poolId, ...(targetId !== undefined ? { target_id: targetId } : {}), format, files: payloadFiles }) }) as { job_id: string; status: Job['status'] }
+      const response = await apiFetch('/codex-import', { method: 'POST', body: JSON.stringify({ pool_id: poolId, ...(targetId !== undefined ? { target_id: targetId } : {}), format, files: payloadFiles, ...(cost !== undefined ? { purchase_cost_cny: cost, purchase_batch_key: purchaseBatchKey } : {}) }) }) as { job_id: string; status: Job['status'] }
+      setPurchaseCost(''); setPurchaseBatchKey(crypto.randomUUID())
       setFiles([]); setPaste(''); setJob({ id: response.job_id, status: response.status || 'queued' }); onCompleted?.()
     } catch (error) { setSubmitError(error instanceof Error ? error.message : '提交导入任务失败') }
     finally { setSubmitting(false) }
@@ -116,7 +130,12 @@ function CodexAccountImportModalContent({ open, onClose, onLegacyImport, onCompl
       {format === 'auto' && <Input.TextArea aria-label="Session JSON" rows={5} placeholder="粘贴 Session JSON，或选择文件夹" value={paste} onChange={event => setPaste(event.target.value)} />}
       {format !== 'auto' && <Upload accept={format === 'json' || format === 'json_at' ? '.json' : '.txt'} multiple beforeUpload={() => false} showUploadList={{ showRemoveIcon: true }} onChange={async ({ fileList }: { fileList: UploadFile[] }) => { const list = await Promise.all(fileList.map(item => item.originFileObj ? readFile(item.originFileObj) : Promise.resolve(null))); setFiles(list.filter(Boolean) as ImportFile[]) }}><Button>选择文件</Button></Upload>}
       {format === 'auto' && <><input ref={inputRef} type="file" multiple accept=".txt,.json" {...({ webkitdirectory: '', directory: '' } as any)} style={{ display: 'none' }} onChange={event => { void collectFolder(event.target.files) }} /><Button icon={<FolderOpenOutlined />} onClick={() => inputRef.current?.click()}>选择文件夹（递归）</Button>{files.length > 0 && <Typography.Text type="secondary">已读取 {files.length} 个文件</Typography.Text>}</>}
-      <Space><Button type="primary" loading={submitting} onClick={() => { void submit() }}>提交导入</Button>{onLegacyImport && <Button type="link" onClick={onLegacyImport}>使用旧版邮箱/密码导入</Button>}</Space>
+      <div>
+        <Typography.Text style={{ display: 'block', marginBottom: 8 }}>本批购号总成本（元）</Typography.Text>
+        <Input aria-label="本批购号总成本（元）" inputMode="decimal" value={purchaseCost} onChange={event => setPurchaseCost(event.target.value)} placeholder="例如 25.00，表示整批总价" disabled={submitting} />
+        <Typography.Text type="secondary" style={{ display: 'block', marginTop: 6, fontSize: 12 }}>可选，填写本批总价，后台按本批账号分摊；导入失败的账号仍计入购号成本。留空不记录，0 表示零成本。</Typography.Text>
+      </div>
+      <Space><Button aria-label="提交导入" type="primary" loading={submitting} onClick={() => { void submit() }}>提交导入</Button>{onLegacyImport && <Button type="link" onClick={onLegacyImport}>使用旧版邮箱/密码导入</Button>}</Space>
       {submitError && <Alert type="error" showIcon message={submitError} />}
       {job && <div aria-live="polite"><Space><Tag color={job.status === 'completed' ? 'success' : job.status === 'failed' ? 'error' : 'processing'}>{job.status}</Tag><Typography.Text>任务 {job.id}</Typography.Text></Space><Progress percent={percent} status={job.status === 'failed' ? 'exception' : undefined} /><Typography.Text type="secondary">总数 {job.total ?? '-'} · 已处理 {job.processed ?? 0} · 成功 {job.success ?? 0} · 重复 {job.duplicate ?? 0} · 失败 {job.failed ?? 0}</Typography.Text>{job.error && <Alert type="error" message={job.error} style={{ marginTop: 8 }} />}{isDone && <Button style={{ marginTop: 8 }} onClick={() => { onCompleted?.(); message.info('账号列表已刷新'); }}>刷新账号列表</Button>}</div>}
     </Space>

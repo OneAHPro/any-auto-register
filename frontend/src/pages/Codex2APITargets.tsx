@@ -1,10 +1,10 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Alert,
   Button,
-  Card,
   Col,
   Form,
+  Grid,
   Input,
   InputNumber,
   Modal,
@@ -16,12 +16,8 @@ import {
   Tag,
   Typography,
   message,
-  theme,
 } from 'antd'
 import {
-  ApiOutlined,
-  CheckCircleOutlined,
-  CloudServerOutlined,
   EditOutlined,
   PlusOutlined,
   ReloadOutlined,
@@ -29,8 +25,10 @@ import {
 } from '@ant-design/icons'
 
 import { apiFetch } from '@/lib/utils'
+import { ConsolePageHeader } from '@/components/console/ConsolePageHeader'
+import './management-workspace.css'
 
-const { Paragraph, Text, Title } = Typography
+const { Text } = Typography
 
 interface Codex2APITarget {
   id: number
@@ -49,6 +47,19 @@ interface Codex2APITarget {
   last_sync_at?: string | null
   last_error?: string
   account_count: number
+}
+
+interface SalePrice {
+  target_id: number
+  price_cny_per_usd: string
+  effective_at: string
+}
+
+function normalizeSalePrice(value: string): string {
+  const text = value.trim()
+  if (!/^\d+(?:\.\d{1,4})?$/.test(text)) throw new Error('请输入非负售价，最多保留四位小数')
+  const [whole, fraction = ''] = text.split('.')
+  return `${whole.replace(/^0+(?=\d)/, '')}.${fraction.padEnd(4, '0')}`
 }
 
 interface AccountPool {
@@ -127,7 +138,7 @@ function parseApiKeyIds(value?: string): number[] {
 }
 
 export default function Codex2APITargets() {
-  const { token } = theme.useToken()
+  const screens = Grid.useBreakpoint()
   const [targetForm] = Form.useForm<TargetFormValues>()
   const [poolForm] = Form.useForm<PoolFormValues>()
   const [targets, setTargets] = useState<Codex2APITarget[]>([])
@@ -138,9 +149,57 @@ export default function Codex2APITargets() {
   const [editorOpen, setEditorOpen] = useState(false)
   const [poolOpen, setPoolOpen] = useState(false)
   const [editing, setEditing] = useState<Codex2APITarget | null>(null)
+  const [salePrices, setSalePrices] = useState<SalePrice[]>([])
+  const [priceLoading, setPriceLoading] = useState(true)
+  const [priceLoadError, setPriceLoadError] = useState('')
+  const [saleEditing, setSaleEditing] = useState<Codex2APITarget | null>(null)
+  const [salePriceInput, setSalePriceInput] = useState('')
+  const [priceSaving, setPriceSaving] = useState(false)
+  const [priceSaveError, setPriceSaveError] = useState('')
+  const priceRequestEpoch = useRef(0)
+
+  const loadSalePrices = useCallback(async () => {
+    const epoch = ++priceRequestEpoch.current
+    setPriceLoading(true)
+    try {
+      const response = await apiFetch('/operations/sale-prices')
+      if (epoch !== priceRequestEpoch.current) return
+      setSalePrices(Array.isArray(response?.items) ? response.items : [])
+      setPriceLoadError('')
+    } catch (error: unknown) {
+      if (epoch === priceRequestEpoch.current) setPriceLoadError(`售价读取失败：${errorText(error)}`)
+    } finally {
+      if (epoch === priceRequestEpoch.current) setPriceLoading(false)
+    }
+  }, [])
+
+  const openSalePrice = (target: Codex2APITarget) => {
+    setSaleEditing(target)
+    setSalePriceInput(salePrices.find(item => item.target_id === target.id)?.price_cny_per_usd ?? '')
+    setPriceSaveError('')
+  }
+
+  const saveSalePrice = async () => {
+    if (!saleEditing) return
+    let price: string
+    try { price = normalizeSalePrice(salePriceInput) }
+    catch (error) { setPriceSaveError(errorText(error)); return }
+    setPriceSaving(true)
+    setPriceSaveError('')
+    try {
+      await apiFetch(`/operations/targets/${saleEditing.id}/sale-price`, {
+        method: 'PUT', body: JSON.stringify({ price_cny_per_usd: price }),
+      })
+      setSaleEditing(null)
+      message.success('销售单价已保存')
+      await loadSalePrices()
+    } catch (error: unknown) { setPriceSaveError(`售价保存失败：${errorText(error)}`) }
+    finally { setPriceSaving(false) }
+  }
 
   const load = useCallback(async () => {
     setLoading(true)
+    void loadSalePrices()
     try {
       const [targetData, poolData] = await Promise.all([
         apiFetch('/codex2api/targets'),
@@ -153,7 +212,7 @@ export default function Codex2APITargets() {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [loadSalePrices])
 
   useEffect(() => {
     const timer = window.setTimeout(() => { void load() }, 0)
@@ -265,22 +324,36 @@ export default function Codex2APITargets() {
     }
   }
 
+  const renderSalePrice = (record: Codex2APITarget) => {
+    const price = salePrices.find(item => item.target_id === record.id)
+    const amount = Number(price?.price_cny_per_usd)
+    const label = priceLoading ? '读取售价…' : !price ? '售价未设置'
+      : Number.isFinite(amount) && amount >= 0 ? `¥${amount.toFixed(4)}/$` : '售价数据待确认'
+    return <Space size={[8, 4]} wrap style={{ marginTop: 8 }}>
+      <Text>{label}</Text>
+      <Button size="small" onClick={() => openSalePrice(record)} disabled={priceLoading}>设置售价</Button>
+    </Space>
+  }
+
   const columns = [
     {
-      title: '目标',
+      title: '实例 / 销售单价',
       key: 'target',
       width: 230,
       render: (_value: unknown, record: Codex2APITarget) => (
-        <Space direction="vertical" size={2}>
-          <Space size={8}>
+        <div className="management-instance-identity">
+          <div className="management-instance-name">
             <span className={`target-status-dot target-status-dot--${record.health_status}`} />
             <Text strong>{record.name}</Text>
+          </div>
+          <Space size={[4, 4]} wrap>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {record.server_label || `实例 #${record.id}`}
+            </Text>
             <Tag bordered={false}>{TYPE_LABELS[record.target_type] || record.target_type}</Tag>
           </Space>
-          <Text type="secondary" style={{ fontSize: 12 }}>
-            {record.server_label || `目标 #${record.id}`}
-          </Text>
-        </Space>
+          {renderSalePrice(record)}
+        </div>
       ),
     },
     {
@@ -293,7 +366,7 @@ export default function Codex2APITargets() {
       },
     },
     {
-      title: '节点地址',
+      title: '连接地址',
       dataIndex: 'base_url',
       key: 'base_url',
       ellipsis: true,
@@ -329,7 +402,7 @@ export default function Codex2APITargets() {
       title: '操作',
       key: 'actions',
       width: 190,
-      fixed: 'right' as const,
+      fixed: screens.md ? 'right' as const : undefined,
       render: (_value: unknown, record: Codex2APITarget) => (
         <Space>
           <Button
@@ -349,42 +422,23 @@ export default function Codex2APITargets() {
   ]
 
   return (
-    <div className="control-plane-page page-enter">
-      <section className="control-plane-heading">
-        <div>
-          <Text className="control-plane-eyebrow">CODEX2API FLEET</Text>
-          <Title level={2} style={{ margin: '4px 0 6px' }}>目标节点</Title>
-          <Paragraph type="secondary" style={{ margin: 0, maxWidth: 720 }}>
-            这里登记每一套未修改的 Codex2API。账号身份、额度和归属由本系统统一管理。
-          </Paragraph>
-        </div>
-        <Space wrap>
+    <div className="console-page management-workspace">
+      <ConsolePageHeader
+        title="实例管理"
+        description="查看各 Codex2API 实例的连接状态，管理号池归属与接入信息。"
+        actions={<Space wrap>
           <Button icon={<ReloadOutlined spin={loading} />} onClick={load}>刷新</Button>
           <Button icon={<PlusOutlined />} onClick={openCreatePool} disabled={targets.length === 0}>新建号池</Button>
-          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>添加目标</Button>
-        </Space>
-      </section>
+          <Button type="primary" icon={<PlusOutlined />} onClick={openCreate}>添加实例</Button>
+        </Space>}
+      />
+      <dl className="management-summary">
+        <div><dt>已接入实例</dt><dd>{targets.length}</dd></div>
+        <div><dt>迁移就绪</dt><dd>{healthyCount}</dd></div>
+        <div><dt>逻辑号池</dt><dd>{pools.length}</dd></div>
+      </dl>
 
-      <Row gutter={[12, 12]} className="control-plane-metrics">
-        <Col xs={24} sm={8}>
-          <Card size="small" className="control-metric-card">
-            <CloudServerOutlined />
-            <div><strong>{targets.length}</strong><span>已登记节点</span></div>
-          </Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card size="small" className="control-metric-card control-metric-card--healthy">
-            <CheckCircleOutlined />
-            <div><strong>{healthyCount}</strong><span>迁移就绪</span></div>
-          </Card>
-        </Col>
-        <Col xs={24} sm={8}>
-          <Card size="small" className="control-metric-card">
-            <ApiOutlined />
-            <div><strong>{pools.length}</strong><span>逻辑号池</span></div>
-          </Card>
-        </Col>
-      </Row>
+      {priceLoadError && <Alert type="warning" showIcon message={priceLoadError} action={<Button onClick={() => void loadSalePrices()}>重试读取售价</Button>} />}
 
       {targets.some(item => item.health_status === 'degraded') ? (
         <Alert
@@ -395,11 +449,8 @@ export default function Codex2APITargets() {
         />
       ) : null}
 
-      <Card
-        className="control-plane-table-card"
-        styles={{ body: { padding: 0 } }}
-        title={<Space><span className="control-plane-rail" />节点拓扑</Space>}
-      >
+      <section className="console-panel management-table-section" aria-labelledby="instances-heading">
+        <div className="console-section-heading"><h2 id="instances-heading">实例列表</h2><span>{screens.md ? '连接、健康与账号承载情况' : '左右滑动查看连接信息和操作'}</span></div>
         <Table<Codex2APITarget>
           rowKey="id"
           columns={columns}
@@ -407,15 +458,33 @@ export default function Codex2APITargets() {
           loading={loading}
           pagination={false}
           scroll={{ x: 1220 }}
-          locale={{ emptyText: '还没有目标。先添加当前正在使用的 Codex2API。' }}
+          locale={{ emptyText: '尚未接入实例。添加正在使用的 Codex2API 后，即可查看连接与账号状态。' }}
         />
-      </Card>
+      </section>
 
-      <Card title="号池与目标绑定" className="control-plane-table-card">
+      <Modal
+        title={saleEditing ? `设置 ${saleEditing.name} 的销售单价` : '设置销售单价'}
+        open={Boolean(saleEditing)}
+        onCancel={() => { if (!priceSaving) setSaleEditing(null) }}
+        onOk={() => void saveSalePrice()}
+        confirmLoading={priceSaving}
+        okText="保存售价"
+        cancelText="取消"
+        maskClosable={false}
+        destroyOnHidden
+      >
+        <label htmlFor="instance-sale-price">销售单价（元/美元）</label>
+        <Input id="instance-sale-price" aria-label="销售单价（元/美元）" inputMode="decimal" value={salePriceInput} onChange={event => setSalePriceInput(event.target.value)} placeholder="例如 0.2400" disabled={priceSaving} style={{ margin: '8px 0' }} />
+        <Text type="secondary" style={{ fontSize: 12 }}>每 1 美元计费对应的人民币售价，仅对当前实例生效。请输入实际售价，0 表示零售价。</Text>
+        {priceSaveError && <Alert type="error" showIcon message={priceSaveError} style={{ marginTop: 12 }} />}
+      </Modal>
+
+      <section className="console-panel management-pool-section" aria-labelledby="pools-heading">
+        <div className="console-section-heading"><h2 id="pools-heading">号池归属</h2><span>每套实例的保底规模与容量上限</span></div>
         {pools.length ? (
-          <div className="pool-chip-list">
+          <div className="management-pool-list">
             {pools.map(pool => (
-              <div className="pool-chip" key={pool.id} style={{ borderColor: token.colorBorder }}>
+              <div className="management-pool-row" key={pool.id}>
                 <div>
                   <Text strong>{pool.name}</Text>
                   <Text type="secondary">{pool.id}</Text>
@@ -435,27 +504,28 @@ export default function Codex2APITargets() {
         ) : (
           <Text type="secondary">尚未建立企业号池。公共池、浮动池和备用池会在服务初始化后自动创建。</Text>
         )}
-      </Card>
+      </section>
 
       <Modal
-        title={editing ? `编辑目标 · ${editing.name}` : '添加 Codex2API 目标'}
+        className="management-dialog"
+        title={editing ? `编辑实例 · ${editing.name}` : '添加 Codex2API 实例'}
         open={editorOpen}
         onCancel={() => setEditorOpen(false)}
         onOk={saveTarget}
         confirmLoading={saving}
-        okText="保存目标"
+        okText="保存实例"
         cancelText="取消"
         destroyOnHidden
       >
         <Form form={targetForm} layout="vertical" requiredMark="optional">
           <Row gutter={12}>
-            <Col span={14}>
-              <Form.Item name="name" label="目标名称" rules={[{ required: true, message: '请输入目标名称' }]}>
+            <Col xs={24} sm={14}>
+              <Form.Item name="name" label="实例名称" rules={[{ required: true, message: '请输入目标名称' }]}>
                 <Input placeholder="例如：美国二号机" />
               </Form.Item>
             </Col>
-            <Col span={10}>
-              <Form.Item name="target_type" label="节点类型" rules={[{ required: true }]}>
+            <Col xs={24} sm={10}>
+              <Form.Item name="target_type" label="实例类型" rules={[{ required: true }]}>
                 <Select options={Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label }))} />
               </Form.Item>
             </Col>
@@ -479,12 +549,12 @@ export default function Codex2APITargets() {
             <Input.Password aria-label="Admin Key" autoComplete="new-password" placeholder={editing ? '留空不修改' : '输入 Admin Key'} />
           </Form.Item>
           <Row gutter={12}>
-            <Col span={18}>
+            <Col xs={24} sm={18}>
               <Form.Item name="default_pool_id" label="默认号池">
                 <Input placeholder="PUBLIC_POOL" />
               </Form.Item>
             </Col>
-            <Col span={6}>
+            <Col xs={12} sm={6}>
               <Form.Item name="enabled" label="启用" valuePropName="checked">
                 <Switch />
               </Form.Item>
@@ -494,7 +564,8 @@ export default function Codex2APITargets() {
       </Modal>
 
       <Modal
-        title="新建企业号池"
+        className="management-dialog"
+        title="新建号池"
         open={poolOpen}
         onCancel={() => setPoolOpen(false)}
         onOk={savePool}
@@ -506,41 +577,41 @@ export default function Codex2APITargets() {
       >
         <Form form={poolForm} layout="vertical" requiredMark="optional">
           <Row gutter={12}>
-            <Col span={12}>
+            <Col xs={24} sm={12}>
               <Form.Item name="id" label="号池 ID" rules={[{ required: true, pattern: /^[A-Z][A-Z0-9_]{1,63}$/, message: '使用大写字母、数字和下划线' }]}>
                 <Input placeholder="ENTERPRISE_A_POOL" />
               </Form.Item>
             </Col>
-            <Col span={12}>
+            <Col xs={24} sm={12}>
               <Form.Item name="name" label="显示名称" rules={[{ required: true }]}>
                 <Input placeholder="企业 A 号池" />
               </Form.Item>
             </Col>
           </Row>
           <Row gutter={12}>
-            <Col span={8}>
+            <Col xs={24} sm={8}>
               <Form.Item name="pool_type" label="号池类型" rules={[{ required: true }]}>
                 <Select options={Object.entries(TYPE_LABELS).map(([value, label]) => ({ value, label }))} />
               </Form.Item>
             </Col>
-            <Col span={16}>
-              <Form.Item name="target_id" label="承载目标" rules={[{ required: true }]}>
+            <Col xs={24} sm={16}>
+              <Form.Item name="target_id" label="承载实例" rules={[{ required: true }]}>
                 <Select options={targets.map(item => ({ value: item.id, label: `${item.name} · #${item.id}` }))} />
               </Form.Item>
             </Col>
           </Row>
           <Row gutter={12}>
-            <Col span={12}><Form.Item name="customer_id" label="客户 ID"><Input placeholder="customer-a" /></Form.Item></Col>
-            <Col span={12}><Form.Item name="customer_name" label="客户名称"><Input placeholder="企业 A" /></Form.Item></Col>
+            <Col xs={24} sm={12}><Form.Item name="customer_id" label="客户 ID"><Input placeholder="customer-a" /></Form.Item></Col>
+            <Col xs={24} sm={12}><Form.Item name="customer_name" label="客户名称"><Input placeholder="企业 A" /></Form.Item></Col>
           </Row>
           <Form.Item name="remote_api_key_ids" label="Codex2API API Key ID" extra="多个 ID 用逗号分隔；留空表示统计该目标全部 Key。">
             <Input placeholder="11, 12" />
           </Form.Item>
           <Row gutter={12}>
-            <Col span={6}><Form.Item name="min_accounts" label="最少账号"><InputNumber min={0} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col span={6}><Form.Item name="max_accounts" label="最多账号"><InputNumber min={0} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col span={6}><Form.Item name="safe_concurrency_per_account" label="单号安全并发"><InputNumber min={1} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
-            <Col span={6}><Form.Item name="min_lease_hours" label="最小租约(时)"><InputNumber min={1} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name="min_accounts" label="保底账号数"><InputNumber min={0} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name="max_accounts" label="账号数上限"><InputNumber min={0} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name="safe_concurrency_per_account" label="单号安全并发"><InputNumber min={1} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
+            <Col xs={12} sm={6}><Form.Item name="min_lease_hours" label="最小租约(时)"><InputNumber min={1} precision={0} style={{ width: '100%' }} /></Form.Item></Col>
           </Row>
           <Form.Item name="bandwidth_mbps" label="目标带宽 Mbps">
             <InputNumber min={0} precision={0} style={{ width: '100%' }} />

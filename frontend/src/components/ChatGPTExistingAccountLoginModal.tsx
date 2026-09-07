@@ -4,6 +4,7 @@ import {
   Button,
   Col,
   Form,
+  Input,
   InputNumber,
   Modal,
   Radio,
@@ -39,6 +40,7 @@ type LoginFormValues = {
   register_delay_seconds: number
   sms_mode: ChatGPTSmsMode
   rotate_mfa: boolean
+  purchase_cost_cny?: string
 }
 
 type ImportedMailProvider = 'microsoft' | 'applemail'
@@ -104,6 +106,14 @@ function formatMoney(value: number | null, currency: string): string {
   return `${moneySymbol(currency)}${value.toFixed(2)}`
 }
 
+function normalizePurchaseCost(value: string | undefined): string | undefined {
+  const text = String(value ?? '').trim()
+  if (!text) return undefined
+  if (!/^\d+(?:\.\d{1,2})?$/.test(text)) throw new Error('请输入非负金额，最多保留两位小数')
+  const [whole, fraction = ''] = text.split('.')
+  return `${whole.replace(/^0+(?=\d)/, '')}.${fraction.padEnd(2, '0')}`
+}
+
 function sanitizeLoginConfig(value: unknown): Record<string, unknown> {
   const config = { ...(asRecord(value) ?? {}) }
   delete config.leadbee_api_key
@@ -125,6 +135,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
   const [loadingConfig, setLoadingConfig] = useState(false)
   const [submitting, setSubmitting] = useState(false)
   const [taskId, setTaskId] = useState<string | null>(null)
+  const [purchaseBatchKey, setPurchaseBatchKey] = useState('')
   const smsMode = Form.useWatch('sms_mode', form) || 'none'
   const rotateMfa = Form.useWatch('rotate_mfa', form) !== false
   const watchedCount = Math.max(1, Number(Form.useWatch('count', form) || 1))
@@ -224,6 +235,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
 
     const startTimer = window.setTimeout(() => {
       setTaskId(null)
+      setPurchaseBatchKey(crypto.randomUUID())
       setPoolCount(null)
       setMailProviderPlan([])
       setSmsPoolAvailable(null)
@@ -263,9 +275,13 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
         mailProviderPlan: mailProviderPlan.slice(0, values.count),
         config,
       })
+      const purchaseCost = normalizePurchaseCost(values.purchase_cost_cny)
       const result = await apiFetch('/tasks/register', {
         method: 'POST',
-        body: JSON.stringify(payload),
+        body: JSON.stringify({
+          ...payload,
+          ...(purchaseCost !== undefined ? { purchase_cost_cny: purchaseCost, purchase_batch_key: purchaseBatchKey } : {}),
+        }),
       })
       setTaskId(String(result.task_id || ''))
     } catch (error) {
@@ -361,6 +377,18 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 </Form.Item>
               </Col>
             </Row>
+
+            <Form.Item
+              name="purchase_cost_cny"
+              label="本批购号总成本（元）"
+              extra={<span style={{ fontSize: 12 }}>可选，填写本批总价，后台按本批账号分摊；登录失败的账号仍计入购号成本。留空不记录，0 表示零成本。</span>}
+              rules={[{ validator: (_rule, value) => {
+                try { normalizePurchaseCost(value); return Promise.resolve() }
+                catch (error) { return Promise.reject(error) }
+              } }]}
+            >
+              <Input inputMode="decimal" placeholder="例如 25.00，表示整批总价" />
+            </Form.Item>
 
             <div
               style={{

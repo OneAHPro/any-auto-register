@@ -631,11 +631,17 @@ class SmsPoolStartupRecoveryTests(unittest.TestCase):
     def test_init_db_runs_interrupted_recovery_before_stale_active_recovery(self):
         from core import db as db_module
 
+        startup_engine = create_engine(
+            "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+        )
+        SQLModel.metadata.create_all(startup_engine)
+        self.addCleanup(startup_engine.dispose)
         calls: list[str] = []
         pool = mock.Mock()
         pool.recover_interrupted.side_effect = lambda: calls.append("interrupted")
         pool.recover_stale_active.side_effect = lambda: calls.append("stale-active")
         with (
+            mock.patch.object(db_module, "engine", startup_engine),
             mock.patch.object(db_module.SQLModel.metadata, "create_all"),
             mock.patch.object(db_module, "_migrate_outlook_accounts_schema"),
             mock.patch.object(db_module, "_recover_chatgpt_attempt_bindings"),
@@ -1278,6 +1284,37 @@ class SmsPoolTaskIntegrationTests(unittest.TestCase):
 
         self.assertNotIn("card-secret-value", str(public))
         self.assertIn("[卡密已隐藏]", public["error"])
+
+    def test_task_preserves_card_order_when_first_worker_is_delayed(self):
+        from concurrent.futures import ThreadPoolExecutor
+        import api.tasks as task_api
+
+        second_started = threading.Event()
+        original_submit = ThreadPoolExecutor.submit
+        original_log = task_api._log
+
+        def observe_start(task_id, message):
+            if "开始登录并接码第 2/4 个账号" in message:
+                second_started.set()
+            return original_log(task_id, message)
+
+        def delayed_submit(executor, function, *args, **kwargs):
+            if getattr(function, "__name__", "") != "_do_one" or args != (0,):
+                return original_submit(executor, function, *args, **kwargs)
+
+            def delayed_first():
+                # Force a later worker to reach admission first. Ordered
+                # admission must keep it waiting rather than consume card two.
+                second_started.wait(timeout=0.25)
+                return function(*args, **kwargs)
+
+            return original_submit(executor, delayed_first)
+
+        with (
+            mock.patch.object(ThreadPoolExecutor, "submit", new=delayed_submit),
+            mock.patch("api.tasks._log", side_effect=observe_start),
+        ):
+            self.test_task_preserves_provider_lifecycle_when_finalizing_pool_cards()
 
     def test_task_preserves_provider_lifecycle_when_finalizing_pool_cards(self):
         task_id = "task-pool-finalize"

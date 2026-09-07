@@ -92,6 +92,18 @@ describe('RunningTasks lightweight summaries', () => {
     vi.useRealTimers()
   })
 
+  it('separates tasks needing attention from completed tasks', async () => {
+    vi.mocked(apiFetch).mockResolvedValue([
+      automaticSummary({ id: 'done', error_count: 0 }),
+      automaticSummary({ id: 'failed', status: 'failed' }),
+      automaticSummary({ id: 'running', status: 'running' }),
+    ])
+    render(<RunningTasks />)
+    expect(await screen.findByRole('heading', { name: '需要处理 · 1' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '执行中 · 1' })).toBeTruthy()
+    expect(screen.getByRole('heading', { name: '已结束 · 1' })).toBeTruthy()
+  })
+
   it('loads cards from the summary endpoint and separates failures from deleted accounts', async () => {
     render(<RunningTasks />)
 

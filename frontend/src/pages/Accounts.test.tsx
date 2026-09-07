@@ -124,7 +124,7 @@ function createMessageResult(): ReturnType<typeof message.success> {
 }
 
 async function selectAccount(user: ReturnType<typeof userEvent.setup>, email: string) {
-  const row = (await screen.findByText(email)).closest('tr')
+  const row = (await screen.findByText(email)).closest('[data-account-row]')
   expect(row).toBeTruthy()
   await user.click(within(row as HTMLElement).getByRole('checkbox'))
 }
@@ -151,6 +151,41 @@ describe('Accounts ChatGPT staged login integration', () => {
 
   afterEach(() => {
     cleanup()
+  })
+
+  it('presents an account workspace with supply access and no new-account registration action', async () => {
+    render(<Accounts />)
+
+    await screen.findByText('eligible@example.com')
+    expect(screen.getByRole('heading', { name: '账号池', level: 1 })).toBeTruthy()
+    expect(screen.getByRole('link', { name: '补充账号' }).getAttribute('href')).toBe('/supply')
+    expect(screen.queryByRole('button', { name: /^注\s*册$/ })).toBeNull()
+    expect(screen.getByRole('region', { name: '账号筛选与批量操作' })).toBeTruthy()
+  })
+
+  it('clears selected records without changing the current account filter', async () => {
+    const user = userEvent.setup()
+    render(<Accounts />)
+    await selectAccount(user, 'eligible@example.com')
+    const requests = accountRequestCount()
+    await user.click(screen.getByRole('button', { name: '清空选择' }))
+    expect((screen.getByRole('checkbox', { name: '选择 eligible@example.com' }) as HTMLInputElement).checked).toBe(false)
+    expect((screen.getByRole('button', { name: /重登所选.*0/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(accountRequestCount()).toBe(requests)
+  })
+
+  it('distinguishes an empty filtered result from an empty account pool', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path: string) => {
+      if (path.startsWith('/accounts?')) return { items: path.includes('email=') ? [] : [eligibleAccount], total: path.includes('email=') ? 0 : 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+    await screen.findByText('eligible@example.com')
+    await user.type(screen.getByRole('searchbox', { name: '搜索账号邮箱' }), 'missing@example.com{Enter}')
+    expect(await screen.findByText('没有符合筛选条件的账号')).toBeTruthy()
+    expect(screen.getByRole('link', { name: '前往补充账号' }).getAttribute('href')).toBe('/supply')
   })
 
   it('updates only the saved cost on a managed account and preserves the live quota', async () => {
@@ -362,8 +397,8 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('tr')
-    const completedRow = screen.getByText('complete@example.com').closest('tr')
+    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
+    const completedRow = screen.getByText('complete@example.com').closest('[data-account-row]')
     expect(eligibleRow).toBeTruthy()
     expect(completedRow).toBeTruthy()
 
@@ -667,17 +702,19 @@ describe('Accounts ChatGPT staged login integration', () => {
 
     render(<Accounts />)
 
-    const row = (await screen.findByText('legacy@example.com')).closest('tr')
+    const row = (await screen.findByText('legacy@example.com')).closest('[data-account-row]')
     expect(within(row as HTMLElement).queryByRole('button', { name: '接码' })).toBeNull()
   })
 
-  it('keeps the email column fixed while the ChatGPT table scrolls horizontally', async () => {
+  it('groups each account as an independently selectable record in the account list', async () => {
     render(<Accounts />)
 
     await screen.findByText('eligible@example.com')
-    expect(screen.getByRole('columnheader', { name: '邮箱' }).className).toContain(
-      'ant-table-cell-fix-left',
-    )
+    const list = screen.getByRole('list', { name: '账号列表' })
+    const records = within(list).getAllByRole('listitem')
+    expect(records).toHaveLength(2)
+    expect(within(records[0]).getByRole('checkbox', { name: '选择 eligible@example.com' })).toBeTruthy()
+    expect(within(records[1]).getByRole('checkbox', { name: '选择 complete@example.com' })).toBeTruthy()
   })
 
   it('renders one responsive card per account and keeps a current-page select-all control', async () => {
@@ -776,10 +813,12 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(within(quota).getByText('未设置')).toBeTruthy()
   })
 
-  it('constrains long refresh-token previews inside their table cell', async () => {
+  it('keeps refresh-token previews inside their record after opening credentials', async () => {
     render(<Accounts />)
 
-    const completedRow = (await screen.findByText('complete@example.com')).closest('tr')
+    const completedRow = (await screen.findByText('complete@example.com')).closest('[data-account-row]')
+    expect(within(completedRow as HTMLElement).queryByText('refresh-token')).toBeNull()
+    await userEvent.click(within(completedRow as HTMLElement).getByRole('button', { name: '登录凭据' }))
     const tokenPreview = within(completedRow as HTMLElement).getByText('refresh-token')
     expect((tokenPreview as HTMLElement).style.display).toBe('inline-block')
   })
@@ -798,7 +837,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('tr')
+    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(eligibleRow as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*1/ }))
     expect(
@@ -830,8 +869,8 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('tr')
-    const completedRow = screen.getByText('complete@example.com').closest('tr')
+    const eligibleRow = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
+    const completedRow = screen.getByText('complete@example.com').closest('[data-account-row]')
     await user.click(within(eligibleRow as HTMLElement).getByRole('checkbox'))
     await user.click(within(completedRow as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*2/ }))
@@ -901,7 +940,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*1/ }))
     await user.click(await screen.findByRole('button', { name: '确认' }))
@@ -922,7 +961,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     const { rerender } = render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*1/ }))
     await user.click(await screen.findByRole('button', { name: '确认' }))
@@ -950,7 +989,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     const { rerender } = render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*1/ }))
     await user.click(await screen.findByRole('button', { name: '确认' }))
@@ -981,7 +1020,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     const { rerender } = render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('checkbox'))
     await user.click(screen.getByRole('button', { name: /重登所选.*1/ }))
     await user.click(await screen.findByRole('button', { name: '确认' }))
@@ -1041,8 +1080,8 @@ describe('Accounts ChatGPT staged login integration', () => {
     await confirmBatchDelete(user, 2)
 
     await waitFor(() => expect(screen.getByText('已选 1 个')).toBeTruthy())
-    const successfulRow = screen.getByText('eligible@example.com').closest('tr')
-    const failedRow = screen.getByText('complete@example.com').closest('tr')
+    const successfulRow = screen.getByText('eligible@example.com').closest('[data-account-row]')
+    const failedRow = screen.getByText('complete@example.com').closest('[data-account-row]')
     expect((within(successfulRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
     expect((within(failedRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
     expect(warning).toHaveBeenCalledWith(
@@ -1083,8 +1122,8 @@ describe('Accounts ChatGPT staged login integration', () => {
     await confirmBatchDelete(user, 2)
 
     await waitFor(() => expect(screen.queryByText(/已选 \d+ 个/)).toBeNull())
-    expect((within(screen.getByText('eligible@example.com').closest('tr') as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
-    expect((within(screen.getByText('complete@example.com').closest('tr') as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
+    expect((within(screen.getByText('eligible@example.com').closest('[data-account-row]') as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
+    expect((within(screen.getByText('complete@example.com').closest('[data-account-row]') as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
     expect(success).toHaveBeenCalledWith('批量删除完成：删除 2 个')
     success.mockRestore()
   })
@@ -1135,8 +1174,8 @@ describe('Accounts ChatGPT staged login integration', () => {
     await confirmBatchDelete(user, 2)
 
     await waitFor(() => expect(screen.getByText('已选 1 个')).toBeTruthy())
-    const notFoundRow = screen.getByText('eligible@example.com').closest('tr')
-    const unknownRow = screen.getByText('complete@example.com').closest('tr')
+    const notFoundRow = screen.getByText('eligible@example.com').closest('[data-account-row]')
+    const unknownRow = screen.getByText('complete@example.com').closest('[data-account-row]')
     expect((within(notFoundRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(false)
     expect((within(unknownRow as HTMLElement).getByRole('checkbox') as HTMLInputElement).checked).toBe(true)
     expect(error).toHaveBeenCalledWith('批量删除失败：失败 1 个')
@@ -1274,7 +1313,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('button', { name: '删除' }))
     const popover = screen.getByText('确认删除该账号吗？').closest('.ant-popover')
     await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
@@ -1309,7 +1348,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     const user = userEvent.setup()
     render(<Accounts />)
 
-    const row = (await screen.findByText('eligible@example.com')).closest('tr')
+    const row = (await screen.findByText('eligible@example.com')).closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('button', { name: '删除' }))
     const popover = screen.getByText('确认删除该账号吗？').closest('.ant-popover')
     await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
@@ -1340,7 +1379,7 @@ describe('Accounts ChatGPT staged login integration', () => {
     render(<Accounts />)
 
     await selectAccount(user, 'eligible@example.com')
-    const row = screen.getByText('eligible@example.com').closest('tr')
+    const row = screen.getByText('eligible@example.com').closest('[data-account-row]')
     await user.click(within(row as HTMLElement).getByRole('button', { name: '删除' }))
     const popover = screen.getByText('确认删除该账号吗？').closest('.ant-popover')
     await user.click(within(popover as HTMLElement).getByRole('button', { name: /删\s*除/ }))
