@@ -53,7 +53,7 @@
 | 单账号跨实例历史展示 | 现有卡片维持当前绑定实例的全部计费；迁移后的单号分段详情继续完善 | 后续工作 |
 | 趋势自动调度 | 实例保底、共享候选全局预留、趋势余量、迁移恢复与供给不足通知 | 待开发 |
 | 后端精简 | 旧平台注册/集成/自动补注册与专属依赖，保留共享登录能力 | 待开发 |
-| 生产发布 | 回归、备份、不可变release、在线验证 | 已上线 `f6d49d3`，校验通过 |
+| 生产发布 | 回归、备份、不可变release、在线验证 | 已上线 `855dde4`，校验通过 |
 
 本次新增真实经营统计API及成本账本。趋势自动调度仍使用现有预览与人工执行流程，后续工作未冒充全自动完成。每个工作包完成时更新状态与证据。
 
@@ -90,11 +90,12 @@
 
 ## 线上交付记录
 
-- 当前代码版本：`f6d49d3`，已推送main并发布至 `https://accounts.anhepro.com/`。
+- 当前代码版本：`855dde4`，已推送main并发布至 `https://accounts.anhepro.com/`。
 - 服务健康检查、受保护的总览/账号/售价读取接口均成功；总览与账号列表数量及状态完全一致。
 - 公网HTML、JavaScript、CSS与发布包逐字节/哈希核对一致；字体返回 `font/ttf`，站点图标返回 `image/svg+xml`。
 - 使用真实浏览器验证 `TCloudNumber` 状态为loaded，字体栈沿用原规范，页面标题28px。
 - 真实上游的今日及累计计费完整读取；首次慢请求时保留已知数据并标注来源未完成，后续更新可恢复完整统计。
 - 未配置实例售价或缺少成本时，销售额/盈亏不伪装成零；使用前在实例管理填写售价，并按实际情况补齐成本。
-- 数据库 `quick_check=ok`。发布前备份保存在 `/www/any-auto-register/shared/backups/account-manager-before-f6d49d3.sqlite3`；旧release保留供回滚。
+- 数据库 `quick_check=ok`。发布前备份保存在 `/www/any-auto-register/shared/backups/account-manager-before-855dde4.sqlite3`；旧release保留供回滚。
+- 本次补丁补齐 MFA 删除/停用终态识别、JSON accounts 混合结构导入与大小写敏感 token 去重，并复用远端账号恢复后的 standby assignment。
 - 线上验证未提交登录、接码、购号或售价变更；涉及这些写操作的验证使用隔离测试和fixture。
