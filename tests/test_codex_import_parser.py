@@ -45,6 +45,32 @@ class CodexImportParserTests(unittest.TestCase):
         self.assertEqual(row["session_token"], "st")
         self.assertEqual(row["access_token"], "at")
 
+    def test_accounts_collection_preserves_all_direct_credentials(self):
+        content = json.dumps({"accounts": [
+            {"email": "one@example.com", "refresh_token": "fixture-rt-one"},
+            {"email": "two@example.com", "accessToken": "fixture-at-two"},
+        ]})
+        rows = parse_import_content(content, "json")
+        self.assertEqual([row["email"] for row in rows], ["one@example.com", "two@example.com"])
+        self.assertEqual(rows[1]["access_token"], "fixture-at-two")
+
+    def test_accounts_collection_mixes_wrapped_and_direct_credentials_in_order(self):
+        content = json.dumps({"accounts": [
+            {"name": "Wrapped", "email": "one@example.com", "credentials": {
+                "refresh_token": "fixture-rt-one",
+            }},
+            {"email": "two@example.com", "refresh_token": "fixture-rt-two"},
+            None,
+            {"credentials": {}},
+            {"email": "three@example.com", "sessionToken": "fixture-st-three"},
+        ]})
+        rows = parse_import_content(content, "json")
+        self.assertEqual([row["email"] for row in rows], [
+            "one@example.com", "two@example.com", "three@example.com",
+        ])
+        self.assertEqual(rows[0]["name"], "Wrapped")
+        self.assertEqual(rows[2]["session_token"], "fixture-st-three")
+
     def test_session_json_object_and_array(self):
         one = '{"user":{"id":"u","name":"John","email":"john@example.com"},"accessToken":"at","expires":1767225600}'
         rows = parse_import_content(one, "json")

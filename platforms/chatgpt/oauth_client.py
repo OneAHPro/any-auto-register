@@ -273,6 +273,32 @@ class OAuthClient:
             return ""
 
     @staticmethod
+    def _mfa_response_error_details(response) -> tuple[str, str]:
+        """Extract only safe, structured MFA error fields from a response."""
+        try:
+            payload = response.json()
+        except Exception:
+            return "", ""
+        if not isinstance(payload, dict):
+            return "", ""
+        detail = payload.get("error") or payload.get("错误")
+        if isinstance(detail, dict):
+            code = str(
+                detail.get("code") or detail.get("error_code")
+                or detail.get("type") or detail.get("代码") or ""
+            ).strip()
+            message = str(
+                detail.get("message") or detail.get("消息") or ""
+            ).strip()
+            return code, message
+        if isinstance(detail, str):
+            return detail.strip(), ""
+        return (
+            str(payload.get("code") or payload.get("error_code") or payload.get("type") or "").strip(),
+            str(payload.get("message") or payload.get("error_description") or "").strip(),
+        )
+
+    @staticmethod
     def _is_explicit_mfa_rejection_code(code: str) -> bool:
         return str(code or "").strip().lower() in {
             "incorrect_code",
@@ -288,6 +314,20 @@ class OAuthClient:
             status = 0
         self.last_http_status = status
         remote_code = self._safe_response_error_code(response)
+        structured_code, structured_message = self._mfa_response_error_details(response)
+        if not remote_code:
+            remote_code = structured_code.lower()
+        if status == 403 and _is_password_verify_deactivation_response(
+            status, structured_code, structured_message
+        ):
+            self._set_auth_failure(
+                stage=stage,
+                domain=AuthFailureDomain.REMOTE_ACCOUNT,
+                code="account_deactivated",
+                message="ChatGPT 账号已被删除或停用",
+                retryable=False,
+            )
+            raise ChatGPTAccountDeactivatedError()
         if self._is_explicit_mfa_rejection_code(remote_code):
             self._set_auth_failure(
                 stage=stage,
@@ -2445,6 +2485,8 @@ class OAuthClient:
             self._set_auth_success(stage="mfa_totp_verify")
             self._log(f"MFA 通过 {describe_flow_state(next_state)}")
             return next_state
+        except TaskInterruption:
+            raise
         except Exception as exc:
             self._set_mfa_exception_failure(exc, stage="mfa_totp_verify")
             return None
@@ -2728,10 +2770,9 @@ class OAuthClient:
                 f"{issue_response.status_code}"
             )
             if issue_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT MFA 恢复码 challenge 初始化失败: "
-                    f"{issue_response.status_code} - "
-                    f"{issue_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    issue_response,
+                    stage="mfa_recovery_issue",
                 )
                 return None
 
@@ -2768,10 +2809,9 @@ class OAuthClient:
                 f"{verify_response.status_code}"
             )
             if verify_response.status_code != 200:
-                self._set_error(
-                    "ChatGPT MFA 恢复码验证失败: "
-                    f"{verify_response.status_code} - "
-                    f"{verify_response.text[:180]}"
+                self._set_mfa_response_failure(
+                    verify_response,
+                    stage="mfa_recovery_verify",
                 )
                 return None
 
@@ -2805,6 +2845,8 @@ class OAuthClient:
                 return None
             self._log(f"MFA 恢复码通过 {describe_flow_state(next_state)}")
             return next_state
+        except TaskInterruption:
+            raise
         except Exception as exc:
             self._set_error(f"ChatGPT MFA 恢复码验证异常: {exc}")
             return None

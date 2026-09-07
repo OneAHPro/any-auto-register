@@ -111,11 +111,26 @@ def _parse_json(data: str) -> list[dict[str, Any]]:
     elif isinstance(parsed, Mapping):
         # Sub2API export is {accounts:[{name,credentials:{...}}]}.
         accounts = parsed.get("accounts")
-        if isinstance(accounts, list) and any(isinstance(x, Mapping) and isinstance(x.get("credentials"), Mapping) for x in accounts):
+        if isinstance(accounts, list):
+            # Account exports can contain both the Sub2API wrapper shape and
+            # direct credential objects. Normalize each item independently so
+            # one wrapped item does not cause the direct items to disappear.
             for item in accounts:
-                if not isinstance(item, Mapping) or not isinstance(item.get("credentials"), Mapping):
+                if not isinstance(item, Mapping):
                     continue
-                entries.append(dict(item["credentials"], name=item.get("name", "")))
+                credentials = item.get("credentials")
+                if isinstance(credentials, Mapping):
+                    merged = dict(credentials)
+                    # Sub2API's outer name is the display label. Keep that
+                    # precedence while filling an omitted credential email
+                    # from the account wrapper.
+                    if item.get("name") not in (None, ""):
+                        merged["name"] = item.get("name")
+                    if "email" not in merged and item.get("email") not in (None, ""):
+                        merged["email"] = item.get("email")
+                    entries.append(merged)
+                else:
+                    entries.append(item)
         else:
             entries = [parsed]
     else:

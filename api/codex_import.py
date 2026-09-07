@@ -249,7 +249,10 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
                 client = get_target_client(int(target.id), database_engine)
             seen: set[str] = set()
             for index, row in enumerate(rows, start=1):
-                identity = _credential_identity(row).lower()
+                # Token credentials are case-sensitive. Keep their identity
+                # byte-for-byte stable so distinct tokens differing only in
+                # case are imported as separate accounts.
+                identity = _credential_identity(row)
                 item_result = {"index": index, "file": request.files[min(index - 1, len(request.files) - 1)].name, "status": "failed"}
                 if not identity or identity in seen:
                     job.duplicate += 1
@@ -268,7 +271,7 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
                             candidate_extra = candidate.get_extra()
                         except Exception:
                             candidate_extra = {}
-                        if _credential_identity(candidate_extra).lower() == identity:
+                        if _credential_identity(candidate_extra) == identity:
                             existing = candidate
                             break
                 elif identity.startswith("chatgpt_account_id:"):
@@ -276,7 +279,7 @@ def _import_job(job: _ImportJob, request: CodexImportRequest, database_engine) -
                         existing_extra = existing.get_extra()
                     except Exception:
                         existing_extra = {}
-                    if _credential_identity(existing_extra).lower() != identity:
+                    if _credential_identity(existing_extra) != identity:
                         # Codex2API permits multiple identities sharing an
                         # email; the stable ChatGPT account ID is authoritative.
                         existing = None

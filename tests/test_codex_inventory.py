@@ -57,6 +57,28 @@ def test_missing_remote_only_rows_are_removed_from_active_scheduling():
     assert binding.remote_status == 'remote_missing'
     assert assignment.state == 'standby'
 
+
+def test_materialize_reactivates_existing_standby_assignment_when_account_returns():
+    e = make_engine()
+    client = Client([{'id': 9, 'email': 'returned@example.com', 'status': 'active'}])
+    sync_inventory(e, target_id=1, clients={1: client})
+    materialize_inventory(e)
+    with Session(e) as session:
+        assignment_id = session.exec(select(db.AccountAssignmentModel)).one().id
+
+    client.rows = []
+    sync_inventory(e, target_id=1, clients={1: client})
+    client.rows = [{'id': 9, 'email': 'returned@example.com', 'status': 'active'}]
+    sync_inventory(e, target_id=1, clients={1: client})
+    materialize_inventory(e)
+    materialize_inventory(e)
+
+    with Session(e) as session:
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+        assert assignment.id == assignment_id
+        assert assignment.state == 'active'
+        assert session.exec(select(db.AccountModel)).one().email == 'returned@example.com'
+
 def test_snapshots_are_isolated_by_target_and_idempotent():
     e=make_engine(); c1=Client([{'id':4,'email':'same@example.com'}]); c2=Client([{'id':4,'email':'same@example.com','plan_type':'pro'}])
     sync_inventory(e,target_id=1,clients={1:c1}); sync_inventory(e,target_id=2,clients={2:c2}); sync_inventory(e,target_id=2,clients={2:c2})

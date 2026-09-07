@@ -525,6 +525,17 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 .where(AccountAssignmentModel.state.in_(_ASSIGNMENT_STATES))
                 .order_by(AccountAssignmentModel.updated_at.desc())
             ).first()
+            if assignment is None:
+                # A temporarily missing remote row is moved to standby during
+                # sync. Reuse that durable assignment when the row returns so
+                # the identity remains stable and no unique-key collision is
+                # created by materialization.
+                assignment = session.exec(
+                    select(AccountAssignmentModel)
+                    .where(AccountAssignmentModel.identity_id == identity_id)
+                    .where(AccountAssignmentModel.state == "standby")
+                    .order_by(AccountAssignmentModel.updated_at.desc())
+                ).first()
             if _schedulable(row):
                 if assignment is None:
                     assignment = AccountAssignmentModel(identity_id=identity_id, local_account_id=int(account.id or 0), pool_id=pool_id, target_id=target_id, state="active", lease_reason="inventory_materialize", lease_started_at=datetime.now(timezone.utc), assignment_version=1)

@@ -21,6 +21,7 @@ from platforms.chatgpt.refresh_token_registration_engine import (
 from platforms.chatgpt.utils import FlowState
 from core import base_mailbox
 from core.task_runtime import StopTaskRequested
+from services.chatgpt_account_state import ChatGPTAccountDeactivatedError
 
 
 class DummyEmailService:
@@ -262,6 +263,88 @@ class RefreshTokenRegistrationEngineTests(unittest.TestCase):
 class OAuthClientPasswordlessTests(unittest.TestCase):
     def _make_client(self):
         return OAuthClient({}, proxy="http://127.0.0.1:7890", verbose=False)
+
+    def _submit_single_mfa_factor(self, client, factor_type):
+        mailbox = mock.Mock()
+        mailbox.supports_totp_code.return_value = False
+        mailbox.wait_for_verification_code.return_value = "123456"
+        return client._submit_mfa_challenge(
+            FlowState(
+                page_type="mfa_challenge",
+                payload={"factors": [{"id": "factor-1", "factor_type": factor_type}]},
+            ),
+            email="user@example.com",
+            skymail_client=mailbox,
+            totp_secret="JBSWY3DPEHPK3PXP" if factor_type == "totp" else "",
+            mfa_recovery_code="RECOVERY-SECRET" if factor_type == "recovery_code" else "",
+            device_id="device-fixed",
+        )
+
+    def _mock_mfa_failure(self, client, phase, payload):
+        failure = mock.Mock(status_code=403, text="RAW-RESPONSE-SECRET")
+        failure.json.return_value = payload
+        issue = mock.Mock(status_code=200, text="{}")
+        issue.json.return_value = {}
+        client.session.post = mock.Mock(
+            side_effect=[failure] if phase == "issue" else [issue, failure]
+        )
+
+    def test_mfa_official_deletion_stops_each_factor_at_issue_or_verify(self):
+        payloads = (
+            {"error": {"code": "account_deleted", "message": "RAW-RESPONSE-SECRET"}},
+            {"error": {"type": "account_deactivated"}},
+            {"type": "account_deactivated"},
+            {"error": "account_deleted"},
+            {"error": {"message": (
+                "You do not have an account because it has been deleted or deactivated. "
+                "If you believe this was an error, please contact us through our help center."
+            )}},
+            {"错误": {"消息": "账号已被删除或停用"}},
+        )
+        for factor_type in ("totp", "email", "recovery_code"):
+            for phase in ("issue", "verify"):
+                for payload in payloads:
+                    with self.subTest(factor=factor_type, phase=phase, payload=payload):
+                        client = self._make_client()
+                        logs = []
+                        client._log = logs.append
+                        self._mock_mfa_failure(client, phase, payload)
+
+                        with self.assertRaisesRegex(
+                            ChatGPTAccountDeactivatedError, "账号已被删除或停用"
+                        ):
+                            self._submit_single_mfa_factor(client, factor_type)
+
+                        self.assertEqual(client.session.post.call_count, 1 if phase == "issue" else 2)
+                        self.assertEqual(client.last_auth_outcome.domain, AuthFailureDomain.REMOTE_ACCOUNT)
+                        self.assertFalse(client.last_auth_outcome.retryable)
+                        self.assertFalse(client.last_auth_outcome.credential_rejected)
+                        self.assertIn("账号已被删除或停用", client.last_error)
+                        self.assertNotIn("RAW-RESPONSE-SECRET", "\n".join(logs))
+
+    def test_mfa_generic_or_diagnostic_403_keeps_session_failure(self):
+        payloads = (
+            {"error": {"code": "forbidden", "message": "RAW-RESPONSE-SECRET"}},
+            {"error": {"message": "This request is blocked; account status is unknown."}},
+            {"error": {"message": "Diagnostic example: account has been deleted or deactivated"}},
+            {"diagnostic": {"code": "account_deleted"}},
+        )
+        for factor_type in ("totp", "email", "recovery_code"):
+            for phase in ("issue", "verify"):
+                for payload in payloads:
+                    with self.subTest(factor=factor_type, phase=phase, payload=payload):
+                        client = self._make_client()
+                        logs = []
+                        client._log = logs.append
+                        self._mock_mfa_failure(client, phase, payload)
+
+                        self.assertIsNone(self._submit_single_mfa_factor(client, factor_type))
+
+                        self.assertEqual(client.last_auth_outcome.domain, AuthFailureDomain.SESSION)
+                        self.assertEqual(client.last_auth_outcome.code, "http_403")
+                        self.assertTrue(client.last_auth_outcome.retryable)
+                        self.assertFalse(client.last_auth_outcome.credential_rejected)
+                        self.assertNotIn("RAW-RESPONSE-SECRET", "\n".join(logs))
 
     def test_auth_outcome_records_retryable_failure_without_credential_rejection(self):
         outcome = AuthOutcome.failure(
