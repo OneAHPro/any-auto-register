@@ -328,7 +328,16 @@ def _schedulable(summary: Mapping[str, Any]) -> bool:
     return bool(summary.get("enabled", True)) and not bool(summary.get("locked", False)) and status in {"active", "ready", "rate_limited"}
 
 
+_MATERIALIZE_LOCK = threading.RLock()
+
+
 def materialize_inventory(database_engine) -> dict[str, int]:
+    # The account page and operations page can discover the same new row together.
+    with _MATERIALIZE_LOCK:
+        return _materialize_inventory(database_engine)
+
+
+def _materialize_inventory(database_engine) -> dict[str, int]:
     """Create local, credential-free rows for remote accounts in the inventory."""
 
     rows = [row for row in read_inventory(database_engine) if not row.get("_inventory_missing")]

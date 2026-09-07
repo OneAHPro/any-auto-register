@@ -54,6 +54,7 @@ interface OperationsOverview {
     prices_complete: boolean
     costs_complete: boolean
     unknown_cost_accounts: number
+    unknown_cost_records?: number
     undated_cost_cny: Amount
     errors: string[]
   }
@@ -306,7 +307,7 @@ export default function Dashboard() {
         <section className="console-panel" aria-labelledby="overview-batch-heading">
           <div className="operations-section-top"><h2 id="overview-batch-heading" className="console-section-heading">最近购号批次</h2><span className="operations-helper">整批总价与已关联账号</span></div>
           <Table className="business-batches-table" rowKey="id" columns={batchColumns} dataSource={overview?.recent_batches || []} pagination={false} scroll={{ x: 484 }} locale={{ emptyText: <Empty image={Empty.PRESENTED_IMAGE_SIMPLE} description={overview ? '暂无已记录的购号批次' : '尚未获取购号批次'} /> }} />
-          <div className="business-cost-notes"><span>今日购入 {count(supply?.today_purchased_accounts)} 个 · 今日补入 {count(supply?.today_added_accounts)} 个</span>{costsIncomplete && <span>{count(coverage?.unknown_cost_accounts)} 个账号未录购号成本，盈亏与回本待录齐成本后计算。</span>}{(number(coverage?.undated_cost_cny) ?? 0) > 0 && <span>{money(coverage?.undated_cost_cny)} 成本未注明购买日期，仅计入累计成本。</span>}</div>
+          <div className="business-cost-notes"><span>今日购入 {count(supply?.today_purchased_accounts)} 个 · 今日补入 {count(supply?.today_added_accounts)} 个</span>{costsIncomplete && <span>{(number(coverage?.unknown_cost_accounts) ?? 0) > 0 ? `${count(coverage?.unknown_cost_accounts)} 个账号未录购号成本` : '历史成本记录金额待补齐'}，盈亏与回本待录齐成本后计算。</span>}{(number(coverage?.undated_cost_cny) ?? 0) > 0 && <span>{money(coverage?.undated_cost_cny)} 成本未注明购买日期，仅计入累计成本。</span>}</div>
         </section>
         <section className="console-panel" aria-labelledby="overview-attention-heading">
           <div className="operations-section-top"><h2 id="overview-attention-heading" className="console-section-heading">需要处理</h2><span className="operations-helper">实例异常与低余量</span></div>

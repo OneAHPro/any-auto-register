@@ -16,7 +16,8 @@ def setup_world(monkeypatch):
     SQLModel.metadata.create_all(engine)
     with Session(engine) as s:
         for i, cost in ((1, 1000), (2, 2000)):
-            s.add(AccountModel(id=i, platform='chatgpt', email=f'fixture{i}@example.test', password='PRIVATE_PASSWORD', identity_id=f'identity-{i}', purchase_cost_cents=cost, created_at=NOW))
+            s.add(AccountModel(id=i, platform='chatgpt', email=f'fixture{i}@example.test', password='PRIVATE_PASSWORD', identity_id=f'identity-{i}', purchase_cost_cents=cost, created_at=NOW,
+                extra_json=json.dumps({'refresh_token':'fixture-refresh','remote_target_id':i,'remote_id':i*11,'codex_remote_snapshot':{'target_id':i,'remote_id':i*11,'status':'active','email':f'fixture{i}@example.test'}})))
             s.add(Codex2APITargetModel(id=i, name=f'node-{i}', base_url=f'https://node-{i}.example.test', admin_key_ref=f'fixture-ref-{i}', health_status='healthy', enabled=True))
             s.add(AccountTargetBindingModel(identity_id=f'identity-{i}', local_account_id=i, target_id=i, remote_account_id=i*11, enabled=True))
             s.add(CodexInventorySnapshotModel(target_id=i, remote_id=i*11, summary_json=json.dumps({'status':'active','enabled':True,'usage_percent_7d':20,'email':f'fixture{i}@example.test'}), fetched_at=NOW))
@@ -46,6 +47,47 @@ def test_global_finance_uses_all_nodes_and_actual_purchase_dates(monkeypatch):
     assert data['account_status']['total']==2
     assert len(data['targets'])==2
     assert 'PRIVATE_PASSWORD' not in json.dumps(data)
+
+def test_overview_uses_same_account_population_as_cards(monkeypatch):
+    module,engine,_=setup_world(monkeypatch)
+    from core.db import AccountModel
+    from api.accounts import list_accounts
+    with Session(engine) as s:
+        s.add(AccountModel(id=3,platform='chatgpt',email='unfinished@example.test',password='fixture',extra_json='{}'))
+        s.add(AccountModel(id=4,platform='chatgpt',email='removed@example.test',password='',extra_json=json.dumps({'remote_only':True,'remote_target_id':1,'remote_id':999,'codex_remote_snapshot':{'remote_id':999,'target_id':1}})))
+        s.commit()
+    data=module.build_operations_overview(engine,now=NOW)
+    with Session(engine) as s:
+        listed=list_accounts(platform='chatgpt',include_live=True,session=s)
+    assert data['account_status']==listed['summary']
+    assert data['account_status']['total']==listed['total']==2
+    assert data['coverage']['unknown_cost_accounts']==0
+
+def test_new_remote_inventory_enters_the_shared_account_population(monkeypatch):
+    module,engine,details=setup_world(monkeypatch)
+    from core.db import CodexInventorySnapshotModel
+    with Session(engine) as session:
+        session.add(CodexInventorySnapshotModel(target_id=1,remote_id=33,summary_json=json.dumps({'remote_id':33,'email':'new-remote@example.test','status':'active','enabled':True}),fetched_at=NOW))
+        session.commit()
+    details[(1,33)]={'total_billed_usd':'0','today_date':'2026-09-07','today_billed_usd':'0','today_requests':0,'fetched_at':NOW.isoformat()}
+    result=module.build_operations_overview(engine,now=NOW)
+    assert result['account_status']['total']==3
+    assert result['coverage']['unknown_cost_accounts']==1
+
+def test_unknown_hidden_expense_does_not_inflate_visible_account_count(monkeypatch):
+    module,engine,_=setup_world(monkeypatch)
+    from core.db import AccountModel
+    from core.purchase_cost_models import PurchaseCostRecordModel
+    with Session(engine) as session:
+        session.add(AccountModel(id=3,platform='chatgpt',email='unfinished@example.test',password='fixture',extra_json='{}'))
+        session.add(PurchaseCostRecordModel(record_key='hidden-expense',account_id=3,cost_cents=None))
+        session.commit()
+    result=module.build_operations_overview(engine,now=NOW)
+    assert result['account_status']['total']==2
+    assert result['coverage']['unknown_cost_accounts']==0
+    assert result['coverage']['unknown_cost_records']==1
+    assert result['coverage']['costs_complete'] is False
+    assert result['finance']['total_profit_cny'] is None
 
 def test_missing_cost_is_not_a_free_account_or_a_profit_claim(monkeypatch):
     module,engine,_=setup_world(monkeypatch)

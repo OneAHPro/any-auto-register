@@ -11,7 +11,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from zoneinfo import ZoneInfo
 from sqlmodel import Session, select
 
-from core.db import AccountModel, AccountAssignmentModel, AccountTargetBindingModel, Codex2APITargetModel, CodexInventorySnapshotModel
+from core.db import AccountModel, AccountTargetBindingModel, Codex2APITargetModel, CodexInventorySnapshotModel
 from core.purchase_cost_models import PurchaseBatchModel, PurchaseCostRecordModel
 from core.operations_models import InstanceSalePriceModel, OperationsBillingSnapshotModel
 from services.codex_account_billing import fetch_account_usage_details
@@ -121,7 +121,6 @@ def build_operations_overview(database_engine, refresh=False, now=None):
         accounts = session.exec(select(AccountModel).where(AccountModel.platform == 'chatgpt')).all()
         bindings = session.exec(select(AccountTargetBindingModel)).all()
         inventory = session.exec(select(CodexInventorySnapshotModel)).all()
-        assignments = session.exec(select(AccountAssignmentModel)).all()
         prices = {row.target_id: row for row in session.exec(select(InstanceSalePriceModel)).all()}
         costs = session.exec(select(PurchaseCostRecordModel)).all()
         batches = session.exec(select(PurchaseBatchModel).order_by(PurchaseBatchModel.created_at.desc()).limit(8)).all()
@@ -129,6 +128,14 @@ def build_operations_overview(database_engine, refresh=False, now=None):
 
     target_map = {row.id: row for row in targets}
     inventory_map = {(row.target_id, row.remote_id): row for row in inventory}
+    account_ids = {row.id for row in accounts}
+    bound_keys = {(row.target_id, row.remote_account_id) for row in bindings if row.local_account_id in account_ids}
+    if any(key not in bound_keys and not row.missing and not row.error for key, row in inventory_map.items()):
+        from services.codex_inventory import materialize_inventory
+        materialize_inventory(database_engine)
+        with Session(database_engine) as session:
+            accounts = session.exec(select(AccountModel).where(AccountModel.platform == 'chatgpt')).all()
+            bindings = session.exec(select(AccountTargetBindingModel)).all()
     keys = set(inventory_map) | set(persisted) | {(row.target_id, row.remote_account_id) for row in bindings if row.remote_account_id > 0}
     active_keys = [key for key in sorted(keys) if key[0] in target_map and target_map[key[0]].enabled]
     details = fetch_account_usage_details(database_engine, active_keys, refresh=refresh)
@@ -161,42 +168,29 @@ def build_operations_overview(database_engine, refresh=False, now=None):
                 freshness[key] = 'stale' if previous and previous.total_billed_micros is not None else 'unavailable'
         session.commit()
 
-    assignment_states = {row.identity_id: {'state': row.state, 'target_id': row.target_id} for row in assignments}
-    live_display = {}
-    used_keys = set()
+    # Use exactly the same visibility, missing-remote and auth-state rules as
+    # the account cards. Incomplete local attempts must not inflate the pool.
+    from api.accounts import _build_account_list
+    with Session(database_engine) as session:
+        population = _build_account_list(platform='chatgpt', include_live=True, session=session, summary_only=True)
+    visible_ids = set(population['account_ids'])
+    accounts = [account for account in accounts if account.id in visible_ids]
+    account_status = population['summary']
+    remote_count = population['remote_count']
     account_targets = {}
-    for account in accounts:
-        choices = [row for row in bindings if row.local_account_id == account.id and row.remote_account_id > 0]
-        preferred = assignment_states.get(account.identity_id, {}).get('target_id')
-        choices.sort(key=lambda row: (row.target_id == preferred, row.enabled, _iso(row.last_sync_at) or ''), reverse=True)
-        if choices:
-            binding = choices[0]
-            key = (binding.target_id, binding.remote_account_id)
-            used_keys.add(key)
-            account_targets[account.id] = binding.target_id
-            snap = inventory_map.get(key)
-            raw = _json(snap.summary_json) if snap else {}
-            status = str(raw.get('remote_status') or raw.get('status') or binding.remote_status or '')
-            live_display[account.id] = {'remote_status': status, 'remote_enabled': raw.get('enabled', binding.enabled),
-                'quota_status': 'stale' if snap is None or snap.missing or snap.error else 'live',
-                'quota': {'window': '7d', 'usage_percent': raw.get('usage_percent_7d')}}
-
-    from api.accounts import _account_operational_summary
-    from services.codex2api_remote_accounts import remote_account_payload
-    remote_items = []
-    for key, snap in inventory_map.items():
-        if key not in used_keys and not snap.missing:
-            remote_items.append(remote_account_payload(_json(snap.summary_json), target_id=key[0]))
-    account_status = _account_operational_summary(accounts, remote_items, live_display, assignment_states)
+    for binding in bindings:
+        if binding.local_account_id in visible_ids and binding.enabled:
+            account_targets[binding.local_account_id] = binding.target_id
 
     known_cost = sum(row.cost_cents or 0 for row in costs)
     today_cost = sum(row.cost_cents or 0 for row in costs if _same_day(row.incurred_at, day))
     undated_cost = sum(row.cost_cents or 0 for row in costs if row.incurred_at is None)
     covered_ids = {row.account_id for row in costs if row.account_id is not None and row.cost_cents is not None}
     unknown_ids = {account.id for account in accounts if account.id not in covered_ids or account.purchase_cost_cents is None}
-    unknown_ids.update(row.account_id for row in costs if row.account_id is not None and row.cost_cents is None)
-    unknown_cost_count = len(unknown_ids) + sum(row.account_id is None and row.cost_cents is None for row in costs) + len(remote_items)
-    costs_complete = unknown_cost_count == 0
+    unknown_ids.update(row.account_id for row in costs if row.account_id in visible_ids and row.cost_cents is None)
+    unknown_cost_count = len(unknown_ids) + remote_count
+    unknown_cost_records = sum(row.cost_cents is None and row.account_id not in visible_ids for row in costs)
+    costs_complete = unknown_cost_count == 0 and unknown_cost_records == 0
     today_costs_complete = costs_complete and undated_cost == 0
 
     target_rows = []
@@ -271,7 +265,8 @@ def build_operations_overview(database_engine, refresh=False, now=None):
     return {'as_of': now.isoformat(), 'timezone': 'Asia/Shanghai', 'date': day.isoformat(), 'pricing_basis': 'current_configured_price',
         'coverage': {'targets_total': len(target_rows), 'targets_available': sum(row['billing_status']=='available' for row in target_rows),
             'billing_complete': billing_complete, 'today_complete': today_complete, 'prices_complete': prices_complete, 'costs_complete': costs_complete, 'today_costs_complete': today_costs_complete,
-            'unknown_cost_accounts': unknown_cost_count, 'undated_cost_cny': _money(Decimal(undated_cost)/100), 'errors': errors},
+            'unknown_cost_accounts': unknown_cost_count, 'unknown_cost_records': unknown_cost_records,
+            'undated_cost_cny': _money(Decimal(undated_cost)/100), 'errors': errors},
         'finance': {'today_cost_cny': _money(today_cost_cny), 'total_cost_cny': _money(total_cost_cny),
             'today_billed_usd': _money(today_billed,6), 'total_billed_usd': _money(total_billed,6),
             'today_revenue_cny': _money(today_revenue), 'total_revenue_cny': _money(total_revenue),

@@ -867,8 +867,7 @@ class BatchDeleteRequest(BaseModel):
     ids: list[int]
 
 
-@router.get("")
-def list_accounts(
+def _build_account_list(
     platform: Optional[str] = None,
     status: Optional[str] = None,
     email: Optional[str] = None,
@@ -881,6 +880,7 @@ def list_accounts(
     subscription_plan: Optional[str] = None,
     operational_status: Optional[str] = None,
     session: Session = Depends(get_session),
+    summary_only: bool = False,
 ):
     def load_visible_accounts() -> list[AccountModel]:
         query = select(AccountModel)
@@ -1151,6 +1151,13 @@ def list_accounts(
         live_display,
         assignment_states,
     )
+    if summary_only:
+        return {
+            "total": len(combined),
+            "summary": operational_summary,
+            "account_ids": [int(account.id) for account in visible_accounts if account.id is not None],
+            "remote_count": len(remote_items),
+        }
     requested_operational_status = _summary_state(operational_status)
     if requested_operational_status in {"all", "any"}:
         requested_operational_status = ""
@@ -1238,6 +1245,30 @@ def list_accounts(
         "page": page,
         "items": response_items,
     }
+
+
+@router.get("")
+def list_accounts(
+    platform: Optional[str] = None,
+    status: Optional[str] = None,
+    email: Optional[str] = None,
+    created_at_start: Optional[datetime] = None,
+    created_at_end: Optional[datetime] = None,
+    page: int = 1,
+    page_size: int = 20,
+    include_live: bool = False,
+    refresh_live: bool = False,
+    subscription_plan: Optional[str] = None,
+    operational_status: Optional[str] = None,
+    session: Session = Depends(get_session),
+):
+    return _build_account_list(
+        platform=platform, status=status, email=email,
+        created_at_start=created_at_start, created_at_end=created_at_end,
+        page=page, page_size=page_size, include_live=include_live,
+        refresh_live=refresh_live, subscription_plan=subscription_plan,
+        operational_status=operational_status, session=session,
+    )
 
 
 @router.post("")
