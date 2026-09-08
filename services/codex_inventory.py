@@ -409,6 +409,10 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                     if (
                         not _account_is_remote_only(candidate)
                         and (target_id, int(candidate.id or 0)) not in claimed_account_ids
+                        and (
+                            not _account_stable_ids(candidate)
+                            or _account_stable_ids(candidate) & row_stable_ids
+                        )
                     )
                 ]
                 if len(credential_email_matches) == 1:
