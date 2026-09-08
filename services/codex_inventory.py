@@ -383,6 +383,7 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 .where(AccountTargetBindingModel.remote_account_id == remote_id)
             ).first()
             account = None
+            row_stable_ids = _row_stable_ids(row)
             if binding is not None and int(binding.local_account_id or 0) > 0:
                 account = session.get(AccountModel, int(binding.local_account_id))
                 if account is not None and str(account.platform or "").lower() != "chatgpt":
@@ -390,6 +391,11 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 if account is not None and (
                     (target_id, int(account.id or 0)) in claimed_account_ids
                     or _stable_id(account.email) != _stable_id(email)
+                    or (
+                        row_stable_ids
+                        and _account_stable_ids(account)
+                        and not _account_stable_ids(account) & row_stable_ids
+                    )
                 ):
                     # A stale binding can point at a different row that
                     # shares a provider account ID. Let the exact email match
@@ -397,12 +403,11 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                     account = None
                 if account is not None:
                     claimed_account_ids.add((target_id, int(account.id or 0)))
-            row_stable_ids = _row_stable_ids(row)
             # Email is the strongest match when the provider has reused a
             # ChatGPT/workspace ID across several remote rows. Prefer the
             # exact credential email before falling back to that shared ID;
             # otherwise one row can inherit another row's billing history.
-            if account is None:
+            if account is None or _account_is_remote_only(account):
                 email_matches = by_email.get(_stable_id(email), [])
                 credential_email_matches = [
                     candidate for candidate in email_matches
@@ -417,6 +422,17 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 ]
                 if len(credential_email_matches) == 1:
                     account = credential_email_matches[0]
+            if account is not None and not _account_is_remote_only(account):
+                if binding is not None and int(binding.local_account_id or 0) != int(account.id or 0):
+                    # Transfer the target row from a duplicate remote-only
+                    # local account to the credential-bearing account while
+                    # retaining the unique remote slot.
+                    binding.local_account_id = int(account.id or 0)
+                    if str(account.identity_id or "").strip():
+                        binding.identity_id = str(account.identity_id).strip()
+                    binding.last_error = "远端账号身份已转移到当前凭据账号"
+                    binding.updated_at = datetime.now(timezone.utc)
+                    session.add(binding)
             if account is None and row_stable_ids:
                 stable_matches = []
                 seen_ids: set[int] = set()

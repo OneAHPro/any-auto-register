@@ -183,6 +183,36 @@ def test_materialize_repairs_stale_binding_to_exact_email_account():
     assert binding.local_account_id == exact_id
     assert binding.remote_account_id == 8
 
+
+def test_materialize_transfers_remote_row_from_duplicate_remote_only_account():
+    e = make_engine()
+    stable_id = 'current-stable-id'
+    with Session(e) as session:
+        credential = db.AccountModel(
+            platform='chatgpt', email='same@example.com', password='p',
+            extra_json=json.dumps({'chatgpt_account_id': stable_id}),
+        )
+        remote_only = db.AccountModel(
+            platform='chatgpt', email='same@example.com', password='',
+            extra_json=json.dumps({'remote_only': True, 'remote_id': 7}),
+        )
+        session.add(credential); session.add(remote_only); session.flush()
+        credential_id = int(credential.id or 0); remote_only_id = int(remote_only.id or 0)
+        session.add(db.AccountTargetBindingModel(
+            identity_id='remote-only', local_account_id=remote_only_id,
+            target_id=1, remote_account_id=7, remote_email='same@example.com',
+        ))
+        session.commit()
+    sync_inventory(e, target_id=1, clients={1: Client([{
+        'id': 7, 'email': 'same@example.com', 'chatgpt_account_id': stable_id, 'status': 'active',
+    }])})
+    materialize_inventory(e)
+    with Session(e) as session:
+        bindings = session.exec(select(db.AccountTargetBindingModel)).all()
+    assert len(bindings) == 1
+    assert bindings[0].local_account_id == credential_id
+    assert bindings[0].remote_account_id == 7
+
 def test_materialize_inventory_reuses_identity_binding_when_remote_id_rotates():
     e = make_engine()
     with Session(e) as session:
