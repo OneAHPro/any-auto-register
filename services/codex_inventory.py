@@ -427,12 +427,31 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                     # Transfer the target row from a duplicate remote-only
                     # local account to the credential-bearing account while
                     # retaining the unique remote slot.
-                    binding.local_account_id = int(account.id or 0)
+                    preferred_binding = None
                     if str(account.identity_id or "").strip():
-                        binding.identity_id = str(account.identity_id).strip()
-                    binding.last_error = "远端账号身份已转移到当前凭据账号"
-                    binding.updated_at = datetime.now(timezone.utc)
-                    session.add(binding)
+                        preferred_binding = session.exec(
+                            select(AccountTargetBindingModel)
+                            .where(AccountTargetBindingModel.identity_id == str(account.identity_id).strip())
+                            .where(AccountTargetBindingModel.target_id == target_id)
+                        ).first()
+                    if preferred_binding is not None and int(preferred_binding.id or 0) != int(binding.id or 0):
+                        binding.remote_account_id = 0
+                        binding.remote_email = ""
+                        binding.enabled = False
+                        binding.sync_status = "superseded"
+                        binding.remote_status = "superseded"
+                        binding.last_error = "远端账号身份已转移到当前凭据账号"
+                        binding.updated_at = datetime.now(timezone.utc)
+                        session.add(binding)
+                        session.flush()
+                        binding = preferred_binding
+                    else:
+                        binding.local_account_id = int(account.id or 0)
+                        if str(account.identity_id or "").strip():
+                            binding.identity_id = str(account.identity_id).strip()
+                        binding.last_error = "远端账号身份已转移到当前凭据账号"
+                        binding.updated_at = datetime.now(timezone.utc)
+                        session.add(binding)
             if account is None and row_stable_ids:
                 stable_matches = []
                 seen_ids: set[int] = set()
