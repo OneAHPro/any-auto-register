@@ -127,6 +127,22 @@ def _persist_explicit_target_binding(
         and str(row.get("email") or row.get("name") or "").strip().lower()
         == normalized_email
     ]
+    if len(matches) > 1:
+        # Re-login/import can leave the old remote row beside the freshly
+        # uploaded credential. Prefer a usable row, then the newest remote ID
+        # so a stale error row cannot make a successful sync look failed.
+        usable = [
+            row for row in matches
+            if str(row.get("status") or "").strip().lower()
+            not in {"error", "invalid", "unauthorized", "token_invalidated"}
+        ]
+        if usable:
+            matches = usable
+        matches = sorted(
+            matches,
+            key=lambda row: int(row.get("id") or row.get("remote_id") or 0),
+            reverse=True,
+        )[:1]
     if len(matches) != 1:
         raise RuntimeError("目标账号同步后身份不唯一")
     row = matches[0]
