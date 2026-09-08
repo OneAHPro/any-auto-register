@@ -843,6 +843,7 @@ export default function Accounts() {
   const [reloginStartError, setReloginStartError] = useState('')
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
   const accountLoadEpochRef = useRef(0)
+  const snapshotFollowupTimerRef = useRef<number | null>(null)
   const costSaveEpochRef = useRef(0)
   const savedAccountCostsRef = useRef(new Map<number, { epoch: number; cost: string | null }>())
   const reloginRequestEpochRef = useRef(0)
@@ -937,6 +938,10 @@ export default function Accounts() {
   const load = useCallback(async (forceLive = false) => {
     const requestEpoch = ++accountLoadEpochRef.current
     const costEpoch = costSaveEpochRef.current
+    if (snapshotFollowupTimerRef.current !== null) {
+      window.clearTimeout(snapshotFollowupTimerRef.current)
+      snapshotFollowupTimerRef.current = null
+    }
     setLoading(true)
     try {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
@@ -976,6 +981,15 @@ export default function Accounts() {
       // The snapshot is the first meaningful paint. Do not keep the list in
       // a loading state while the optional upstream reconciliation runs.
       if (forceLive && currentPlatform === 'chatgpt') setLoading(false)
+      // Billing is warmed by the server-side background refresh. Read the
+      // cache again once that short pass has had time to finish, so users see
+      // the all-time amount without manually refreshing the page.
+      if (forceLive && currentPlatform === 'chatgpt') {
+        snapshotFollowupTimerRef.current = window.setTimeout(() => {
+          snapshotFollowupTimerRef.current = null
+          if (requestEpoch === accountLoadEpochRef.current) void load(false)
+        }, 6000)
+      }
 
     } catch (error) {
       if (requestEpoch !== accountLoadEpochRef.current) return
@@ -987,6 +1001,12 @@ export default function Accounts() {
       if (requestEpoch === accountLoadEpochRef.current) setLoading(false)
     }
   }, [currentPlatform, search, filterStatus, subscriptionPlan, operationalFilter, page, pageSize])
+
+  useEffect(() => () => {
+    if (snapshotFollowupTimerRef.current !== null) {
+      window.clearTimeout(snapshotFollowupTimerRef.current)
+    }
+  }, [])
 
   const refreshAccounts = useCallback(async () => {
     let syncError = ''
