@@ -8,6 +8,23 @@ from types import SimpleNamespace
 from sqlalchemy import create_engine
 
 
+def test_read_cached_billing_is_nonblocking_and_only_returns_fresh_copies(monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine("sqlite://")
+    clock = [100.0]
+    monkeypatch.setattr(module, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no remote reads")))
+    module._remember(engine, (1, 7), module._summary(12.5))
+    result = module.read_cached_account_billing_summaries(engine, [(1, 7), (2, 7)])
+    assert result[(1, 7)]["billed_usd"] == 12.5
+    assert (2, 7) not in result
+    result[(1, 7)]["billed_usd"] = 99
+    assert module.read_cached_account_billing_summaries(engine, [(1, 7)])[(1, 7)]["billed_usd"] == 12.5
+    clock[0] = 160.0
+    assert module.read_cached_account_billing_summaries(engine, [(1, 7)]) == {}
+
+
 def test_billing_queries_only_requested_target_account_pairs(monkeypatch):
     from services import codex_account_billing as module
 

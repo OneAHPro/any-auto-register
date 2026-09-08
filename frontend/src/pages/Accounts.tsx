@@ -942,6 +942,9 @@ export default function Accounts() {
       const params = new URLSearchParams({ platform: currentPlatform, page: String(page), page_size: String(pageSize) })
       if (currentPlatform === 'chatgpt') {
         params.set('include_live', '1')
+        // Render durable snapshots first. A live inventory sync can take
+        // several seconds and must never hold the first paint hostage.
+        params.set('snapshot_only', '1')
         if (forceLive) params.set('refresh_live', '1')
       }
       if (search) params.set('email', search)
@@ -970,6 +973,10 @@ export default function Accounts() {
       setTotal(data.total)
       setAccountSummary(normalizeAccountSummary(data.summary, data.total))
       setAccountLoadError('')
+      // The snapshot is the first meaningful paint. Do not keep the list in
+      // a loading state while the optional upstream reconciliation runs.
+      if (forceLive && currentPlatform === 'chatgpt') setLoading(false)
+
     } catch (error) {
       if (requestEpoch !== accountLoadEpochRef.current) return
       setAccountSummary(null)

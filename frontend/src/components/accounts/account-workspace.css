@@ -152,7 +152,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   align-items: stretch;
-  gap: 16px;
+  gap: 12px;
 }
 
 .accounts-workspace .accounts-records > [role="listitem"] {
@@ -165,8 +165,8 @@
   flex-direction: column;
   flex: 1;
   min-width: 0;
-  gap: 16px;
-  padding: 20px;
+  gap: 10px;
+  padding: 14px;
   border: 1px solid var(--console-border);
   border-radius: 10px;
   background: var(--console-surface);
@@ -190,17 +190,17 @@
   transform: none;
 }
 
-@container accounts-grid (min-width: 696px) {
+@container accounts-grid (min-width: 620px) {
   .accounts-workspace .accounts-records,
   .accounts-workspace .account-card-skeleton-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }
 
-@container accounts-grid (min-width: 1052px) {
+@container accounts-grid (min-width: 900px) {
   .accounts-workspace .accounts-records,
   .accounts-workspace .account-card-skeleton-grid {
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(4, minmax(0, 1fr));
   }
 }
 
@@ -215,7 +215,7 @@
 
 .accounts-workspace .account-card__header {
   grid-template-columns: auto minmax(0, 1fr) auto;
-  gap: 10px;
+  gap: 8px;
   padding: 0;
 }
 
@@ -228,7 +228,7 @@
   flex-wrap: wrap;
   align-items: center;
   gap: 8px;
-  margin-top: 2px;
+  margin-top: 0;
   color: var(--console-muted);
   font-size: 11px;
 }
@@ -239,19 +239,35 @@
 
 .accounts-workspace .account-card__tag-row {
   gap: 4px;
-  margin-top: 8px;
+  margin-top: 4px;
 }
 
 .accounts-workspace .account-card__identity-grid {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(max-content, 1fr);
-  gap: 12px;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 6px 12px;
   margin: 0;
   padding: 0;
   border: 0;
 }
 
 .accounts-workspace .account-card__identity-item {
-  gap: 5px;
+  flex-direction: row;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.accounts-workspace .account-card__identity-item > .account-card__field-label {
+  flex-shrink: 0;
+}
+
+.accounts-workspace .account-card__identity-item > .ant-typography {
+  text-align: right;
+}
+
+.accounts-workspace .account-card__cost-button {
+  grid-column: 1 / -1;
+  min-height: 24px;
 }
 
 .accounts-workspace .account-card__field-label .anticon,
@@ -271,20 +287,18 @@
 }
 
 .accounts-workspace .account-card__quota {
-  padding: 16px 0;
+  padding: 10px 0;
   border-top: 1px solid var(--console-border);
   border-bottom: 1px solid var(--console-border);
 }
 
 .accounts-workspace .account-card__section-heading {
-  flex-wrap: wrap;
-  justify-content: flex-start;
-  gap: 4px 8px;
+  justify-content: space-between;
+  gap: 8px;
 }
 
 .accounts-workspace .account-card__section-heading > .ant-typography {
-  flex-basis: 100%;
-  white-space: normal;
+  white-space: nowrap;
 }
 
 .accounts-workspace .account-card__window-label {
@@ -292,16 +306,30 @@
 }
 
 .accounts-workspace .account-card__quota-headline {
-  margin-top: 12px;
+  margin-top: 0;
+  gap: 5px;
 }
 
 .accounts-workspace .account-card__quota-headline strong {
   color: var(--console-text);
 }
 
+.accounts-workspace .account-card__quota-headline .ant-tag {
+  margin-inline-start: 4px;
+}
+
+.accounts-workspace .account-card__quota-updated {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 4px;
+  color: var(--console-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .accounts-workspace .account-card__metrics-grid {
-  gap: 12px;
-  margin-top: 12px;
+  gap: 8px;
+  margin-top: 8px;
 }
 
 .accounts-workspace .account-card__quota--chatgpt .account-card__metrics-grid {
@@ -323,7 +351,7 @@
 }
 
 .accounts-workspace .account-card__commercial {
-  gap: 8px;
+  gap: 6px;
 }
 
 .accounts-workspace .account-card__commercial-row {
@@ -338,14 +366,16 @@
 }
 
 .accounts-workspace .account-card__footer {
-  gap: 8px;
+  gap: 4px 8px;
   margin-top: auto;
-  padding-top: 12px;
+  padding-top: 8px;
   border-top: 1px solid var(--console-border);
 }
 
 .accounts-workspace .account-card__created {
   flex-basis: 100%;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .accounts-workspace .account-card__actions {
@@ -353,7 +383,7 @@
 }
 
 .accounts-workspace .account-card__actions .ant-btn {
-  min-height: 32px;
+  min-height: 28px;
   padding-inline: 6px;
 }
 
@@ -394,8 +424,8 @@
 }
 
 .accounts-workspace .account-card-skeleton {
-  min-height: 400px;
-  padding: 20px;
+  min-height: 292px;
+  padding: 14px;
   border: 1px solid var(--console-border);
   border-radius: 10px;
 }
@@ -496,7 +526,7 @@
   }
 
   .accounts-workspace .account-card {
-    padding: 20px 16px;
+    padding: 14px;
   }
 
   .accounts-workspace .account-card__actions {

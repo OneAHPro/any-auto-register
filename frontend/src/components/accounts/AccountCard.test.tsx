@@ -95,6 +95,21 @@ describe('AccountCard', () => {
     expect(within(card).getByRole('button', { name: '删除' })).toBeTruthy()
   })
 
+  it.each([false, true])('labels the first local import time for persisted accounts (remote: %s)', (remoteOnly) => {
+    render(<AccountCard account={{ ...account, remote_only: remoteOnly }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    const imported = screen.getByLabelText('导入时间')
+    expect(imported.textContent).toContain('导入时间')
+    expect(imported.querySelector('time')?.getAttribute('dateTime')).toBe(account.created_at)
+    expect(imported.textContent).not.toContain('待入库')
+  })
+
+  it('does not present an upstream timestamp as the import time of a temporary remote account', () => {
+    render(<AccountCard account={{ ...account, id: -42, remote_only: true }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    const imported = screen.getByLabelText('导入时间')
+    expect(imported.textContent).toContain('待入库')
+    expect(imported.querySelector('time')).toBeNull()
+  })
+
   it.each([
     [undefined, '未设置'],
     ['12.50', '¥12.50'],

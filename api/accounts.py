@@ -21,6 +21,7 @@ from typing import Mapping, Optional
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 import io, csv, json, logging
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 from urllib.parse import urlsplit, urlunsplit
 from services.codex2api_remote_accounts import (
@@ -34,7 +35,18 @@ from services.codex2api_remote_accounts import (
 _CHATGPT_DIRECT_PASSWORD_DOMAINS = {"icloud.com", "me.com", "mac.com"}
 
 logger = logging.getLogger(__name__)
+_SNAPSHOT_REFRESH_EXECUTOR = ThreadPoolExecutor(max_workers=1, thread_name_prefix="accounts-snapshot-refresh")
 
+
+def _schedule_snapshot_refresh(database_engine) -> None:
+    def refresh() -> None:
+        try:
+            from services.codex_inventory import materialize_inventory, sync_inventory
+            sync_inventory(database_engine, refresh=True)
+            materialize_inventory(database_engine)
+        except Exception as exc:
+            logger.warning("后台刷新 Codex2API 账号库存失败: %s", type(exc).__name__)
+    _SNAPSHOT_REFRESH_EXECUTOR.submit(refresh)
 _ACCOUNT_EXTRA_SECRET_KEYS = {
     "access_token",
     "accesstoken",
@@ -881,6 +893,7 @@ def _build_account_list(
     operational_status: Optional[str] = None,
     session: Session = Depends(get_session),
     summary_only: bool = False,
+    snapshot_only: bool = False,
 ):
     def load_visible_accounts() -> list[AccountModel]:
         query = select(AccountModel)
@@ -914,7 +927,10 @@ def _build_account_list(
     if include_live and str(platform or "").strip().lower() == "chatgpt":
         from services.chatgpt_account_display import build_chatgpt_account_display
 
-        if refresh_live:
+        if snapshot_only and refresh_live:
+            _schedule_snapshot_refresh(session.get_bind())
+
+        if refresh_live and not snapshot_only:
             try:
                 from services.codex_inventory import materialize_inventory, sync_inventory
 
@@ -948,10 +964,10 @@ def _build_account_list(
         # Transitional compatibility for local rows created before the
         # inventory table existed. Once the explicit sync endpoint has run,
         # every row is rendered from its durable local snapshot.
-        if not visible_accounts or any(
+        if not snapshot_only and (not visible_accounts or any(
             not isinstance((account.get_extra() or {}).get("codex_remote_snapshot"), dict)
             for account in visible_accounts
-        ):
+        )):
             try:
                 from services.chatgpt_codex2api_health import fetch_codex2api_quota_accounts
 
@@ -1230,9 +1246,13 @@ def _build_account_list(
             try:
                 from services.codex_account_billing import fetch_account_billing_summaries
 
-                billing = fetch_account_billing_summaries(
-                    session.get_bind(), billing_keys, refresh=bool(refresh_live),
-                )
+                if snapshot_only:
+                    from services.codex_account_billing import read_cached_account_billing_summaries
+                    billing = read_cached_account_billing_summaries(session.get_bind(), billing_keys)
+                else:
+                    billing = fetch_account_billing_summaries(
+                        session.get_bind(), billing_keys, refresh=bool(refresh_live),
+                    )
                 for key, displays in display_by_key.items():
                     if key in billing:
                         for display in displays:
@@ -1260,6 +1280,7 @@ def list_accounts(
     refresh_live: bool = False,
     subscription_plan: Optional[str] = None,
     operational_status: Optional[str] = None,
+    snapshot_only: bool = False,
     session: Session = Depends(get_session),
 ):
     return _build_account_list(
@@ -1268,6 +1289,7 @@ def list_accounts(
         page=page, page_size=page_size, include_live=include_live,
         refresh_live=refresh_live, subscription_plan=subscription_plan,
         operational_status=operational_status, session=session,
+        snapshot_only=snapshot_only,
     )
 
 

@@ -43,6 +43,26 @@ _CACHE_LOCK = RLock()
 _EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="codex-account-billing")
 
 
+def read_cached_account_billing_summaries(
+    database_engine: Engine, keys: list[AccountBillingKey],
+) -> dict[AccountBillingKey, BillingSummary]:
+    """Return unexpired billing snapshots without resolving a remote target.
+
+    This is intentionally separate from ``fetch_account_billing_summaries`` so
+    a fast account-list render can never accidentally block on an upstream API.
+    """
+    now = monotonic()
+    result: dict[AccountBillingKey, BillingSummary] = {}
+    with _CACHE_LOCK:
+        cached = _CACHE.get(database_engine, {})
+        for key, (expires_at, value) in list(cached.items()):
+            if expires_at <= now:
+                del cached[key]
+            elif key in keys:
+                result[key] = dict(value)
+    return result
+
+
 def _summary(billed_usd: float | None) -> BillingSummary:
     return {
         "scope": "all",

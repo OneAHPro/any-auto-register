@@ -486,7 +486,8 @@ export function AccountCard({
       || '',
   ).trim()
   const password = String(account?.password || '').trim()
-  const createdAt = formatDate(account?.created_at, true)
+  const pendingImport = remoteOnly && Number(account?.id) <= 0
+  const importedAt = pendingImport ? undefined : account?.created_at
   return (
     <article
       className={`account-card${remoteOnly ? ' account-card--remote' : ''}${selected ? ' account-card--selected' : ''}`}
@@ -658,7 +659,15 @@ export function AccountCard({
       ) : null}
 
       <footer className="account-card__footer">
-        <span className="account-card__created"><CalendarOutlined />{createdAt}</span>
+        <span
+          className="account-card__created"
+          aria-label="导入时间"
+          title={pendingImport ? '远端账号尚未同步入库' : '账号首次导入或同步到本地的时间'}
+        >
+          <CalendarOutlined />
+          <span>导入时间</span>
+          {importedAt ? <time dateTime={String(importedAt)}>{formatDate(importedAt, true)}</time> : <span>{pendingImport ? '待入库' : '—'}</span>}
+        </span>
         <Space size={2} className="account-card__actions" wrap>
           {!remoteOnly && (password || refreshToken) ? (
             <Button

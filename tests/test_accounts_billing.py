@@ -64,3 +64,48 @@ def test_billing_failure_keeps_card_and_quota_without_substituting_weekly_cost(m
     assert display["billing"]["scope"] == "all"
     assert display["billing"]["billed_usd"] is None
     assert display["quota"]["billed_usd"] == 10.4
+
+
+def test_snapshot_list_uses_cached_billing_without_any_remote_fetch(monkeypatch):
+    from services import codex_account_billing, codex_inventory, chatgpt_codex2api_health
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    init_account_pool_schema(engine)
+    remote_fetch = Mock(side_effect=AssertionError("snapshot list must not wait on remote services"))
+    monkeypatch.setattr(codex_account_billing, "get_target_client", remote_fetch)
+    monkeypatch.setattr(codex_inventory, "sync_inventory", remote_fetch)
+    monkeypatch.setattr(chatgpt_codex2api_health, "fetch_codex2api_quota_accounts", remote_fetch)
+    codex_account_billing._remember(engine, (1, 7), codex_account_billing._summary(23.5))
+    with Session(engine) as session:
+        session.add(AccountModel(platform="chatgpt", email="legacy@example.com", password="p", status="active",
+                                 extra_json=json.dumps({"account_type": "chatgpt_password"})))
+        session.add(AccountModel(
+            platform="chatgpt", email="snapshot@example.com", password="p",
+            status="active", extra_json=json.dumps({"account_type": "chatgpt_password", "codex_remote_snapshot": {
+                "email": "snapshot@example.com", "target_id": 1, "remote_id": 7,
+                "usage_percent_7d": 12, "billed_7d": 4.5,
+            }}),
+        ))
+        session.commit()
+        result = list_accounts(platform="chatgpt", include_live=True, refresh_live=True,
+                               snapshot_only=True, session=session)
+    assert result["total"] == 2
+    snapshot = next(item for item in result["items"] if item["email"] == "snapshot@example.com")
+    assert snapshot["chatgpt_display"]["billing"]["billed_usd"] == 23.5
+    assert snapshot["chatgpt_display"]["quota"]["usage_percent"] == 12
+    # Remote reconciliation is queued after the response path; it is not
+    # awaited by the snapshot list.
+    assert remote_fetch.call_args_list[0][1] == {"refresh": True}
+
+
+def test_empty_snapshot_list_does_not_fetch_legacy_remote_inventory(monkeypatch):
+    from services import chatgpt_codex2api_health
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    init_account_pool_schema(engine)
+    fetch = Mock(side_effect=AssertionError("empty snapshot list must return immediately"))
+    monkeypatch.setattr(chatgpt_codex2api_health, "fetch_codex2api_quota_accounts", fetch)
+    with Session(engine) as session:
+        result = list_accounts(platform="chatgpt", include_live=True, snapshot_only=True, session=session)
+    assert result["items"] == []
+    fetch.assert_not_called()
