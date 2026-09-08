@@ -130,6 +130,59 @@ def test_materialize_inventory_reuses_local_credentials_by_stable_chatgpt_id_wit
     assert not accounts[0].get_extra().get('remote_only')
     assert accounts[0].get_extra()['codex_remote_snapshot']['remote_id'] == 7
 
+
+def test_materialize_prefers_exact_email_when_stable_id_is_shared():
+    e = make_engine()
+    shared_id = 'shared-chatgpt-account-id'
+    with Session(e) as session:
+        session.add(db.AccountModel(
+            platform='chatgpt', email='generic-account@example.com', password='p',
+            extra_json=json.dumps({'account_type': 'chatgpt_password', 'chatgpt_account_id': shared_id}),
+        ))
+        session.add(db.AccountModel(
+            platform='chatgpt', email='exact@example.com', password='p',
+            extra_json=json.dumps({'account_type': 'chatgpt_password', 'chatgpt_account_id': shared_id}),
+        ))
+        session.commit()
+    sync_inventory(e, target_id=1, clients={1: Client([{
+        'id': 8, 'email': 'exact@example.com', 'chatgpt_account_id': shared_id, 'status': 'active',
+    }])})
+    materialize_inventory(e)
+    with Session(e) as session:
+        exact = session.exec(select(db.AccountModel).where(db.AccountModel.email == 'exact@example.com')).one()
+        generic = session.exec(select(db.AccountModel).where(db.AccountModel.email == 'generic-account@example.com')).one()
+    assert exact.get_extra()['codex_remote_snapshot']['remote_id'] == 8
+    assert 'codex_remote_snapshot' not in generic.get_extra()
+
+
+def test_materialize_repairs_stale_binding_to_exact_email_account():
+    e = make_engine()
+    shared_id = 'shared-chatgpt-account-id'
+    with Session(e) as session:
+        stale = db.AccountModel(
+            platform='chatgpt', email='generic-account@example.com', password='p',
+            extra_json=json.dumps({'account_type': 'chatgpt_password', 'chatgpt_account_id': shared_id}),
+        )
+        exact = db.AccountModel(
+            platform='chatgpt', email='exact@example.com', password='p',
+            extra_json=json.dumps({'account_type': 'chatgpt_password', 'chatgpt_account_id': shared_id}),
+        )
+        session.add(stale); session.add(exact); session.flush()
+        exact_id = int(exact.id or 0)
+        session.add(db.AccountTargetBindingModel(
+            identity_id='stale-identity', local_account_id=int(stale.id or 0),
+            target_id=1, remote_account_id=8, remote_email='old@example.com',
+        ))
+        session.commit()
+    sync_inventory(e, target_id=1, clients={1: Client([{
+        'id': 8, 'email': 'exact@example.com', 'chatgpt_account_id': shared_id, 'status': 'active',
+    }])})
+    materialize_inventory(e)
+    with Session(e) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+    assert binding.local_account_id == exact_id
+    assert binding.remote_account_id == 8
+
 def test_materialize_inventory_reuses_identity_binding_when_remote_id_rotates():
     e = make_engine()
     with Session(e) as session:

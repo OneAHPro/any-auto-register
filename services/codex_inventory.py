@@ -387,9 +387,36 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 account = session.get(AccountModel, int(binding.local_account_id))
                 if account is not None and str(account.platform or "").lower() != "chatgpt":
                     account = None
+                if account is not None and (
+                    (target_id, int(account.id or 0)) in claimed_account_ids
+                    or _stable_id(account.email) != _stable_id(email)
+                ):
+                    # A stale binding can point at a different row that
+                    # shares a provider account ID. Let the exact email match
+                    # below repair that mapping during reconciliation.
+                    account = None
                 if account is not None:
                     claimed_account_ids.add((target_id, int(account.id or 0)))
             row_stable_ids = _row_stable_ids(row)
+            # Email is the strongest match when the provider has reused a
+            # ChatGPT/workspace ID across several remote rows. Prefer the
+            # exact credential email before falling back to that shared ID;
+            # otherwise one row can inherit another row's billing history.
+            if account is None:
+                email_matches = by_email.get(_stable_id(email), [])
+                credential_email_matches = [
+                    candidate for candidate in email_matches
+                    if (
+                        not _account_is_remote_only(candidate)
+                        and (target_id, int(candidate.id or 0)) not in claimed_account_ids
+                        and (
+                            _account_remote_key(candidate) is None
+                            or _account_remote_key(candidate) == (target_id, remote_id)
+                        )
+                    )
+                ]
+                if len(credential_email_matches) == 1:
+                    account = credential_email_matches[0]
             if account is None and row_stable_ids:
                 stable_matches = []
                 seen_ids: set[int] = set()
@@ -411,10 +438,10 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                     account = credential_matches[0]
             if account is None:
                 email_matches = by_email.get(_stable_id(email), [])
-                credential_email_matches = [
+                remote_email_matches = [
                     candidate for candidate in email_matches
                     if (
-                        not _account_is_remote_only(candidate)
+                        _account_is_remote_only(candidate)
                         and (target_id, int(candidate.id or 0)) not in claimed_account_ids
                         and not bound_account_ids.get((int(candidate.id or 0), target_id), set())
                         and (
@@ -423,23 +450,8 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                         )
                     )
                 ]
-                if len(credential_email_matches) == 1:
-                    account = credential_email_matches[0]
-                elif len(credential_email_matches) == 0:
-                    remote_email_matches = [
-                        candidate for candidate in email_matches
-                        if (
-                            _account_is_remote_only(candidate)
-                            and (target_id, int(candidate.id or 0)) not in claimed_account_ids
-                            and not bound_account_ids.get((int(candidate.id or 0), target_id), set())
-                            and (
-                                _account_remote_key(candidate) is None
-                                or _account_remote_key(candidate) == (target_id, remote_id)
-                            )
-                        )
-                    ]
-                    if len(remote_email_matches) == 1:
-                        account = remote_email_matches[0]
+                if len(remote_email_matches) == 1:
+                    account = remote_email_matches[0]
             identity_id = (
                 str(binding.identity_id)
                 if binding is not None
