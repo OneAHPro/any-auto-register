@@ -189,6 +189,9 @@ def _persist_explicit_target_binding(
             conflicting.last_error = "凭据重登后转移到当前账号"
             conflicting.updated_at = now
             session.add(conflicting)
+            # SQLite enforces the composite unique key per statement, so the
+            # slot must be flushed free before the current binding claims it.
+            session.flush()
         if binding is None:
             binding = AccountTargetBindingModel(
                 identity_id=identity_id,
