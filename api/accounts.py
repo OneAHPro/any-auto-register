@@ -42,10 +42,33 @@ def _schedule_snapshot_refresh(database_engine) -> None:
     def refresh() -> None:
         try:
             from services.codex_inventory import materialize_inventory, sync_inventory
+            from services.codex_account_billing import fetch_account_billing_summaries
             sync_inventory(database_engine, refresh=True)
             materialize_inventory(database_engine)
+            # The fast list path only reads the in-memory billing cache. Warm
+            # that cache in the same background pass so a restart does not
+            # leave every card at “—” until a slower live request is made.
+            with Session(database_engine) as background_session:
+                bindings = background_session.exec(
+                    select(AccountTargetBindingModel)
+                    .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
+                ).all()
+            billing_keys = []
+            for binding in bindings:
+                try:
+                    key = (int(binding.target_id), int(binding.remote_account_id))
+                except (TypeError, ValueError):
+                    continue
+                if key[0] > 0 and key[1] > 0:
+                    billing_keys.append(key)
+            if billing_keys:
+                fetch_account_billing_summaries(
+                    database_engine,
+                    list(dict.fromkeys(billing_keys)),
+                    refresh=True,
+                )
         except Exception as exc:
-            logger.warning("后台刷新 Codex2API 账号库存失败: %s", type(exc).__name__)
+            logger.warning("后台刷新 Codex2API 账号库存或计费失败: %s", type(exc).__name__)
     _SNAPSHOT_REFRESH_EXECUTOR.submit(refresh)
 _ACCOUNT_EXTRA_SECRET_KEYS = {
     "access_token",

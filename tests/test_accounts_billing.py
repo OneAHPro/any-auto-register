@@ -7,7 +7,7 @@ from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine
 
 from api.accounts import list_accounts
-from core.db import AccountModel, init_account_pool_schema
+from core.db import AccountModel, AccountTargetBindingModel, init_account_pool_schema
 
 
 def test_account_cards_attach_all_time_billing_by_target_and_remote_id_after_pagination(monkeypatch):
@@ -109,3 +109,33 @@ def test_empty_snapshot_list_does_not_fetch_legacy_remote_inventory(monkeypatch)
         result = list_accounts(platform="chatgpt", include_live=True, snapshot_only=True, session=session)
     assert result["items"] == []
     fetch.assert_not_called()
+
+
+def test_snapshot_refresh_warms_all_time_billing_cache_after_inventory_sync(monkeypatch):
+    import api.accounts as accounts_api
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    init_account_pool_schema(engine)
+    with Session(engine) as session:
+        session.add(AccountTargetBindingModel(
+            identity_id="identity-1", local_account_id=1, target_id=2,
+            remote_account_id=77, enabled=True,
+        ))
+        session.commit()
+    sync = Mock()
+    materialize = Mock()
+    billing = Mock()
+    monkeypatch.setitem(sys.modules, "services.codex_inventory", SimpleNamespace(
+        sync_inventory=sync, materialize_inventory=materialize,
+    ))
+    monkeypatch.setitem(sys.modules, "services.codex_account_billing", SimpleNamespace(
+        fetch_account_billing_summaries=billing,
+    ))
+    submit = Mock(side_effect=lambda callback: callback())
+    monkeypatch.setattr(accounts_api, "_SNAPSHOT_REFRESH_EXECUTOR", SimpleNamespace(submit=submit))
+
+    accounts_api._schedule_snapshot_refresh(engine)
+
+    sync.assert_called_once_with(engine, refresh=True)
+    materialize.assert_called_once_with(engine)
+    billing.assert_called_once_with(engine, [(2, 77)], refresh=True)
