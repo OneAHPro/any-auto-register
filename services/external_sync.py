@@ -170,6 +170,25 @@ def _persist_explicit_target_binding(
             .where(AccountTargetBindingModel.target_id == int(target_id))
         ).first()
         now = datetime.now(timezone.utc)
+        conflicting = session.exec(
+            select(AccountTargetBindingModel)
+            .where(AccountTargetBindingModel.target_id == int(target_id))
+            .where(AccountTargetBindingModel.remote_account_id == int(remote_id))
+        ).first()
+        if conflicting is not None and (
+            binding is None or int(conflicting.id or 0) != int(binding.id or 0)
+        ):
+            # A prior inventory pass may have materialized the freshly
+            # uploaded row under a duplicate local account. Free that unique
+            # remote slot before transferring it to the account just relogged.
+            conflicting.remote_account_id = 0
+            conflicting.remote_email = ""
+            conflicting.enabled = False
+            conflicting.sync_status = "superseded"
+            conflicting.remote_status = "superseded"
+            conflicting.last_error = "凭据重登后转移到当前账号"
+            conflicting.updated_at = now
+            session.add(conflicting)
         if binding is None:
             binding = AccountTargetBindingModel(
                 identity_id=identity_id,

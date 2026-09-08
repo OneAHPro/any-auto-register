@@ -844,6 +844,44 @@ def test_explicit_target_sync_uses_new_active_row_when_old_duplicate_email_is_er
     assert binding.remote_account_id == 13
 
 
+def test_explicit_target_sync_transfers_remote_slot_from_duplicate_local_row():
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.account_identity import ensure_identity
+    from services import external_sync
+
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool,
+    )
+    db.init_account_pool_schema(engine)
+    current = db.AccountModel(platform="chatgpt", email="a@example.com", password="p", extra_json='{"refresh_token":"rt"}')
+    duplicate = db.AccountModel(platform="chatgpt", email="a@example.com", password="", extra_json='{"remote_only":true}')
+    with Session(engine) as session:
+        session.add(current); session.add(duplicate); session.commit(); session.refresh(current); session.refresh(duplicate)
+        current_id = int(current.id or 0)
+        duplicate_id = int(duplicate.id or 0)
+        session.add(db.AccountTargetBindingModel(identity_id="current", local_account_id=current.id, target_id=2, remote_account_id=10))
+        session.add(db.AccountTargetBindingModel(identity_id="duplicate", local_account_id=duplicate.id, target_id=2, remote_account_id=11, remote_email="a@example.com"))
+        session.commit()
+    ensure_identity(engine, account_id=current_id, platform="chatgpt", email="a@example.com", workspace_id="workspace-current")
+    with Session(engine) as session: current = session.get(db.AccountModel, current_id)
+
+    class FakeTarget:
+        def import_refresh_token(self, payload): return {"success": 1, "failed": 0}
+        def list_accounts(self): return [{"id": 11, "email": "a@example.com", "status": "active", "enabled": True}]
+
+    result = external_sync.sync_codex2api_account(current, target=SimpleNamespace(id=2), client=FakeTarget(), database_engine=engine)
+    assert result["ok"] is True
+    with Session(engine) as session:
+        bindings = session.exec(select(db.AccountTargetBindingModel).order_by(db.AccountTargetBindingModel.id)).all()
+    by_local = {int(binding.local_account_id): binding for binding in bindings}
+    assert by_local[current_id].remote_account_id == 11
+    assert by_local[duplicate_id].remote_account_id == 0
+    assert by_local[duplicate_id].sync_status == "superseded"
+
+
 def test_legacy_sync_call_routes_to_the_account_assignment_target(monkeypatch):
     from sqlalchemy.pool import StaticPool
     from sqlmodel import Session, create_engine
