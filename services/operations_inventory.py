@@ -12,9 +12,9 @@ _CACHE = WeakKeyDictionary()
 _DEFERRED = WeakKeyDictionary()
 _LOCK = RLock()
 
-def _refresh(engine, target_id):
+def _refresh(engine, target_id, refresh=False):
     try:
-        result = sync_inventory(engine, target_id=target_id, refresh=False)
+        result = sync_inventory(engine, target_id=target_id, refresh=bool(refresh))
         return result.get('targets', 0) == 1 and result.get('errors', 0) == 0
     except Exception:
         return False
@@ -47,7 +47,7 @@ def refresh_operations_inventory(engine, target_ids, refresh=False):
                 continue
             future = in_flight.get(target_id)
             if future is None:
-                future = _EXECUTOR.submit(_refresh, engine, target_id)
+                future = _EXECUTOR.submit(_refresh, engine, target_id, refresh)
                 in_flight[target_id] = future
                 future.add_done_callback(lambda completed, target_id=target_id: _completed(engine, target_id, completed))
             futures[future] = target_id

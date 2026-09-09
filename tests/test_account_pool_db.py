@@ -1,4 +1,7 @@
 import sqlite3
+import os
+import subprocess
+import sys
 
 from sqlalchemy import inspect
 from sqlalchemy.pool import StaticPool
@@ -62,6 +65,28 @@ def test_pool_tables_and_account_identity_column_are_created():
             )
         }
     assert "uq_account_target_binding_identity_target" in indexes
+
+
+def test_schema_initializer_registers_durable_operations_tables_in_a_fresh_process():
+    project_root = os.path.dirname(os.path.dirname(__file__))
+    script = """
+from sqlalchemy import inspect
+from sqlmodel import create_engine
+from core.db import init_account_pool_schema
+engine = create_engine('sqlite://')
+init_account_pool_schema(engine)
+print(','.join(sorted(inspect(engine).get_table_names())))
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        env={**os.environ, "PYTHONPATH": project_root},
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    tables = set(result.stdout.strip().split(","))
+    assert {"operations_billing_snapshots", "operations_instance_sale_prices"} <= tables
 
 
 def test_schema_migration_is_idempotent():

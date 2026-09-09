@@ -293,9 +293,15 @@ def persist_sub2api_sync_result(account: Any, ok: bool, msg: str) -> None:
         record_sub2api_sync_result(extra, ok, msg)
 
 
-def persist_codex2api_sync_result(account: Any, ok: bool, msg: str) -> None:
+def persist_codex2api_sync_result(
+    account: Any,
+    ok: bool,
+    msg: str,
+    *,
+    database_engine=None,
+) -> None:
     if isinstance(account, AccountModel) and account.id is not None:
-        with Session(engine) as session:
+        with Session(database_engine or engine) as session:
             row = session.get(AccountModel, account.id)
             if row:
                 update_account_model_codex2api_sync(

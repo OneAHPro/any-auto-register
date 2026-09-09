@@ -213,6 +213,81 @@ def test_target_health_failure_is_reported_as_bad_gateway(monkeypatch):
     assert response.json()["detail"] == "target unavailable"
 
 
+def test_disabled_target_health_does_not_resolve_or_call_an_api_client(monkeypatch):
+    client, engine, module = build_client(monkeypatch)
+    created = client.post(
+        "/api/codex2api/targets",
+        json={"name": "disabled", "base_url": "https://node", "admin_key": "secret", "enabled": False},
+    ).json()["target"]
+    unexpected = lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("disabled target must not connect"))
+    monkeypatch.setattr(module, "get_target_client", unexpected)
+
+    response = client.post(f"/api/codex2api/targets/{created['id']}/health")
+
+    assert response.status_code == 200
+    assert response.json()["health_status"] == "disabled"
+
+
+def test_disabling_target_quarantines_its_bindings_and_assignments(monkeypatch):
+    client, engine, _module = build_client(monkeypatch)
+    created = client.post(
+        "/api/codex2api/targets",
+        json={"name": "node", "base_url": "https://node", "admin_key": "secret"},
+    ).json()["target"]
+    with Session(engine) as session:
+        identity = db.AccountIdentityModel(
+            id="target-disable-identity", platform="chatgpt",
+            canonical_email="disable@example.com",
+        )
+        session.add_all([
+            identity,
+            db.AccountTargetBindingModel(
+                identity_id=identity.id, local_account_id=0,
+                target_id=created["id"], remote_account_id=7,
+                enabled=True, sync_status="synced",
+            ),
+            db.AccountAssignmentModel(
+                identity_id=identity.id, local_account_id=0,
+                pool_id="PUBLIC_POOL", target_id=created["id"], state="active",
+            ),
+        ])
+        session.commit()
+
+    response = client.patch(
+        f"/api/codex2api/targets/{created['id']}",
+        json={"enabled": False},
+    )
+
+    assert response.status_code == 200
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+    assert binding.enabled is False and binding.sync_status == "target_disabled"
+    assert assignment.state == "standby"
+
+
+def test_target_database_status_is_read_only_and_reports_not_configured(monkeypatch):
+    client, _engine, _module = build_client(monkeypatch)
+    created = client.post(
+        "/api/codex2api/targets",
+        json={"name": "node", "base_url": "https://node", "admin_key": "secret"},
+    ).json()["target"]
+    monkeypatch.delenv("CODEX2API_DATABASE_URL", raising=False)
+    monkeypatch.delenv("CODEX2API_DATABASE_URL_1", raising=False)
+    monkeypatch.delenv("CODEX2API_DATABASE_URLS_JSON", raising=False)
+
+    response = client.get(f"/api/codex2api/targets/{created['id']}/database-status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "target_id": created["id"],
+        "available": False,
+        "status": "not_configured",
+        "source": "postgresql",
+        "error": "DSN is not configured",
+    }
+
+
 def test_pool_create_persists_target_policy(monkeypatch):
     client, engine, _module = build_client(monkeypatch)
     target = client.post(

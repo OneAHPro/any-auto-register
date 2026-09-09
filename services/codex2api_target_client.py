@@ -17,6 +17,11 @@ from urllib.parse import urlencode
 
 from curl_cffi import CurlMime
 from curl_cffi import requests as cffi_requests
+from services.codex2api_remote_accounts import (
+    positive_remote_id,
+    remote_account_id,
+    remote_bool,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -118,6 +123,16 @@ def _response_detail(response: Any, secrets: list[str]) -> str:
 def _contains_marker(value: Any, markers: tuple[str, ...]) -> bool:
     normalized = _text(value).lower()
     return any(marker in normalized for marker in markers)
+
+
+def _validated_remote_id(value: Any, *, endpoint: str = "accounts") -> int:
+    parsed = positive_remote_id(value)
+    if parsed <= 0:
+        raise Codex2APITargetError(
+            "Codex2API 远端账号 ID 无效",
+            endpoint=endpoint,
+        )
+    return parsed
 
 
 _AUTH_FAILURE_MARKERS = (
@@ -232,8 +247,13 @@ def _coerce_target_entry(raw: Mapping[str, Any], index: int) -> TargetConfig | N
         return None
     if raw.get("id") in (None, ""):
         raise ValueError("structured Codex2API target requires a stable positive id")
+    raw_target_id = raw.get("id")
+    if isinstance(raw_target_id, bool) or (
+        isinstance(raw_target_id, float) and not raw_target_id.is_integer()
+    ):
+        raise ValueError("structured Codex2API target id must be an integer")
     try:
-        target_id = int(raw.get("id"))
+        target_id = int(raw_target_id)
     except (TypeError, ValueError):
         raise ValueError("structured Codex2API target id must be an integer") from None
     if target_id <= 0:
@@ -730,12 +750,17 @@ class Codex2APITargetClient:
         rows = payload.get("accounts") if isinstance(payload, Mapping) else payload
         if not isinstance(rows, list):
             raise Codex2APITargetError("Codex2API 账号清单格式无效", endpoint="accounts")
-        return [dict(row) for row in rows if isinstance(row, Mapping)]
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise Codex2APITargetError(
+                "Codex2API 账号清单包含无效行",
+                endpoint="accounts",
+            )
+        return [dict(row) for row in rows]
 
     def account_usage_all(self, remote_id: int) -> dict[str, Any]:
         """Read the account modal's all-time, account-billed USD total."""
 
-        account_id = int(remote_id)
+        account_id = _validated_remote_id(remote_id, endpoint="usage")
         path = f"/api/admin/accounts/{account_id}/usage?days=0"
         payload = self._request("GET", path, timeout=10)
         if not isinstance(payload, Mapping):
@@ -833,10 +858,11 @@ class Codex2APITargetClient:
         )
 
     def test_account(self, remote_id: int) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="test")
         try:
             result = self._request(
                 "GET",
-                f"/api/admin/accounts/{int(remote_id)}/test",
+                f"/api/admin/accounts/{account_id}/test",
                 accept="text/event-stream, application/json",
                 timeout=45,
                 allowed_statuses=(200, 201, 202, 204, 429),
@@ -856,7 +882,7 @@ class Codex2APITargetClient:
             return {**result, "success": False, "auth_failed": True}
         if _contains_marker(status_text, _USAGE_LIMIT_MARKERS):
             return {**result, "success": True, "usage_limited": True}
-        if not bool(result.get("success")):
+        if not remote_bool(result.get("success"), False):
             return {
                 **result,
                 "success": False,
@@ -867,38 +893,44 @@ class Codex2APITargetClient:
         return result
 
     def set_enabled(self, remote_id: int, enabled: bool) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="enable")
         return self._request(
             "POST",
-            f"/api/admin/accounts/{int(remote_id)}/enable",
+            f"/api/admin/accounts/{account_id}/enable",
             json_body={"enabled": bool(enabled)},
         )
 
     def set_locked(self, remote_id: int, locked: bool) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="lock")
         return self._request(
             "POST",
-            f"/api/admin/accounts/{int(remote_id)}/lock",
+            f"/api/admin/accounts/{account_id}/lock",
             json_body={"locked": bool(locked)},
         )
 
     def refresh_account(self, remote_id: int) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="refresh")
         return self._request(
             "POST",
-            f"/api/admin/accounts/{int(remote_id)}/refresh",
+            f"/api/admin/accounts/{account_id}/refresh",
         )
 
     def delete_account(self, remote_id: int) -> dict[str, Any]:
-        return self._request("DELETE", f"/api/admin/accounts/{int(remote_id)}")
+        account_id = _validated_remote_id(remote_id, endpoint="accounts")
+        return self._request("DELETE", f"/api/admin/accounts/{account_id}")
 
     def restore_account(self, remote_id: int) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="restore")
         return self._request(
             "POST",
-            f"/api/admin/accounts/{int(remote_id)}/restore",
+            f"/api/admin/accounts/{account_id}/restore",
         )
 
     def update_scheduler(self, remote_id: int, payload: Mapping[str, Any]) -> dict[str, Any]:
+        account_id = _validated_remote_id(remote_id, endpoint="scheduler")
         return self._request(
             "PATCH",
-            f"/api/admin/accounts/{int(remote_id)}/scheduler",
+            f"/api/admin/accounts/{account_id}/scheduler",
             json_body=payload,
         )
 
@@ -910,6 +942,7 @@ class Codex2APITargetClient:
         poll_interval_seconds: float = 2,
         sleep_fn=time.sleep,
     ) -> bool:
+        account_id = _validated_remote_id(remote_id, endpoint="accounts")
         deadline = time.monotonic() + max(float(timeout_seconds), 0)
         while True:
             rows = self.list_accounts()
@@ -917,7 +950,7 @@ class Codex2APITargetClient:
                 (
                     item
                     for item in rows
-                    if int(item.get("id") or 0) == int(remote_id)
+                    if remote_account_id(item) == account_id
                 ),
                 None,
             )

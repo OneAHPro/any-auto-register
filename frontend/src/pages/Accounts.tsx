@@ -844,6 +844,7 @@ export default function Accounts() {
   const [reloginConcurrency, setReloginConcurrency] = useState(1)
   const accountLoadEpochRef = useRef(0)
   const snapshotFollowupTimerRef = useRef<number | null>(null)
+  const loadRef = useRef<((forceLive?: boolean) => Promise<void>) | null>(null)
   const costSaveEpochRef = useRef(0)
   const savedAccountCostsRef = useRef(new Map<number, { epoch: number; cost: string | null }>())
   const reloginRequestEpochRef = useRef(0)
@@ -987,7 +988,9 @@ export default function Accounts() {
       if (forceLive && currentPlatform === 'chatgpt') {
         snapshotFollowupTimerRef.current = window.setTimeout(() => {
           snapshotFollowupTimerRef.current = null
-          if (requestEpoch === accountLoadEpochRef.current) void load(false)
+          if (requestEpoch === accountLoadEpochRef.current) {
+            void loadRef.current?.(false)
+          }
         }, 6000)
       }
 
@@ -1001,6 +1004,13 @@ export default function Accounts() {
       if (requestEpoch === accountLoadEpochRef.current) setLoading(false)
     }
   }, [currentPlatform, search, filterStatus, subscriptionPlan, operationalFilter, page, pageSize])
+
+  useEffect(() => {
+    loadRef.current = load
+    return () => {
+      if (loadRef.current === load) loadRef.current = null
+    }
+  }, [load])
 
   useEffect(() => () => {
     if (snapshotFollowupTimerRef.current !== null) {

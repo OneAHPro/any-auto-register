@@ -8,12 +8,14 @@ def test_empty_successful_inventory_is_distinct_from_failed_inventory(monkeypatc
     engine=create_engine('sqlite://')
     calls=[]
     def sync(database_engine,target_id=None,refresh=False):
-        calls.append(target_id)
+        calls.append((target_id, refresh))
         return {'targets':1,'errors':int(target_id==2),'upserted':0}
     monkeypatch.setattr(module,'sync_inventory',sync)
     assert module.refresh_operations_inventory(engine,[1,2])=={1:True,2:False}
     assert module.refresh_operations_inventory(engine,[1,2])=={1:True,2:False}
-    assert sorted(calls)==[1,2]
+    assert sorted(calls)==[(1, False), (2, False)]
+    module.refresh_operations_inventory(engine, [1], refresh=True)
+    assert calls[-1] == (1, True)
 
 
 def test_overlapping_overviews_share_inventory_work(monkeypatch):

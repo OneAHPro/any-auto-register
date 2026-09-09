@@ -76,6 +76,21 @@ class FakeClient:
         ]
 
 
+def test_quota_collection_rejects_fractional_remote_id_without_truncation():
+    from services.control_plane_workers import collect_target_quota
+
+    engine = make_engine()
+    client = FakeClient()
+    client.list_accounts = lambda: [{"id": 1.5, "email": "fractional@example.com", "status": "active"}]
+
+    try:
+        collect_target_quota(engine, target_id=1, client=client, now=NOW)
+    except RuntimeError as exc:
+        assert "invalid remote ID" in str(exc)
+    else:
+        raise AssertionError("fractional remote ID was accepted")
+
+
 def test_target_health_requires_two_successes_before_healthy():
     from services.control_plane_workers import collect_target_health
 
@@ -316,6 +331,147 @@ def test_default_target_reconciliation_bootstraps_binding_and_assignment():
     assert binding.remote_account_id == 77
     assert assignment.target_id == 1
     assert assignment.pool_id == "PUBLIC_POOL"
+
+
+def test_reconciliation_quarantines_a_stable_identity_alias_mismatch():
+    from services.control_plane_workers import reconcile_target_bindings
+
+    engine = make_engine()
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="a@example.com",
+        password="password",
+        identity_id="identity-alias-mismatch",
+        extra_json='{"workspace_id":"workspace-local"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+        session.add(db.AccountIdentityModel(
+            id="identity-alias-mismatch", platform="chatgpt",
+            canonical_email=account.email, current_account_id=account.id,
+        ))
+        session.add(db.AccountAssignmentModel(
+            identity_id="identity-alias-mismatch", local_account_id=account.id,
+            pool_id="PUBLIC_POOL", target_id=1, state="active",
+        ))
+        session.commit()
+
+    reconcile_target_bindings(
+        engine,
+        target_id=1,
+        rows=[{
+            "id": 77, "email": "a@example.com", "workspace_id": "workspace-remote",
+            "status": "active", "enabled": True,
+        }],
+        now=NOW,
+    )
+
+    with Session(engine) as session:
+        identity = session.get(db.AccountIdentityModel, "identity-alias-mismatch")
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+        bindings = session.exec(select(db.AccountTargetBindingModel)).all()
+    assert identity.state == "ambiguous"
+    assert assignment.state == "standby"
+    assert bindings == []
+
+
+def test_quota_collection_quarantines_a_reused_remote_id_with_different_identity():
+    from services.control_plane_workers import collect_target_quota
+
+    engine = make_engine()
+    account = db.AccountModel(
+        platform="chatgpt", email="a@example.com", password="",
+        identity_id="identity-reused-id", extra_json='{"workspace_id":"workspace-a"}',
+    )
+    with Session(engine) as session:
+        session.add(account); session.commit(); session.refresh(account)
+        session.add(db.AccountIdentityModel(
+            id="identity-reused-id", platform="chatgpt",
+            canonical_email=account.email, current_account_id=account.id,
+        ))
+        session.add(db.AccountTargetBindingModel(
+            identity_id="identity-reused-id", local_account_id=account.id,
+            target_id=1, remote_account_id=77, remote_email=account.email,
+            enabled=True, sync_status="synced",
+        ))
+        session.add(db.AccountAssignmentModel(
+            identity_id="identity-reused-id", local_account_id=account.id,
+            pool_id="PUBLIC_POOL", target_id=1, state="active",
+        ))
+        session.commit()
+
+    class ReusedIdClient(FakeClient):
+        def list_accounts(self):
+            return [{
+                "id": 77, "email": "a@example.com", "workspace_id": "workspace-b",
+                "status": "active", "enabled": True,
+            }]
+
+    result = collect_target_quota(engine, target_id=1, client=ReusedIdClient(), now=NOW)
+
+    assert result.collected_accounts == 0
+    assert result.ambiguous_accounts == 1
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assignment = session.exec(select(db.AccountAssignmentModel)).one()
+    assert binding.enabled is False
+    assert binding.sync_status == "ambiguous"
+    assert assignment.state == "standby"
+
+
+def test_quota_collection_reports_preexisting_ambiguous_identity_without_binding():
+    """A state-level ambiguity remains visible after reconcile creates/quarantines a binding."""
+
+    from services.control_plane_workers import collect_target_quota
+
+    engine = make_engine()
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="ambiguous@example.com",
+        password="",
+        identity_id="identity-preexisting-ambiguous",
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+        session.add(
+            db.AccountIdentityModel(
+                id="identity-preexisting-ambiguous",
+                platform="chatgpt",
+                canonical_email=account.email,
+                state="ambiguous",
+                current_account_id=account.id,
+            )
+        )
+        session.commit()
+
+    class AmbiguousClient(FakeClient):
+        def list_accounts(self):
+            return [
+                {
+                    "id": 77,
+                    "email": "ambiguous@example.com",
+                    "status": "active",
+                    "enabled": True,
+                }
+            ]
+
+    result = collect_target_quota(
+        engine,
+        target_id=1,
+        client=AmbiguousClient(),
+        now=NOW,
+    )
+
+    assert result.collected_accounts == 0
+    assert result.ambiguous_accounts == 1
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+    assert binding.enabled is False
+    assert binding.sync_status == "ambiguous"
 
 
 def test_customer_usage_collection_filters_configured_api_keys():

@@ -7,9 +7,18 @@ from sqlmodel import Session, create_engine, select
 
 from core import db
 from services.account_identity import ensure_identity
+from services.account_migration import _remote_id_from_payload
 
 
 NOW = datetime(2026, 9, 2, 12, 0, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize("payload", [
+    {"remote_id": True, "id": 7},
+    {"remote_id": 1.5, "id": 7},
+])
+def test_remote_id_parser_rejects_lossy_numeric_aliases(payload):
+    assert _remote_id_from_payload(payload) == 0
 
 
 class FakeTarget:

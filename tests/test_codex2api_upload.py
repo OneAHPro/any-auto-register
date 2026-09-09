@@ -1138,6 +1138,16 @@ class Codex2APICredentialDeletionTests(unittest.TestCase):
 
         self.assertEqual(result["status"], "deleted")
         self.assertEqual(result["remote_id"], 11)
+
+    def test_identity_match_can_delete_when_remote_email_changed(self):
+        result, _get, delete = self._delete(
+            [{"id": 12, "email": "renamed@example.com", "workspace_id": "workspace-1"}],
+            identity={"workspace_id": "workspace-1"},
+        )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(result["remote_id"], 12)
+        delete.assert_called_once()
         delete.assert_called_once()
 
     def test_local_identity_does_not_fall_back_to_legacy_among_mismatches(self):
@@ -1272,6 +1282,38 @@ class Codex2APICredentialDeletionTests(unittest.TestCase):
             {"status": "already_absent", "remote_id": 41, "message": ""},
         )
         delete.assert_called_once()
+
+    def test_explicit_target_delete_uses_target_client_instead_of_legacy_url(self):
+        class TargetClient:
+            def __init__(self):
+                self.deleted = []
+
+            def list_accounts(self):
+                return [{"id": 88, "email": "demo@example.com"}]
+
+            def delete_account(self, remote_id):
+                self.deleted.append(remote_id)
+                return {"deleted": True}
+
+        target_client = TargetClient()
+        with mock.patch(
+            "services.codex2api_target_client.get_target_client",
+            return_value=target_client,
+        ), mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.get"
+        ) as legacy_get, mock.patch(
+            "platforms.chatgpt.codex2api_upload.cffi_requests.delete"
+        ) as legacy_delete:
+            result = delete_codex2api_credential(
+                email="demo@example.com",
+                target_id=2,
+                database_engine=object(),
+            )
+
+        self.assertEqual(result["status"], "deleted")
+        self.assertEqual(target_client.deleted, [88])
+        legacy_get.assert_not_called()
+        legacy_delete.assert_not_called()
 
     def test_missing_configuration_skips_network(self):
         for values in (

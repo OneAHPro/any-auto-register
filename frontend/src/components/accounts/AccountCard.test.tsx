@@ -141,6 +141,16 @@ describe('AccountCard', () => {
     expect(within(quota).queryByText('可用')).toBeNull()
   })
 
+  it('marks an aggregate billing value as partial when one pool is unavailable', () => {
+    render(<AccountCard account={{ ...account, chatgpt_display: {
+      remote_status: 'active',
+      quota_status: 'live',
+      billing: { scope: 'all', billed_usd: 12.5, status: 'partial', partial: true },
+      quota: { window: '7d', usage_percent: 10 },
+    } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
+    expect(screen.getByText('部分号池')).toBeTruthy()
+  })
+
   it('does not substitute legacy window billing for missing all-time billing', () => {
     render(<AccountCard account={{ ...account, extra: { ...account.extra, purchase_cost_cny: '20.00' }, quota: { '7d': { continuous_billed_usd: 100, billed_usd: 40 } } }} platform="chatgpt" selected={false} onSelect={vi.fn()} onCopy={vi.fn()} onOpenDetails={vi.fn()} onDelete={vi.fn()} />)
     const quota = screen.getByRole('region', { name: '7天使用' })

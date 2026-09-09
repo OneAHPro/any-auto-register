@@ -8,7 +8,7 @@ import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 from uuid import uuid4
 
 from sqlalchemy import func, update
@@ -16,8 +16,10 @@ from sqlmodel import Session, select
 
 from core.db import (
     AccountIdentityAliasModel,
+    AccountAssignmentModel,
     AccountIdentityModel,
     AccountModel,
+    AccountTargetBindingModel,
     engine as default_engine,
 )
 
@@ -399,6 +401,119 @@ def ensure_identity_for_model(database_engine, account: AccountModel) -> Identit
     )
 
 
+def supersede_other_target_bindings(
+    session: Session,
+    *,
+    identity_id: str,
+    current_target_id: int,
+    reason: str = "identity_target_changed",
+) -> int:
+    """Disable enabled bindings for an identity on targets it left.
+
+    ``AccountAssignmentModel`` represents the current target, while binding
+    rows also retain the remote history. Keeping an old row enabled makes
+    target account counts and reconciliation treat it as current, so target
+    changes must explicitly supersede those rows.
+    """
+    normalized_identity = str(identity_id or "").strip()
+    if not normalized_identity:
+        return 0
+    rows = session.exec(
+        select(AccountTargetBindingModel)
+        .where(AccountTargetBindingModel.identity_id == normalized_identity)
+        .where(AccountTargetBindingModel.target_id != int(current_target_id))
+        .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
+    ).all()
+    now = _utcnow()
+    changed = 0
+    for row in rows:
+        row.enabled = False
+        row.sync_status = "superseded"
+        row.remote_status = "superseded"
+        row.last_error = str(reason or "identity_target_changed")[:240]
+        row.updated_at = now
+        session.add(row)
+        changed += 1
+    return changed
+
+
+def move_assignments_to_standby(
+    session: Session,
+    *,
+    identity_id: str,
+    reason: str,
+    target_id: int | None = None,
+) -> int:
+    """Quarantine in-flight assignments and advance their CAS version."""
+    normalized_identity = str(identity_id or "").strip()
+    if not normalized_identity:
+        return 0
+    states = {
+        "active", "draining", "planned", "locking", "uploading", "pending",
+        "verifying", "assignment_committing", "source_cleaning", "target_enabling",
+        "migrating", "target_disabled",
+    }
+    # Include an already-standby row when the quarantine reason changes (or
+    # when a legacy row has never recorded a reason).  Advancing the version
+    # in that case invalidates an in-flight plan that may still hold the old
+    # CAS token, while the same reconciliation is idempotent once the reason
+    # has been persisted.
+    statement = select(AccountAssignmentModel).where(
+        AccountAssignmentModel.identity_id == normalized_identity,
+        AccountAssignmentModel.state.in_(states | {"standby"}),
+    )
+    if target_id is not None:
+        statement = statement.where(AccountAssignmentModel.target_id == int(target_id))
+    rows = session.exec(statement).all()
+    if len(rows) > 1:
+        def _assignment_stamp(row):
+            value = row.updated_at
+            if value is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        rows.sort(
+            key=lambda row: (
+                _assignment_stamp(row),
+                int(row.id or 0),
+            ),
+            reverse=True,
+        )
+        # The partial current-assignment index should permit only one active
+        # row.  If legacy transitional duplicates exist, fence the older rows
+        # outside that index before quarantining the canonical one.
+        for duplicate in rows[1:]:
+            duplicate.state = "superseded"
+            duplicate.assignment_version = max(
+                1, int(duplicate.assignment_version or 0)
+            ) + 1
+            duplicate.lease_owner = ""
+            duplicate.lease_expires_at = None
+            duplicate.lease_reason = "duplicate_assignment_fenced"
+            duplicate.updated_at = _utcnow()
+            session.add(duplicate)
+        rows = rows[:1]
+    now = _utcnow()
+    normalized_reason = str(reason or "assignment_quarantined")[:200]
+    for row in rows:
+        if row.state == "standby" and str(row.lease_reason or "") == normalized_reason:
+            if not str(row.lease_owner or "").strip() and row.lease_expires_at is None:
+                continue
+        row.state = "standby"
+        row.assignment_version = max(1, int(row.assignment_version or 0)) + 1
+        # A quarantined assignment no longer owns a scheduler lease.  Leaving
+        # the old owner/expiry populated makes the account appear leased to
+        # readers that inspect those fields independently of ``state``.
+        row.lease_owner = ""
+        row.lease_expires_at = None
+        row.lease_reason = normalized_reason
+        row.updated_at = now
+        session.add(row)
+    return len(rows)
+
+
 def _account_identity_values(account: AccountModel) -> dict[str, str]:
     try:
         extra = account.get_extra()
@@ -407,15 +522,40 @@ def _account_identity_values(account: AccountModel) -> dict[str, str]:
     if not isinstance(extra, dict):
         extra = {}
 
+    # Remote-only rows keep the provider identifiers inside
+    # ``codex_remote_snapshot``.  Walk the credential-free projection as well
+    # as the legacy top-level fields so startup reconciliation does not treat a
+    # pair of target-scoped projections as unrelated mailboxes.  The values are
+    # used only to derive a one-way fingerprint/alias; secrets are never read
+    # from arbitrary nested fields here.
+    sources: list[Mapping[str, Any]] = []
+
+    def collect(value: object, depth: int = 0) -> None:
+        if not isinstance(value, Mapping) or depth > 6:
+            return
+        sources.append(value)
+        for child in value.values():
+            if isinstance(child, Mapping):
+                collect(child, depth + 1)
+            elif isinstance(child, (list, tuple, set)):
+                for item in child:
+                    if isinstance(item, Mapping):
+                        collect(item, depth + 1)
+
+    collect(extra)
+
     def first(*keys: str) -> str:
-        for key in keys:
-            value = str(extra.get(key) or "").strip()
-            if value:
-                return value
+        for source in sources:
+            for key in keys:
+                value = str(source.get(key) or "").strip()
+                if value:
+                    return value
         return ""
 
-    workspace_id = first("workspace_id", "workspaceId")
-    account_id = first("chatgpt_account_id", "chatgptAccountId", "account_id", "accountId")
+    workspace_id = first("workspace_id", "workspaceId", "effective_workspace_id")
+    account_id = first(
+        "chatgpt_account_id", "chatgptAccountId", "account_id", "accountId", "user_id"
+    )
     fingerprint = credential_fingerprint(
         account.platform,
         account.email,
@@ -430,6 +570,80 @@ def _account_identity_values(account: AccountModel) -> dict[str, str]:
         "chatgpt_account_id": account_id,
         "credential_fingerprint": fingerprint,
     }
+
+
+def _is_remote_only_projection(account: AccountModel) -> bool:
+    """Whether an account row is a credential-free remote projection.
+
+    These rows intentionally have target-scoped identities.  They can appear
+    in more than one pool, so the normal credential identity resolver must not
+    mark them ambiguous merely because their mailbox alias is shared.
+    """
+
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    return isinstance(extra, Mapping) and bool(extra.get("remote_only"))
+
+
+def _repair_remote_projection_states(database_engine) -> int:
+    """Clear stale ambiguity flags for identical remote projections.
+
+    Older boots ran the credential resolver against remote-only rows and could
+    mark two target-scoped identities ambiguous after seeing the same mailbox
+    email.  When the provider also supplies the same strong account/workspace
+    alias, those rows are the same display identity; keep their target-scoped
+    bindings intact and restore their operational state.  Rows with different
+    aliases or different mailboxes remain untouched.
+    """
+
+    changed = 0
+    try:
+        with Session(database_engine) as session:
+            accounts = [
+                account
+                for account in session.exec(
+                    select(AccountModel).where(AccountModel.platform == "chatgpt")
+                ).all()
+                if _is_remote_only_projection(account)
+                and str(account.identity_id or "").strip()
+            ]
+            by_alias: dict[tuple[str, str], list[AccountModel]] = {}
+            for account in accounts:
+                values = _account_identity_values(account)
+                for alias_type in ("workspace_id", "chatgpt_account_id"):
+                    value = normalize_alias(values.get(alias_type))
+                    if value:
+                        by_alias.setdefault((alias_type, value), []).append(account)
+            repaired_identity_ids: set[str] = set()
+            for rows in by_alias.values():
+                if len(rows) < 2:
+                    continue
+                emails = {
+                    normalize_email(account.email)
+                    for account in rows
+                    if normalize_email(account.email)
+                }
+                if len(emails) != 1:
+                    continue
+                for account in rows:
+                    identity_id = str(account.identity_id or "").strip()
+                    identity = session.get(AccountIdentityModel, identity_id)
+                    if identity is None or identity.state != "ambiguous":
+                        continue
+                    identity.state = "active"
+                    identity.updated_at = _utcnow()
+                    session.add(identity)
+                    repaired_identity_ids.add(identity_id)
+            if repaired_identity_ids:
+                session.commit()
+                changed = len(repaired_identity_ids)
+    except Exception:
+        # Startup reconciliation is best-effort for legacy installations.  A
+        # failed repair must not prevent the application from serving cards.
+        return 0
+    return changed
 
 
 def reconcile_existing_accounts(database_engine=None) -> int:
@@ -454,12 +668,21 @@ def reconcile_existing_accounts(database_engine=None) -> int:
                 str(account.platform or ""),
                 str(account.email or ""),
                 _account_identity_values(account),
+                _is_remote_only_projection(account),
+                str(account.identity_id or "").strip(),
             )
             for account in accounts
             if account.id and normalize_email(account.email)
         ]
     reconciled = 0
-    for account_id, platform, email, values in account_values:
+    for account_id, platform, email, values, remote_only, existing_identity_id in account_values:
+        if remote_only and existing_identity_id:
+            # Remote projections already carry a target-scoped identity from
+            # inventory materialization.  Running the credential resolver here
+            # would interpret the same mailbox alias on another target as a
+            # credential conflict and mark both rows ambiguous.
+            reconciled += 1
+            continue
         ensure_identity(
             target_engine,
             account_id=account_id,
@@ -471,6 +694,7 @@ def reconcile_existing_accounts(database_engine=None) -> int:
             source="startup_reconcile",
         )
         reconciled += 1
+    _repair_remote_projection_states(target_engine)
     return reconciled
 
 
@@ -483,5 +707,7 @@ __all__ = [
     "identity_for_account",
     "normalize_alias",
     "normalize_email",
+    "move_assignments_to_standby",
     "reconcile_existing_accounts",
+    "supersede_other_target_bindings",
 ]

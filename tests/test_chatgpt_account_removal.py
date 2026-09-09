@@ -295,6 +295,32 @@ def test_non_chatgpt_account_is_always_local_only(database_engine):
     remote.assert_not_called()
 
 
+def test_account_removal_routes_enterprise_target_to_target_aware_delete(database_engine):
+    account_id, _created, _updated = _add_account(
+        database_engine,
+        extra={
+            "access_token": "at-extra-secret",
+            "workspace_id": "workspace-enterprise",
+            "remote_target_id": 2,
+            "remote_id": 77,
+        },
+    )
+    with mock.patch(
+        "services.chatgpt_account_removal.delete_codex2api_credential",
+        return_value={"status": "deleted", "remote_id": 77, "message": ""},
+    ) as remote:
+        result = remove_account(
+            account_id,
+            database_engine=database_engine,
+            codex2api_delete_on_account_remove_enabled=True,
+        )
+
+    assert result["ok"] is True
+    kwargs = remote.call_args.kwargs
+    assert kwargs["target_id"] == 2
+    assert kwargs["database_engine"] is database_engine
+
+
 def test_zero_id_cleanup_does_not_quarantine_unbound_mailboxes(database_engine):
     with Session(database_engine) as session:
         account = AccountModel(

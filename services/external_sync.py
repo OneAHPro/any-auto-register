@@ -13,7 +13,12 @@ from services.chatgpt_sync import (
     persist_sub2api_sync_result,
     upload_chatgpt_account_to_cpa,
 )
-from services.chatgpt_account_coordination import codex2api_account_mutation_lock
+from services.chatgpt_account_coordination import (
+    codex2api_account_mutation_lock,
+    codex2api_credential_lock,
+    codex2api_target_lock,
+)
+from services.codex2api_remote_accounts import remote_account_email, remote_bool
 
 
 logger = logging.getLogger(__name__)
@@ -94,6 +99,255 @@ def _build_chatgpt_upload_account(account):
     return upload_account
 
 
+def _account_credential_identity_key(account: Any) -> str:
+    """Build a stable lock identity without retaining credential plaintext."""
+
+    extra = _get_account_extra(account)
+    if not isinstance(extra, dict):
+        extra = {}
+    for key in (
+        "agent_runtime_id",
+        "chatgpt_account_id",
+        "account_id",
+        "refresh_token",
+        "session_token",
+        "access_token",
+    ):
+        value = str(
+            extra.get(key)
+            or (getattr(account, "token", "") if key == "access_token" else "")
+            or ""
+        ).strip()
+        if value:
+            return f"{key}:{value}"
+    return f"email:{str(getattr(account, 'email', '') or '').strip().casefold()}"
+
+
+def _positive_remote_id(row: Any) -> int:
+    if not isinstance(row, dict):
+        return 0
+    for key in ("id", "remote_id"):
+        value = row.get(key)
+        if isinstance(value, bool) or (
+            isinstance(value, float) and not value.is_integer()
+        ):
+            return 0
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            if value not in (None, ""):
+                return 0
+            continue
+        if parsed > 0:
+            return parsed
+    return 0
+
+
+def _remote_import_confirmed(response: Any) -> bool:
+    """Require an explicit provider acknowledgement before binding locally."""
+
+    if not isinstance(response, dict):
+        return False
+    try:
+        if int(response.get("failed") or 0) > 0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    for key in ("success", "updated", "duplicate", "imported"):
+        value = response.get(key)
+        if value is True:
+            return True
+        try:
+            if int(value or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    if response.get("ok") is True:
+        return True
+    if _positive_remote_id(response) > 0:
+        return True
+    if str(response.get("status") or "").strip().lower() in {
+        "ok", "success", "imported", "updated", "duplicate"
+    }:
+        return True
+    return bool(
+        str(response.get("account_id") or "").strip()
+        and str(response.get("email") or response.get("name") or "").strip()
+    )
+
+
+def _identity_aliases(value: Any) -> set[str]:
+    if not isinstance(value, dict):
+        return set()
+    nested = value.get("credentials")
+    nested = nested if isinstance(nested, dict) else {}
+    aliases: set[str] = set()
+    for key in (
+        "workspace_id",
+        "effective_workspace_id",
+        "chatgpt_account_id",
+        "account_id",
+        "user_id",
+    ):
+        for source in (value, nested):
+            text = str(source.get(key) or "").strip().casefold()
+            if text:
+                aliases.add(text)
+    return aliases
+
+
+def _local_identity_aliases(account: Any) -> set[str]:
+    try:
+        extra = _get_account_extra(account)
+    except Exception:
+        extra = {}
+    aliases = _identity_aliases(extra if isinstance(extra, dict) else {})
+    user_id = str(getattr(account, "user_id", "") or "").strip().casefold()
+    if user_id:
+        aliases.add(user_id)
+    return aliases
+
+
+def _remote_row_matches_account(
+    row: dict[str, Any],
+    account: AccountModel,
+    local_aliases: set[str],
+) -> bool:
+    row_aliases = _identity_aliases(row)
+    account_email = str(getattr(account, "email", "") or "").strip().casefold()
+    row_email = remote_account_email(row).strip().casefold()
+    email_matches = bool(account_email and row_email and account_email == row_email)
+    if local_aliases and row_aliases:
+        # Stable IDs must agree; an old remote row with a reused numeric ID is
+        # not the same credential merely because its email happens to match.
+        # A provider may legitimately rotate the display email, so an
+        # intersecting stable alias takes precedence over that stale field.
+        return bool(local_aliases & row_aliases)
+    return email_matches
+
+
+def _remote_row_status_usable(row: dict[str, Any]) -> bool:
+    return str(
+        row.get("remote_status") or row.get("status") or ""
+    ).strip().lower() not in {
+        "error",
+        "invalid",
+        "unauthorized",
+        "token_invalidated",
+        "deleted",
+        "expired",
+    }
+
+
+def _identity_has_conflicting_alias(session: Any, identity_id: str) -> bool:
+    from sqlmodel import select
+    from core.db import AccountIdentityAliasModel, AccountIdentityModel
+
+    aliases = session.exec(
+        select(AccountIdentityAliasModel).where(
+            AccountIdentityAliasModel.identity_id == str(identity_id)
+        )
+    ).all()
+    for alias in aliases:
+        if str(alias.alias_type or "") not in {
+            "workspace_id", "chatgpt_account_id", "credential_fingerprint"
+        }:
+            continue
+        if session.exec(
+            select(AccountIdentityAliasModel)
+            .join(
+                AccountIdentityModel,
+                AccountIdentityModel.id == AccountIdentityAliasModel.identity_id,
+            )
+            .where(AccountIdentityModel.platform == "chatgpt")
+            .where(AccountIdentityAliasModel.alias_type == alias.alias_type)
+            .where(AccountIdentityAliasModel.normalized_value == alias.normalized_value)
+            .where(AccountIdentityAliasModel.identity_id != str(identity_id))
+        ).first() is not None:
+            return True
+    return False
+
+
+def _select_remote_binding_row(
+    account: AccountModel,
+    rows: list[dict[str, Any]],
+    *,
+    identity_id: str,
+    target_id: int,
+    database_engine: Any,
+) -> dict[str, Any]:
+    """Select one remote row using binding/strong identity before email."""
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise RuntimeError("目标账号同步后远端账号清单格式无效")
+    candidates = [row for row in rows if isinstance(row, dict)]
+    if not candidates:
+        raise RuntimeError("目标账号同步后未返回远端账号")
+
+    local_aliases = _local_identity_aliases(account)
+
+    existing_remote_id = 0
+    try:
+        from sqlmodel import Session, select
+        from core.db import AccountTargetBindingModel
+
+        with Session(database_engine) as session:
+            binding = session.exec(
+                select(AccountTargetBindingModel)
+                .where(AccountTargetBindingModel.identity_id == str(identity_id))
+                .where(AccountTargetBindingModel.target_id == int(target_id))
+            ).first()
+            existing_remote_id = int(binding.remote_account_id or 0) if binding else 0
+    except Exception as exc:
+        # An unreadable local binding table is an identity-integrity failure;
+        # falling through to an email guess could silently retarget a live
+        # account. Callers receive a retryable sync error instead.
+        raise RuntimeError("本地目标绑定读取失败") from exc
+
+    if existing_remote_id > 0:
+        bound = [
+            row
+            for row in candidates
+            if _positive_remote_id(row) == existing_remote_id
+            and _remote_row_matches_account(row, account, local_aliases)
+            and _remote_row_status_usable(row)
+        ]
+        if len(bound) == 1:
+            return bound[0]
+        if len(bound) > 1:
+            raise RuntimeError("目标账号已有绑定对应多个远端账号")
+
+    if local_aliases:
+        strong = [
+            row
+            for row in candidates
+            if local_aliases & _identity_aliases(row)
+            and _remote_row_status_usable(row)
+        ]
+        if len(strong) == 1:
+            return strong[0]
+        if len(strong) > 1:
+            raise RuntimeError("目标账号稳定身份对应多个远端账号")
+
+    email = str(getattr(account, "email", "") or "").strip().casefold()
+    email_matches = [
+        row for row in candidates
+        if email
+        and remote_account_email(row).strip().casefold() == email
+        and _remote_row_matches_account(row, account, local_aliases)
+    ]
+    usable = [
+        row for row in email_matches
+        if _remote_row_status_usable(row)
+    ]
+    if len(usable) == 1:
+        return usable[0]
+    if len(usable) > 1 or len(email_matches) > 1:
+        raise RuntimeError("目标账号同步后身份不唯一")
+    if len(email_matches) == 1:
+        raise RuntimeError("目标账号同步后仅匹配到不可用远端账号")
+    raise RuntimeError("目标账号同步后未找到唯一远端账号")
+
+
 def _persist_explicit_target_binding(
     account: Any,
     *,
@@ -106,11 +360,16 @@ def _persist_explicit_target_binding(
     from sqlmodel import Session, select
 
     from core.db import (
+        AccountAssignmentModel,
+        AccountIdentityModel,
         AccountModel,
         AccountTargetBindingModel,
         ChatGPTAuthStateModel,
+        Codex2APITargetModel,
     )
     from services.account_identity import ensure_identity_for_model
+    from services.account_identity import move_assignments_to_standby
+    from services.account_identity import supersede_other_target_bindings
     from services.chatgpt_sync import update_account_model_codex2api_sync
 
     if not isinstance(account, AccountModel) or account.id is None:
@@ -119,43 +378,31 @@ def _persist_explicit_target_binding(
     if not identity_id:
         identity_id = ensure_identity_for_model(database_engine, account).identity_id
     rows = client.list_accounts()
-    normalized_email = str(account.email or "").strip().lower()
-    matches = [
-        row
-        for row in rows
-        if isinstance(row, dict)
-        and str(row.get("email") or row.get("name") or "").strip().lower()
-        == normalized_email
-    ]
-    if len(matches) > 1:
-        # Re-login/import can leave the old remote row beside the freshly
-        # uploaded credential. Prefer a usable row, then the newest remote ID
-        # so a stale error row cannot make a successful sync look failed.
-        usable = [
-            row for row in matches
-            if str(row.get("status") or "").strip().lower()
-            not in {"error", "invalid", "unauthorized", "token_invalidated"}
-        ]
-        if usable:
-            matches = usable
-        matches = sorted(
-            matches,
-            key=lambda row: int(row.get("id") or row.get("remote_id") or 0),
-            reverse=True,
-        )[:1]
-    if len(matches) != 1:
-        raise RuntimeError("目标账号同步后身份不唯一")
-    row = matches[0]
-    try:
-        remote_id = int(row.get("id") or row.get("remote_id") or 0)
-    except (TypeError, ValueError):
-        remote_id = 0
+    row = _select_remote_binding_row(
+        account,
+        rows,
+        identity_id=identity_id,
+        target_id=int(target_id),
+        database_engine=database_engine,
+    )
+    remote_id = _positive_remote_id(row)
     if remote_id <= 0:
         raise RuntimeError("目标账号同步后缺少远端 ID")
+    normalized_email = str(account.email or "").strip().lower()
     with Session(database_engine) as session:
         saved = session.get(AccountModel, int(account.id))
         if saved is None:
             raise RuntimeError("本地账号不存在")
+        identity_row = session.get(AccountIdentityModel, identity_id)
+        if (
+            identity_row is None
+            or str(identity_row.platform or "").strip().lower() != "chatgpt"
+        ):
+            resolved_identity = ensure_identity_for_model(database_engine, saved)
+            identity_id = resolved_identity.identity_id
+            saved.identity_id = identity_id
+            session.add(saved)
+            identity_row = session.get(AccountIdentityModel, identity_id)
         auth_state = session.exec(
             select(ChatGPTAuthStateModel).where(
                 ChatGPTAuthStateModel.account_id == int(account.id)
@@ -200,15 +447,138 @@ def _persist_explicit_target_binding(
                 created_at=now,
             )
         binding.remote_account_id = remote_id
-        binding.remote_email = normalized_email
+        binding.remote_email = str(
+            row.get("email") or row.get("name") or normalized_email
+        ).strip().lower()
         binding.sync_status = "synced"
-        binding.remote_status = str(row.get("status") or "")
-        binding.enabled = bool(row.get("enabled", True))
+        binding.remote_status = str(
+            row.get("remote_status") or row.get("status") or ""
+        )
+        binding.enabled = remote_bool(row.get("enabled"), True) and not remote_bool(
+            row.get("locked"), False
+        )
         binding.credential_revision = credential_revision
         binding.last_sync_at = now
         binding.last_error = ""
         binding.updated_at = now
         session.add(binding)
+        identity_row = session.get(AccountIdentityModel, identity_id)
+        if (
+            identity_row is not None
+            and binding.enabled
+            and not _identity_has_conflicting_alias(session, identity_id)
+        ):
+            identity_row.state = "active"
+            identity_row.current_account_id = int(account.id)
+            identity_row.updated_at = now
+            session.add(identity_row)
+        elif identity_row is not None and _identity_has_conflicting_alias(session, identity_id):
+            binding.enabled = False
+            binding.sync_status = "ambiguous"
+            binding.remote_status = "ambiguous"
+            binding.last_error = "身份存在歧义，等待人工确认"
+        if binding.enabled:
+            supersede_other_target_bindings(
+                session,
+                identity_id=identity_id,
+                current_target_id=int(target_id),
+                reason="explicit_target_sync",
+            )
+        # Keep the durable scheduler assignment aligned with the binding that
+        # was just verified.  A relogin can explicitly select a new target
+        # while an older active assignment still points at the previous node;
+        # advance its CAS version before moving it so an in-flight migration
+        # cannot write the stale target back.
+        assignment_rows = session.exec(
+            select(AccountAssignmentModel)
+            .where(AccountAssignmentModel.identity_id == identity_id)
+            .where(
+                AccountAssignmentModel.state.in_(
+                    [
+                        "active",
+                        "draining",
+                        "planned",
+                        "locking",
+                        "uploading",
+                        "pending",
+                        "verifying",
+                        "assignment_committing",
+                        "source_cleaning",
+                        "target_enabling",
+                        "migrating",
+                        "target_disabled",
+                        "standby",
+                    ]
+                )
+            )
+        ).all()
+        def _assignment_stamp(item):
+            value = item.updated_at
+            if value is None:
+                return datetime.min.replace(tzinfo=timezone.utc)
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        assignment_rows.sort(
+            key=lambda item: (_assignment_stamp(item), int(item.id or 0)),
+            reverse=True,
+        )
+        assignment = assignment_rows[0] if assignment_rows else None
+        for duplicate in assignment_rows[1:]:
+            duplicate.state = "superseded"
+            duplicate.assignment_version = max(
+                1, int(duplicate.assignment_version or 0)
+            ) + 1
+            duplicate.lease_owner = ""
+            duplicate.lease_expires_at = None
+            duplicate.lease_reason = "explicit_target_duplicate_assignment"
+            duplicate.updated_at = now
+            session.add(duplicate)
+        if assignment is None:
+            target_model = session.get(Codex2APITargetModel, int(target_id))
+            if target_model is not None:
+                assignment = AccountAssignmentModel(
+                    identity_id=identity_id,
+                    local_account_id=int(account.id),
+                    pool_id=str(target_model.default_pool_id or "PUBLIC_POOL"),
+                    target_id=int(target_id),
+                    state="active" if binding.enabled else "standby",
+                    lease_reason="explicit_target_sync" if binding.enabled else "explicit_target_remote_disabled",
+                    lease_started_at=now,
+                    assignment_version=1,
+                )
+                session.add(assignment)
+        elif int(assignment.target_id or 0) != int(target_id) and binding.enabled:
+            previous_version = int(assignment.assignment_version or 0)
+            move_assignments_to_standby(
+                session,
+                identity_id=identity_id,
+                reason="explicit_target_sync",
+            )
+            assignment.target_id = int(target_id)
+            assignment.state = "active"
+            assignment.assignment_version = max(1, previous_version) + 1
+            assignment.lease_reason = "explicit_target_sync"
+            assignment.updated_at = now
+            session.add(assignment)
+        elif assignment is not None and binding.enabled and assignment.state == "standby":
+            assignment.state = "active"
+            assignment.assignment_version = max(
+                1, int(assignment.assignment_version or 0)
+            ) + 1
+            assignment.lease_owner = ""
+            assignment.lease_expires_at = None
+            assignment.lease_reason = "explicit_target_sync"
+            assignment.updated_at = now
+            session.add(assignment)
+        elif assignment is not None and not binding.enabled and int(assignment.target_id or 0) == int(target_id):
+            move_assignments_to_standby(
+                session,
+                identity_id=identity_id,
+                target_id=int(target_id),
+                reason="explicit_target_remote_disabled",
+            )
         update_account_model_codex2api_sync(
             saved,
             True,
@@ -217,6 +587,53 @@ def _persist_explicit_target_binding(
             commit=False,
         )
         session.commit()
+
+
+def _quarantine_explicit_target_sync(
+    account: Any,
+    *,
+    target_id: int,
+    database_engine: Any,
+    reason: str,
+) -> None:
+    """Persist a failed explicit sync as non-schedulable local state."""
+
+    from sqlmodel import Session, select
+    from core.db import AccountAssignmentModel, AccountModel, AccountTargetBindingModel
+    from services.account_identity import move_assignments_to_standby
+
+    if not isinstance(account, AccountModel) or account.id is None:
+        return
+    identity_id = str(account.identity_id or "").strip()
+    if not identity_id:
+        return
+    try:
+        with Session(database_engine) as session:
+            bindings = session.exec(
+                select(AccountTargetBindingModel)
+                .where(AccountTargetBindingModel.identity_id == identity_id)
+                .where(AccountTargetBindingModel.target_id == int(target_id))
+            ).all()
+            now = datetime.now(timezone.utc)
+            for binding in bindings:
+                binding.enabled = False
+                binding.sync_status = "failed"
+                binding.remote_status = "sync_failed"
+                binding.last_error = str(reason or "explicit target sync failed")[:240]
+                binding.updated_at = now
+                session.add(binding)
+            move_assignments_to_standby(
+                session,
+                identity_id=identity_id,
+                target_id=int(target_id),
+                reason="explicit_target_sync_failed",
+            )
+            session.commit()
+    except Exception as exc:
+        logger.warning(
+            "failed to quarantine explicit Codex2API sync (%s)",
+            type(exc).__name__,
+        )
 
 
 def _assigned_codex2api_target(account: Any, database_engine: Any):
@@ -238,7 +655,12 @@ def _assigned_codex2api_target(account: Any, database_engine: Any):
                     AccountAssignmentModel.local_account_id == int(account.id),
                     AccountAssignmentModel.identity_id == str(account.identity_id or ""),
                     AccountAssignmentModel.state.in_(
-                        ["active", "draining", "standby"]
+                        [
+                            "active", "draining", "planned", "locking", "uploading",
+                            "pending", "verifying", "assignment_committing",
+                            "source_cleaning", "target_enabling", "migrating",
+                            "target_disabled", "standby",
+                        ]
                     ),
                 )
             ).first()
@@ -270,6 +692,14 @@ def sync_codex2api_account(
     # separate preserves the long-tested legacy upload path and its exact
     # response semantics for existing login/relogin flows.
     if client is not None or target is not None:
+        if target is not None and not remote_bool(
+            getattr(target, "enabled", True), True
+        ):
+            return {
+                "name": "Codex2API",
+                "ok": False,
+                "msg": "目标节点已停用",
+            }
         if client is None:
             from services.codex2api_target_client import Codex2APITargetClient, TargetConfig
 
@@ -298,7 +728,11 @@ def sync_codex2api_account(
         if payload.get("workspace_id"):
             payload["account_id"] = payload["workspace_id"]
         try:
-            with codex2api_account_mutation_lock():
+            with (
+                codex2api_credential_lock(_account_credential_identity_key(account)),
+                codex2api_account_mutation_lock(),
+                codex2api_target_lock(getattr(target, "id", 0)),
+            ):
                 if payload.get("refresh_token") and payload.get("access_token"):
                     response = client.import_full_json(payload)
                 elif payload.get("refresh_token"):
@@ -307,30 +741,39 @@ def sync_codex2api_account(
                     response = client.import_access_token(payload)
                 else:
                     return {"name": "Codex2API", "ok": False, "msg": "账号缺少凭证"}
-            response = response if isinstance(response, dict) else {}
-            failed = int(response.get("failed") or 0)
-            successful = sum(
-                int(response.get(key) or 0)
-                for key in ("success", "updated", "duplicate")
-            )
-            if failed or successful <= 0:
-                message = str(
-                    response.get("message")
-                    or response.get("msg")
-                    or response.get("error")
-                    or "Codex2API 未确认账号已导入"
-                ).strip()[:200]
-                return {"name": "Codex2API", "ok": False, "msg": message}
-            if target is not None and getattr(target, "id", None) is not None:
-                from core.db import engine as default_engine
+                response = response if isinstance(response, dict) else response
+                if not _remote_import_confirmed(response):
+                    response_message = (
+                        response.get("message")
+                        or response.get("msg")
+                        or response.get("error")
+                        if isinstance(response, dict)
+                        else ""
+                    )
+                    message = str(
+                        response_message
+                        or "Codex2API 未确认账号已导入"
+                    ).strip()[:200]
+                    return {"name": "Codex2API", "ok": False, "msg": message}
+                if target is not None and getattr(target, "id", None) is not None:
+                    from core.db import engine as default_engine
 
-                _persist_explicit_target_binding(
-                    account,
-                    target_id=int(target.id),
-                    client=client,
-                    database_engine=database_engine or default_engine,
-                )
-            return {"name": "Codex2API", "ok": True, "msg": "目标账号已导入"}
+                    try:
+                        _persist_explicit_target_binding(
+                            account,
+                            target_id=int(target.id),
+                            client=client,
+                            database_engine=database_engine or default_engine,
+                        )
+                    except Exception as persist_exc:
+                        _quarantine_explicit_target_sync(
+                            account,
+                            target_id=int(target.id),
+                            database_engine=database_engine or default_engine,
+                            reason=f"{type(persist_exc).__name__}",
+                        )
+                        raise
+                return {"name": "Codex2API", "ok": True, "msg": "目标账号已导入"}
         except Exception as exc:
             logger.error("Codex2API target sync failed (%s)", type(exc).__name__)
             return {"name": "Codex2API", "ok": False, "msg": "目标账号同步异常"}
@@ -368,11 +811,17 @@ def sync_codex2api_account(
                 type(exc).__name__,
             )
             try:
-                persist_codex2api_sync_result(
-                    account,
-                    False,
-                    "目标节点同步异常",
-                )
+                if database_engine is None:
+                    persist_codex2api_sync_result(
+                        account, False, "目标节点同步异常"
+                    )
+                else:
+                    persist_codex2api_sync_result(
+                        account,
+                        False,
+                        "目标节点同步异常",
+                        database_engine=target_engine,
+                    )
             except Exception:
                 pass
             return {
@@ -384,9 +833,10 @@ def sync_codex2api_account(
     try:
         from platforms.chatgpt.codex2api_upload import upload_to_codex2api
 
-        with codex2api_account_mutation_lock():
+        upload_account = _build_chatgpt_upload_account(account)
+        with codex2api_credential_lock(_account_credential_identity_key(account)), codex2api_account_mutation_lock():
             ok, msg = upload_to_codex2api(
-                _build_chatgpt_upload_account(account),
+                upload_account,
                 replace_existing=replace_existing,
             )
     except Exception as exc:
@@ -395,7 +845,12 @@ def sync_codex2api_account(
         logger.error("%s (%s)", msg, type(exc).__name__)
 
     try:
-        persist_codex2api_sync_result(account, ok, msg)
+        if database_engine is None:
+            persist_codex2api_sync_result(account, ok, msg)
+        else:
+            persist_codex2api_sync_result(
+                account, ok, msg, database_engine=target_engine
+            )
     except Exception as exc:
         logger.error(
             "Codex2API sync state persistence failed (%s)",

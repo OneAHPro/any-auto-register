@@ -393,11 +393,40 @@ DATABASE_URL=sqlite:////app/data/account_manager.db
 | `HOST` | `0.0.0.0` | FastAPI 监听地址 |
 | `PORT` | `8000` | FastAPI 监听端口 |
 | `DATABASE_URL` | `sqlite:////app/data/account_manager.db` | SQLite 数据库地址 |
+| `CODEX2API_DATABASE_URL` | 空 | 可选：Codex2API PostgreSQL 只读连接（默认仅用于目标 1） |
+| `CODEX2API_DATABASE_TARGET_ID` | 空 | 将未带编号的 PostgreSQL DSN 固定到指定目标 ID |
+| `CODEX2API_DATABASE_URL_<目标ID>` | 空 | 多实例部署时为某个目标指定独立 PostgreSQL DSN |
+| `CODEX2API_DATABASE_URLS_JSON` | 空 | 多实例 DSN 映射，例如 `{"1":"postgresql://...","2":"postgresql://..."}` |
+| `CODEX2API_DATABASE_CONNECT_TIMEOUT` | `5` | PostgreSQL 连接超时秒数 |
+| `CODEX2API_DATABASE_STATEMENT_TIMEOUT_MS` | `15000` | PostgreSQL 只读聚合查询的单语句超时 |
+| `CODEX2API_DATABASE_TIMEZONE` | `Asia/Shanghai` | 日计费历史的业务时区 |
 | `APP_ENABLE_SOLVER` | `1` | 是否自动启动本地 Solver，设为 `0` 可禁用 |
 | `SOLVER_PORT` | `8889` | Solver 监听端口 |
 | `LOCAL_SOLVER_URL` | `http://127.0.0.1:8889` | 后端访问 Solver 的地址 |
 
 如需传入 `SMSTOME_COOKIE`、`OPENAI_*` 等配置，可直接写入仓库根目录 `.env` 文件，`docker compose` 会自动注入到容器环境中。
+
+### Codex2API PostgreSQL 只读同步
+
+账号卡片和经营统计支持从 Codex2API PostgreSQL 批量读取账号元数据与
+`usage_logs.account_billed`。连接只读事务，结果会写入本项目的本地计费快照，
+服务重启后仍可显示最近一次有效数据。导入账号、更新凭据和删除账号仍通过
+Codex2API 管理接口执行。
+
+企业号池不要求控制台与目标节点共用数据库：每个目标只需配置自己的管理 API
+地址和密钥；对应的 `CODEX2API_DATABASE_URL_<目标ID>` 可以省略，控制台会直接
+使用该目标的 API，并把结果保存到本地快照。只有网络可达且权限正确时才启用直读。
+
+同一 ChatGPT 身份如果同时出现在多个号池，账号列表会按已确认的稳定身份
+（workspace/account ID 或凭据指纹）合并为一张卡；每个目标的远端键仍分别保存，
+卡片上的“已计费”是这些键的累计值。邮箱单独不足以确认身份时会保留为独立卡片，
+避免把共享邮箱下的不同账号串在一起。
+
+数据库端应按 [`deploy/codex2api-postgres-reader.md`](deploy/codex2api-postgres-reader.md)
+创建专用只读角色和脱敏投影视图；角色只读投影视图及 `usage_logs` 所需列，
+不授予 `public.accounts` 的完整凭据 JSONB 权限。不要把 PostgreSQL 管理员账号
+写入项目配置；DSN 通过部署环境变量注入。多套 Codex2API 使用带目标 ID 的变量，
+避免把一个实例的数据库误用于另一个实例。
 
 ### Camoufox 构建参数
 

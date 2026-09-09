@@ -383,11 +383,41 @@ The host machine mounts to:
 | `HOST` | `0.0.0.0` | FastAPI listen address |
 | `PORT` | `8000` | FastAPI listen port |
 | `DATABASE_URL` | `sqlite:////app/data/account_manager.db` | SQLite database path |
+| `CODEX2API_DATABASE_URL` | empty | Optional read-only Codex2API PostgreSQL DSN (target 1 by default) |
+| `CODEX2API_DATABASE_TARGET_ID` | empty | Pins the unsuffixed DSN to one target ID |
+| `CODEX2API_DATABASE_URL_<target-id>` | empty | Per-target PostgreSQL DSN for multi-instance deployments |
+| `CODEX2API_DATABASE_URLS_JSON` | empty | JSON map of target IDs to PostgreSQL DSNs |
+| `CODEX2API_DATABASE_CONNECT_TIMEOUT` | `5` | PostgreSQL connection timeout in seconds |
+| `CODEX2API_DATABASE_STATEMENT_TIMEOUT_MS` | `15000` | Read-only aggregation statement timeout |
+| `CODEX2API_DATABASE_TIMEZONE` | `Asia/Shanghai` | Business timezone for daily billing history |
 | `APP_ENABLE_SOLVER` | `1` | Whether to auto-start Solver, set to `0` to disable |
 | `SOLVER_PORT` | `8889` | Solver listen port |
 | `LOCAL_SOLVER_URL` | `http://127.0.0.1:8889` | Backend access URL for Solver |
 
 To change settings like `SMSTOME_COOKIE`, `OPENAI_*`, simply write them to the `.env` file in the repo root, and `docker compose` will automatically inject them into the container environment.
+
+### Optional Codex2API PostgreSQL reader
+
+Account cards and operations reports can read Codex2API account metadata and
+`usage_logs.account_billed` in batches. The connection is read-only and the
+sanitized results are persisted in local billing snapshots so a restarted
+control plane can still show the last known values. Credential imports and
+mutations continue to use each target's admin API. Follow
+[`deploy/codex2api-postgres-reader.md`](deploy/codex2api-postgres-reader.md) to
+create a projection view and least-privilege reader role; never grant the role
+the full `public.accounts` credentials JSONB.
+
+Enterprise pools do not require the control plane and a target to share a
+database server. Configure each target's API URL and key; omit its
+`CODEX2API_DATABASE_URL_<target-id>` when direct database access is unavailable.
+The reader then falls back to that target's API and keeps a local snapshot.
+
+When one confirmed ChatGPT identity appears in more than one pool, the account
+list renders one card and adds the all-time billing for each `(target_id,
+remote_id)` component. The components remain separate in durable snapshots.
+Email alone is not used to merge identities, so shared mailboxes stay isolated
+until a stable workspace/account alias or credential fingerprint confirms the
+match.
 
 ### Camoufox Build Parameters
 

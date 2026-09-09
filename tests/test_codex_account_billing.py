@@ -2,16 +2,21 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from datetime import timezone
 from threading import Event, Lock
 from types import SimpleNamespace
 
 from sqlalchemy import create_engine
+from sqlmodel import SQLModel, Session
+
+from core.operations_models import OperationsBillingSnapshotModel
 
 
 def test_read_cached_billing_is_nonblocking_and_only_returns_fresh_copies(monkeypatch):
     from services import codex_account_billing as module
 
     engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
     clock = [100.0]
     monkeypatch.setattr(module, "monotonic", lambda: clock[0])
     monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("no remote reads")))
@@ -23,6 +28,414 @@ def test_read_cached_billing_is_nonblocking_and_only_returns_fresh_copies(monkey
     assert module.read_cached_account_billing_summaries(engine, [(1, 7)])[(1, 7)]["billed_usd"] == 12.5
     clock[0] = 160.0
     assert module.read_cached_account_billing_summaries(engine, [(1, 7)]) == {}
+
+
+def test_read_cached_billing_survives_a_new_engine_by_loading_the_durable_snapshot(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    database_path = tmp_path / "billing.sqlite3"
+    writer = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(writer)
+    captured_at = datetime(2026, 9, 8, 1, 2, 3, tzinfo=timezone.utc)
+    with Session(writer) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=4,
+            remote_id=19,
+            total_billed_micros=12_345_000,
+            captured_at=captured_at,
+        ))
+        session.commit()
+
+    reader = create_engine(f"sqlite:///{database_path}")
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("durable billing reads must not resolve a remote target")
+    ))
+    result = module.read_cached_account_billing_summaries(reader, [(4, 19), (4, 20)])
+
+    assert result[(4, 19)] == {
+        "scope": "all",
+        "billed_usd": 12.345,
+        "source": "codex2api",
+        "status": "available",
+        "fetched_at": captured_at.isoformat(),
+    }
+    assert (4, 20) not in result
+
+
+def test_successful_usage_fetch_writes_a_durable_snapshot_for_cards_and_overview(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    database_path = tmp_path / "billing.sqlite3"
+    writer = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(writer)
+    payload = {
+        "total_account_billed": "12.345",
+        "total_requests": 8,
+        "last_request_at": "2026-09-08T23:59:00+00:00",
+        "today": {"date": "2026-09-08", "account_billed": "1.25", "requests": 7},
+        "history": [{"date": "2026-09-07", "account_billed": "11.095", "requests": 30}],
+    }
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(
+        account_usage_all=lambda remote_id: payload,
+    ))
+
+    result = module.fetch_account_usage_details(writer, [(4, 19)])
+    assert result[(4, 19)]["total_billed_usd"] == "12.345"
+
+    with Session(writer) as session:
+        row = session.exec(
+            __import__("sqlmodel").select(OperationsBillingSnapshotModel).where(
+                OperationsBillingSnapshotModel.target_id == 4,
+                OperationsBillingSnapshotModel.remote_id == 19,
+            )
+        ).one()
+        assert row.total_billed_micros == 12_345_000
+        assert row.total_requests == 8
+        assert row.source == "codex2api_api"
+        assert row.last_request_at.replace(tzinfo=timezone.utc).isoformat() == "2026-09-08T23:59:00+00:00"
+        assert row.today_date == "2026-09-08"
+        assert row.today_billed_micros == 1_250_000
+        assert row.today_requests == 7
+
+    reader = create_engine(f"sqlite:///{database_path}")
+    module._CACHE.clear()
+    module._DETAIL_CACHE.clear()
+    cached = module.read_cached_account_billing_summaries(reader, [(4, 19)])
+    assert cached[(4, 19)]["billed_usd"] == 12.345
+
+
+def test_snapshot_only_read_prefers_durable_success_over_a_transient_memory_error(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    database_path = tmp_path / "billing.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(engine)
+    captured_at = datetime(2026, 9, 8, 1, 2, 3, tzinfo=timezone.utc)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=4,
+            remote_id=19,
+            total_billed_micros=12_345_000,
+            captured_at=captured_at,
+        ))
+        session.commit()
+
+    # A failed live refresh may leave an error in the process cache with a
+    # newer wall-clock timestamp. The snapshot-only account list must continue
+    # showing the last valid amount while the next refresh is pending.
+    module._remember(engine, (4, 19), module._summary(None))
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("snapshot-only reads must not perform a remote request")
+    ))
+    result = module.read_cached_account_billing_summaries(engine, [(4, 19)])
+
+    assert result[(4, 19)]["status"] == "available"
+    assert result[(4, 19)]["billed_usd"] == 12.345
+
+
+def test_persisted_summary_retains_snapshot_provenance(tmp_path):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'provenance.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=4,
+            remote_id=19,
+            total_billed_micros=1_000_000,
+            captured_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+            source="codex2api_postgresql",
+        ))
+        session.commit()
+
+    assert module.read_persisted_account_billing_summaries(engine, [(4, 19)])[(4, 19)]["source"] == "codex2api_postgresql"
+
+
+def test_persisted_usage_details_are_available_after_process_cache_is_cleared(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    database_path = tmp_path / "billing.sqlite3"
+    writer = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(writer)
+    payload = {
+        "total_account_billed": "12.345",
+        "today": {"date": "2026-09-08", "account_billed": "1.25", "requests": 7},
+        "history": [{"date": "2026-09-07", "account_billed": "11.095", "requests": 30}],
+    }
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(
+        account_usage_all=lambda remote_id: payload,
+    ))
+    module.fetch_account_usage_details(writer, [(4, 19)])
+    module._DETAIL_CACHE.clear()
+    module._CACHE.clear()
+
+    reader = create_engine(f"sqlite:///{database_path}")
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("a durable detail must be enough for a restarted process")
+    ))
+    result = module.fetch_account_usage_details(reader, [(4, 19)])
+
+    assert result[(4, 19)] == {
+        "total_billed_usd": "12.345",
+        "today_date": "2026-09-08",
+        "today_billed_usd": "1.25",
+        "today_requests": 7,
+        "fetched_at": result[(4, 19)]["fetched_at"],
+        "history": [{"date": "2026-09-07", "account_billed": "11.095", "requests": 30}],
+    }
+
+
+def test_negative_durable_total_is_ignored_instead_of_becoming_negative_billing(tmp_path):
+    from services import codex_account_billing as module
+
+    database_path = tmp_path / "billing.sqlite3"
+    engine = create_engine(f"sqlite:///{database_path}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=4,
+            remote_id=19,
+            total_billed_micros=-1,
+            captured_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+        ))
+        session.commit()
+
+    assert module.read_persisted_account_billing_summaries(engine, [(4, 19)]) == {}
+
+
+def test_configured_postgres_reader_is_used_before_per_account_api(monkeypatch):
+    from services import codex_account_billing as module
+    from services import codex2api_db
+
+    engine = create_engine("sqlite://")
+    SQLModel.metadata.create_all(engine)
+    calls = []
+
+    class FakeDatabaseAdapter:
+        def __init__(self, config):
+            calls.append(("init", config.target_id))
+
+        def fetch_account_snapshots(self, keys):
+            calls.append(("fetch", list(keys)))
+            return {
+                (1, 7): {
+                    "target_id": 1,
+                    "remote_id": 7,
+                    "total": {"requests": 8, "tokens": 1000, "billed_usd": 12.5, "user_billed_usd": 12.5},
+                    "today": {"requests": 2, "tokens": 300, "billed_usd": 1.25, "user_billed_usd": 1.25},
+                    "history": [{"date": "2026-09-09", "requests": 2, "tokens": 300, "billed_usd": 1.25, "user_billed_usd": 1.25}],
+                }
+            }
+
+    monkeypatch.setenv("CODEX2API_DATABASE_URL", "postgresql://reader:secret@db/codex2api")
+    monkeypatch.setattr(codex2api_db, "Codex2APIDBAdapter", FakeDatabaseAdapter)
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("configured PostgreSQL should satisfy the batch read")
+    ))
+
+    result = module.fetch_account_usage_details(engine, [(1, 7)])
+
+    assert result[(1, 7)]["total_billed_usd"] == "12.5"
+    assert result[(1, 7)]["today_requests"] == 2
+    assert calls == [("init", 1), ("fetch", [(1, 7)])]
+    with Session(engine) as session:
+        snapshot = session.exec(
+            __import__("sqlmodel").select(OperationsBillingSnapshotModel).where(
+                OperationsBillingSnapshotModel.target_id == 1,
+                OperationsBillingSnapshotModel.remote_id == 7,
+            )
+        ).one()
+    assert snapshot.total_requests == 8
+    assert snapshot.source == "codex2api_postgresql"
+
+
+def test_older_equal_total_does_not_replace_a_newer_snapshot_detail(tmp_path):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'billing.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=1,
+            remote_id=7,
+            total_billed_micros=10_000_000,
+            today_date="2026-09-09",
+            today_billed_micros=2_000_000,
+            today_requests=4,
+            history_json='[{"date":"2026-09-09","account_billed":"2.0","requests":4}]',
+            captured_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc),
+            source="newer",
+        ))
+        session.commit()
+
+    module._persist_usage_snapshot(
+        engine,
+        (1, 7),
+        {
+            "total_billed_usd": "10.0",
+            "today_date": "2026-09-08",
+            "today_billed_usd": "1.0",
+            "today_requests": 1,
+            "history": [{"date": "2026-09-08", "account_billed": "1.0", "requests": 1}],
+            "fetched_at": "2026-09-09T01:00:00+00:00",
+        },
+        total_requests=2,
+        source="older",
+    )
+
+    with Session(engine) as session:
+        row = session.exec(__import__("sqlmodel").select(OperationsBillingSnapshotModel)).one()
+    assert row.today_date == "2026-09-09"
+    assert row.today_requests == 4
+    assert row.source == "newer"
+
+
+def test_persisted_snapshot_selection_compares_capture_instants_in_utc(tmp_path):
+    from services import codex_account_billing as module
+    older = OperationsBillingSnapshotModel(
+        target_id=1, remote_id=7, total_billed_micros=1_000_000,
+        captured_at=datetime.fromisoformat("2026-09-09T00:00:00+08:00"),
+    )
+    newer = OperationsBillingSnapshotModel(
+        target_id=1, remote_id=7, total_billed_micros=2_000_000,
+        captured_at=datetime.fromisoformat("2026-09-08T23:00:00+00:00"),
+    )
+
+    # 00:00+08 is 16:00Z and therefore older than 23:00Z.
+    assert module._row_is_newer(older, newer) is False
+    assert module._row_is_newer(newer, older) is True
+
+
+def test_sparse_usage_response_keeps_existing_daily_history(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'billing.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=1,
+            remote_id=7,
+            total_billed_micros=9_000_000,
+            today_date="2026-09-09",
+            today_billed_micros=1_000_000,
+            today_requests=3,
+            history_json='[{"date":"2026-09-08","account_billed":"8.0","requests":20}]',
+            captured_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc),
+        ))
+        session.commit()
+    monkeypatch.setattr(module, "get_target_client", lambda *args, **kwargs: SimpleNamespace(
+        account_usage_all=lambda remote_id: {
+            "total_account_billed": 9.5,
+            "total_requests": 30,
+            "last_request_at": "2026-09-09T03:00:00+00:00",
+        },
+    ))
+
+    module.fetch_account_usage_details(engine, [(1, 7)], refresh=True)
+
+    with Session(engine) as session:
+        row = session.exec(__import__("sqlmodel").select(OperationsBillingSnapshotModel)).one()
+    assert row.today_date == "2026-09-09"
+    assert row.today_requests == 3
+    assert "2026-09-08" in row.history_json
+
+
+def test_snapshot_writer_preserves_cumulative_requests_and_rejects_an_older_business_day(tmp_path):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'counter-fence.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=1,
+            remote_id=7,
+            total_billed_micros=10_000_000,
+            total_requests=100,
+            today_date="2026-09-09",
+            today_billed_micros=3_000_000,
+            today_requests=30,
+            captured_at=datetime(2026, 9, 9, 2, tzinfo=timezone.utc),
+        ))
+        session.commit()
+
+    module._persist_usage_snapshot(
+        engine,
+        (1, 7),
+        {
+            "total_billed_usd": "10.0",
+            "total_requests": 2,
+            "today_date": "2026-09-08",
+            "today_billed_usd": "1.0",
+            "today_requests": 1,
+            "fetched_at": "2026-09-09T03:00:00+00:00",
+        },
+        total_requests=2,
+    )
+
+    with Session(engine) as session:
+        row = session.exec(__import__("sqlmodel").select(OperationsBillingSnapshotModel)).one()
+    assert row.total_requests == 100
+    assert row.today_date == "2026-09-09"
+    assert row.today_billed_micros == 3_000_000
+    assert row.today_requests == 30
+
+
+def test_newer_partial_history_is_unioned_with_existing_days(tmp_path):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'history-union.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    with Session(engine) as session:
+        session.add(OperationsBillingSnapshotModel(
+            target_id=1,
+            remote_id=7,
+            total_billed_micros=1_000_000,
+            history_json='[{"date":"2026-09-07","account_billed":"1","requests":1}]',
+            captured_at=datetime(2026, 9, 8, tzinfo=timezone.utc),
+        ))
+        session.commit()
+
+    module._persist_usage_snapshot(
+        engine,
+        (1, 7),
+        {
+            "total_billed_usd": "2",
+            "history": [{"date": "2026-09-08", "account_billed": "1", "requests": 2}],
+            "fetched_at": "2026-09-09T00:00:00+00:00",
+        },
+    )
+
+    with Session(engine) as session:
+        row = session.exec(__import__("sqlmodel").select(OperationsBillingSnapshotModel)).one()
+    assert {item["date"] for item in __import__("json").loads(row.history_json)} == {
+        "2026-09-07", "2026-09-08"
+    }
+
+
+def test_history_persistence_strips_unknown_and_credential_fields(tmp_path):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'history-sanitize.sqlite3'}")
+    SQLModel.metadata.create_all(engine)
+    module._persist_usage_snapshot(
+        engine,
+        (1, 7),
+        {
+            "total_billed_usd": "1",
+            "history": [{
+                "day": "2026-09-08",
+                "account_billed": "1",
+                "requests": 2,
+                "refresh_token": "secret",
+                "email": "private@example.com",
+            }],
+            "fetched_at": "2026-09-09T00:00:00+00:00",
+        },
+    )
+    with Session(engine) as session:
+        row = session.exec(__import__("sqlmodel").select(OperationsBillingSnapshotModel)).one()
+    history = __import__("json").loads(row.history_json)
+    assert history == [{"date": "2026-09-08", "account_billed": "1", "requests": 2}]
 
 
 def test_billing_queries_only_requested_target_account_pairs(monkeypatch):
@@ -275,6 +688,41 @@ def test_billing_deadline_returns_unknown_and_cancels_queued_requests(monkeypatc
             release.set()
 
     assert sorted(called) == [1, 2, 3, 4]
+
+
+def test_slow_database_batch_does_not_extend_the_shared_api_deadline(tmp_path, monkeypatch):
+    from services import codex_account_billing as module
+
+    engine = create_engine(f"sqlite:///{tmp_path / 'slow-db.sqlite3'}")
+    release = Event()
+    started = Event()
+
+    class SlowDatabase:
+        def fetch_account_snapshots(self, keys, **kwargs):
+            started.set()
+            release.wait(timeout=2)
+            return {}
+
+    monkeypatch.setattr(module, "_database_adapter_for_target", lambda target_id: SlowDatabase())
+    monkeypatch.setattr(module, "_FETCH_DEADLINE_SECONDS", 0.2)
+    monkeypatch.setattr(
+        module,
+        "get_target_client",
+        lambda *args, **kwargs: SimpleNamespace(
+            account_usage_all=lambda remote_id: {"total_account_billed": 3}
+        ),
+    )
+
+    started_at = __import__("time").monotonic()
+    try:
+        result = module.fetch_account_billing_summaries(engine, [(1, 7)])
+    finally:
+        release.set()
+    elapsed = __import__("time").monotonic() - started_at
+
+    assert started.wait(timeout=0.5)
+    assert elapsed < 0.5
+    assert result[(1, 7)]["billed_usd"] == 3
 
 
 def test_billing_overlapping_refresh_reuses_inflight_and_late_result_populates_cache(monkeypatch):

@@ -187,8 +187,11 @@ def _remote_email(row: Mapping[str, object]) -> str:
 
 
 def _remote_id(row: Mapping[str, object]) -> int | None:
+    raw = row.get("id") or row.get("remote_id") or 0
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        return None
     try:
-        parsed = int(row.get("id") or row.get("remote_id") or 0)
+        parsed = int(raw)
     except (TypeError, ValueError):
         return None
     return parsed if parsed > 0 else None
@@ -325,6 +328,8 @@ def fetch_codex2api_quota_accounts(
             ) from None
         if not isinstance(rows, list):
             raise Codex2APIHealthError("Codex2API 账号清单格式无效")
+        if any(not isinstance(row, Mapping) for row in rows):
+            raise Codex2APIHealthError("Codex2API 账号清单包含无效行")
         return [
             _quota_record(
                 row,
@@ -717,6 +722,10 @@ def _fetch_enabled_target_quota(
         if not isinstance(remote_rows, list):
             raise Codex2APIHealthError(
                 f"Codex2API 目标 {target_id} 账号清单格式无效"
+            )
+        if any(not isinstance(row, Mapping) for row in remote_rows):
+            raise Codex2APIHealthError(
+                f"Codex2API 目标 {target_id} 账号清单包含无效行"
             )
         for raw_row in remote_rows:
             if not isinstance(raw_row, Mapping):
@@ -1159,7 +1168,9 @@ def _probe_target_client(
         ) from None
     if not isinstance(rows, list):
         raise Codex2APIHealthError("Codex2API 账号清单格式无效")
-    return [row for row in rows if isinstance(row, dict)]
+    if any(not isinstance(row, Mapping) for row in rows):
+        raise Codex2APIHealthError("Codex2API 账号清单包含无效行")
+    return [dict(row) for row in rows]
 
 
 def _classify_remote_rows(

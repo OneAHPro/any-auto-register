@@ -14,6 +14,8 @@ import json
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
+from services.codex2api_remote_accounts import remote_bool
+
 
 _AUTH_CLAIM = "https://api.openai.com/auth"
 
@@ -292,8 +294,8 @@ def build_chatgpt_account_display(
         "quota_windows": quota_windows,
         "quota_status": quota_status,
         "remote_status": remote_status,
-        "remote_enabled": bool(remote.get("enabled", True)) if remote is not None else None,
-        "remote_locked": bool(remote.get("locked", False)) if remote is not None else None,
+        "remote_enabled": remote_bool(remote.get("enabled"), True) if remote is not None else None,
+        "remote_locked": remote_bool(remote.get("locked"), False) if remote is not None else None,
         "remote_id": remote_id,
         "match": match if remote is not None else None,
         "target_id": remote.get("target_id") if remote is not None else None,

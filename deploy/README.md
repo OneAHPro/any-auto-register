@@ -53,6 +53,11 @@ solver, loopback API, Nginx, and HTTPS first. For final cutover:
 
 The existing new and Codex2API services are not restarted during this cutover.
 
+For the optional direct Codex2API usage reader, follow
+[`codex2api-postgres-reader.md`](codex2api-postgres-reader.md). It uses a dedicated
+read-only PostgreSQL role and a stable loopback/network address; the application
+keeps the HTTP admin API for credential writes and account management.
+
 ## Nginx and TLS
 
 Copy `deploy/nginx/accounts.anhepro.com.conf` to
@@ -65,4 +70,3 @@ health check passes.
 
 Stop `any-auto-register.service`, disable only the new Nginx site, and reload
 Nginx after `nginx -t`. Existing Docker services continue running throughout.
-

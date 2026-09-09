@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import time
+from collections import Counter
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,6 +29,7 @@ from services.codex2api_remote_accounts import (
     remote_account_email,
     remote_account_id,
     remote_account_is_schedulable,
+    remote_bool,
     remote_identity_id,
 )
 
@@ -71,6 +73,26 @@ def _client_for(target_id: int, database_engine, client: Any | None):
 
 
 def collect_target_health(
+    database_engine=None,
+    *,
+    target_id: int,
+    client: Any | None = None,
+    now: datetime | None = None,
+) -> TargetHealthResult:
+    """Probe one target under the shared target-state lock."""
+
+    from services.chatgpt_account_coordination import codex2api_target_lock
+
+    with codex2api_target_lock(target_id):
+        return _collect_target_health_impl(
+            database_engine,
+            target_id=target_id,
+            client=client,
+            now=now,
+        )
+
+
+def _collect_target_health_impl(
     database_engine=None,
     *,
     target_id: int,
@@ -155,25 +177,92 @@ def collect_target_health(
 
 
 def _remote_id(row: Mapping[str, Any]) -> int:
+    raw = row.get("id") or row.get("remote_id") or 0
+    if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+        return 0
     try:
-        value = int(row.get("id") or row.get("remote_id") or 0)
+        value = int(raw)
     except (TypeError, ValueError):
         return 0
     return value if value > 0 else 0
 
 
+_STABLE_ALIAS_KEYS = {
+    "workspace_id",
+    "effective_workspace_id",
+    "chatgpt_account_id",
+    "account_id",
+    "user_id",
+}
+
+
+def _stable_aliases(value: Any) -> set[str]:
+    if isinstance(value, AccountModel):
+        try:
+            extra = value.get_extra()
+        except Exception:
+            extra = {}
+        source = dict(extra) if isinstance(extra, Mapping) else {}
+        if str(value.user_id or "").strip():
+            source["user_id"] = value.user_id
+    elif isinstance(value, Mapping):
+        source = value
+        nested = value.get("credentials")
+        if isinstance(nested, Mapping):
+            source = {**nested, **value}
+    else:
+        source = {}
+    return {
+        str(source.get(key) or "").strip().casefold()
+        for key in _STABLE_ALIAS_KEYS
+        if str(source.get(key) or "").strip()
+    }
+
+
+def _remote_row_matches_binding(
+    item: Mapping[str, Any],
+    row: Mapping[str, Any],
+    account: AccountModel | None,
+) -> bool:
+    expected_email = str(item.get("remote_email") or "").strip().casefold()
+    actual_email = remote_account_email(row).strip().casefold()
+    local_aliases = _stable_aliases(account) if account is not None else set()
+    remote_aliases = _stable_aliases(row)
+    if expected_email:
+        if actual_email and expected_email != actual_email and not (
+            local_aliases
+            and remote_aliases
+            and local_aliases.intersection(remote_aliases)
+        ):
+            return False
+        if not actual_email and not (
+            local_aliases
+            and remote_aliases
+            and local_aliases.intersection(remote_aliases)
+        ):
+            return False
+    return not (local_aliases and remote_aliases and not local_aliases.intersection(remote_aliases))
+
+
 def _binding_data(database_engine, target_id: int) -> list[dict[str, Any]]:
     with Session(database_engine) as session:
-        active_target_by_identity = {
-            str(assignment.identity_id): int(assignment.target_id)
-            for assignment in session.exec(
-                select(AccountAssignmentModel).where(
-                    AccountAssignmentModel.state.in_(
-                        ["active", "draining", "standby"]
-                    )
-                )
-            ).all()
-        }
+        assignment_state_by_identity = {}
+        assignments = session.exec(select(AccountAssignmentModel)).all()
+        assignments.sort(
+            key=lambda assignment: (
+                _aware(assignment.updated_at),
+                int(assignment.id or 0),
+            ),
+            reverse=True,
+        )
+        for assignment in assignments:
+            identity_key = str(assignment.identity_id or "")
+            if not identity_key:
+                continue
+            assignment_state_by_identity.setdefault(
+                identity_key,
+                (str(assignment.state or "").lower(), int(assignment.target_id or 0)),
+            )
         bindings = session.exec(
             select(AccountTargetBindingModel).where(
                 AccountTargetBindingModel.target_id == int(target_id)
@@ -183,8 +272,18 @@ def _binding_data(database_engine, target_id: int) -> list[dict[str, Any]]:
         bindings = [
             binding
             for binding in bindings
-            if active_target_by_identity.get(str(binding.identity_id), int(target_id))
-            == int(target_id)
+            if (
+                (
+                    str(binding.identity_id) not in assignment_state_by_identity
+                    and int(binding.local_account_id or 0) > 0
+                )
+                or (
+                    assignment_state_by_identity.get(str(binding.identity_id), ("", 0))[0]
+                    in {"active", "draining", "standby"}
+                    and assignment_state_by_identity.get(str(binding.identity_id), ("", 0))[1]
+                    == int(target_id)
+                )
+            )
         ]
         return [
             {
@@ -205,8 +304,46 @@ def reconcile_target_bindings(
     rows: list[dict[str, Any]],
     now: datetime,
     include_remote_only: bool = False,
+    ambiguity_keys: set[tuple[str, int]] | None = None,
+) -> int:
+    """Bootstrap bindings under the same per-target reconciliation fence."""
+
+    from services.chatgpt_account_coordination import codex2api_target_lock
+
+    with codex2api_target_lock(target_id):
+        return _reconcile_target_bindings_impl(
+            database_engine,
+            target_id=target_id,
+            rows=rows,
+            now=now,
+            include_remote_only=include_remote_only,
+            ambiguity_keys=ambiguity_keys,
+        )
+
+
+def _reconcile_target_bindings_impl(
+    database_engine,
+    *,
+    target_id: int,
+    rows: list[dict[str, Any]],
+    now: datetime,
+    include_remote_only: bool = False,
+    ambiguity_keys: set[tuple[str, int]] | None = None,
 ) -> int:
     """Bootstrap local binding/assignment rows from a target account list."""
+
+    from services.account_identity import (
+        move_assignments_to_standby,
+        supersede_other_target_bindings,
+    )
+
+    def mark_ambiguity(identity_id: Any, remote_id: Any) -> None:
+        if ambiguity_keys is None:
+            return
+        identity_key = str(identity_id or "").strip()
+        remote_key = _remote_id({"id": remote_id})
+        if identity_key and remote_key > 0:
+            ambiguity_keys.add((identity_key, remote_key))
 
     with Session(database_engine) as session:
         target = session.get(Codex2APITargetModel, int(target_id))
@@ -223,19 +360,61 @@ def reconcile_target_bindings(
             local_by_email.setdefault(str(account.email or "").strip().lower(), []).append(account)
         remote_by_email: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
-            email = str(row.get("email") or row.get("name") or "").strip().lower()
+            email = remote_account_email(row).strip().lower()
             if email:
                 remote_by_email.setdefault(email, []).append(row)
         created = 0
         for email, local_matches in local_by_email.items():
             remote_matches = remote_by_email.get(email, [])
             if len(local_matches) != 1 or len(remote_matches) != 1:
+                # Preserve the concrete rows involved in an email collision
+                # for the quota result.  The normal reconcile path skips these
+                # pairs because it cannot choose a safe identity.
+                if remote_matches and (
+                    len(local_matches) > 1 or len(remote_matches) > 1
+                ):
+                    for account in local_matches:
+                        for remote in remote_matches:
+                            mark_ambiguity(
+                                getattr(account, "identity_id", ""),
+                                _remote_id(remote),
+                            )
                 continue
             account = local_matches[0]
             remote = remote_matches[0]
             remote_id = _remote_id(remote)
             if remote_id <= 0:
                 continue
+            identity = session.get(AccountIdentityModel, str(account.identity_id or ""))
+            identity_ambiguous = identity is not None and str(identity.state or "") == "ambiguous"
+            local_aliases = _stable_aliases(account)
+            remote_aliases = _stable_aliases(remote)
+            if local_aliases and remote_aliases and not local_aliases.intersection(remote_aliases):
+                mark_ambiguity(account.identity_id, remote_id)
+                if identity is not None:
+                    identity.state = "ambiguous"
+                    identity.updated_at = now
+                    session.add(identity)
+                move_assignments_to_standby(
+                    session,
+                    identity_id=str(account.identity_id or ""),
+                    reason="remote_identity_alias_mismatch",
+                )
+                mismatched_binding = session.exec(
+                    select(AccountTargetBindingModel)
+                    .where(AccountTargetBindingModel.identity_id == str(account.identity_id or ""))
+                    .where(AccountTargetBindingModel.target_id == int(target_id))
+                ).first()
+                if mismatched_binding is not None:
+                    mismatched_binding.enabled = False
+                    mismatched_binding.sync_status = "ambiguous"
+                    mismatched_binding.remote_status = "ambiguous"
+                    mismatched_binding.last_error = "本地与远端稳定身份不一致"
+                    mismatched_binding.updated_at = now
+                    session.add(mismatched_binding)
+                continue
+            target_enabled = bool(target.enabled)
+            remote_schedulable = target_enabled and remote_account_is_schedulable(remote)
             binding = session.exec(
                 select(AccountTargetBindingModel)
                 .where(AccountTargetBindingModel.identity_id == account.identity_id)
@@ -249,18 +428,67 @@ def reconcile_target_bindings(
                     remote_account_id=remote_id,
                     remote_email=email,
                     sync_status="synced",
-                    remote_status=str(remote.get("status") or ""),
-                    enabled=bool(remote.get("enabled", True)) and not bool(remote.get("locked", False)),
+                    remote_status=str(remote.get("remote_status") or remote.get("status") or ""),
+                    enabled=remote_schedulable,
                     last_sync_at=now,
                     created_at=now,
                     updated_at=now,
                 )
                 session.add(binding)
                 created += 1
+            else:
+                binding.local_account_id = int(account.id or 0)
+                binding.remote_account_id = remote_id
+                binding.remote_email = email
+                binding.remote_status = str(remote.get("remote_status") or remote.get("status") or "")
+                binding.enabled = remote_schedulable
+                binding.sync_status = "synced"
+                binding.last_sync_at = now
+                binding.last_error = ""
+                binding.updated_at = now
+            if not target_enabled:
+                binding.sync_status = "target_disabled"
+                binding.remote_status = "target_disabled"
+                binding.last_error = "目标节点已停用"
+            if identity_ambiguous:
+                mark_ambiguity(account.identity_id, remote_id)
+                binding.enabled = False
+                binding.sync_status = "ambiguous"
+                binding.remote_status = "ambiguous"
+                binding.last_error = "身份存在歧义，等待人工确认"
+            session.add(binding)
+            supersede_other_target_bindings(
+                session,
+                identity_id=str(account.identity_id or ""),
+                current_target_id=int(target_id),
+                reason="target_binding_reconciled",
+            )
+            if identity_ambiguous:
+                move_assignments_to_standby(
+                    session,
+                    identity_id=str(account.identity_id or ""),
+                    reason="identity_ambiguous",
+                )
+                continue
+            if not binding.enabled:
+                move_assignments_to_standby(
+                    session,
+                    identity_id=str(account.identity_id or ""),
+                    target_id=int(target_id),
+                    reason="remote_account_not_schedulable",
+                )
+                continue
             assignment = session.exec(
                 select(AccountAssignmentModel).where(
                     AccountAssignmentModel.identity_id == account.identity_id,
-                    AccountAssignmentModel.state.in_(["active", "draining", "standby"]),
+                    AccountAssignmentModel.state.in_(
+                        [
+                            "active", "draining", "planned", "locking", "uploading",
+                            "pending", "verifying", "assignment_committing",
+                            "source_cleaning", "target_enabling", "migrating",
+                            "target_disabled", "standby",
+                        ]
+                    ),
                 )
             ).first()
             if assignment is None:
@@ -286,6 +514,35 @@ def reconcile_target_bindings(
                         to_target_id=int(target_id),
                         assignment_version=1,
                         reason="initial_target_reconcile",
+                        created_at=now,
+                    )
+                )
+            elif assignment.state != "active" or int(assignment.target_id or 0) != int(target_id):
+                previous_target = int(assignment.target_id or 0)
+                previous_version = int(assignment.assignment_version or 0)
+                move_assignments_to_standby(
+                    session,
+                    identity_id=str(account.identity_id or ""),
+                    reason="target_binding_reconciled",
+                )
+                assignment.state = "active"
+                assignment.target_id = int(target_id)
+                assignment.assignment_version = max(1, previous_version) + 1
+                assignment.lease_owner = ""
+                assignment.lease_expires_at = None
+                assignment.lease_reason = "target_binding_reconciled"
+                assignment.updated_at = now
+                session.add(assignment)
+                session.add(
+                    AccountAssignmentEventModel(
+                        identity_id=str(account.identity_id),
+                        local_account_id=int(account.id or 0),
+                        event_type="target_binding_reconciled",
+                        from_target_id=previous_target,
+                        to_pool_id=assignment.pool_id,
+                        to_target_id=int(target_id),
+                        assignment_version=int(assignment.assignment_version or 0),
+                        reason="target_binding_reconciled",
                         created_at=now,
                     )
                 )
@@ -321,6 +578,7 @@ def reconcile_target_bindings(
             else:
                 identity_key = remote_identity_id(int(target_id), remote_id)
             identity = session.get(AccountIdentityModel, identity_key)
+            identity_ambiguous = identity is not None and str(identity.state or "") == "ambiguous"
             if identity is None:
                 identity = AccountIdentityModel(
                     id=identity_key,
@@ -335,10 +593,12 @@ def reconcile_target_bindings(
                 identity.canonical_email = identity_email
                 identity.platform = "chatgpt"
                 identity.current_account_id = 0
-                identity.state = "active"
+                if not identity_ambiguous:
+                    identity.state = "active"
                 identity.updated_at = now
             session.add(identity)
 
+            target_enabled = bool(target.enabled)
             binding = session.exec(
                 select(AccountTargetBindingModel)
                 .where(AccountTargetBindingModel.identity_id == identity_key)
@@ -353,7 +613,7 @@ def reconcile_target_bindings(
                     remote_email=identity_email,
                     sync_status="synced",
                     remote_status=str(remote.get("remote_status") or remote.get("status") or ""),
-                    enabled=bool(remote.get("enabled", True)),
+                    enabled=target_enabled and remote_account_is_schedulable(remote),
                     last_sync_at=now,
                     created_at=now,
                     updated_at=now,
@@ -363,20 +623,53 @@ def reconcile_target_bindings(
                 binding.remote_account_id = remote_id
                 binding.remote_email = identity_email
                 binding.remote_status = str(remote.get("remote_status") or remote.get("status") or "")
-                binding.enabled = bool(remote.get("enabled", True)) and not bool(remote.get("locked", False))
+                binding.enabled = target_enabled and remote_account_is_schedulable(remote)
                 binding.sync_status = "synced"
                 binding.last_sync_at = now
                 binding.last_error = ""
                 binding.updated_at = now
+            if not target_enabled:
+                binding.sync_status = "target_disabled"
+                binding.remote_status = "target_disabled"
+                binding.last_error = "目标节点已停用"
+            if identity_ambiguous:
+                mark_ambiguity(identity_key, remote_id)
+                binding.enabled = False
+                binding.sync_status = "ambiguous"
+                binding.remote_status = "ambiguous"
+                binding.last_error = "身份存在歧义，等待人工确认"
             session.add(binding)
+            supersede_other_target_bindings(
+                session,
+                identity_id=identity_key,
+                current_target_id=int(target_id),
+                reason="target_binding_reconciled",
+            )
 
             assignment = session.exec(
                 select(AccountAssignmentModel)
                 .where(AccountAssignmentModel.identity_id == identity_key)
                 .where(AccountAssignmentModel.local_account_id == 0)
-                .where(AccountAssignmentModel.state.in_(["active", "draining", "standby"]))
+                .where(
+                    AccountAssignmentModel.state.in_(
+                        [
+                            "active", "draining", "planned", "locking",
+                            "uploading", "pending", "verifying",
+                            "assignment_committing", "source_cleaning",
+                            "target_enabling", "migrating", "standby",
+                            "target_disabled",
+                        ]
+                    )
+                )
+                .order_by(AccountAssignmentModel.updated_at.desc())
             ).first()
-            if remote_account_is_schedulable(remote):
+            if identity_ambiguous:
+                move_assignments_to_standby(
+                    session,
+                    identity_id=identity_key,
+                    reason="identity_ambiguous",
+                )
+            elif target_enabled and remote_account_is_schedulable(remote):
                 if assignment is None:
                     assignment = AccountAssignmentModel(
                         identity_id=identity_key,
@@ -403,15 +696,31 @@ def reconcile_target_bindings(
                         )
                     )
                 else:
+                    previous_state = str(assignment.state or "")
+                    previous_target = int(assignment.target_id or 0)
+                    previous_version = int(assignment.assignment_version or 0)
+                    if previous_target != int(target_id) or previous_state not in {"active", "standby"}:
+                        move_assignments_to_standby(
+                            session,
+                            identity_id=identity_key,
+                            reason="remote_account_reconcile",
+                        )
+                    elif previous_state == "standby":
+                        assignment.assignment_version = max(1, previous_version) + 1
                     assignment.state = "active"
                     assignment.target_id = int(target_id)
+                    assignment.lease_owner = ""
+                    assignment.lease_expires_at = None
                     assignment.updated_at = now
+                    assignment.lease_reason = "remote_account_reconcile"
                 session.add(assignment)
-            elif assignment is not None and assignment.state == "active":
-                assignment.state = "standby"
-                assignment.lease_reason = "remote_account_not_schedulable"
-                assignment.updated_at = now
-                session.add(assignment)
+            elif assignment is not None:
+                move_assignments_to_standby(
+                    session,
+                    identity_id=identity_key,
+                    target_id=int(target_id),
+                    reason="remote_account_not_schedulable",
+                )
         session.commit()
         return created
 
@@ -427,7 +736,36 @@ def collect_target_quota(
     freshness_seconds: int | None = None,
     sleep_fn=time.sleep,
 ) -> TargetQuotaResult:
+    """Run one target probe under the shared target reconciliation fence."""
+
+    from services.chatgpt_account_coordination import codex2api_target_lock
+
+    with codex2api_target_lock(target_id):
+        return _collect_target_quota_impl(
+            database_engine,
+            target_id=target_id,
+            client=client,
+            now=now,
+            probe_poll_attempts=probe_poll_attempts,
+            probe_poll_interval_seconds=probe_poll_interval_seconds,
+            freshness_seconds=freshness_seconds,
+            sleep_fn=sleep_fn,
+        )
+
+
+def _collect_target_quota_impl(
+    database_engine=None,
+    *,
+    target_id: int,
+    client: Any | None = None,
+    now: datetime | None = None,
+    probe_poll_attempts: int = 30,
+    probe_poll_interval_seconds: float = 1,
+    freshness_seconds: int | None = None,
+    sleep_fn=time.sleep,
+) -> TargetQuotaResult:
     """Run one target-level probe and persist every bound account snapshot."""
+    from services.account_identity import move_assignments_to_standby
 
     target_engine = database_engine or default_engine
     captured_at = _aware(now)
@@ -458,7 +796,8 @@ def collect_target_quota(
 
     resolved_client = _client_for(int(target_id), target_engine, client)
     resolved_client.trigger_usage_probe()
-    for attempt in range(max(min(int(probe_poll_attempts), 300), 1)):
+    attempts = max(min(int(probe_poll_attempts), 300), 1)
+    for attempt in range(attempts):
         runtime = resolved_client.runtime_status()
         probes = runtime.get("probes") if isinstance(runtime, Mapping) else {}
         running = bool(
@@ -467,53 +806,107 @@ def collect_target_quota(
         )
         if not running:
             break
-        if attempt + 1 < probe_poll_attempts:
+        if attempt + 1 < attempts:
             sleep_fn(max(float(probe_poll_interval_seconds), 0))
     else:
         raise RuntimeError("Codex2API usage probe did not finish")
 
-    rows = [
-        dict(row)
-        for row in resolved_client.list_accounts()
-        if isinstance(row, Mapping)
-    ]
+    raw_rows = resolved_client.list_accounts()
+    if not isinstance(raw_rows, list) or any(
+        not isinstance(row, Mapping) for row in raw_rows
+    ):
+        raise RuntimeError("Codex2API account list contains malformed rows")
+    rows = [dict(row) for row in raw_rows]
+    remote_ids = [_remote_id(row) for row in rows]
+    if any(remote_id <= 0 for remote_id in remote_ids):
+        raise RuntimeError("Codex2API account list contains an invalid remote ID")
+    duplicate_ids = {
+        remote_id
+        for remote_id, count in Counter(remote_ids).items()
+        if count > 1
+    }
+    if duplicate_ids:
+        raise RuntimeError(
+            "Codex2API account list contains duplicate remote IDs: "
+            + ",".join(str(remote_id) for remote_id in sorted(duplicate_ids))
+        )
+    # Reconciliation may quarantine an ambiguous binding (and thus make it
+    # invisible to the enabled-binding query).  Keep the concrete response
+    # rows that reconciliation rejects so the result still reports them.
+    ambiguous_keys: set[tuple[str, int]] = set()
     reconcile_target_bindings(
         target_engine,
         target_id=int(target_id),
         rows=rows,
         now=captured_at,
+        ambiguity_keys=ambiguous_keys,
     )
     binding_data = _binding_data(target_engine, int(target_id))
+    with Session(target_engine) as session:
+        local_accounts = {
+            int(account.id): account
+            for account in session.exec(
+                select(AccountModel).where(AccountModel.platform == "chatgpt")
+            ).all()
+            if account.id is not None
+        }
     by_id = {_remote_id(row): row for row in rows if _remote_id(row)}
     by_email: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
-        email = str(row.get("email") or row.get("name") or "").strip().lower()
+        email = remote_account_email(row).strip().lower()
         if email:
             by_email.setdefault(email, []).append(row)
 
     collected = 0
     missing = 0
-    ambiguous = 0
     for item in binding_data:
+        status = ""
         row = by_id.get(int(item["remote_account_id"]))
-        if row is None:
+        bound_account = local_accounts.get(int(item.get("local_account_id") or 0))
+        if row is not None and not _remote_row_matches_binding(item, row, bound_account):
+            # A reused numeric remote ID must never transfer another identity's
+            # quota into this binding. Treat an alternate same-email row as an
+            # ambiguity and quarantine the binding below.
+            row = None
             candidates = by_email.get(str(item["remote_email"]).lower(), [])
-            if len(candidates) == 1:
-                row = candidates[0]
-            elif len(candidates) > 1:
-                ambiguous += 1
+            if candidates:
+                ambiguous_keys.add((str(item["identity_id"]), int(item["remote_account_id"] or 0)))
                 status = "ambiguous"
             else:
                 missing += 1
                 status = "remote_missing"
+        if row is None:
+            candidates = by_email.get(str(item["remote_email"]).lower(), [])
+            if not status:
+                if len(candidates) == 1:
+                    if _remote_row_matches_binding(item, candidates[0], bound_account):
+                        row = candidates[0]
+                    else:
+                        ambiguous_keys.add(
+                            (
+                                str(item["identity_id"]),
+                                _remote_id(candidates[0]),
+                            )
+                        )
+                        status = "ambiguous"
+                elif len(candidates) > 1:
+                    for candidate in candidates:
+                        ambiguous_keys.add(
+                            (str(item["identity_id"]), _remote_id(candidate))
+                        )
+                    status = "ambiguous"
+                else:
+                    missing += 1
+                    status = "remote_missing"
             if row is None:
                 with Session(target_engine) as session:
                     binding = session.get(AccountTargetBindingModel, int(item["id"]))
                     if binding is not None:
                         binding.sync_status = status
-                        if int(item["local_account_id"] or 0) <= 0:
-                            binding.enabled = False
-                            binding.remote_status = "remote_missing"
+                        binding.enabled = False
+                        binding.remote_status = (
+                            "ambiguous" if status == "ambiguous" else "remote_missing"
+                        )
                         binding.last_error = (
                             "目标节点存在多个同邮箱账号"
                             if status == "ambiguous"
@@ -521,18 +914,31 @@ def collect_target_quota(
                         )
                         binding.updated_at = captured_at
                         session.add(binding)
-                        if int(item["local_account_id"] or 0) <= 0:
-                            assignment = session.exec(
+                        assignment = session.exec(
                                 select(AccountAssignmentModel)
                                 .where(AccountAssignmentModel.identity_id == str(item["identity_id"]))
-                                .where(AccountAssignmentModel.local_account_id == 0)
-                                .where(AccountAssignmentModel.state == "active")
+                                .where(
+                                    AccountAssignmentModel.state.in_(
+                                        [
+                                            "active", "draining", "planned", "locking",
+                                            "uploading", "pending", "verifying",
+                                            "assignment_committing", "source_cleaning",
+                                            "target_enabling", "migrating", "target_disabled", "standby",
+                                        ]
+                                    )
+                                )
                             ).first()
-                            if assignment is not None:
-                                assignment.state = "standby"
-                                assignment.lease_reason = "remote_account_missing"
-                                assignment.updated_at = captured_at
-                                session.add(assignment)
+                        if assignment is not None:
+                            move_assignments_to_standby(
+                                session,
+                                identity_id=str(item["identity_id"]),
+                                target_id=int(target_id),
+                                reason=(
+                                    "remote_account_ambiguous"
+                                    if status == "ambiguous"
+                                    else "remote_account_missing"
+                                ),
+                            )
                         session.commit()
                 continue
 
@@ -543,7 +949,6 @@ def collect_target_quota(
             local_account_id=int(item["local_account_id"]),
             target_id=int(target_id),
             remote_id=remote_id,
-            email=str(item["remote_email"]),
             rows=[row],
             captured_at=captured_at,
             freshness_seconds=freshness_seconds,
@@ -552,11 +957,15 @@ def collect_target_quota(
             binding = session.get(AccountTargetBindingModel, int(item["id"]))
             if binding is not None:
                 binding.remote_account_id = remote_id
-                binding.remote_email = str(
-                    row.get("email") or row.get("name") or binding.remote_email
-                ).strip().lower()
-                binding.remote_status = str(row.get("status") or "")
-                binding.enabled = bool(row.get("enabled", True)) and not bool(row.get("locked", False))
+                observed_email = remote_account_email(row).strip().lower()
+                if observed_email:
+                    binding.remote_email = observed_email
+                binding.remote_status = str(
+                    row.get("remote_status") or row.get("status") or ""
+                )
+                binding.enabled = remote_bool(row.get("enabled"), True) and not remote_bool(
+                    row.get("locked"), False
+                )
                 binding.sync_status = "synced"
                 binding.last_sync_at = captured_at
                 binding.last_error = ""
@@ -578,7 +987,7 @@ def collect_target_quota(
         remote_accounts=len(rows),
         collected_accounts=collected,
         missing_accounts=missing,
-        ambiguous_accounts=ambiguous,
+        ambiguous_accounts=len(ambiguous_keys),
     )
 
 

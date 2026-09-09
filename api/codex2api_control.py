@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -11,7 +12,8 @@ from uuid import uuid4
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import func, update
+from sqlalchemy import update
+from sqlalchemy.exc import IntegrityError
 from sqlmodel import Session, select
 
 from core.config_store import ConfigItem
@@ -59,10 +61,19 @@ router = APIRouter(tags=["codex2api-control"])
 _POOL_ID_RE = re.compile(r"^[A-Z][A-Z0-9_]{1,63}$")
 _TARGET_TYPES = {"public", "enterprise", "float", "standby"}
 _POOL_TYPES = {"public", "enterprise", "float", "standby"}
+_TARGET_MUTATION_LOCK = threading.RLock()
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _utc_value(value: datetime | None) -> datetime:
+    if value is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 def _operation_id() -> str:
@@ -155,6 +166,10 @@ def _target_payload(target: Codex2APITargetModel, binding_count: int = 0) -> dic
         if target.last_sync_at
         else None,
         "last_error": target.last_error,
+        "inventory_last_sync_at": target.inventory_last_sync_at.isoformat()
+        if target.inventory_last_sync_at
+        else None,
+        "inventory_last_error": target.inventory_last_error,
         "account_count": int(binding_count),
     }
 
@@ -242,14 +257,43 @@ def list_targets(session: Session = Depends(get_session)):
     targets = session.exec(
         select(Codex2APITargetModel).order_by(Codex2APITargetModel.id)
     ).all()
-    counts = {
-        int(target_id): int(count)
-        for target_id, count in session.exec(
-            select(AccountTargetBindingModel.target_id, func.count(AccountTargetBindingModel.id))
-            .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
-            .group_by(AccountTargetBindingModel.target_id)
-        ).all()
+    identities = {
+        str(row.id): row
+        for row in session.exec(select(AccountIdentityModel)).all()
     }
+    assignments = session.exec(
+        select(AccountAssignmentModel).where(
+            AccountAssignmentModel.state.in_(["active", "draining", "standby"])
+        )
+    ).all()
+    current_target_by_identity = {}
+    for assignment in sorted(
+        assignments,
+        key=lambda row: (_utc_value(row.updated_at), int(row.id or 0)),
+        reverse=True,
+    ):
+        current_target_by_identity.setdefault(
+            str(assignment.identity_id or ""), int(assignment.target_id or 0)
+        )
+    counts: dict[int, int] = {}
+    counted_bindings: set[tuple[str, int]] = set()
+    for binding in session.exec(select(AccountTargetBindingModel)).all():
+        identity = identities.get(str(binding.identity_id or ""))
+        binding_key = (str(binding.identity_id or ""), int(binding.target_id or 0))
+        if (
+            not bool(binding.enabled)
+            or int(binding.remote_account_id or 0) <= 0
+            or str(binding.sync_status or "").lower() != "synced"
+            or identity is None
+            or str(identity.state or "").strip().lower() != "active"
+            or current_target_by_identity.get(str(binding.identity_id or ""))
+            != int(binding.target_id or 0)
+            or binding_key in counted_bindings
+        ):
+            continue
+        counted_bindings.add(binding_key)
+        target_key = int(binding.target_id or 0)
+        counts[target_key] = counts.get(target_key, 0) + 1
     return {
         "targets": [
             _target_payload(target, counts.get(int(target.id or 0), 0))
@@ -260,6 +304,11 @@ def list_targets(session: Session = Depends(get_session)):
 
 @router.post("/codex2api/targets", status_code=status.HTTP_201_CREATED)
 def create_target(body: TargetCreate, session: Session = Depends(get_session)):
+    with _TARGET_MUTATION_LOCK:
+        return _create_target_impl(body, session)
+
+
+def _create_target_impl(body: TargetCreate, session: Session):
     target_type = str(body.target_type or "").strip().lower()
     if target_type not in _TARGET_TYPES:
         raise HTTPException(status_code=422, detail="目标类型无效")
@@ -268,25 +317,32 @@ def create_target(body: TargetCreate, session: Session = Depends(get_session)):
         select(Codex2APITargetModel).where(Codex2APITargetModel.name == name)
     ).first() is not None:
         raise HTTPException(status_code=409, detail="目标名称已存在")
-    max_id = session.exec(select(func.max(Codex2APITargetModel.id))).one() or 0
-    target_id = int(max_id) + 1
-    ref = f"codex2api_target_{target_id}_admin_key"
     try:
         sealed = seal_secret(body.admin_key)
     except SecretStoreError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from None
     ConfigItem.__table__.create(bind=session.get_bind(), checkfirst=True)
     row = Codex2APITargetModel(
-        id=target_id,
         name=name,
         target_type=target_type,
         server_label=body.server_label.strip(),
         base_url=_normalize_url(body.base_url),
-        admin_key_ref=ref,
+        # The database allocates the ID atomically; deriving max(id)+1 races
+        # when two operators create targets at the same time.
+        admin_key_ref="pending_codex2api_target_admin_key",
         default_pool_id=body.default_pool_id.strip() or "PUBLIC_POOL",
         enabled=bool(body.enabled),
         health_status="unknown",
     )
+    session.add(row)
+    try:
+        session.flush()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(status_code=409, detail="目标名称已存在") from None
+    target_id = int(row.id or 0)
+    ref = f"codex2api_target_{target_id}_admin_key"
+    row.admin_key_ref = ref
     session.add(row)
     session.add(ConfigItem(key=ref, value=sealed))
     session.commit()
@@ -303,6 +359,20 @@ def update_target(
     target_id: int,
     body: TargetUpdate,
     session: Session = Depends(get_session),
+):
+    # Target enable/disable and credential rotation must share the same
+    # process-local mutation fence as creation.  Otherwise a concurrent
+    # disable can race a key update and leave bindings half-quarantined.
+    from services.chatgpt_account_coordination import codex2api_target_lock
+
+    with _TARGET_MUTATION_LOCK, codex2api_target_lock(target_id):
+        return _update_target_impl(target_id, body, session)
+
+
+def _update_target_impl(
+    target_id: int,
+    body: TargetUpdate,
+    session: Session,
 ):
     row = session.get(Codex2APITargetModel, int(target_id))
     if row is None:
@@ -329,8 +399,32 @@ def update_target(
         row.base_url = _normalize_url(body.base_url)
     if body.default_pool_id is not None:
         row.default_pool_id = body.default_pool_id.strip() or "PUBLIC_POOL"
+    target_disabled = body.enabled is False and bool(row.enabled)
     if body.enabled is not None:
         row.enabled = bool(body.enabled)
+    if target_disabled:
+        from services.account_identity import move_assignments_to_standby
+
+        bindings = session.exec(
+            select(AccountTargetBindingModel).where(
+                AccountTargetBindingModel.target_id == int(target_id),
+                AccountTargetBindingModel.enabled == True,  # noqa: E712
+            )
+        ).all()
+        now = _utcnow()
+        for binding in bindings:
+            binding.enabled = False
+            binding.sync_status = "target_disabled"
+            binding.remote_status = "target_disabled"
+            binding.last_error = "目标节点已停用"
+            binding.updated_at = now
+            session.add(binding)
+            move_assignments_to_standby(
+                session,
+                identity_id=str(binding.identity_id or ""),
+                target_id=int(target_id),
+                reason="target_disabled",
+            )
     if body.admin_key is not None and body.admin_key.strip():
         try:
             sealed = seal_secret(body.admin_key)
@@ -355,8 +449,20 @@ def update_target(
 
 @router.post("/codex2api/targets/{target_id}/health")
 def check_target_health(target_id: int, session: Session = Depends(get_session)):
-    if session.get(Codex2APITargetModel, int(target_id)) is None:
+    target_row = session.get(Codex2APITargetModel, int(target_id))
+    if target_row is None:
         raise HTTPException(status_code=404, detail="目标不存在")
+    if not bool(target_row.enabled):
+        return {
+            "operation_id": _operation_id(),
+            "status": "committed",
+            "target_id": int(target_id),
+            "health_status": "disabled",
+            "health_success_count": int(target_row.health_success_count or 0),
+            "health_failure_count": int(target_row.health_failure_count or 0),
+            "capabilities": {},
+            "last_error": "",
+        }
     try:
         client = get_target_client(int(target_id), session.get_bind())
         result = collect_target_health(
@@ -378,6 +484,26 @@ def check_target_health(target_id: int, session: Session = Depends(get_session))
         "capabilities": result.capabilities,
         "last_error": result.last_error,
     }
+
+
+@router.get("/codex2api/targets/{target_id}/database-status")
+def check_target_database_status(target_id: int, session: Session = Depends(get_session)):
+    """Report the optional PostgreSQL reader state without mutating either DB."""
+    if session.get(Codex2APITargetModel, int(target_id)) is None:
+        raise HTTPException(status_code=404, detail="目标不存在")
+    from services.codex2api_db import get_codex2api_db_adapter
+
+    adapter = get_codex2api_db_adapter(int(target_id))
+    if adapter is None:
+        return {
+            "target_id": int(target_id),
+            "available": False,
+            "status": "not_configured",
+            "source": "postgresql",
+            "error": "DSN is not configured",
+        }
+    result = adapter.probe()
+    return {"target_id": int(target_id), **result}
 
 
 @router.get("/codex2api/pools")

@@ -132,6 +132,17 @@ def test_transient_failure_retains_durable_billing_with_a_stale_marker(monkeypat
     assert data['targets'][1]['billing_status']=='stale'
     assert data['finance']['total_profit_cny'] is None
 
+
+def test_old_durable_detail_is_reported_stale_even_when_it_has_a_value(monkeypatch):
+    module,engine,details=setup_world(monkeypatch)
+    details[(1,11)]['fetched_at'] = datetime(2026, 9, 6, tzinfo=timezone.utc).isoformat()
+
+    data = module.build_operations_overview(engine, now=NOW)
+
+    assert data['targets'][0]['billing_status'] == 'stale'
+    assert Decimal(data['targets'][0]['total_billed_usd']) == 100
+    assert data['coverage']['billing_complete'] is False
+
 def test_cost_day_boundary_uses_shanghai_calendar(monkeypatch):
     module,engine,_=setup_world(monkeypatch)
     from core.purchase_cost_models import PurchaseCostRecordModel

@@ -1,12 +1,18 @@
 """数据库模型 - SQLite via SQLModel"""
 from datetime import datetime, timezone
 import os
+import logging
+from decimal import Decimal, InvalidOperation
 from typing import Optional
 from sqlalchemy import delete, event, func, update, UniqueConstraint
+from sqlalchemy import inspect as sqlalchemy_inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlmodel import Field, SQLModel, create_engine, Session, select
 import json
 from core.purchase_cost_models import PurchaseBatchModel, PurchaseCostRecordModel
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _utcnow():
@@ -289,6 +295,8 @@ class Codex2APITargetModel(SQLModel, table=True):
     last_health_at: Optional[datetime] = None
     last_sync_at: Optional[datetime] = None
     last_error: str = ""
+    inventory_last_sync_at: Optional[datetime] = None
+    inventory_last_error: str = ""
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
 
@@ -1232,6 +1240,1008 @@ def _recover_chatgpt_attempt_bindings() -> None:
         session.commit()
 
 
+_OPERATIONS_BILLING_SNAPSHOT_UNIQUE_INDEX = (
+    "uq_operations_billing_snapshot_target_remote"
+)
+_CODEX_INVENTORY_SNAPSHOT_UNIQUE_INDEX = "uq_codex_inventory_target_remote"
+
+
+def _coerce_snapshot_timestamp(value):
+    """Return a comparable UTC datetime for a legacy snapshot timestamp."""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    else:
+        text = str(value).strip()
+        if not text:
+            return None
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _snapshot_row_sort_key(row: dict):
+    """Sort legacy rows by capture time, then stable primary-key order."""
+    captured = _coerce_snapshot_timestamp(row.get("captured_at"))
+    try:
+        row_id = int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        row_id = 0
+    # Rows without a timestamp are older than every valid captured snapshot;
+    # their id still gives deterministic ordering when all timestamps are
+    # missing (a common shape in the first release of this table).
+    return (
+        captured is not None,
+        captured or datetime.min.replace(tzinfo=timezone.utc),
+        row_id,
+    )
+
+
+def _snapshot_history_items(value) -> list[dict]:
+    """Decode a legacy history payload while dropping malformed entries."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+    if not isinstance(value, list):
+        return []
+    result: list[dict] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        day = item.get("date") or item.get("day")
+        if day is None or not str(day).strip():
+            continue
+        result.append(dict(item))
+    return result
+
+
+def _merge_snapshot_history(rows: list[dict]) -> str:
+    """Union history days from duplicate rows, preferring newer data.
+
+    During the migration a summary-only refresh may have written ``[]`` over a
+    previously populated history payload.  Keep every known day and let the
+    newest row win when the same day appears more than once; missing keys in
+    that newer entry are filled from the older entry.
+    """
+    by_day: dict[str, dict] = {}
+    # ``rows`` is passed newest-first, so the first value for a day is the
+    # authoritative one. Older rows only contribute missing fields.
+    for row in rows:
+        for item in _snapshot_history_items(row.get("history_json")):
+            day = str(item.get("date") or item.get("day") or "").strip()
+            if not day:
+                continue
+            current = by_day.get(day)
+            if current is None:
+                by_day[day] = item
+                continue
+            merged = dict(current)
+            for key, value in item.items():
+                if key not in merged or merged[key] in (None, "", [], {}):
+                    if value not in (None, "", [], {}):
+                        merged[key] = value
+                elif key in {"account_billed", "billed_usd", "requests", "tokens"}:
+                    try:
+                        if Decimal(str(value)) > Decimal(str(merged[key])):
+                            merged[key] = value
+                    except (InvalidOperation, TypeError, ValueError):
+                        pass
+            by_day[day] = merged
+    if not by_day:
+        return "[]"
+    # Stable chronological output makes the result deterministic and easier
+    # to inspect in backups. Keep malformed date strings after valid dates.
+    def _day_key(item):
+        day = item[0]
+        try:
+            return (0, datetime.fromisoformat(day).date().isoformat())
+        except (TypeError, ValueError):
+            return (1, day)
+
+    ordered = [item for _, item in sorted(by_day.items(), key=_day_key)]
+    return json.dumps(ordered, ensure_ascii=False, separators=(",", ":"))
+
+
+def _migrate_operations_billing_snapshot_schema(conn, existing_tables: set[str]) -> None:
+    """Upgrade and compact legacy billing snapshots before adding uniqueness.
+
+    ``create_all`` cannot alter an existing SQLite table, and releases before
+    the control-plane writer did not always enforce the natural
+    ``(target_id, remote_id)`` key.  This migration is intentionally local and
+    deterministic: it keeps the newest row (``captured_at``, then ``id``),
+    carries forward missing history/aggregate values, removes older duplicates,
+    and leaves a named unique index for future upserts.
+    """
+    table_name = "operations_billing_snapshots"
+    if table_name not in existing_tables:
+        return
+
+    billing_table = conn.exec_driver_sql(
+        "PRAGMA table_info('operations_billing_snapshots')"
+    ).fetchall()
+    if not billing_table:
+        return
+    billing_columns = {str(row[1]) for row in billing_table}
+    additive_columns = {
+        "total_requests": "INTEGER",
+        "source": "TEXT DEFAULT 'codex2api'",
+        "error": "TEXT DEFAULT ''",
+        "last_request_at": "DATETIME",
+    }
+    for column, definition in additive_columns.items():
+        if column not in billing_columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE operations_billing_snapshots "
+                f"ADD COLUMN {column} {definition}"
+            )
+    # Refresh after ALTER TABLE so the duplicate compactor can select every
+    # field that is available on both old and current installations.
+    billing_columns = {
+        str(row[1])
+        for row in conn.exec_driver_sql(
+            "PRAGMA table_info('operations_billing_snapshots')"
+        ).fetchall()
+    }
+    conn.exec_driver_sql(
+        "UPDATE operations_billing_snapshots SET source = 'codex2api' "
+        "WHERE source IS NULL OR TRIM(source) = ''"
+    )
+    conn.exec_driver_sql(
+        "UPDATE operations_billing_snapshots SET error = '' "
+        "WHERE error IS NULL"
+    )
+
+    if not {"target_id", "remote_id"} <= billing_columns:
+        # A malformed/partially-created table cannot be made safe here. Leave
+        # it untouched so the existing startup diagnostics can report it.
+        return
+
+    duplicate_groups = conn.exec_driver_sql(
+        "SELECT target_id, remote_id "
+        "FROM operations_billing_snapshots "
+        "WHERE target_id IS NOT NULL AND remote_id IS NOT NULL "
+        "GROUP BY target_id, remote_id HAVING COUNT(*) > 1"
+    ).fetchall()
+    if not duplicate_groups:
+        return
+
+    fields = (
+        "id",
+        "target_id",
+        "remote_id",
+        "total_billed_micros",
+        "total_requests",
+        "today_date",
+        "today_billed_micros",
+        "today_requests",
+        "history_json",
+        "captured_at",
+        "source",
+        "error",
+        "last_request_at",
+    )
+    available_fields = [field for field in fields if field in billing_columns]
+    id_column_expression = "id"
+    if "id" not in billing_columns:
+        # ``id`` is part of the model, but rowid keeps the migration useful for
+        # an interrupted hand-created table that omitted the declared key.
+        id_column_expression = "rowid"
+        available_fields = [field for field in available_fields if field != "id"]
+        available_fields.insert(0, "rowid AS id")
+    select_sql = ", ".join(available_fields)
+
+    for target_id, remote_id in duplicate_groups:
+        rows = conn.exec_driver_sql(
+            "SELECT " + select_sql + " FROM operations_billing_snapshots "
+            "WHERE target_id = ? AND remote_id = ?",
+            (target_id, remote_id),
+        ).fetchall()
+        result_fields = [field.split(" AS ")[-1] for field in available_fields]
+        mapped_rows = [dict(zip(result_fields, row)) for row in rows]
+        if len(mapped_rows) < 2:
+            continue
+        ordered = sorted(mapped_rows, key=_snapshot_row_sort_key, reverse=True)
+        winner = ordered[0]
+        losers = ordered[1:]
+        updates: dict[str, object] = {}
+
+        # All-time counters are monotonic. Preserve the largest known value if
+        # an older row captured a later upstream total than the selected row.
+        for field in ("total_billed_micros", "total_requests"):
+            if field not in billing_columns:
+                continue
+            values = [
+                row.get(field) for row in ordered if row.get(field) is not None
+            ]
+            if not values:
+                continue
+            try:
+                maximum = max(int(value) for value in values)
+            except (TypeError, ValueError):
+                continue
+            current = winner.get(field)
+            try:
+                current_value = int(current) if current is not None else None
+            except (TypeError, ValueError):
+                current_value = None
+            if current_value is None or maximum > current_value:
+                updates[field] = maximum
+
+        # A summary row can omit today's fields. Fill them from a duplicate
+        # only when the day matches; never replace a newer day's values with an
+        # older day's snapshot.
+        winner_day = str(winner.get("today_date") or "").strip()
+        if not winner_day:
+            for row in ordered:
+                candidate_day = str(row.get("today_date") or "").strip()
+                if candidate_day:
+                    winner_day = candidate_day
+                    updates["today_date"] = candidate_day
+                    for field in ("today_billed_micros", "today_requests"):
+                        if field in billing_columns and row.get(field) is not None:
+                            updates[field] = row[field]
+                    break
+        if winner_day:
+            for row in losers:
+                if str(row.get("today_date") or "").strip() != winner_day:
+                    continue
+                for field in ("today_billed_micros", "today_requests"):
+                    if field not in billing_columns or row.get(field) is None:
+                        continue
+                    current = updates.get(field, winner.get(field))
+                    if current is None:
+                        updates[field] = row[field]
+                        continue
+                    try:
+                        if int(row[field]) > int(current):
+                            updates[field] = int(row[field])
+                    except (TypeError, ValueError):
+                        continue
+
+        if "history_json" in billing_columns:
+            merged_history = _merge_snapshot_history(ordered)
+            current_history = _merge_snapshot_history([winner])
+            if merged_history != current_history:
+                updates["history_json"] = merged_history
+
+        if "last_request_at" in billing_columns:
+            latest_request = None
+            latest_value = None
+            for row in ordered:
+                parsed = _coerce_snapshot_timestamp(row.get("last_request_at"))
+                if parsed is not None and (
+                    latest_request is None or parsed > latest_request
+                ):
+                    latest_request = parsed
+                    latest_value = row.get("last_request_at")
+            if latest_value is not None:
+                current_request = _coerce_snapshot_timestamp(winner.get("last_request_at"))
+                if current_request is None or latest_request > current_request:
+                    updates["last_request_at"] = latest_value
+
+        winner_id = winner.get("id")
+        if winner_id is None:
+            continue
+        if updates:
+            assignments = ", ".join(f"{field} = ?" for field in updates)
+            conn.exec_driver_sql(
+                "UPDATE operations_billing_snapshots SET "
+                + assignments
+                + f" WHERE {id_column_expression} = ?",
+                tuple(updates.values()) + (winner_id,),
+            )
+        for row in losers:
+            loser_id = row.get("id")
+            if loser_id is not None:
+                conn.exec_driver_sql(
+                    "DELETE FROM operations_billing_snapshots "
+                    f"WHERE {id_column_expression} = ?",
+                    (loser_id,),
+                )
+
+
+def _inventory_summary_dict(value) -> dict:
+    """Decode one credential-free inventory summary for migration merging."""
+    if isinstance(value, str):
+        try:
+            value = json.loads(value or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _inventory_summary_decodable(value) -> bool:
+    """Whether an inventory summary is a JSON object (including ``{}`)."""
+    if isinstance(value, dict):
+        return True
+    if not isinstance(value, str):
+        return False
+    try:
+        return isinstance(json.loads(value or "{}"), dict)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+
+
+def _merge_inventory_summary_missing(rows: list[dict]) -> str:
+    """Merge duplicate inventory summaries, preferring the newest row.
+
+    Inventory rows are sanitized projections.  A newer response can omit an
+    optional quota/identity field, so fill only empty values from older rows
+    and recurse through nested objects.  Newer non-empty values always win.
+    """
+
+    def merge_missing(current: dict, older: dict) -> dict:
+        merged = dict(current)
+        for key, value in older.items():
+            if key not in merged or merged[key] in (None, "", [], {}):
+                if value not in (None, "", [], {}):
+                    merged[key] = value
+            elif isinstance(merged[key], dict) and isinstance(value, dict):
+                merged[key] = merge_missing(merged[key], value)
+        return merged
+
+    # ``rows`` is newest-first. Start with the newest valid summary and fill
+    # omitted fields from older rows without replacing current values.
+    merged: dict = {}
+    for row in reversed(rows):
+        if str(row.get("error") or "").strip() or not _inventory_summary_decodable(
+            row.get("summary_json")
+        ):
+            continue
+        summary = _inventory_summary_dict(row.get("summary_json"))
+        if summary:
+            merged = merge_missing(summary, merged)
+    # The loop above intentionally lets the newest object be authoritative;
+    # apply a final pass in the same direction so nested fields are retained.
+    newest_first = [
+        _inventory_summary_dict(row.get("summary_json"))
+        for row in rows
+        if not str(row.get("error") or "").strip()
+        and _inventory_summary_decodable(row.get("summary_json"))
+    ]
+    for summary in newest_first:
+        if summary:
+            merged = merge_missing(merged, summary)
+    return json.dumps(merged, ensure_ascii=False, separators=(",", ":")) if merged else "{}"
+
+
+def _inventory_snapshot_sort_key(row: dict):
+    """Rank decodable, non-error projections before failed rows.
+
+    ``missing=True`` is a valid result of a complete inventory response, so it
+    must not be demoted behind an older non-missing row.  Only an explicit
+    error (or malformed summary) makes a row ineligible for the primary slot.
+    """
+    valid = (
+        not str(row.get("error") or "").strip()
+        and _inventory_summary_decodable(row.get("summary_json"))
+    )
+    fetched = _coerce_snapshot_timestamp(row.get("fetched_at"))
+    source_updated = _coerce_snapshot_timestamp(row.get("source_updated_at"))
+    updated = _coerce_snapshot_timestamp(row.get("updated_at"))
+    created = _coerce_snapshot_timestamp(row.get("created_at"))
+    try:
+        row_id = int(row.get("id") or 0)
+    except (TypeError, ValueError):
+        row_id = 0
+    return (
+        valid,
+        fetched or datetime.min.replace(tzinfo=timezone.utc),
+        source_updated or datetime.min.replace(tzinfo=timezone.utc),
+        updated or datetime.min.replace(tzinfo=timezone.utc),
+        created or datetime.min.replace(tzinfo=timezone.utc),
+        row_id,
+    )
+
+
+def _migrate_codex_inventory_snapshot_schema(
+    conn,
+    existing_tables: set[str],
+) -> None:
+    """Compact legacy inventory rows and install their natural-key index.
+
+    Older SQLite installations could contain duplicate target/remote rows or
+    omit columns added after the first inventory release.  Keep the newest
+    valid projection, merge optional fields from older rows, then delete only
+    the redundant rows before the unique index is created.
+    """
+
+    table_name = "codex_inventory_snapshots"
+    if table_name not in existing_tables:
+        return
+    table_info = conn.exec_driver_sql(
+        "PRAGMA table_info('codex_inventory_snapshots')"
+    ).fetchall()
+    if not table_info:
+        return
+    columns = {str(row[1]) for row in table_info}
+    additive_columns = {
+        "summary_json": "TEXT DEFAULT '{}'",
+        "fetched_at": "DATETIME",
+        "source_updated_at": "TEXT DEFAULT ''",
+        "missing": "INTEGER DEFAULT 0",
+        "error": "TEXT DEFAULT ''",
+        "created_at": "DATETIME",
+        "updated_at": "DATETIME",
+    }
+    for column, definition in additive_columns.items():
+        if column not in columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE codex_inventory_snapshots "
+                f"ADD COLUMN {column} {definition}"
+            )
+    columns = {
+        str(row[1])
+        for row in conn.exec_driver_sql(
+            "PRAGMA table_info('codex_inventory_snapshots')"
+        ).fetchall()
+    }
+    for column, value in (("source_updated_at", ""), ("error", "")):
+        if column in columns:
+            conn.exec_driver_sql(
+                f"UPDATE codex_inventory_snapshots SET {column} = ? "
+                f"WHERE {column} IS NULL",
+                (value,),
+            )
+    if "missing" in columns:
+        conn.exec_driver_sql(
+            "UPDATE codex_inventory_snapshots SET missing = 0 WHERE missing IS NULL"
+        )
+    if not {"target_id", "remote_id"} <= columns:
+        return
+
+    duplicate_groups = conn.exec_driver_sql(
+        "SELECT target_id, remote_id FROM codex_inventory_snapshots "
+        "WHERE target_id IS NOT NULL AND remote_id IS NOT NULL "
+        "GROUP BY target_id, remote_id HAVING COUNT(*) > 1"
+    ).fetchall()
+    if not duplicate_groups:
+        return
+
+    fields = (
+        "id",
+        "target_id",
+        "remote_id",
+        "summary_json",
+        "fetched_at",
+        "source_updated_at",
+        "missing",
+        "error",
+        "created_at",
+        "updated_at",
+    )
+    available_fields = [field for field in fields if field in columns]
+    id_column_expression = "id"
+    if "id" not in columns:
+        id_column_expression = "rowid"
+        available_fields.insert(0, "rowid AS id")
+    select_fields = [field for field in available_fields if field in columns or " AS " in field]
+    result_fields = [field.split(" AS ")[-1] for field in select_fields]
+    select_sql = ", ".join(select_fields)
+
+    for target_id, remote_id in duplicate_groups:
+        raw_rows = conn.exec_driver_sql(
+            "SELECT " + select_sql + " FROM codex_inventory_snapshots "
+            "WHERE target_id = ? AND remote_id = ?",
+            (target_id, remote_id),
+        ).fetchall()
+        rows = [dict(zip(result_fields, row)) for row in raw_rows]
+        if len(rows) < 2:
+            continue
+        ordered = sorted(rows, key=_inventory_snapshot_sort_key, reverse=True)
+        winner = ordered[0]
+        losers = ordered[1:]
+        updates: dict[str, object] = {}
+
+        if "summary_json" in columns:
+            merged_summary = _merge_inventory_summary_missing(ordered)
+            current_summary = _inventory_summary_dict(winner.get("summary_json"))
+            if merged_summary != "{}" and _inventory_summary_dict(merged_summary) != current_summary:
+                updates["summary_json"] = merged_summary
+
+        if "source_updated_at" in columns:
+            newest_source = None
+            newest_source_value = None
+            for row in ordered:
+                parsed = _coerce_snapshot_timestamp(row.get("source_updated_at"))
+                if parsed is not None and (
+                    newest_source is None or parsed > newest_source
+                ):
+                    newest_source = parsed
+                    newest_source_value = row.get("source_updated_at")
+            if newest_source_value is not None:
+                current_source = _coerce_snapshot_timestamp(
+                    winner.get("source_updated_at")
+                )
+                if current_source is None or newest_source > current_source:
+                    updates["source_updated_at"] = newest_source_value
+
+        if "created_at" in columns:
+            oldest_created = None
+            oldest_created_value = None
+            for row in ordered:
+                parsed = _coerce_snapshot_timestamp(row.get("created_at"))
+                if parsed is not None and (
+                    oldest_created is None or parsed < oldest_created
+                ):
+                    oldest_created = parsed
+                    oldest_created_value = row.get("created_at")
+            if oldest_created_value is not None:
+                current_created = _coerce_snapshot_timestamp(winner.get("created_at"))
+                if current_created is None or oldest_created < current_created:
+                    updates["created_at"] = oldest_created_value
+
+        if "updated_at" in columns:
+            newest_updated = None
+            newest_updated_value = None
+            for row in ordered:
+                parsed = _coerce_snapshot_timestamp(row.get("updated_at"))
+                if parsed is not None and (
+                    newest_updated is None or parsed > newest_updated
+                ):
+                    newest_updated = parsed
+                    newest_updated_value = row.get("updated_at")
+            if newest_updated_value is not None:
+                current_updated = _coerce_snapshot_timestamp(winner.get("updated_at"))
+                if current_updated is None or newest_updated > current_updated:
+                    updates["updated_at"] = newest_updated_value
+
+        winner_id = winner.get("id")
+        if winner_id is None:
+            continue
+        if updates:
+            assignments = ", ".join(f"{field} = ?" for field in updates)
+            conn.exec_driver_sql(
+                "UPDATE codex_inventory_snapshots SET "
+                + assignments
+                + f" WHERE {id_column_expression} = ?",
+                tuple(updates.values()) + (winner_id,),
+            )
+        for row in losers:
+            loser_id = row.get("id")
+            if loser_id is not None:
+                conn.exec_driver_sql(
+                    "DELETE FROM codex_inventory_snapshots "
+                    f"WHERE {id_column_expression} = ?",
+                    (loser_id,),
+                )
+
+
+def _migrate_operations_billing_snapshot_relational_schema(database_engine) -> None:
+    """Apply additive snapshot columns on non-SQLite control databases.
+
+    ``SQLModel.metadata.create_all`` intentionally does not alter an existing
+    table.  A deployment that stores the control plane in PostgreSQL therefore
+    needs the same four columns that the SQLite startup migration adds before
+    ORM reads/writes use the new provenance fields.
+    """
+
+    table_name = "operations_billing_snapshots"
+    try:
+        inspector = sqlalchemy_inspect(database_engine)
+        schema = getattr(inspector, "default_schema_name", None)
+        table_names = set(inspector.get_table_names(schema=schema))
+        if table_name not in table_names:
+            return
+        columns = {
+            str(column["name"])
+            for column in inspector.get_columns(table_name, schema=schema)
+        }
+        missing = {
+            "total_requests": "INTEGER",
+            "source": "TEXT DEFAULT 'codex2api'",
+            "error": "TEXT DEFAULT ''",
+            "last_request_at": "TIMESTAMP WITH TIME ZONE",
+        }
+        missing = {name: ddl for name, ddl in missing.items() if name not in columns}
+        backend = str(database_engine.url.get_backend_name()).lower()
+        if backend == "postgresql":
+            with database_engine.begin() as conn:
+                for name, ddl in missing.items():
+                    conn.exec_driver_sql(
+                        "ALTER TABLE operations_billing_snapshots "
+                        f"ADD COLUMN IF NOT EXISTS {name} {ddl}"
+                    )
+                conn.exec_driver_sql(
+                    "UPDATE operations_billing_snapshots SET source = 'codex2api' "
+                    "WHERE source IS NULL OR BTRIM(source) = ''"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE operations_billing_snapshots SET error = '' "
+                    "WHERE error IS NULL"
+                )
+                _compact_postgresql_billing_snapshots(conn)
+                existing_unique = conn.execute(
+                    text(
+                        "SELECT indexrelid::regclass::text, indisunique "
+                        "FROM pg_index JOIN pg_class "
+                        "ON pg_class.oid = pg_index.indexrelid "
+                        "WHERE pg_class.relname = :index_name"
+                    ),
+                    {"index_name": _OPERATIONS_BILLING_SNAPSHOT_UNIQUE_INDEX},
+                ).first()
+                if existing_unique is not None and not bool(existing_unique[1]):
+                    conn.exec_driver_sql(
+                        "DROP INDEX IF EXISTS "
+                        "uq_operations_billing_snapshot_target_remote"
+                    )
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_operations_billing_snapshot_target_remote "
+                    "ON operations_billing_snapshots (target_id, remote_id)"
+                )
+            return
+        if not missing:
+            return
+        else:
+            # Keep the fallback useful for dialects with PostgreSQL-like
+            # additive ALTER support; unsupported dialects surface their
+            # normal startup error instead of silently losing snapshots.
+            with database_engine.begin() as conn:
+                for name, ddl in missing.items():
+                    conn.exec_driver_sql(
+                        "ALTER TABLE operations_billing_snapshots "
+                        f"ADD COLUMN {name} {ddl}"
+                    )
+    except Exception as exc:
+        # The main schema creation path has historically been best-effort for
+        # optional operations tables.  Billing readers already fall back to
+        # API/local memory when a rolling migration is in progress; preserving
+        # startup here keeps that compatibility while the next boot retries.
+        _LOGGER.warning(
+            "operations billing snapshot schema migration deferred: %s",
+            type(exc).__name__,
+        )
+        return
+
+
+def _migrate_codex_inventory_snapshot_relational_schema(database_engine) -> None:
+    """Upgrade inventory snapshots and enforce their target/remote key.
+
+    PostgreSQL deployments created before the inventory natural-key constraint
+    was added can contain duplicate rows just like the SQLite installations.
+    Compact those rows before creating the unique index.  The operation is
+    deliberately idempotent and also runs when all additive columns already
+    exist; otherwise a partially applied prior migration would never repair
+    the missing constraint.
+    """
+
+    table_name = "codex_inventory_snapshots"
+    try:
+        inspector = sqlalchemy_inspect(database_engine)
+        schema = getattr(inspector, "default_schema_name", None)
+        table_names = set(inspector.get_table_names(schema=schema))
+        if table_name not in table_names:
+            return
+        columns = {
+            str(column["name"])
+            for column in inspector.get_columns(table_name, schema=schema)
+        }
+        missing = {
+            "summary_json": "TEXT DEFAULT '{}'",
+            "fetched_at": "TIMESTAMP WITH TIME ZONE",
+            "source_updated_at": "TEXT DEFAULT ''",
+            "missing": "BOOLEAN DEFAULT FALSE",
+            "error": "TEXT DEFAULT ''",
+            "created_at": "TIMESTAMP WITH TIME ZONE",
+            "updated_at": "TIMESTAMP WITH TIME ZONE",
+        }
+        missing = {name: ddl for name, ddl in missing.items() if name not in columns}
+        backend = str(database_engine.url.get_backend_name()).lower()
+        if backend == "postgresql":
+            with database_engine.begin() as conn:
+                for name, ddl in missing.items():
+                    conn.exec_driver_sql(
+                        "ALTER TABLE codex_inventory_snapshots "
+                        f"ADD COLUMN IF NOT EXISTS {name} {ddl}"
+                    )
+                conn.exec_driver_sql(
+                    "UPDATE codex_inventory_snapshots SET source_updated_at = '' "
+                    "WHERE source_updated_at IS NULL"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE codex_inventory_snapshots SET error = '' "
+                    "WHERE error IS NULL"
+                )
+                conn.exec_driver_sql(
+                    "UPDATE codex_inventory_snapshots SET missing = FALSE "
+                    "WHERE missing IS NULL"
+                )
+                _compact_postgresql_inventory_snapshots(conn)
+                existing_unique = conn.execute(
+                    text(
+                        "SELECT indexrelid::regclass::text, indisunique "
+                        "FROM pg_index JOIN pg_class "
+                        "ON pg_class.oid = pg_index.indexrelid "
+                        "WHERE pg_class.relname = :index_name"
+                    ),
+                    {"index_name": _CODEX_INVENTORY_SNAPSHOT_UNIQUE_INDEX},
+                ).first()
+                if existing_unique is not None and not bool(existing_unique[1]):
+                    conn.exec_driver_sql(
+                        "DROP INDEX IF EXISTS uq_codex_inventory_target_remote"
+                    )
+                conn.exec_driver_sql(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS "
+                    "uq_codex_inventory_target_remote "
+                    "ON codex_inventory_snapshots (target_id, remote_id)"
+                )
+            return
+        if not missing:
+            return
+        with database_engine.begin() as conn:
+            for name, ddl in missing.items():
+                conn.exec_driver_sql(
+                    "ALTER TABLE codex_inventory_snapshots "
+                    f"ADD COLUMN {name} {ddl}"
+                )
+    except Exception as exc:
+        _LOGGER.warning(
+            "codex inventory snapshot schema migration deferred: %s",
+            type(exc).__name__,
+        )
+        return
+
+
+def _migrate_codex_target_relational_schema(database_engine) -> None:
+    """Add inventory-specific target markers on non-SQLite control DBs."""
+
+    table_name = "codex2api_targets"
+    try:
+        inspector = sqlalchemy_inspect(database_engine)
+        schema = getattr(inspector, "default_schema_name", None)
+        if table_name not in set(inspector.get_table_names(schema=schema)):
+            return
+        columns = {
+            str(column["name"])
+            for column in inspector.get_columns(table_name, schema=schema)
+        }
+        missing = {
+            "inventory_last_sync_at": "TIMESTAMP WITH TIME ZONE",
+            "inventory_last_error": "TEXT DEFAULT ''",
+        }
+        missing = {name: ddl for name, ddl in missing.items() if name not in columns}
+        if not missing:
+            return
+        backend = str(database_engine.url.get_backend_name()).lower()
+        with database_engine.begin() as conn:
+            for name, ddl in missing.items():
+                suffix = " IF NOT EXISTS" if backend == "postgresql" else ""
+                conn.exec_driver_sql(
+                    "ALTER TABLE codex2api_targets ADD COLUMN"
+                    + suffix
+                    + f" {name} {ddl}"
+                )
+            conn.exec_driver_sql(
+                "UPDATE codex2api_targets SET inventory_last_error = '' "
+                "WHERE inventory_last_error IS NULL"
+            )
+    except Exception as exc:
+        _LOGGER.warning(
+            "codex target inventory schema migration deferred: %s",
+            type(exc).__name__,
+        )
+        return
+
+
+def _compact_postgresql_billing_snapshots(conn) -> None:
+    """Merge legacy duplicate rows before creating the PostgreSQL key."""
+
+    groups = conn.execute(
+        text(
+            "SELECT target_id, remote_id FROM operations_billing_snapshots "
+            "WHERE target_id IS NOT NULL AND remote_id IS NOT NULL "
+            "GROUP BY target_id, remote_id HAVING COUNT(*) > 1"
+        )
+    ).fetchall()
+    for target_id, remote_id in groups:
+        rows = conn.execute(
+            text(
+                "SELECT id, total_billed_micros, total_requests, today_date, "
+                "today_billed_micros, today_requests, history_json, "
+                "captured_at, source, error, last_request_at "
+                "FROM operations_billing_snapshots "
+                "WHERE target_id = :target_id AND remote_id = :remote_id "
+                "ORDER BY captured_at DESC NULLS LAST, id DESC FOR UPDATE"
+            ),
+            {"target_id": target_id, "remote_id": remote_id},
+        ).mappings().all()
+        if len(rows) < 2:
+            continue
+        winner = dict(rows[0])
+        losers = rows[1:]
+        updates: dict[str, object] = {}
+        for field in ("total_billed_micros", "total_requests"):
+            values = [row[field] for row in rows if row[field] is not None]
+            if values:
+                try:
+                    updates[field] = max(int(value) for value in values)
+                except (TypeError, ValueError):
+                    pass
+        winner_day = str(winner.get("today_date") or "").strip()
+        if not winner_day:
+            for row in rows:
+                candidate_day = str(row.get("today_date") or "").strip()
+                if candidate_day:
+                    winner_day = candidate_day
+                    updates["today_date"] = candidate_day
+                    if row.get("today_billed_micros") is not None:
+                        updates["today_billed_micros"] = row["today_billed_micros"]
+                    if row.get("today_requests") is not None:
+                        updates["today_requests"] = row["today_requests"]
+                    break
+        if winner_day:
+            for row in losers:
+                if str(row.get("today_date") or "").strip() != winner_day:
+                    continue
+                for field in ("today_billed_micros", "today_requests"):
+                    value = row.get(field)
+                    if value is None:
+                        continue
+                    current = updates.get(field, winner.get(field))
+                    try:
+                        if current is None or int(value) > int(current):
+                            updates[field] = int(value)
+                    except (TypeError, ValueError):
+                        continue
+        # Union history days, preferring the newest row while filling omitted
+        # fields from older snapshots.
+        history_by_day: dict[str, dict] = {}
+        for row in reversed(rows):
+            try:
+                history = json.loads(row.get("history_json") or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                history = []
+            if not isinstance(history, list):
+                continue
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                day = str(item.get("date") or "").strip()
+                if not day:
+                    continue
+                current = history_by_day.setdefault(day, {})
+                for field, value in item.items():
+                    if value not in (None, "", [], {}):
+                        if field in {"account_billed", "billed_usd", "requests", "tokens"} and field in current:
+                            try:
+                                if Decimal(str(value)) > Decimal(str(current[field])):
+                                    current[field] = value
+                                continue
+                            except (InvalidOperation, TypeError, ValueError):
+                                pass
+                        current[field] = value
+        if history_by_day:
+            updates["history_json"] = json.dumps(
+                [history_by_day[day] for day in sorted(history_by_day)],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        latest_request = None
+        latest_request_value = None
+        for row in rows:
+            parsed = _coerce_snapshot_timestamp(row.get("last_request_at"))
+            if parsed is not None and (latest_request is None or parsed > latest_request):
+                latest_request = parsed
+                latest_request_value = row.get("last_request_at")
+        if latest_request_value is not None:
+            updates["last_request_at"] = latest_request_value
+        if updates:
+            assignments = ", ".join(f"{field} = :{field}" for field in updates)
+            params = dict(updates)
+            params["id"] = winner["id"]
+            conn.execute(
+                text(
+                    "UPDATE operations_billing_snapshots SET "
+                    + assignments
+                    + " WHERE id = :id"
+                ),
+                params,
+            )
+        for loser in losers:
+            conn.execute(
+                text("DELETE FROM operations_billing_snapshots WHERE id = :id"),
+                {"id": loser["id"]},
+            )
+
+
+def _compact_postgresql_inventory_snapshots(conn) -> None:
+    """Merge duplicate PostgreSQL inventory rows before key creation."""
+
+    groups = conn.execute(
+        text(
+            "SELECT target_id, remote_id FROM codex_inventory_snapshots "
+            "WHERE target_id IS NOT NULL AND remote_id IS NOT NULL "
+            "GROUP BY target_id, remote_id HAVING COUNT(*) > 1"
+        )
+    ).fetchall()
+    for target_id, remote_id in groups:
+        raw_rows = conn.execute(
+            text(
+                "SELECT id, target_id, remote_id, summary_json, fetched_at, "
+                "source_updated_at, missing, error, created_at, updated_at "
+                "FROM codex_inventory_snapshots "
+                "WHERE target_id = :target_id AND remote_id = :remote_id "
+                "ORDER BY fetched_at DESC NULLS LAST, updated_at DESC NULLS LAST, id DESC "
+                "FOR UPDATE"
+            ),
+            {"target_id": target_id, "remote_id": remote_id},
+        ).mappings().all()
+        rows = [dict(row) for row in raw_rows]
+        if len(rows) < 2:
+            continue
+        ordered = sorted(rows, key=_inventory_snapshot_sort_key, reverse=True)
+        winner = ordered[0]
+        losers = ordered[1:]
+        updates: dict[str, object] = {}
+        merged_summary = _merge_inventory_summary_missing(ordered)
+        if merged_summary != "{}" and _inventory_summary_dict(merged_summary) != _inventory_summary_dict(
+            winner.get("summary_json")
+        ):
+            updates["summary_json"] = merged_summary
+
+        latest_source = None
+        latest_source_value = None
+        for row in ordered:
+            parsed = _coerce_snapshot_timestamp(row.get("source_updated_at"))
+            if parsed is not None and (latest_source is None or parsed > latest_source):
+                latest_source = parsed
+                latest_source_value = row.get("source_updated_at")
+        if latest_source_value is not None:
+            current_source = _coerce_snapshot_timestamp(winner.get("source_updated_at"))
+            if current_source is None or latest_source > current_source:
+                updates["source_updated_at"] = latest_source_value
+
+        oldest_created = None
+        oldest_created_value = None
+        for row in ordered:
+            parsed = _coerce_snapshot_timestamp(row.get("created_at"))
+            if parsed is not None and (oldest_created is None or parsed < oldest_created):
+                oldest_created = parsed
+                oldest_created_value = row.get("created_at")
+        if oldest_created_value is not None:
+            current_created = _coerce_snapshot_timestamp(winner.get("created_at"))
+            if current_created is None or oldest_created < current_created:
+                updates["created_at"] = oldest_created_value
+
+        newest_updated = None
+        newest_updated_value = None
+        for row in ordered:
+            parsed = _coerce_snapshot_timestamp(row.get("updated_at"))
+            if parsed is not None and (newest_updated is None or parsed > newest_updated):
+                newest_updated = parsed
+                newest_updated_value = row.get("updated_at")
+        if newest_updated_value is not None:
+            current_updated = _coerce_snapshot_timestamp(winner.get("updated_at"))
+            if current_updated is None or newest_updated > current_updated:
+                updates["updated_at"] = newest_updated_value
+
+        if updates:
+            assignments = ", ".join(f"{field} = :{field}" for field in updates)
+            params = dict(updates)
+            params["id"] = winner["id"]
+            conn.execute(
+                text(
+                    "UPDATE codex_inventory_snapshots SET "
+                    + assignments
+                    + " WHERE id = :id"
+                ),
+                params,
+            )
+        for loser in losers:
+            conn.execute(
+                text("DELETE FROM codex_inventory_snapshots WHERE id = :id"),
+                {"id": loser["id"]},
+            )
+
+
 def init_account_pool_schema(database_engine=None) -> None:
     """Create account-pool tables and apply additive legacy migrations.
 
@@ -1241,9 +2251,17 @@ def init_account_pool_schema(database_engine=None) -> None:
     """
 
     target_engine = database_engine or engine
+    # The operations snapshot models are imported by ``main`` in production,
+    # but standalone workers and tests may call this initializer directly.
+    # Register them before ``create_all`` so durable billing tables always
+    # exist regardless of the entry point that boots the control plane.
+    from core import operations_models as _operations_models  # noqa: F401
     SQLModel.metadata.create_all(target_engine)
 
     if target_engine.url.get_backend_name() != "sqlite":
+        _migrate_operations_billing_snapshot_relational_schema(target_engine)
+        _migrate_codex_inventory_snapshot_relational_schema(target_engine)
+        _migrate_codex_target_relational_schema(target_engine)
         return
 
     with target_engine.begin() as conn:
@@ -1253,6 +2271,9 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "SELECT name FROM sqlite_master WHERE type='table'"
             ).fetchall()
         }
+
+        _migrate_operations_billing_snapshot_schema(conn, existing_tables)
+        _migrate_codex_inventory_snapshot_schema(conn, existing_tables)
         account_table = conn.exec_driver_sql(
             "PRAGMA table_info('accounts')"
         ).fetchall()
@@ -1369,6 +2390,19 @@ def init_account_pool_schema(database_engine=None) -> None:
                 conn.exec_driver_sql(
                     f"UPDATE codex2api_targets SET {column} = 0 WHERE {column} IS NULL"
                 )
+            for column, sql_type in (
+                ("inventory_last_sync_at", "DATETIME"),
+                ("inventory_last_error", "TEXT DEFAULT ''"),
+            ):
+                if column not in target_columns:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE codex2api_targets "
+                        f"ADD COLUMN {column} {sql_type}"
+                    )
+            conn.exec_driver_sql(
+                "UPDATE codex2api_targets SET inventory_last_error = '' "
+                "WHERE inventory_last_error IS NULL"
+            )
 
         policy_table = conn.exec_driver_sql(
             "PRAGMA table_info('pool_target_policies')"
@@ -1439,6 +2473,18 @@ def init_account_pool_schema(database_engine=None) -> None:
                 f"ON {table_name} ({columns})"
             )
         unique_index_specs = (
+            (
+                _OPERATIONS_BILLING_SNAPSHOT_UNIQUE_INDEX,
+                "operations_billing_snapshots",
+                "target_id, remote_id",
+                "",
+            ),
+            (
+                _CODEX_INVENTORY_SNAPSHOT_UNIQUE_INDEX,
+                "codex_inventory_snapshots",
+                "target_id, remote_id",
+                "",
+            ),
             (
                 "uq_account_identity_alias_platform_type_value",
                 "account_identity_aliases",
@@ -1611,6 +2657,49 @@ def init_account_pool_schema(database_engine=None) -> None:
         for index_name, table_name, columns, condition in unique_index_specs:
             if table_name not in existing_tables:
                 continue
+            if index_name in {
+                _OPERATIONS_BILLING_SNAPSHOT_UNIQUE_INDEX,
+                _CODEX_INVENTORY_SNAPSHOT_UNIQUE_INDEX,
+            }:
+                # A partially-created legacy table may exist without the
+                # natural-key columns.  The additive migration deliberately
+                # leaves such a table untouched so startup diagnostics can
+                # report it; do not turn that diagnostic into a hard startup
+                # failure by issuing an index statement against missing
+                # columns.
+                natural_key_columns = {
+                    str(row[1])
+                    for row in conn.exec_driver_sql(
+                        f"PRAGMA table_info('{table_name}')"
+                    ).fetchall()
+                }
+                if not {"target_id", "remote_id"} <= natural_key_columns:
+                    continue
+                # ``IF NOT EXISTS`` does not upgrade an old same-named
+                # non-unique index.  Drop that specific index so the following
+                # statement can enforce the natural key.
+                legacy_index = next(
+                    (
+                        row
+                        for row in conn.exec_driver_sql(
+                            f"PRAGMA index_list('{table_name}')"
+                        ).fetchall()
+                        if str(row[1]) == index_name
+                    ),
+                    None,
+                )
+                if legacy_index is not None:
+                    legacy_columns = [
+                        str(row[2])
+                        for row in conn.exec_driver_sql(
+                            f"PRAGMA index_info('{index_name}')"
+                        ).fetchall()
+                    ]
+                    if not bool(legacy_index[2]) or legacy_columns != [
+                        "target_id",
+                        "remote_id",
+                    ]:
+                        conn.exec_driver_sql(f"DROP INDEX {index_name}")
             try:
                 conn.exec_driver_sql(
                     f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "

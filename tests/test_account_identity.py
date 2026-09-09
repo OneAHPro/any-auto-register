@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 from concurrent.futures import ThreadPoolExecutor
 
 from sqlalchemy.pool import StaticPool
@@ -275,6 +276,60 @@ def test_reconcile_does_not_change_account_updated_at_after_identity_exists():
     with Session(engine) as session:
         second = session.get(db.AccountModel, account.id)
     assert second.updated_at == first_updated_at
+
+
+def test_reconcile_keeps_identical_remote_projection_identities_active():
+    """Nested provider aliases must not become credential conflicts on boot."""
+
+    from services.account_identity import reconcile_existing_accounts
+
+    engine = make_engine()
+    email = "remote-shared@example.com"
+    provider_id = "provider-account-1"
+    with Session(engine) as session:
+        for account_id, target_id, remote_id in ((1, 1, 101), (2, 2, 202)):
+            identity_id = f"codex2api:{target_id}:{remote_id}"
+            session.add(
+                db.AccountModel(
+                    id=account_id,
+                    platform="chatgpt",
+                    email=email,
+                    password="",
+                    identity_id=identity_id,
+                    extra_json=json.dumps(
+                        {
+                            "remote_only": True,
+                            "remote_target_id": target_id,
+                            "remote_id": remote_id,
+                            "codex_remote_snapshot": {
+                                "email": email,
+                                "chatgpt_account_id": provider_id,
+                                "effective_workspace_id": provider_id,
+                                "target_id": target_id,
+                                "remote_id": remote_id,
+                            },
+                        }
+                    ),
+                )
+            )
+            session.add(
+                db.AccountIdentityModel(
+                    id=identity_id,
+                    platform="chatgpt",
+                    canonical_email=email,
+                    current_account_id=account_id,
+                    state="ambiguous",
+                )
+            )
+        session.commit()
+
+    assert reconcile_existing_accounts(engine) == 2
+
+    with Session(engine) as session:
+        identities = session.exec(
+            select(db.AccountIdentityModel).order_by(db.AccountIdentityModel.id)
+        ).all()
+    assert [identity.state for identity in identities] == ["active", "active"]
 
 
 def test_concurrent_identity_resolution_reuses_one_identity(tmp_path):

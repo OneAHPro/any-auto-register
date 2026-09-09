@@ -11,6 +11,7 @@ import json
 import logging
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Mapping
@@ -32,7 +33,11 @@ from core.db import (
     ChatGPTAuthStateModel,
     engine as default_engine,
 )
-from services.chatgpt_account_coordination import chatgpt_account_operation_lock
+from services.chatgpt_account_coordination import (
+    chatgpt_account_operation_lock,
+    codex2api_target_lock,
+)
+from services.codex2api_remote_accounts import remote_bool
 
 
 logger = logging.getLogger(__name__)
@@ -123,6 +128,27 @@ def _target_lock(target_id: int) -> threading.RLock:
     normalized = int(target_id)
     with _TARGET_LOCKS_GUARD:
         return _TARGET_LOCKS.setdefault(normalized, threading.RLock())
+
+
+@contextmanager
+def _migration_target_locks(*target_ids: int):
+    """Acquire both migration and shared target fences in stable order."""
+
+    normalized = sorted(
+        {
+            int(target_id)
+            for target_id in target_ids
+            if int(target_id) > 0
+        }
+    )
+    with ExitStack() as stack:
+        for target_id in normalized:
+            # Keep the legacy migration lock for callers that may still use it
+            # indirectly, and share the public fence with inventory/import
+            # workers so a migration cannot race a complete-list reconcile.
+            stack.enter_context(_target_lock(target_id))
+            stack.enter_context(codex2api_target_lock(target_id))
+        yield
 
 
 def _find_assignment(session: Session, identity_id: str) -> AccountAssignmentModel | None:
@@ -451,9 +477,18 @@ def _credential_payload(account: AccountModel) -> dict[str, Any]:
 def _remote_id_from_payload(payload: Mapping[str, Any] | None) -> int:
     source = payload if isinstance(payload, Mapping) else {}
     for key in ("remote_id", "id", "account_id"):
+        raw = source.get(key)
+        if isinstance(raw, bool) or (isinstance(raw, float) and not raw.is_integer()):
+            # An explicit lossy numeric ID must not fall through to another
+            # alias and bind a different remote account.
+            return 0
         try:
-            value = int(source.get(key) or 0)
-        except (TypeError, ValueError):
+            value = int(raw or 0)
+        except (TypeError, ValueError, OverflowError):
+            if raw not in (None, ""):
+                # A populated primary ID field with junk must not fall through
+                # to another alias and bind a different remote account.
+                return 0
             value = 0
         if value > 0:
             return value
@@ -881,7 +916,7 @@ def run_migration(
     destination_remote_id = 0
     account: AccountModel | None = None
 
-    with _target_lock(destination_target_id):
+    with _migration_target_locks(source_target_id, destination_target_id):
         try:
             with chatgpt_account_operation_lock(
                 int(migration.local_account_id),
@@ -1203,7 +1238,7 @@ def run_migration(
                         )
                         if enabled_row is None:
                             raise MigrationError("目标节点账号在启用后未出现")
-                        if enabled_row.get("enabled") is False:
+                        if not remote_bool(enabled_row.get("enabled"), True):
                             raise MigrationError("目标节点账号未成功启用")
                         try:
                             destination.set_locked(destination_remote_id, False)

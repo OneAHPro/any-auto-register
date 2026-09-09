@@ -14,11 +14,16 @@ from sqlmodel import Session, select
 from core.db import AccountModel, AccountTargetBindingModel, Codex2APITargetModel, CodexInventorySnapshotModel
 from core.purchase_cost_models import PurchaseBatchModel, PurchaseCostRecordModel
 from core.operations_models import InstanceSalePriceModel, OperationsBillingSnapshotModel
-from services.codex_account_billing import fetch_account_usage_details
+from services.codex_account_billing import (
+    fetch_account_usage_details,
+    persist_account_usage_snapshot,
+    read_persisted_account_billing_summaries,
+)
 from services.operations_inventory import refresh_operations_inventory
 
 BUSINESS_TZ = ZoneInfo('Asia/Shanghai')
 MICRO = Decimal(1_000_000)
+BILLING_FRESHNESS_SECONDS = 900
 
 def _aware(value):
     if value is None:
@@ -57,6 +62,14 @@ def _same_day(value, day):
     parsed = _aware(value)
     return bool(parsed and parsed.astimezone(BUSINESS_TZ).date() == day)
 
+
+def _detail_is_fresh(detail, now):
+    stamp = _aware(detail.get('fetched_at')) if isinstance(detail, dict) else None
+    if stamp is None:
+        return False
+    age = (now - stamp).total_seconds()
+    return age <= BILLING_FRESHNESS_SECONDS and age >= -60
+
 def _row_status(row):
     status = str(row.get('remote_status') or row.get('status') or '').lower()
     if row.get('_missing') or row.get('_error') or status in {'invalid', 'unauthorized', 'disabled', 'banned', 'deleted', 'error', 'expired'}:
@@ -78,7 +91,7 @@ def _billing_trend(persisted, keys, prices, day, inventory_complete):
         days = {}
         valid = isinstance(rows, list)
         for row in rows if isinstance(rows, list) else []:
-            try: row_day = date.fromisoformat(str(row.get('date', ''))).isoformat()
+            try: row_day = date.fromisoformat(str(row.get('date') or row.get('day') or '')).isoformat()
             except (ValueError, AttributeError): valid = False; continue
             amount = _number(row.get('account_billed'))
             if amount is None or row_day in days: valid = False; continue
@@ -124,12 +137,38 @@ def build_operations_overview(database_engine, refresh=False, now=None):
         prices = {row.target_id: row for row in session.exec(select(InstanceSalePriceModel)).all()}
         costs = session.exec(select(PurchaseCostRecordModel)).all()
         batches = session.exec(select(PurchaseBatchModel).order_by(PurchaseBatchModel.created_at.desc()).limit(8)).all()
-        persisted = {(row.target_id, row.remote_id): row for row in session.exec(select(OperationsBillingSnapshotModel)).all()}
+        persisted = {}
+        for row in session.exec(select(OperationsBillingSnapshotModel)).all():
+            key = (row.target_id, row.remote_id)
+            current = persisted.get(key)
+            if current is None:
+                persisted[key] = row
+                continue
+            current_stamp = _aware(current.captured_at)
+            candidate_stamp = _aware(row.captured_at)
+            if candidate_stamp is not None and (
+                current_stamp is None
+                or candidate_stamp > current_stamp
+                or (
+                    candidate_stamp == current_stamp
+                    and int(row.id or 0) > int(current.id or 0)
+                )
+            ):
+                persisted[key] = row
 
     target_map = {row.id: row for row in targets}
     inventory_map = {(row.target_id, row.remote_id): row for row in inventory}
     account_ids = {row.id for row in accounts}
-    bound_keys = {(row.target_id, row.remote_account_id) for row in bindings if row.local_account_id in account_ids}
+    bound_keys = {
+        (row.target_id, row.remote_account_id)
+        for row in bindings
+        if (
+            row.local_account_id in account_ids
+            and bool(row.enabled)
+            and str(row.sync_status or "").lower() == "synced"
+            and int(row.remote_account_id or 0) > 0
+        )
+    }
     if any(key not in bound_keys and not row.missing and not row.error for key, row in inventory_map.items()):
         from services.codex_inventory import materialize_inventory
         materialize_inventory(database_engine)
@@ -139,34 +178,81 @@ def build_operations_overview(database_engine, refresh=False, now=None):
     keys = set(inventory_map) | set(persisted) | {(row.target_id, row.remote_account_id) for row in bindings if row.remote_account_id > 0}
     active_keys = [key for key in sorted(keys) if key[0] in target_map and target_map[key[0]].enabled]
     details = fetch_account_usage_details(database_engine, active_keys, refresh=refresh)
+    # The usage reader may have persisted a newer direct-PostgreSQL or API
+    # observation while loading ``details``.  Preserve that provenance when
+    # the overview writes the same canonical row instead of relabeling every
+    # observation as an overview-only read.
+    observed_sources = read_persisted_account_billing_summaries(
+        database_engine,
+        list(keys),
+    )
     freshness = {}
+    # Route every overview write through the same monotonic CAS writer used by
+    # account cards and background refreshes.  This prevents a slower overview
+    # request from regressing a newer total or replacing complete history with
+    # a sparse response.
+    for key in sorted(keys):
+        detail = details.get(key)
+        previous = persisted.get(key)
+        amount = _micros(detail.get('total_billed_usd')) if detail else None
+        if detail and amount is not None:
+            if detail.get('refresh_error'):
+                # This is a last-known fallback, not a fresh observation. Do
+                # not clear a durable error or advance its capture timestamp
+                # while the upstream read is failing.
+                freshness[key] = 'stale'
+                continue
+            # A decreasing all-time counter is not silently treated as new income.
+            if previous and previous.total_billed_micros is not None and amount < previous.total_billed_micros:
+                freshness[key] = 'stale'
+                continue
+            history = detail.get('history')
+            source = str(
+                (observed_sources.get(key) or {}).get("source") or ""
+            ).strip()
+            if not source:
+                source = "operations_overview"
+            persist_account_usage_snapshot(
+                database_engine,
+                key,
+                detail,
+                include_history=True,
+                total_requests=detail.get('total_requests'),
+                last_request_at=detail.get('last_request_at'),
+                source=source,
+                history_complete=isinstance(history, list),
+            )
+            freshness[key] = (
+                'available'
+                if _detail_is_fresh(detail, now)
+                and not (previous and str(previous.error or '').strip())
+                else 'stale'
+            )
+        else:
+            freshness[key] = 'stale' if previous and previous.total_billed_micros is not None else 'unavailable'
+
+    # Reload canonical rows after the CAS writes.  Detached copies are used by
+    # the rest of the aggregation so a later session mutation cannot leak into
+    # the response or in-process cache.
     with Session(database_engine) as session:
-        for key in sorted(keys):
-            detail = details.get(key)
-            previous = persisted.get(key)
-            if detail and _micros(detail.get('total_billed_usd')) is not None:
-                amount = _micros(detail['total_billed_usd'])
-                # A decreasing all-time counter is not silently treated as new income.
-                if previous and previous.total_billed_micros is not None and amount < previous.total_billed_micros:
-                    freshness[key] = 'stale'
-                    continue
-                row = session.get(OperationsBillingSnapshotModel, previous.id) if previous else OperationsBillingSnapshotModel(target_id=key[0], remote_id=key[1])
-                row.total_billed_micros = amount
-                row.today_date = str(detail.get('today_date') or '')
-                row.today_billed_micros = _micros(detail.get('today_billed_usd'))
-                requests = detail.get('today_requests')
-                row.today_requests = requests if isinstance(requests, int) and not isinstance(requests, bool) and requests >= 0 else None
-                row.captured_at = _aware(detail.get('fetched_at')) or now
-                history = detail.get('history')
-                if isinstance(history, list): row.history_json = json.dumps(history)
-                session.add(row)
-                session.flush()
-                # Keep only detached values after this transaction.
+        persisted = {}
+        for row in session.exec(select(OperationsBillingSnapshotModel)).all():
+            key = (row.target_id, row.remote_id)
+            current = persisted.get(key)
+            if current is None:
                 persisted[key] = OperationsBillingSnapshotModel(**row.model_dump())
-                freshness[key] = 'stale' if detail.get('refresh_error') else 'available'
-            else:
-                freshness[key] = 'stale' if previous and previous.total_billed_micros is not None else 'unavailable'
-        session.commit()
+                continue
+            current_stamp = _aware(current.captured_at)
+            candidate_stamp = _aware(row.captured_at)
+            if candidate_stamp is not None and (
+                current_stamp is None
+                or candidate_stamp > current_stamp
+                or (
+                    candidate_stamp == current_stamp
+                    and int(row.id or 0) > int(current.id or 0)
+                )
+            ):
+                persisted[key] = OperationsBillingSnapshotModel(**row.model_dump())
 
     # Use exactly the same visibility, missing-remote and auth-state rules as
     # the account cards. Incomplete local attempts must not inflate the pool.

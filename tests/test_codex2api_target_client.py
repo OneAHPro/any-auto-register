@@ -134,6 +134,28 @@ def test_client_lists_accounts_with_target_credentials(monkeypatch):
     assert calls[0][1]["headers"]["X-Admin-Key"] == "admin-secret"
 
 
+def test_client_rejects_malformed_account_rows_instead_of_treating_them_as_missing(monkeypatch):
+    from services.codex2api_target_client import Codex2APITargetClient, TargetConfig, Codex2APITargetError
+
+    class Response:
+        status_code = 200
+        text = ""
+
+        def json(self):
+            return {"accounts": [{"id": 1}, "malformed"]}
+
+    monkeypatch.setattr(
+        "services.codex2api_target_client.cffi_requests.request",
+        lambda *args, **kwargs: Response(),
+    )
+    client = Codex2APITargetClient(
+        TargetConfig(id=1, base_url="https://node", admin_key="secret")
+    )
+
+    with pytest.raises(Codex2APITargetError, match="无效行"):
+        client.list_accounts()
+
+
 def test_client_sets_enabled_with_json_payload(monkeypatch):
     from services import codex2api_target_client as module
 
@@ -188,6 +210,11 @@ def test_structured_target_rejects_missing_or_invalid_stable_id():
         load_target_configs(
             {"codex2api_targets": [{"id": 0, "name": "node", "base_url": "https://node", "admin_key": "key"}]}
         )
+    for invalid_id in (True, 1.5):
+        with pytest.raises(ValueError):
+            load_target_configs(
+                {"codex2api_targets": [{"id": invalid_id, "name": "node", "base_url": "https://node", "admin_key": "key"}]}
+            )
 
 
 def test_client_parses_final_sse_complete_event(monkeypatch):
@@ -842,6 +869,153 @@ def test_explicit_target_sync_uses_new_active_row_when_old_duplicate_email_is_er
     with Session(engine) as session:
         binding = session.exec(select(db.AccountTargetBindingModel)).one()
     assert binding.remote_account_id == 13
+
+
+def test_explicit_target_sync_prefers_matching_stable_identity_over_same_email():
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.account_identity import ensure_identity
+    from services import external_sync
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    db.init_account_pool_schema(engine)
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="same@example.com",
+        password="password",
+        token="access-token",
+        extra_json='{"refresh_token":"refresh-token","workspace_id":"workspace-correct"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+    ensure_identity(engine, account_id=account.id, platform="chatgpt", email=account.email, workspace_id="workspace-correct")
+    with Session(engine) as session:
+        account = session.get(db.AccountModel, account.id)
+
+    class FakeTarget:
+        def import_full_json(self, payload):
+            return {"success": 1, "failed": 0}
+
+        def list_accounts(self):
+            return [
+                {"id": 42, "email": "same@example.com", "workspace_id": "workspace-other", "status": "active"},
+                {"id": 41, "email": "same@example.com", "workspace_id": "workspace-correct", "status": "active"},
+            ]
+
+    result = external_sync.sync_codex2api_account(
+        account,
+        target=SimpleNamespace(id=2),
+        client=FakeTarget(),
+        database_engine=engine,
+    )
+
+    assert result["ok"] is True
+    with Session(engine) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+    assert binding.remote_account_id == 41
+
+
+def test_explicit_target_sync_does_not_reuse_old_bound_id_after_identity_changes():
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.account_identity import ensure_identity
+    from services import external_sync
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    db.init_account_pool_schema(engine)
+    account = db.AccountModel(
+        platform="chatgpt", email="a@example.com", password="password",
+        token="access-token", extra_json='{"refresh_token":"refresh-token","workspace_id":"new-workspace"}',
+    )
+    with Session(engine) as session:
+        session.add(account); session.commit(); session.refresh(account)
+    identity = ensure_identity(
+        engine, account_id=account.id, platform="chatgpt", email=account.email,
+        workspace_id="new-workspace",
+    )
+    with Session(engine) as session:
+        session.add(db.AccountTargetBindingModel(
+            identity_id=identity.identity_id, local_account_id=account.id,
+            target_id=2, remote_account_id=7, enabled=False,
+            sync_status="remote_missing",
+        ))
+        session.commit()
+        account = session.get(db.AccountModel, account.id)
+
+    class FakeTarget:
+        def import_full_json(self, payload): return {"success": 1, "failed": 0}
+        def list_accounts(self):
+            return [
+                {"id": 7, "email": "old@example.com", "workspace_id": "old-workspace", "status": "active"},
+                {"id": 8, "email": "a@example.com", "workspace_id": "new-workspace", "status": "active"},
+            ]
+
+    result = external_sync.sync_codex2api_account(
+        account, target=SimpleNamespace(id=2), client=FakeTarget(), database_engine=engine,
+    )
+
+    assert result["ok"] is True
+    with Session(engine) as session:
+        binding = session.exec(
+            select(db.AccountTargetBindingModel).where(
+                db.AccountTargetBindingModel.identity_id == identity.identity_id,
+                db.AccountTargetBindingModel.target_id == 2,
+            )
+        ).one()
+    assert binding.remote_account_id == 8
+
+
+def test_explicit_target_sync_rejects_duplicate_stable_identity_candidates():
+    from sqlalchemy.pool import StaticPool
+    from sqlmodel import Session, create_engine, select
+
+    from core import db
+    from services.account_identity import ensure_identity
+    from services import external_sync
+
+    engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
+    db.init_account_pool_schema(engine)
+    account = db.AccountModel(
+        platform="chatgpt",
+        email="same@example.com",
+        password="password",
+        token="access-token",
+        extra_json='{"refresh_token":"refresh-token","workspace_id":"workspace-duplicate"}',
+    )
+    with Session(engine) as session:
+        session.add(account)
+        session.commit()
+        session.refresh(account)
+    ensure_identity(engine, account_id=account.id, platform="chatgpt", email=account.email, workspace_id="workspace-duplicate")
+    with Session(engine) as session:
+        account = session.get(db.AccountModel, account.id)
+
+    class FakeTarget:
+        def import_full_json(self, payload):
+            return {"success": 1, "failed": 0}
+
+        def list_accounts(self):
+            return [
+                {"id": 51, "email": "same@example.com", "workspace_id": "workspace-duplicate", "status": "active"},
+                {"id": 52, "email": "same@example.com", "workspace_id": "workspace-duplicate", "status": "active"},
+            ]
+
+    result = external_sync.sync_codex2api_account(
+        account,
+        target=SimpleNamespace(id=2),
+        client=FakeTarget(),
+        database_engine=engine,
+    )
+
+    assert result["ok"] is False
+    with Session(engine) as session:
+        assert session.exec(select(db.AccountTargetBindingModel)).all() == []
 
 
 def test_explicit_target_sync_transfers_remote_slot_from_duplicate_local_row():

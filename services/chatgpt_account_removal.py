@@ -26,6 +26,7 @@ class AccountSnapshot:
     account_id: int
     platform: str
     email: str
+    identity_id: str
     user_id: str
     token: str
     created_at: datetime
@@ -99,6 +100,7 @@ def _load_snapshot(database_engine, account_id: int) -> AccountSnapshot | None:
             account_id=int(account.id),
             platform=_text(account.platform),
             email=_text(account.email),
+            identity_id=_text(account.identity_id),
             user_id=_text(account.user_id),
             token=_text(account.token),
             created_at=account.created_at,
@@ -136,6 +138,85 @@ def _identity_payload(snapshot: AccountSnapshot) -> dict[str, str]:
             _first_text(extra, "access_token", "accessToken") or snapshot.token
         ),
     }
+
+
+def _assigned_codex_target_id(snapshot: AccountSnapshot, database_engine: Any) -> int:
+    """Resolve the remote target for a local account before deletion."""
+
+    # The assignment is the control-plane source of truth.  Account extras can
+    # intentionally retain a historical remote projection during a target
+    # move, so consulting them first could delete the same email on the old
+    # node.  Include transitional states because deletion may be requested
+    # while a migration is draining or being verified.
+    try:
+        from core.db import AccountAssignmentModel, AccountTargetBindingModel
+        from sqlmodel import select
+
+        with Session(database_engine) as session:
+            assignment = session.exec(
+                select(AccountAssignmentModel)
+                .where(AccountAssignmentModel.local_account_id == snapshot.account_id)
+                .where(AccountAssignmentModel.identity_id == snapshot.identity_id)
+                .where(
+                    AccountAssignmentModel.state.in_(
+                        [
+                            "active",
+                            "draining",
+                            "standby",
+                            "planned",
+                            "locking",
+                            "uploading",
+                            "pending",
+                            "verifying",
+                            "assignment_committing",
+                            "source_cleaning",
+                            "target_enabling",
+                            "target_disabled",
+                            "migrating",
+                        ]
+                    )
+                )
+                .order_by(
+                    AccountAssignmentModel.updated_at.desc(),
+                    AccountAssignmentModel.id.desc(),
+                )
+            ).first()
+            if assignment is not None and int(assignment.target_id or 0) > 0:
+                return int(assignment.target_id)
+            binding = session.exec(
+                select(AccountTargetBindingModel)
+                .where(AccountTargetBindingModel.local_account_id == snapshot.account_id)
+                .where(AccountTargetBindingModel.identity_id == snapshot.identity_id)
+                .where(AccountTargetBindingModel.enabled == True)  # noqa: E712
+                .where(AccountTargetBindingModel.remote_account_id > 0)
+                .order_by(
+                    AccountTargetBindingModel.updated_at.desc(),
+                    AccountTargetBindingModel.id.desc(),
+                )
+            ).first()
+            if binding is not None and int(binding.target_id or 0) > 0:
+                return int(binding.target_id)
+    except Exception:
+        pass
+
+    # Older local rows may only carry their target in the credential-free
+    # projection.  This fallback is used only when no current assignment is
+    # available; it preserves compatibility without overriding a newer move.
+    extra = snapshot.extra if isinstance(snapshot.extra, dict) else {}
+    raw = extra.get("remote_target_id")
+    remote_snapshot = extra.get("codex_remote_snapshot")
+    if raw in (None, "") and isinstance(remote_snapshot, dict):
+        raw = remote_snapshot.get("target_id") or remote_snapshot.get("remote_target_id")
+    if isinstance(raw, bool) or (
+        isinstance(raw, float) and not raw.is_integer()
+    ):
+        target_id = 0
+    else:
+        try:
+            target_id = int(raw or 0)
+        except (TypeError, ValueError, OverflowError):
+            target_id = 0
+    return target_id if target_id > 0 else 0
 
 
 def _secret_values(snapshot: AccountSnapshot) -> tuple[str, ...]:
@@ -240,10 +321,21 @@ def _remove_account_locked(
     else:
         _checkpoint(task_control, attempt_id)
         try:
-            remote_result = delete_codex2api_credential(
-                email=snapshot.email,
-                identity=_identity_payload(snapshot),
-            )
+            delete_kwargs = {
+                "email": snapshot.email,
+                "identity": _identity_payload(snapshot),
+            }
+            remote_target_id = _assigned_codex_target_id(snapshot, database_engine)
+            # Preserve the legacy call shape for unassigned rows.  Any
+            # explicit assignment, including target 1, is routed through its
+            # target-aware client so a stale global configuration cannot
+            # delete a credential on the wrong node.
+            if remote_target_id > 0:
+                delete_kwargs.update(
+                    target_id=remote_target_id,
+                    database_engine=database_engine,
+                )
+            remote_result = delete_codex2api_credential(**delete_kwargs)
         except Exception as exc:
             remote_result = {
                 "status": "failed",

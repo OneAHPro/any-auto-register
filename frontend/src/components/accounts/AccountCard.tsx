@@ -416,6 +416,8 @@ export function AccountCard({
         ? '当前窗口'
         : '7天窗口'
   const usagePercentDisplay = usagePercent === null ? null : clampPercent(usagePercent)
+  const billingStatus = String(firstValue(liveDisplay, [['billing', 'status']]) || '').toLowerCase()
+  const billingPartial = billingStatus === 'partial' || firstValue(liveDisplay, [['billing', 'partial']]) === true
   const billed = firstValue(liveDisplay, [['billing', 'billed_usd']])
   const requestCount = liveDisplay
     ? firstNumber(quota, [['request_count']])
@@ -549,6 +551,7 @@ export function AccountCard({
           <div className="account-card__section-heading">
             <span><ClockCircleOutlined />{usageWindowTitle}</span>
             <span className="account-card__window-label">{usageWindowLabel}</span>
+            {billingPartial ? <Tag color="warning">部分号池</Tag> : null}
             <Text type="secondary">
               {liveUpdatedAt ? `更新 ${formatDate(liveUpdatedAt, true)}` : quotaResetAt ? `重置 ${formatDate(quotaResetAt, true)}` : '—'}
             </Text>
@@ -573,7 +576,7 @@ export function AccountCard({
           )}
           <div className="account-card__metrics-grid">
             <Metric label="请求数" value={formatNumber(requestCount)} tooltip={`${usageWindowLabel}内的请求数`} />
-            <Metric label="已计费" value={formatMoney(billed)} tooltip="Codex2API 全部时间累计费用" />
+            <Metric label="已计费" value={formatMoney(billed)} tooltip={billingPartial ? '部分号池计费已获取，仍有号池未返回' : 'Codex2API 全部时间累计费用'} />
             <Metric
               label="价格"
               value={formatUnitPrice(cost, billed)}

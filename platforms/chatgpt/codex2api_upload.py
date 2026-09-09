@@ -13,7 +13,12 @@ from urllib.parse import urlsplit, urlunsplit
 from curl_cffi import CurlMime
 from curl_cffi import requests as cffi_requests
 
-from services.chatgpt_account_coordination import codex2api_account_mutation_lock
+from services.chatgpt_account_coordination import (
+    codex2api_account_mutation_lock,
+    codex2api_credential_lock,
+    codex2api_target_lock,
+)
+from services.codex2api_remote_accounts import remote_account_email
 
 logger = logging.getLogger(__name__)
 MAX_ERROR_DETAIL_LENGTH = 200
@@ -230,13 +235,30 @@ def _credential_cleanup_candidates(
     email: str,
     local_aliases: set[str],
 ) -> tuple[bool, list[dict[str, Any]]]:
+    matching_rows = _matching_remote_rows(rows, email=email)
+    if not matching_rows and local_aliases:
+        # A provider can rotate the account email or omit it from a summary.
+        # A unique strong identity alias is still sufficient to identify the
+        # credential, while the ambiguity checks below prevent guessing when
+        # multiple rows claim that alias.
+        matching_rows = [
+            row
+            for row in rows
+            if _identity_aliases(row) & local_aliases
+        ]
+    # A row with the requested email but no usable remote ID is not evidence
+    # that the account is absent.  Keep deletion conservative so a malformed
+    # upstream response cannot cause local-first cleanup to remove credentials
+    # while the remote account remains alive.
+    if any(_remote_row_id(row) <= 0 for row in matching_rows):
+        return True, []
     exact = [
         row
-        for row in _matching_remote_rows(rows, email=email)
+        for row in matching_rows
         if _remote_row_id(row) > 0
     ]
     if not exact:
-        return False, []
+        return bool(matching_rows), []
 
     remote_aliases = [(row, _identity_aliases(row)) for row in exact]
     if local_aliases:
@@ -253,12 +275,127 @@ def _credential_cleanup_candidates(
     return True, []
 
 
+def _credential_lock_identity(
+    email: str,
+    identity: Mapping[str, Any] | None,
+) -> str:
+    """Use the same non-secret identity priority as upload synchronization."""
+
+    source = identity if isinstance(identity, Mapping) else {}
+    for key in (
+        "agent_runtime_id",
+        "chatgpt_account_id",
+        "account_id",
+        "refresh_token",
+        "session_token",
+        "access_token",
+    ):
+        value = _text(source.get(key))
+        if value:
+            return f"{key}:{value}"
+    return f"email:{_text(email).casefold()}"
+
+
 def delete_codex2api_credential(
     *,
     email: str,
     identity: Mapping[str, Any] | None = None,
+    target_id: int | None = None,
+    database_engine: Any | None = None,
 ) -> dict[str, Any]:
     """Delete the uniquely matched Codex2API credential without exposing rows."""
+    # Multi-target callers must use the target-aware client so a local account
+    # assigned to an enterprise node can never delete the same numeric ID on
+    # the legacy target-1 instance.  Keep the original HTTP path below for
+    # callers that omit ``target_id``.
+    normalized_target_id = 0
+    if target_id is not None:
+        raw_target_id = target_id
+        if isinstance(raw_target_id, bool) or (
+            isinstance(raw_target_id, float) and not raw_target_id.is_integer()
+        ):
+            return _cleanup_result(
+                "failed",
+                message="Codex2API 目标 ID 无效",
+            )
+        try:
+            normalized_target_id = int(raw_target_id)
+        except (TypeError, ValueError, OverflowError):
+            return _cleanup_result(
+                "failed",
+                message="Codex2API 目标 ID 无效",
+            )
+        if normalized_target_id <= 0:
+            return _cleanup_result(
+                "failed",
+                message="Codex2API 目标 ID 无效",
+            )
+    if normalized_target_id > 0:
+        try:
+            from services.codex2api_target_client import get_target_client
+
+            target = normalized_target_id
+            normalized_email = _text(email).lower()
+            if not normalized_email:
+                return _cleanup_result("failed", message="本地账号邮箱为空")
+            identity_aliases = _identity_aliases(identity)
+            lock_key = _credential_lock_identity(normalized_email, identity)
+            with (
+                codex2api_credential_lock(lock_key),
+                codex2api_account_mutation_lock(),
+                codex2api_target_lock(target),
+            ):
+                client = get_target_client(target, database_engine)
+                rows = client.list_accounts()
+                exact_email_found, candidates = _credential_cleanup_candidates(
+                    rows,
+                    email=normalized_email,
+                    local_aliases=identity_aliases,
+                )
+                if not exact_email_found:
+                    return _cleanup_result("already_absent")
+                if len(candidates) != 1:
+                    return _cleanup_result(
+                        "ambiguous",
+                        message="Codex2API 对应认证不唯一，已停止删除",
+                    )
+                remote_id = _remote_row_id(candidates[0])
+                if remote_id <= 0:
+                    return _cleanup_result(
+                        "ambiguous",
+                        message="Codex2API 对应账号缺少有效远端 ID，已停止删除",
+                    )
+                try:
+                    response = client.delete_account(remote_id)
+                except Exception as exc:
+                    status_code = int(getattr(exc, "status_code", 0) or 0)
+                    return _cleanup_result(
+                        "already_absent" if status_code == 404 else "unauthorized" if status_code in (401, 403) else "unavailable",
+                        remote_id=remote_id,
+                        message=f"Codex2API 认证删除异常（{type(exc).__name__}）",
+                    )
+                if isinstance(response, Mapping):
+                    negative_ack = any(
+                        response.get(key) is False
+                        for key in ("success", "ok", "deleted", "removed")
+                        if key in response
+                    )
+                    if negative_ack:
+                        return _cleanup_result(
+                            "failed", remote_id=remote_id,
+                            message=str(
+                                response.get("message")
+                                or response.get("error")
+                                or "Codex2API 认证删除失败"
+                            ),
+                        )
+                return _cleanup_result("deleted", remote_id=remote_id)
+        except Exception as exc:
+            return _cleanup_result(
+                "unavailable",
+                message=f"Codex2API 目标节点删除异常（{type(exc).__name__}）",
+            )
+
     api_url = _get_config_value("codex2api_api_url").rstrip("/")
     admin_key = _get_config_value("codex2api_admin_key")
     normalized_email = _text(email).lower()
@@ -397,21 +534,40 @@ def _remote_accounts(
     raw_accounts = payload.get("accounts") if isinstance(payload, dict) else payload
     if not isinstance(raw_accounts, list):
         return None, "Codex2API 账号清单格式无法识别"
-    return [row for row in raw_accounts if isinstance(row, dict)], ""
+    if any(not isinstance(row, dict) for row in raw_accounts):
+        return None, "Codex2API 账号清单包含无效行"
+    rows = [dict(row) for row in raw_accounts]
+    ids = [_remote_row_id(row) for row in rows]
+    if any(remote_id <= 0 for remote_id in ids) or len(ids) != len(set(ids)):
+        return None, "Codex2API 账号清单包含无效或重复远端 ID"
+    return rows, ""
 
 
 def _remote_row_id(row: dict[str, Any]) -> int:
-    try:
-        return int(row.get("id") or 0)
-    except (TypeError, ValueError):
-        return 0
+    for key in ("id", "remote_id"):
+        if key not in row or row.get(key) in (None, ""):
+            continue
+        value = row.get(key)
+        if isinstance(value, bool) or (
+            isinstance(value, float) and not value.is_integer()
+        ):
+            return 0
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return parsed if parsed > 0 else 0
+    return 0
 
 
 def _remote_row_identity(row: dict[str, Any]) -> str:
     return _text(
         row.get("chatgpt_account_id")
         or row.get("workspace_id")
+        or row.get("effective_workspace_id")
         or row.get("account_id")
+        or row.get("user_id")
+        or row.get("chatgpt_user_id")
     )
 
 
@@ -446,9 +602,8 @@ def _matching_remote_rows(
     normalized_email = email.lower()
     matches = []
     for row in rows:
-        row_email = _text(row.get("email")).lower()
-        row_name = _text(row.get("name")).lower()
-        if normalized_email in {row_email, row_name}:
+        row_email = remote_account_email(row).lower()
+        if normalized_email == row_email:
             matches.append(row)
     return matches
 
@@ -917,7 +1072,26 @@ def upload_to_codex2api(
     replace_existing: bool = False,
 ) -> tuple[bool, str]:
     """Upload one account under the shared reentrant mutation lock."""
-    with codex2api_account_mutation_lock():
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if not isinstance(extra, dict):
+        extra = {}
+    credential_key = ""
+    for key in (
+        "agent_runtime_id", "chatgpt_account_id", "account_id",
+        "refresh_token", "session_token", "access_token",
+    ):
+        value = _text(extra.get(key) or (getattr(account, "token", "") if key == "access_token" else ""))
+        if value:
+            credential_key = f"{key}:{value}"
+            break
+    # This legacy helper is hard-wired to the single-target environment
+    # variables below.  Never let a stale multi-target extra field make its
+    # coordination lock cover a different node.
+    target_id = 1
+    with codex2api_credential_lock(credential_key), codex2api_account_mutation_lock(), codex2api_target_lock(target_id):
         return _upload_to_codex2api_locked(
             account,
             replace_existing=replace_existing,

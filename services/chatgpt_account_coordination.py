@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import datetime
+import hashlib
 import threading
 from typing import Iterator
+from weakref import WeakValueDictionary
 
 
 _ACCOUNT_LOCKS_GUARD = threading.Lock()
@@ -13,6 +15,10 @@ _ACCOUNT_LOCKS: dict[int | str, threading.Lock] = {}
 _ACCOUNT_EMAIL_LOCKS_GUARD = threading.Lock()
 _ACCOUNT_EMAIL_LOCKS: dict[str, threading.Lock] = {}
 _CODEX2API_MUTATION_LOCK = threading.RLock()
+_CODEX2API_TARGET_LOCKS_GUARD = threading.Lock()
+_CODEX2API_TARGET_LOCKS: dict[int, threading.RLock] = {}
+_CODEX2API_CREDENTIAL_LOCKS_GUARD = threading.Lock()
+_CODEX2API_CREDENTIAL_LOCKS: WeakValueDictionary[str, threading.RLock] = WeakValueDictionary()
 
 
 def _account_lock_key(account_id) -> int | str:
@@ -108,4 +114,38 @@ def validated_chatgpt_account_operation_lock(
 def codex2api_account_mutation_lock() -> Iterator[None]:
     """Serialize remote credential mutations and allow same-thread nesting."""
     with _CODEX2API_MUTATION_LOCK:
+        yield
+
+
+@contextmanager
+def codex2api_target_lock(target_id) -> Iterator[None]:
+    """Serialize inventory/import/binding work for one remote target."""
+
+    try:
+        key = int(target_id)
+    except (TypeError, ValueError):
+        key = 0
+    with _CODEX2API_TARGET_LOCKS_GUARD:
+        lock = _CODEX2API_TARGET_LOCKS.setdefault(key, threading.RLock())
+    with lock:
+        yield
+
+
+@contextmanager
+def codex2api_credential_lock(identity_key: str) -> Iterator[None]:
+    """Serialize imports of one credential across target locks/workers."""
+
+    raw_key = str(identity_key or "").strip()
+    key = (
+        "credential:"
+        + hashlib.sha256(raw_key.encode("utf-8", errors="replace")).hexdigest()
+        if raw_key
+        else ""
+    )
+    if not key:
+        yield
+        return
+    with _CODEX2API_CREDENTIAL_LOCKS_GUARD:
+        lock = _CODEX2API_CREDENTIAL_LOCKS.setdefault(key, threading.RLock())
+    with lock:
         yield
