@@ -302,6 +302,7 @@ def fetch_codex2api_quota_accounts(
     database_engine=engine,
     _skip_assignment_routing: bool = False,
     include_display_fields: bool = False,
+    deduplicate: bool = True,
     refresh: bool = False,
 ) -> list[dict[str, object]]:
     """Read quota inventory, optionally refreshing each enabled target first."""
@@ -310,6 +311,7 @@ def fetch_codex2api_quota_accounts(
         routed = _fetch_enabled_target_quota(
             database_engine=database_engine,
             include_display_fields=include_display_fields,
+            deduplicate=deduplicate,
             refresh=refresh,
         )
         if routed is not None:
@@ -656,6 +658,7 @@ def _deduplicate_target_quota_rows(
     preferred_targets: Mapping[str, int],
 ) -> list[dict[str, object]]:
     selected: dict[tuple[object, ...], dict[str, object]] = {}
+    grouped: dict[tuple[object, ...], list[dict[str, object]]] = defaultdict(list)
     for index, row in enumerate(rows):
         email = _text(row.get("email")).lower()
         remote_id = _remote_id(row)
@@ -666,6 +669,7 @@ def _deduplicate_target_quota_rows(
             if has_remote_email
             else ("remote", target_id, remote_id or index + 1)
         )
+        grouped[identity].append(row)
         current = selected.get(identity)
         preferred_target_id = (
             preferred_targets.get(email) if has_remote_email else None
@@ -678,6 +682,20 @@ def _deduplicate_target_quota_rows(
             preferred_target_id=preferred_target_id,
         ):
             selected[identity] = row
+    for identity, row in list(selected.items()):
+        members = grouped.get(identity, [])
+        if len(members) < 2:
+            continue
+        has_incomplete_peer = any(
+            not _quota_row_quality(member, preferred_target_id=None)[0]
+            for member in members
+            if _quota_number(member.get("usage_percent_7d")) not in (None, 0)
+        )
+        selected_billed = _quota_number(row.get("billed_7d"))
+        if has_incomplete_peer and selected_billed is not None and selected_billed <= 0.01:
+            selected_copy = dict(row)
+            selected_copy["_quota_duplicate_incomplete"] = True
+            selected[identity] = selected_copy
     return sorted(
         selected.values(),
         key=lambda row: (
@@ -692,6 +710,7 @@ def _fetch_enabled_target_quota(
     *,
     database_engine,
     include_display_fields: bool = False,
+    deduplicate: bool = True,
     refresh: bool = False,
 ) -> list[dict[str, object]] | None:
     context = _quota_target_context(database_engine)
@@ -731,10 +750,16 @@ def _fetch_enabled_target_quota(
             rows.append(row)
     if failures and failures == len(target_ids):
         raise Codex2APIHealthError("读取 Codex2API 目标状态异常")
-    return _deduplicate_target_quota_rows(
-        rows,
-        preferred_targets=preferred_targets,
-    )
+    if not deduplicate:
+        return sorted(
+            rows,
+            key=lambda row: (
+                _text(row.get("email")).lower(),
+                int(row.get("target_id") or 0),
+                int(row.get("remote_id") or 0),
+            ),
+        )
+    return _deduplicate_target_quota_rows(rows, preferred_targets=preferred_targets)
 
 
 def _refresh_target_usage(

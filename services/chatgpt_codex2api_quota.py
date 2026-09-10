@@ -364,6 +364,12 @@ def summarize_available_quota(
         total_used_fallback = total_used_fallback or fallback_7d
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
+        if row.get("_quota_duplicate_incomplete"):
+            # A tiny complete-looking duplicate is unsafe when another copy
+            # of the same mailbox is still missing its billing denominator.
+            # Keep the account in the completeness count, but do not turn the
+            # tiny copy into a false low-balance estimate.
+            estimate = QuotaEstimate(state="invalid")
         total_percent = _decimal(row.get("usage_percent_7d"))
         total_billed = _decimal(row.get("billed_7d"))
         if (

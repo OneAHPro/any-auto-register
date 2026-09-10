@@ -1239,6 +1239,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(events, ["relogin", "final_quota"])
         self.final_quota_reader.assert_called_once_with(
             include_display_fields=True,
+            deduplicate=False,
         )
         relogin_report = self.alert_sender.call_args.kwargs["quota_report"]
         quota_report = self.quota_alert_sender.call_args.kwargs["quota_report"]

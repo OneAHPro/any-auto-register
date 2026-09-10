@@ -1213,6 +1213,38 @@ def test_quota_dedup_prefers_the_full_usage_source_over_tiny_duplicate_pool_copy
     assert result[0]["billed_7d"] == 1086.00
 
 
+def test_quota_dedup_marks_tiny_copy_incomplete_when_peer_is_refreshing():
+    from services import chatgpt_codex2api_health as health
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    rows = [
+        {
+            "target_id": 1,
+            "remote_id": 101,
+            "email": "refreshing-shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 100,
+            "billed_7d": None,
+        },
+        {
+            "target_id": 3,
+            "remote_id": 303,
+            "email": "refreshing-shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 97,
+            "billed_7d": 0.00149,
+        },
+    ]
+
+    result = health._deduplicate_target_quota_rows(rows, preferred_targets={})
+    report = summarize_available_quota(result)
+
+    assert len(result) == 1
+    assert result[0]["_quota_duplicate_incomplete"] is True
+    assert not report.total_data_complete
+    assert not report.available
+
+
 def test_final_quota_reader_never_falls_back_to_legacy_when_registry_is_disabled(
     monkeypatch,
 ):

@@ -2680,6 +2680,7 @@ def _run_chatgpt_relogin_task_inner(
         quota_query_error_type = ""
         try:
             from services.chatgpt_codex2api_health import (
+                _deduplicate_target_quota_rows,
                 fetch_codex2api_quota_accounts,
             )
 
@@ -2694,6 +2695,7 @@ def _run_chatgpt_relogin_task_inner(
                     # billing row solely because it is newer.
                     final_quota_accounts = fetch_codex2api_quota_accounts(
                         include_display_fields=True,
+                        deduplicate=False,
                     )
                 except Exception:
                     quota_query_errors += 1
@@ -2723,6 +2725,14 @@ def _run_chatgpt_relogin_task_inner(
                 stable_quota_accounts = stabilize_quota_rows(
                     final_quota_accounts,
                     stable_quota_accounts,
+                )
+                # Evaluate all target copies after stabilization. Deduplicating
+                # before this step can discard the only complete billing source
+                # and leave a newer, tiny pool-local copy that looks like a
+                # zero balance.
+                stable_quota_accounts = _deduplicate_target_quota_rows(
+                    stable_quota_accounts,
+                    preferred_targets={},
                 )
                 candidate_report = summarize_available_quota(
                     stable_quota_accounts
