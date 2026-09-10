@@ -1176,6 +1176,43 @@ def test_quota_dedup_does_not_prefer_incomplete_assigned_target():
     assert result[0]["billed_7d"] == 40
 
 
+def test_quota_dedup_prefers_the_full_usage_source_over_tiny_duplicate_pool_copy():
+    from services import chatgpt_codex2api_health as health
+
+    rows = [
+        {
+            "target_id": 1,
+            "remote_id": 25352,
+            "email": "shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 97,
+            "billed_7d": 1086.00,
+        },
+        {
+            "target_id": 2,
+            "remote_id": 2,
+            "email": "shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 97,
+            "billed_7d": 646.92,
+        },
+        {
+            "target_id": 3,
+            "remote_id": 3,
+            "email": "shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 97,
+            "billed_7d": 0.00149,
+        },
+    ]
+
+    result = health._deduplicate_target_quota_rows(rows, preferred_targets={})
+
+    assert len(result) == 1
+    assert result[0]["target_id"] == 1
+    assert result[0]["billed_7d"] == 1086.00
+
+
 def test_final_quota_reader_never_falls_back_to_legacy_when_registry_is_disabled(
     monkeypatch,
 ):

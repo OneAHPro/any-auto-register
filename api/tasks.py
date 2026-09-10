@@ -2688,7 +2688,13 @@ def _run_chatgpt_relogin_task_inner(
             stable_quota_accounts = list(remote_quota_accounts)
             for quota_attempt in range(QUOTA_QUERY_MAX_ATTEMPTS):
                 try:
-                    final_quota_accounts = fetch_codex2api_quota_accounts()
+                    # Keep stable provider aliases in the final snapshot so
+                    # duplicate copies across targets can be resolved by
+                    # account identity instead of selecting a tiny pool-local
+                    # billing row solely because it is newer.
+                    final_quota_accounts = fetch_codex2api_quota_accounts(
+                        include_display_fields=True,
+                    )
                 except Exception:
                     quota_query_errors += 1
                     if quota_query_errors >= QUOTA_QUERY_MAX_ERRORS:

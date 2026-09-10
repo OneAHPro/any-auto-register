@@ -643,6 +643,8 @@ def _quota_row_quality(
     return (
         total_complete,
         current_complete,
+        billed_7d is not None and billed_7d > 0,
+        billed_7d if billed_7d is not None else -1.0,
         preferred_target_id is not None and target_id == preferred_target_id,
         updated_at,
     )

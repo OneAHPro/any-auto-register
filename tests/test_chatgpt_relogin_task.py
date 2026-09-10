@@ -1190,7 +1190,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
                 "message": "完整登录并同步成功",
             }
 
-        def fetch_final_rows():
+        def fetch_final_rows(**_kwargs):
             self.assertEqual(events, ["relogin"])
             events.append("final_quota")
             return final_rows
@@ -1237,7 +1237,9 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             _run_chatgpt_relogin_task(task_id, [241])
 
         self.assertEqual(events, ["relogin", "final_quota"])
-        self.final_quota_reader.assert_called_once_with()
+        self.final_quota_reader.assert_called_once_with(
+            include_display_fields=True,
+        )
         relogin_report = self.alert_sender.call_args.kwargs["quota_report"]
         quota_report = self.quota_alert_sender.call_args.kwargs["quota_report"]
         self.assertIs(relogin_report, quota_report)
