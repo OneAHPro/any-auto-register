@@ -198,10 +198,11 @@ def _window_is_complete(row: Mapping[str, object], suffix: str) -> bool:
     percent = _decimal(row.get(f"usage_percent_{suffix}"))
     if percent is None or percent <= 0:
         return False
-    if percent >= HUNDRED:
-        return True
     billed = _decimal(row.get(f"billed_{suffix}"))
-    return billed is not None and billed >= 0
+    # A positive usage percentage with no positive billed denominator is the
+    # transient shape returned while Codex2API rebuilds its usage summary.
+    # It must not be treated as a real zero balance.
+    return billed is not None and billed > 0
 
 
 def stabilize_quota_rows(
@@ -298,22 +299,15 @@ def estimate_account_quota(row: Mapping[str, object]) -> QuotaEstimate:
 def _estimate_quota_values(percent_value: object, billed_value: object) -> QuotaEstimate:
     percent = _decimal(percent_value)
     billed = _decimal(billed_value)
-    if percent is None or percent <= 0:
+    if percent is None or percent <= 0 or billed is None or billed <= 0:
         return QuotaEstimate(state="invalid")
     if percent >= HUNDRED:
         return QuotaEstimate(
             state="exhausted",
             usage_percent=percent,
-            billed_usd=(
-                billed.quantize(CENT, rounding=ROUND_HALF_UP)
-                if billed is not None and billed >= 0
-                else None
-            ),
+            billed_usd=billed.quantize(CENT, rounding=ROUND_HALF_UP),
             remaining_usd=Decimal("0.00"),
         )
-    if billed is None or billed < 0:
-        return QuotaEstimate(state="invalid")
-
     remaining = (
         billed * (HUNDRED - percent) / percent
     ).quantize(CENT, rounding=ROUND_HALF_UP)
@@ -370,7 +364,34 @@ def summarize_available_quota(
         total_used_fallback = total_used_fallback or fallback_7d
         healthy_count += 1
         estimate = estimate_window_quota(row, "7d")
+        total_percent = _decimal(row.get("usage_percent_7d"))
+        total_billed = _decimal(row.get("billed_7d"))
+        if (
+            estimate.state in VALID_ESTIMATE_STATES
+            and total_percent is not None
+            and total_percent > 0
+            and total_billed == 0
+        ):
+            # Do not let a temporary zero summary produce a valid estimate of
+            # exactly $0.00 for an otherwise normal account.
+            estimate = QuotaEstimate(state="invalid")
+        if estimate.state == "exhausted" and total_billed is None:
+            # ``100%`` without its cost is an in-flight/partial observation for
+            # a normal account. Treating it as exhausted would turn a temporary
+            # missing field into a false $0 balance and an alert.
+            estimate = QuotaEstimate(state="invalid")
         short_estimate = estimate_window_quota(row, "5h")
+        current_percent = _decimal(row.get("usage_percent_5h"))
+        current_billed = _decimal(row.get("billed_5h"))
+        if (
+            short_estimate.state in VALID_ESTIMATE_STATES
+            and current_percent is not None
+            and current_percent > 0
+            and current_billed == 0
+        ):
+            short_estimate = QuotaEstimate(state="invalid")
+        if short_estimate.state == "exhausted" and current_billed is None:
+            short_estimate = QuotaEstimate(state="invalid")
         # Accounts with a valid 5-hour window use it for the "current" amount.
         # Accounts without that window (for example Pro) use their weekly
         # estimate so they remain represented instead of contributing zero.

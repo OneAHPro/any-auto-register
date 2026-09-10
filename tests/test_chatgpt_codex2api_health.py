@@ -1142,6 +1142,40 @@ def test_final_quota_reader_uses_enabled_targets_and_deduplicates_by_assignment(
     } == {113, 222}
 
 
+def test_quota_dedup_does_not_prefer_incomplete_assigned_target():
+    from services import chatgpt_codex2api_health as health
+
+    rows = [
+        {
+            "target_id": 11,
+            "remote_id": 111,
+            "email": "shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 100,
+            "billed_7d": None,
+            "updated_at": "2026-09-10T00:02:00Z",
+        },
+        {
+            "target_id": 22,
+            "remote_id": 222,
+            "email": "shared@example.com",
+            "remote_status": "active",
+            "usage_percent_7d": 96,
+            "billed_7d": 40,
+            "updated_at": "2026-09-10T00:01:00Z",
+        },
+    ]
+
+    result = health._deduplicate_target_quota_rows(
+        rows,
+        preferred_targets={"shared@example.com": 11},
+    )
+
+    assert len(result) == 1
+    assert result[0]["target_id"] == 22
+    assert result[0]["billed_7d"] == 40
+
+
 def test_final_quota_reader_never_falls_back_to_legacy_when_registry_is_disabled(
     monkeypatch,
 ):

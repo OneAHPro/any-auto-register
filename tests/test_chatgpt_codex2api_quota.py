@@ -31,7 +31,7 @@ def test_estimate_account_quota_marks_over_one_hundred_percent_exhausted():
     assert estimate.remaining_usd == Decimal("0.00")
 
 
-def test_exhausted_window_is_complete_even_when_billed_cost_is_temporarily_missing():
+def test_exhausted_window_without_billed_cost_is_incomplete():
     from services.chatgpt_codex2api_quota import summarize_available_quota
 
     report = summarize_available_quota(
@@ -48,9 +48,9 @@ def test_exhausted_window_is_complete_even_when_billed_cost_is_temporarily_missi
     )
 
     assert report.estimated_remaining_usd == Decimal("0.00")
-    assert report.total_data_count == 1
-    assert report.total_data_complete
-    assert report.available
+    assert report.total_data_count == 0
+    assert not report.total_data_complete
+    assert not report.available
 
 
 def test_estimate_account_quota_calculates_remaining_usd():
@@ -652,6 +652,52 @@ def test_exhausted_current_window_is_valid_zero_not_missing_data():
     assert report.current_data_complete
     assert report.total_data_complete
     assert report.available
+
+
+def test_exhausted_total_without_billed_cost_is_incomplete():
+    """A transient 100% marker without its cost must not become zero balance."""
+
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "refreshing@example.com",
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "remote_status": "active",
+            "usage_percent_7d": 100,
+            "billed_7d": None,
+        },
+    ])
+
+    assert report.total_remaining_usd == Decimal("0.00")
+    assert report.total_data_count == 0
+    assert not report.total_data_complete
+    assert not report.total_fresh
+    assert not report.available
+
+
+def test_positive_usage_with_zero_billed_cost_is_incomplete():
+    """A zero denominator with non-zero usage is a refreshing snapshot."""
+
+    from services.chatgpt_codex2api_quota import summarize_available_quota
+
+    report = summarize_available_quota([
+        {
+            "email": "refreshing-zero@example.com",
+            "plan_type": "pro",
+            "has_5h_window": False,
+            "remote_status": "active",
+            "usage_percent_7d": 50,
+            "billed_7d": 0,
+        },
+    ])
+
+    assert report.total_remaining_usd == Decimal("0.00")
+    assert report.total_data_count == 0
+    assert not report.total_data_complete
+    assert not report.total_fresh
+    assert not report.available
 
 
 def test_usage_percent_without_billed_cost_is_incomplete():

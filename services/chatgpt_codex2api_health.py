@@ -625,35 +625,25 @@ def _quota_row_quality(
     target_id = int(row.get("target_id") or 0)
     percent_7d = _quota_number(row.get("usage_percent_7d"))
     billed_7d = _quota_number(row.get("billed_7d"))
-    total_complete = bool(
-        percent_7d is not None
-        and percent_7d > 0
-        and (
-            percent_7d >= 100
-            or (billed_7d is not None and billed_7d >= 0)
-        )
-    )
+    def window_complete(percent: float | None, billed: float | None) -> bool:
+        if percent is None or percent <= 0:
+            return False
+        return billed is not None and billed > 0
+
+    total_complete = window_complete(percent_7d, billed_7d)
     percent_5h = _quota_number(row.get("usage_percent_5h"))
     billed_5h = _quota_number(row.get("billed_5h"))
     current_complete = bool(
-        not row.get("has_5h_window")
-        or (
-            percent_5h is not None
-            and percent_5h > 0
-            and (
-                percent_5h >= 100
-                or (billed_5h is not None and billed_5h >= 0)
-            )
-        )
+        not row.get("has_5h_window") or window_complete(percent_5h, billed_5h)
     )
     updated_at = max(
         _text(row.get("quota_5h_updated_at")),
         _text(row.get("quota_7d_updated_at")),
     )
     return (
-        preferred_target_id is not None and target_id == preferred_target_id,
         total_complete,
         current_complete,
+        preferred_target_id is not None and target_id == preferred_target_id,
         updated_at,
     )
 
