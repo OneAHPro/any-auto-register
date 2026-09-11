@@ -276,6 +276,94 @@ class _SuccessfulRefreshTokenAccountAdapter(_SuccessfulAccountAdapter):
 
 
 class ChatGPTPluginTests(unittest.TestCase):
+    def test_retry_persists_recovered_mfa_through_plugin_and_auth_promotion(self):
+        from sqlmodel import Session, SQLModel, create_engine, select
+        from core.db import AccountModel, ChatGPTMfaRotationJournalModel
+        from platforms.chatgpt.refresh_token_registration_engine import RegistrationResult
+        from services.chatgpt_auth_state import (
+            load_login_mfa_candidate,
+            promote_successful_chatgpt_account_auth,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            database_engine = create_engine(f"sqlite:///{directory}/auth.db")
+            SQLModel.metadata.create_all(database_engine)
+            with Session(database_engine) as session:
+                session.add(ChatGPTMfaRotationJournalModel(
+                    email="demo@example.com",
+                    totp_secret="ACTIVATED-NEW-TOTP",
+                    recovery_code="ACTIVATED-NEW-RECOVERY",
+                    status="activated",
+                    rotated_at="2026-09-11T08:52:19+00:00",
+                ))
+                session.commit()
+
+            mailbox = _TrackingMailbox()
+            mailbox.account.extra = {
+                "provider": "chatgpt_credentials",
+                "account_type": "chatgpt_password_totp",
+                "password": "PRIMARY-PASSWORD",
+                "totp_secret": "IMPORTED-OLD-TOTP",
+                "pool_file": "credentials.json",
+            }
+
+            class RecoveredLoginAdapter(RefreshTokenChatGPTRegistrationAdapter):
+                def run(self, context):
+                    login_engine = self._create_engine(context)
+                    if not login_engine._create_email(existing_account_login_only=True):
+                        raise AssertionError(login_engine._email_error_message)
+                    self.login_totp = login_engine.totp_secret
+                    self.logs = login_engine.logs
+                    # External login has succeeded. Exercise the real mailbox
+                    # serializer and the plugin's final metadata projection.
+                    return RegistrationResult(
+                        success=True,
+                        email=login_engine.email,
+                        password=login_engine.password,
+                        access_token="FIXTURE-ACCESS-TOKEN",
+                        source="existing_account_web_login",
+                        metadata={
+                            "mailbox_login_context": context.email_service.get_mailbox_metadata(),
+                        },
+                    )
+
+            adapter = RecoveredLoginAdapter()
+            platform = ChatGPTPlatform(config=RegisterConfig(extra={
+                "chatgpt_registration_mode": "refresh_token",
+                "chatgpt_existing_account_login_only": True,
+                "_chatgpt_auth_engine": database_engine,
+            }), mailbox=mailbox)
+            with mock.patch(
+                "platforms.chatgpt.plugin.build_chatgpt_registration_mode_adapter",
+                return_value=adapter,
+            ):
+                result = platform.register()
+
+            self.assertEqual(adapter.login_totp, "ACTIVATED-NEW-TOTP")
+            context_extra = result.extra["mailbox_login_context"]["extra"]
+            self.assertEqual(context_extra["totp_secret"], adapter.login_totp)
+            self.assertEqual(context_extra["mfa_recovery_code"], "ACTIVATED-NEW-RECOVERY")
+            self.assertTrue(context_extra["chatgpt_mfa_managed"])
+            self.assertNotIn("ACTIVATED-NEW-TOTP", "\n".join(adapter.logs))
+            with Session(database_engine) as session:
+                # Recovery updates the projection but leaves the activation
+                # journal for the existing atomic canonical promotion.
+                self.assertIsNotNone(session.exec(select(ChatGPTMfaRotationJournalModel)).first())
+                account = AccountModel(
+                    platform="chatgpt", email=result.email,
+                    password=result.password, token=result.token,
+                )
+                account.set_extra(result.extra)
+                session.add(account)
+                session.commit()
+                state = promote_successful_chatgpt_account_auth(account.id, session=session)
+                session.commit()
+                candidate = load_login_mfa_candidate(account.id, session=session)
+                self.assertEqual(state.mfa_state.value, "active")
+                self.assertEqual(candidate.totp_secret, "ACTIVATED-NEW-TOTP")
+                self.assertIsNone(session.exec(select(ChatGPTMfaRotationJournalModel)).first())
+            database_engine.dispose()
+
     def test_existing_login_reuses_first_mailbox_when_adapter_rebuilds_engine(self):
         for retry_error in ("service_abuse_mode", "oauth_token_failed"):
             with self.subTest(retry_error=retry_error):

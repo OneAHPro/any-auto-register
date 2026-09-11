@@ -555,6 +555,7 @@ class RefreshTokenRegistrationEngine:
                     self._log(
                         "已加载账号确认生效的 MFA 凭据继续登录"
                     )
+                restored_mfa = candidate is not None
                 activated_rotation = load_chatgpt_mfa_rotation(
                     email_value,
                     database_engine=auth_engine,
@@ -581,10 +582,25 @@ class RefreshTokenRegistrationEngine:
                     self.email_info.pop("totp_url", None)
                     self.email_info.pop("mfa_secret", None)
                     self.email_info.pop("totp", None)
+                    restored_mfa = True
                     self._log(
                         "检测到上次进程中断前已激活的 MFA；"
                         "已恢复该代凭据继续登录"
                     )
+                if restored_mfa:
+                    # Login reads email_info, while the plugin serializes the
+                    # mailbox service's separate credential snapshot. Restore
+                    # both from the confirmed generation, or a successful retry
+                    # would save the old imported TOTP and fail WAL promotion.
+                    # This callback updates local metadata only; the activated
+                    # journal is consumed by the later atomic auth promotion.
+                    restore = getattr(self.email_service, "commit_mfa_rotation", None)
+                    if callable(restore) and restore(
+                        totp_secret=self.email_info["totp_secret"],
+                        recovery_code=self.email_info.get("mfa_recovery_code", ""),
+                        rotated_at=self.email_info.get("mfa_rotated_at", ""),
+                    ) is False:
+                        raise RuntimeError("已恢复生效的 MFA，但邮箱凭据上下文保存失败")
                 account_type = str(
                     self.email_info.get("account_type") or ""
                 ).strip()
