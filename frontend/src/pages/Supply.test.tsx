@@ -9,7 +9,7 @@ import Supply from './Supply'
 
 vi.mock('@/lib/utils', () => ({ apiFetch: vi.fn() }))
 vi.mock('@/components/settings/MailImportPanel', () => ({ default: ({ form }: { form: FormInstance }) => <button onClick={() => form.setFieldsValue({ mail_provider: 'mail_import', mail_import_source: 'applemail', applemail_pool_dir: 'mail', applemail_pool_file: 'purchased.json' })}>导入 AppleMail 资料</button> }))
-vi.mock('@/components/ChatGPTExistingAccountLoginModal', () => ({ ChatGPTExistingAccountLoginModal: ({ open }: { open: boolean }) => open ? <div role="dialog">登录任务</div> : null }))
+vi.mock('@/components/ChatGPTExistingAccountLoginModal', () => ({ ChatGPTExistingAccountLoginModal: ({ open, onDone }: { open: boolean; onDone?: () => void }) => open ? <div role="dialog">登录任务<button onClick={onDone}>完成登录任务</button></div> : null }))
 vi.mock('@/components/CodexAccountImportModal', () => ({ CodexAccountImportModal: ({ open, onCompleted }: { open: boolean; onCompleted: () => void }) => open ? <div role="dialog"><button onClick={onCompleted}>完成 JSON 导入</button></div> : null }))
 
 beforeAll(() => {
@@ -47,6 +47,22 @@ describe('Unified account supply', () => {
     mount('/supply?method=json')
     await user.click(screen.getByRole('button', { name: /选择文件或粘贴凭据/ }))
     await user.click(await screen.findByRole('button', { name: '完成 JSON 导入' }))
+    expect(await screen.findByText('账号池页面')).toBeTruthy()
+  })
+  it('keeps the login task dialog and current page open after completion', async () => {
+    const user = userEvent.setup()
+    mount('/supply?method=login')
+    await user.click(screen.getByRole('button', { name: /设置登录任务/ }))
+    await user.click(await screen.findByRole('button', { name: '完成登录任务' }))
+
+    expect(screen.getByRole('dialog').textContent).toContain('登录任务')
+    expect(screen.getByRole('heading', { name: '补充账号' })).toBeTruthy()
+    expect(screen.queryByText('账号池页面')).toBeNull()
+  })
+  it('still opens the account pool when explicitly requested', async () => {
+    const user = userEvent.setup()
+    mount('/supply?method=json')
+    await user.click(screen.getByRole('button', { name: '查看账号池' }))
     expect(await screen.findByText('账号池页面')).toBeTruthy()
   })
 })

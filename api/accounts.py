@@ -397,8 +397,18 @@ def _account_operational_summary(
                 or status_value == "scheduling"
                 or (isinstance(extra, dict) and extra.get("scheduling") is True)
             )
-            remote_disabled = _summary_is_false(display.get("remote_enabled"))
-            remote_locked = _summary_is_true(display.get("remote_locked"))
+            # A disabled binding intentionally has no live display match. Its
+            # inventory flags still determine health, independent of row order.
+            remote_disabled = _summary_is_false(
+                display.get("remote_enabled")
+                if display.get("remote_enabled") is not None
+                else snapshot.get("enabled", snapshot.get("remote_enabled"))
+            )
+            remote_locked = _summary_is_true(
+                display.get("remote_locked")
+                if display.get("remote_locked") is not None
+                else snapshot.get("locked", snapshot.get("remote_locked"))
+            )
         else:
             item_dict = item if isinstance(item, dict) else {}
             extra = {}
@@ -1755,6 +1765,7 @@ def _build_account_list(
     refresh_live: bool = False,
     subscription_plan: Optional[str] = None,
     operational_status: Optional[str] = None,
+    account_source: Optional[str] = None,
     session: Session = Depends(get_session),
     summary_only: bool = False,
     snapshot_only: bool = False,
@@ -1781,6 +1792,10 @@ def _build_account_list(
     # can carry the only matching plan/status; collapsing it before filters
     # would make a valid account disappear from a filtered result.  We collapse
     # once the predicates have been evaluated below.
+    requested_source = str(account_source or "").strip().lower()
+    if requested_source not in {"", "local", "codex2api"}:
+        requested_source = ""
+
     visible_accounts = load_visible_accounts()
     live_rows: list[dict[str, object]] | None = None
     live_error = ""
@@ -2213,6 +2228,16 @@ def _build_account_list(
             "free": {"free"},
         }
         return plan in aliases.get(requested, {requested})
+
+    # Match live rows against every local credential before filtering by origin.
+    # Otherwise a linked remote copy would reappear as a remote-only account.
+    if requested_source:
+        visible_accounts = [
+            account for account in visible_accounts
+            if _account_source(account) == requested_source
+        ]
+    if requested_source == "local":
+        remote_items = []
 
     visible_accounts = [account for account in visible_accounts if subscription_matches(account)]
     # Apply the display grouping after subscription filtering so any matching
@@ -2680,6 +2705,7 @@ def list_accounts(
     refresh_live: bool = False,
     subscription_plan: Optional[str] = None,
     operational_status: Optional[str] = None,
+    account_source: Optional[str] = None,
     snapshot_only: bool = False,
     session: Session = Depends(get_session),
 ):
@@ -2689,6 +2715,7 @@ def list_accounts(
         page=page, page_size=page_size, include_live=include_live,
         refresh_live=refresh_live, subscription_plan=subscription_plan,
         operational_status=operational_status, session=session,
+        account_source=account_source,
         snapshot_only=snapshot_only,
     )
 

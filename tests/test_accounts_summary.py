@@ -1939,3 +1939,49 @@ def test_operational_filter_changes_items_but_keeps_global_summary_counts():
     assert result["summary"]["total"] == 2
     assert result["summary"]["normal"] == 1
     assert result["summary"]["abnormal"] == 1
+
+
+def test_remote_source_filter_does_not_reclassify_a_live_local_account(monkeypatch):
+    engine = _live_test_engine()
+    monkeypatch.setattr(
+        'services.chatgpt_codex2api_health.fetch_codex2api_quota_accounts',
+        lambda **kwargs: [
+            _remote_row(remote_id=1, email='local@example.com'),
+            _remote_row(remote_id=2, email='remote@example.com'),
+        ],
+    )
+    with Session(engine) as session:
+        session.add(Codex2APITargetModel(id=1, name='default', base_url='https://example.com', admin_key_ref='test', enabled=True))
+        session.add(AccountModel(platform='chatgpt', email='local@example.com', password='p', account_source='local', extra_json='{"account_type":"chatgpt_password"}'))
+        session.commit()
+        result = list_accounts(platform='chatgpt', include_live=True, account_source='codex2api', session=session)
+    assert [row['email'] for row in result['items']] == ['remote@example.com']
+    assert result['summary']['total'] == 1
+
+
+def test_local_source_filter_excludes_live_remote_rows_and_counts_full_local_list(monkeypatch):
+    engine = _live_test_engine()
+    monkeypatch.setattr(
+        'services.chatgpt_codex2api_health.fetch_codex2api_quota_accounts',
+        lambda **kwargs: [_remote_row(remote_id=2, email='remote@example.com')],
+    )
+    with Session(engine) as session:
+        session.add(Codex2APITargetModel(id=1, name='default', base_url='https://example.com', admin_key_ref='test', enabled=True))
+        session.add_all([AccountModel(platform='chatgpt', email=f'local{index}@example.com', password='p', account_source='local', extra_json='{"account_type":"chatgpt_password"}') for index in range(2)])
+        session.commit()
+        result = list_accounts(platform='chatgpt', include_live=True, account_source='local', page_size=1, session=session)
+    assert len(result['items']) == 1
+    assert result['items'][0]['account_source'] == 'local'
+    assert result['total'] == result['summary']['total'] == 2
+
+
+def test_account_summary_respects_disabled_or_locked_inventory_without_live_match():
+    for flags in ({'enabled': False}, {'locked': True}):
+        account = AccountModel(
+            platform='chatgpt', email='disabled@example.com', password='',
+            account_source='codex2api', status='registered',
+            extra_json=json.dumps({'remote_only': True, 'codex_remote_snapshot': {'status': 'active', **flags}}),
+        )
+        result = _account_operational_summary([account], [], {None: {'quota_status': 'not_configured'}})
+        assert result['normal'] == 0
+        assert result['errors'] == 1

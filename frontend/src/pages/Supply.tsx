@@ -87,7 +87,7 @@ export default function Supply() {
         </>}
       </Form>
     </div>
-    <ChatGPTExistingAccountLoginModal open={loginOpen} onClose={() => setLoginOpen(false)} onDone={() => navigate('/accounts/chatgpt')} />
+    <ChatGPTExistingAccountLoginModal open={loginOpen} onClose={() => setLoginOpen(false)} />
     <CodexAccountImportModal open={importOpen} onClose={() => setImportOpen(false)} onCompleted={() => navigate('/accounts/chatgpt')} />
   </div>
 }

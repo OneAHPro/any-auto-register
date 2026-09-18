@@ -1168,6 +1168,9 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
             binding.remote_status = str(row.get("remote_status") or row.get("status") or "")
             binding.enabled = schedulable
             binding.sync_status = "synced" if target_enabled else "target_disabled"
+            # A successful observation supersedes errors from older snapshots.
+            # Current target/identity quarantine is reapplied below.
+            binding.last_error = ""
             if not target_enabled:
                 binding.remote_status = "target_disabled"
                 binding.last_error = "目标节点已停用"

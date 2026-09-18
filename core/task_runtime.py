@@ -215,7 +215,7 @@ class RegisterTaskControl:
     def request_stop(self) -> None:
         self.request_stop_once()
 
-    def request_stop_once(self) -> bool:
+    def request_stop_once(self, *, interrupt_async: bool = False) -> bool:
         """Set the sticky stop flag and report whether this call changed it."""
         callbacks: list[Callable[[], None]] = []
         with self._lock:
@@ -225,7 +225,22 @@ class RegisterTaskControl:
                 callbacks = self._pop_attempt_interrupts_locked(
                     set(self._active_attempt_ids)
                 )
-        self._invoke_interrupts(callbacks)
+        if interrupt_async and callbacks:
+            # A browser/transport close can block. A control request must still
+            # acknowledge its sticky flag without holding the store lock.
+            try:
+                threading.Thread(
+                    target=self._invoke_interrupts,
+                    args=(callbacks,),
+                    name="task-stop-interrupts",
+                    daemon=True,
+                ).start()
+            except RuntimeError:
+                # Cooperative checkpoints still observe the accepted stop.
+                # Never perform potentially blocking cleanup in the caller.
+                pass
+        else:
+            self._invoke_interrupts(callbacks)
         return first_request
 
     def request_skip_current(self) -> None:
@@ -474,6 +489,8 @@ class RegisterTaskStore:
     def request_stop_if_active(
         self,
         task_id: str,
+        *,
+        interrupt_async: bool = False,
     ) -> tuple[str, bool, dict[str, Any]]:
         """Atomically validate active state and set the sticky stop flag."""
         with self._lock:
@@ -482,7 +499,9 @@ class RegisterTaskStore:
                 return "missing", False, {}
             if record.status in ("done", "failed", "stopped"):
                 return "terminal", False, record.control.snapshot()
-            first_request = record.control.request_stop_once()
+            first_request = record.control.request_stop_once(
+                interrupt_async=interrupt_async,
+            )
             record.updated_at = time.time()
             return "active", first_request, record.control.snapshot()
 

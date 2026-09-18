@@ -29,6 +29,13 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.initial_task_ids = {
             snapshot["id"] for snapshot in _task_store.list_snapshots()
         }
+        # Quota/report retries use fake providers in these unit tests. Keep
+        # their backoffs virtual without changing real threading/test clocks.
+        task_time = mock.Mock(wraps=time)
+        task_time.sleep.return_value = None
+        clock = mock.patch("api.tasks.time", task_time)
+        clock.start()
+        self.addCleanup(clock.stop)
         persistence = mock.patch("api.tasks._persist_task_snapshot")
         persistence.start()
         self.addCleanup(persistence.stop)
@@ -2461,191 +2468,279 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         self.assertEqual(snapshot["registered"], 1)
         self.assertEqual(snapshot["progress"], "1/1")
 
-    def test_explicit_stop_escalates_a_stuck_automatic_task(self):
+    def test_stopping_stuck_automation_never_terminates_the_service(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
-            task_id,
-            [201],
-            source="schedule",
-            automation=True,
+            task_id, [201], source="schedule", automation=True,
         )
         _task_store.mark_running(task_id)
         forced_exit = threading.Event()
-        exit_codes: list[int] = []
+        with mock.patch.dict(
+            os.environ, {"CHATGPT_AUTOMATION_FORCE_STOP_SECONDS": "0.01"},
+        ), mock.patch("os._exit", side_effect=lambda code: forced_exit.set()):
+            response = tasks_module.stop_task(task_id)
+            self.assertFalse(forced_exit.wait(timeout=0.1))
+        self.assertTrue(response["ok"])
+        self.assertTrue(response["control"]["stop_requested"])
+        self.assertEqual(_task_store.snapshot(task_id)["status"], "running")
 
-        def record_exit(code: int) -> None:
-            exit_codes.append(code)
-            forced_exit.set()
-
+    def test_stop_acknowledges_without_database_or_synchronous_logging(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(task_id, [202])
         with mock.patch.object(
-            tasks_module,
-            "_finalize_orphan_tasks",
-        ) as finalize_orphans, mock.patch.dict(
-            os.environ,
-            {"CHATGPT_AUTOMATION_FORCE_STOP_SECONDS": "0.05"},
-        ), mock.patch(
-            "os._exit",
-            side_effect=record_exit,
-        ), mock.patch.object(
-            tasks_module,
-            "_append_task_log_best_effort",
-        ) as append_watchdog_log, mock.patch.object(
-            tasks_module,
-            "_persist_task_snapshot_best_effort",
-        ) as persist_watchdog_snapshot:
-            tasks_module.stop_task(task_id)
-            persist_calls_before_watchdog = (
-                persist_watchdog_snapshot.call_count
-            )
-            self.assertTrue(forced_exit.wait(timeout=0.5))
+            tasks_module, "_finalize_orphan_tasks",
+        ) as reconcile, mock.patch.object(
+            tasks_module, "_log",
+        ) as log, mock.patch.object(
+            tasks_module, "_persist_task_snapshot_best_effort",
+        ) as persist:
+            response = tasks_module.stop_task(task_id)
+        self.assertTrue(response["control"]["stop_requested"])
+        reconcile.assert_not_called()
+        log.assert_not_called()
+        persist.assert_not_called()
 
-        self.assertEqual(exit_codes, [75])
-        finalize_orphans.assert_not_called()
-        append_watchdog_log.assert_not_called()
-        # The stop endpoint persists; the watchdog itself must not touch
-        # SQLite because a wedged DB lock may be the reason it is firing.
-        self.assertEqual(
-            persist_watchdog_snapshot.call_count,
-            persist_calls_before_watchdog,
-        )
-        snapshot = _task_store.snapshot(task_id)
-        self.assertTrue(snapshot["control"]["stop_requested"])
+    def test_stop_acknowledges_while_resource_interrupt_is_blocked(self):
+        task_id = f"task-relogin-{uuid.uuid4().hex}"
+        _create_chatgpt_relogin_task_record(task_id, [203])
+        control = _task_store.control_for(task_id)
+        attempt_id = control.start_attempt()
+        interrupt_entered = threading.Event()
+        release_interrupt = threading.Event()
+        stop_returned = threading.Event()
+        responses = []
 
-    def test_force_stop_grace_rejects_non_finite_environment_values(self):
-        for raw_value in ("nan", "inf", "-inf"):
-            with self.subTest(raw_value=raw_value), mock.patch.dict(
-                os.environ,
-                {"CHATGPT_AUTOMATION_FORCE_STOP_SECONDS": raw_value},
-            ):
-                self.assertEqual(
-                    tasks_module._automation_force_stop_seconds(),
-                    30.0,
-                )
+        def blocked_interrupt():
+            interrupt_entered.set()
+            release_interrupt.wait(timeout=2)
 
-    def test_stop_watchdog_keeps_running_until_automation_runner_finishes(self):
+        def stop():
+            responses.append(tasks_module.stop_task(task_id))
+            stop_returned.set()
+
+        control.register_attempt_interrupt(attempt_id, blocked_interrupt)
+        worker = threading.Thread(target=stop)
+        try:
+            worker.start()
+            self.assertTrue(interrupt_entered.wait(timeout=1))
+            self.assertTrue(stop_returned.wait(timeout=0.2))
+            self.assertTrue(responses[0]["control"]["stop_requested"])
+            self.assertEqual(_task_store.snapshot(task_id)["status"], "pending")
+        finally:
+            release_interrupt.set()
+            worker.join(timeout=2)
+            control.finish_attempt(attempt_id)
+        self.assertFalse(worker.is_alive())
+
+    def test_terminal_task_stop_preserves_outcome_without_cleanup_watchdog(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
-            task_id,
-            [202],
-            source="schedule",
-            automation=True,
+            task_id, [207], source="schedule", automation=True,
         )
-        _task_store.mark_running(task_id)
-        tasks_module._mark_automation_runner_started(task_id)
-        forced_exit = threading.Event()
-
-        with mock.patch.dict(
-            os.environ,
-            {"CHATGPT_AUTOMATION_FORCE_STOP_SECONDS": "0.05"},
-        ), mock.patch(
-            "os._exit",
-            side_effect=lambda code: forced_exit.set(),
-        ) as exit_mock:
-            self.assertTrue(
-                tasks_module._arm_automation_stop_watchdog(task_id)
-            )
-            _task_store.finish(
-                task_id,
-                status="stopped",
-                success=0,
-                registered=0,
-                skipped=0,
-                errors=[],
-            )
-            self.assertTrue(forced_exit.wait(timeout=0.5))
-
-        exit_mock.assert_called_once_with(75)
-        tasks_module._mark_automation_runner_finished(task_id)
-
-    def test_stop_watchdog_stands_down_after_automation_runner_finishes(self):
-        task_id = f"task-relogin-{uuid.uuid4().hex}"
-        _create_chatgpt_relogin_task_record(
-            task_id,
-            [205],
-            source="schedule",
-            automation=True,
+        _task_store.finish(
+            task_id, status="done", success=1, registered=1, skipped=0, errors=[],
         )
-        _task_store.mark_running(task_id)
-        tasks_module._mark_automation_runner_started(task_id)
-
-        with mock.patch.dict(
-            os.environ,
-            {"CHATGPT_AUTOMATION_FORCE_STOP_SECONDS": "0.05"},
-        ), mock.patch("os._exit") as forced_exit:
-            self.assertTrue(
-                tasks_module._arm_automation_stop_watchdog(task_id)
-            )
-            _task_store.finish(
-                task_id,
-                status="stopped",
-                success=0,
-                registered=0,
-                skipped=0,
-                errors=[],
-            )
-            tasks_module._mark_automation_runner_finished(task_id)
-            time.sleep(0.1)
-
+        with mock.patch("os._exit") as forced_exit:
+            with self.assertRaises(HTTPException) as error:
+                tasks_module.stop_task(task_id)
+        self.assertEqual(error.exception.status_code, 409)
+        self.assertEqual(_task_store.snapshot(task_id)["status"], "done")
         forced_exit.assert_not_called()
 
-    def test_watchdog_start_failure_immediately_recycles_the_process(self):
+    def test_priority_callback_allows_waiter_cancellation_during_blocked_interrupt(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
         _create_chatgpt_relogin_task_record(
-            task_id,
-            [206],
-            source="schedule",
-            automation=True,
+            task_id, [210], source="schedule", automation=True,
         )
-        thread = mock.Mock()
-        thread.start.side_effect = RuntimeError("thread start failed")
+        gate = ChatGPTTaskGate()
+        control = _task_store.control_for(task_id)
+        started = threading.Event()
+        interrupt_started = threading.Event()
+        interrupt_finished = threading.Event()
+        release = threading.Event()
+        cancelled = threading.Event()
+        foreground_finished = threading.Event()
+        foreground_leases = []
 
-        with mock.patch(
-            "api.tasks.threading.Thread",
-            return_value=thread,
-        ), mock.patch("os._exit") as forced_exit:
-            armed = tasks_module._arm_automation_stop_watchdog(task_id)
+        def interrupt():
+            interrupt_started.set()
+            release.wait(timeout=2)
+            interrupt_finished.set()
 
-        self.assertFalse(armed)
-        forced_exit.assert_called_once_with(75)
-        self.assertNotIn(
-            task_id,
-            tasks_module._automation_stop_watchdog_tasks,
-        )
+        def body(*args, **kwargs):
+            attempt_id = control.start_attempt()
+            control.register_attempt_interrupt(attempt_id, interrupt)
+            started.set()
+            release.wait(timeout=2)
+            control.finish_attempt(attempt_id)
 
-    def test_terminal_snapshot_can_still_stop_an_active_automation_runner(self):
+        def enter_foreground():
+            foreground_leases.append(gate.enter_foreground(cancelled=cancelled.is_set))
+            foreground_finished.set()
+
+        worker = threading.Thread(target=_run_chatgpt_relogin_task, args=(task_id, [210]))
+        foreground = threading.Thread(target=enter_foreground)
+        with mock.patch.object(
+            tasks_module, "chatgpt_task_gate", gate,
+        ), mock.patch.object(
+            tasks_module, "_run_chatgpt_relogin_task_body", side_effect=body,
+        ), mock.patch.object(tasks_module, "_log") as log, mock.patch.object(
+            tasks_module, "_persist_task_snapshot_best_effort",
+        ) as persist:
+            try:
+                worker.start()
+                self.assertTrue(started.wait(timeout=1))
+                foreground.start()
+                self.assertTrue(interrupt_started.wait(timeout=1))
+                cancelled.set()
+                self.assertTrue(foreground_finished.wait(timeout=0.3))
+                self.assertEqual(foreground_leases, [None])
+                self.assertTrue(gate.snapshot()["automation_active"])
+                self.assertEqual(gate.snapshot()["foreground_waiters"], 0)
+                log.assert_not_called()
+                persist.assert_not_called()
+            finally:
+                release.set()
+                worker.join(timeout=2)
+                if foreground.ident is not None:
+                    foreground.join(timeout=2)
+                self.assertTrue(interrupt_finished.wait(timeout=1))
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(foreground.is_alive())
+
+    def test_waiting_manual_stop_stays_responsive_when_persistence_is_blocked(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
-        _create_chatgpt_relogin_task_record(
-            task_id,
-            [207],
-            source="schedule",
-            automation=True,
-        )
-        _task_store.mark_running(task_id)
-        tasks_module._mark_automation_runner_started(task_id)
-        _task_store.finish(
-            task_id,
-            status="done",
-            success=1,
-            registered=1,
-            skipped=0,
-            errors=[],
-        )
+        _create_chatgpt_relogin_task_record(task_id, [209])
+        gate = ChatGPTTaskGate()
+        automation_lease = gate.try_enter_automation()
+        waiting = threading.Event()
+        release_persistence = threading.Event()
+        stop_returned = threading.Event()
+        real_append_log = _task_store.append_log
 
-        try:
-            with mock.patch.object(
-                tasks_module,
-                "_arm_automation_stop_watchdog",
-                return_value=True,
-            ) as arm_watchdog, mock.patch.object(
-                tasks_module,
-                "_persist_task_snapshot_best_effort",
-            ):
-                response = tasks_module.stop_task(task_id)
+        def observe_log(current_task_id, entry):
+            real_append_log(current_task_id, entry)
+            if "等待自动重登释放" in entry:
+                waiting.set()
 
-            self.assertTrue(response["ok"])
-            arm_watchdog.assert_called_once_with(task_id)
-        finally:
-            tasks_module._mark_automation_runner_finished(task_id)
+        def blocked_persistence(*args, **kwargs):
+            release_persistence.wait(timeout=2)
+
+        def stop():
+            tasks_module.stop_task(task_id)
+            stop_returned.set()
+
+        worker = threading.Thread(target=_run_chatgpt_relogin_task, args=(task_id, [209]))
+        stopper = threading.Thread(target=stop)
+        with mock.patch.object(
+            tasks_module, "chatgpt_task_gate", gate,
+        ), mock.patch.object(
+            _task_store, "append_log", side_effect=observe_log,
+        ), mock.patch.object(
+            tasks_module, "_persist_task_snapshot_throttled", side_effect=blocked_persistence,
+        ), mock.patch.object(
+            tasks_module, "_persist_task_snapshot_best_effort", side_effect=blocked_persistence,
+        ), mock.patch("services.chatgpt_relogin.relogin_chatgpt_account") as relogin:
+            try:
+                worker.start()
+                self.assertTrue(waiting.wait(timeout=1))
+                stopper.start()
+                self.assertTrue(stop_returned.wait(timeout=0.2))
+                deadline = time.monotonic() + 0.5
+                while time.monotonic() < deadline:
+                    if _task_store.snapshot(task_id)["status"] == "stopped":
+                        break
+                    time.sleep(0.01)
+                self.assertEqual(_task_store.snapshot(task_id)["status"], "stopped")
+                self.assertEqual(gate.snapshot()["foreground_waiters"], 0)
+                self.assertTrue(gate.snapshot()["automation_active"])
+            finally:
+                release_persistence.set()
+                worker.join(timeout=2)
+                if stopper.ident is not None:
+                    stopper.join(timeout=2)
+                gate.leave_automation(automation_lease)
+        relogin.assert_not_called()
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(stopper.is_alive())
+
+    def test_completed_automation_releases_gate_before_blocked_postprocessing(self):
+        for blocked_phase in ("persistence", "quota", "smtp"):
+            with self.subTest(blocked_phase=blocked_phase):
+                task_id = f"task-relogin-{uuid.uuid4().hex}"
+                _create_chatgpt_relogin_task_record(
+                    task_id, [208], source="schedule", automation=True,
+                )
+                gate = ChatGPTTaskGate()
+                postprocessing_entered = threading.Event()
+                release_postprocessing = threading.Event()
+                foreground_entered = threading.Event()
+                thread_errors = []
+
+                def block_postprocessing():
+                    postprocessing_entered.set()
+                    release_postprocessing.wait(timeout=2)
+
+                def persist(current_task_id):
+                    if (blocked_phase == "persistence"
+                            and _task_store.snapshot(current_task_id)["status"] == "done"):
+                        block_postprocessing()
+
+                def quota(**kwargs):
+                    if blocked_phase == "quota":
+                        block_postprocessing()
+                    return []
+
+                def alert(**kwargs):
+                    if blocked_phase == "smtp":
+                        block_postprocessing()
+                    return {"sent": False, "reason": "below_threshold", "threshold": 5}
+
+                def run_automation():
+                    try:
+                        _run_chatgpt_relogin_task(task_id, [208])
+                    except BaseException as exc:
+                        thread_errors.append(exc)
+
+                def run_foreground():
+                    lease = gate.enter_foreground()
+                    foreground_entered.set()
+                    gate.leave_foreground(lease)
+
+                worker = threading.Thread(target=run_automation)
+                foreground = threading.Thread(target=run_foreground)
+                with mock.patch.object(
+                    tasks_module, "chatgpt_task_gate", gate,
+                ), mock.patch.object(
+                    tasks_module, "_persist_task_snapshot", side_effect=persist,
+                ), mock.patch(
+                    "services.chatgpt_codex2api_health.inspect_codex2api_account_health",
+                    return_value={208: {"account_id": 208, "state": "healthy"}},
+                ), mock.patch(
+                    "services.chatgpt_auth_state.clear_chatgpt_auth_failure",
+                ), mock.patch("os._exit") as forced_exit:
+                    self.final_quota_reader.side_effect = quota
+                    self.alert_sender.side_effect = alert
+                    try:
+                        worker.start()
+                        self.assertTrue(postprocessing_entered.wait(timeout=1))
+                        self.assertEqual(_task_store.snapshot(task_id)["status"], "done")
+                        foreground.start()
+                        self.assertTrue(foreground_entered.wait(timeout=0.2))
+                        self.assertTrue(worker.is_alive())
+                        self.assertFalse(gate.snapshot()["automation_active"])
+                    finally:
+                        release_postprocessing.set()
+                        worker.join(timeout=2)
+                        if foreground.ident is not None:
+                            foreground.join(timeout=2)
+                    forced_exit.assert_not_called()
+                self.assertFalse(worker.is_alive())
+                self.assertFalse(foreground.is_alive())
+                self.assertEqual(thread_errors, [])
+                self.assertEqual(_task_store.snapshot(task_id)["status"], "done")
+                self.final_quota_reader.side_effect = None
+                self.alert_sender.side_effect = None
 
     def test_coordinator_observes_stop_while_account_step_is_blocked(self):
         task_id = f"task-relogin-{uuid.uuid4().hex}"
@@ -2698,9 +2793,6 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         with mock.patch.object(
             tasks_module,
             "_finalize_orphan_tasks",
-        ), mock.patch.object(
-            tasks_module,
-            "_arm_automation_stop_watchdog",
         ):
             tasks_module.stop_task(task_id)
             tasks_module.stop_task(task_id)
@@ -3034,8 +3126,8 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         auto_control = _task_store.control_for(auto_task_id)
         real_request_stop_once = auto_control.request_stop_once
 
-        def request_stop_once() -> bool:
-            first_request = real_request_stop_once()
+        def request_stop_once(**kwargs) -> bool:
+            first_request = real_request_stop_once(**kwargs)
             stop_requested.set()
             return first_request
 
@@ -3135,7 +3227,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
         thread_errors: list[BaseException] = []
         automation_lease = gate.try_enter_automation(lambda: None)
         self.assertIsNotNone(automation_lease)
-        real_log = tasks_module._log
+        real_log = tasks_module._log_control_in_memory
 
         def observe_log(current_task_id, message):
             real_log(current_task_id, message)
@@ -3156,7 +3248,7 @@ class ChatGPTReloginTaskTests(unittest.TestCase):
             ), mock.patch(
                 "api.tasks._run_chatgpt_relogin_task_inner"
             ) as inner, mock.patch(
-                "api.tasks._log",
+                "api.tasks._log_control_in_memory",
                 side_effect=observe_log,
             ):
                 worker.start()

@@ -87,6 +87,54 @@ class RegisterTaskControlTests(unittest.TestCase):
         unregister()
         control.finish_attempt(attempt_id)
 
+    def test_async_stop_interrupts_resources_once_without_holding_store_lock(self):
+        store = RegisterTaskStore()
+        store.create("async-stop", platform="chatgpt", total=1, source="manual")
+        control = store.control_for("async-stop")
+        attempt_id = control.start_attempt()
+        interrupt_started = threading.Event()
+        release_interrupt = threading.Event()
+        interrupt_finished = threading.Event()
+        calls = []
+
+        def interrupt():
+            calls.append(store.snapshot("async-stop")["id"])
+            interrupt_started.set()
+            release_interrupt.wait(timeout=1)
+            interrupt_finished.set()
+
+        control.register_attempt_interrupt(attempt_id, interrupt)
+        try:
+            state, first_request, snapshot = store.request_stop_if_active(
+                "async-stop", interrupt_async=True,
+            )
+            self.assertEqual(state, "active")
+            self.assertTrue(first_request)
+            self.assertTrue(snapshot["stop_requested"])
+            self.assertTrue(interrupt_started.wait(timeout=1))
+            _, first_request, _ = store.request_stop_if_active(
+                "async-stop", interrupt_async=True,
+            )
+            self.assertFalse(first_request)
+            self.assertEqual(calls, ["async-stop"])
+        finally:
+            release_interrupt.set()
+            self.assertTrue(interrupt_finished.wait(timeout=1))
+            control.finish_attempt(attempt_id)
+
+    def test_async_stop_thread_start_failure_keeps_stop_without_running_cleanup(self):
+        control = RegisterTaskControl()
+        attempt_id = control.start_attempt()
+        interrupt = mock.Mock()
+        control.register_attempt_interrupt(attempt_id, interrupt)
+        with mock.patch.object(
+            threading.Thread, "start", side_effect=RuntimeError("no threads"),
+        ):
+            self.assertTrue(control.request_stop_once(interrupt_async=True))
+        self.assertTrue(control.is_stop_requested())
+        interrupt.assert_not_called()
+        control.finish_attempt(attempt_id)
+
     def test_skip_interrupts_only_live_attempt_resources(self):
         control = RegisterTaskControl()
         live_attempt = control.start_attempt()

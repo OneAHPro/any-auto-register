@@ -3,6 +3,7 @@ import os
 import subprocess
 import sys
 
+import pytest
 from sqlalchemy import inspect
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine, select
@@ -65,6 +66,29 @@ def test_pool_tables_and_account_identity_column_are_created():
             )
         }
     assert "uq_account_target_binding_identity_target" in indexes
+
+
+def test_schema_adds_durable_ambiguity_reason_to_existing_identities():
+    engine = make_engine()
+    with engine.begin() as connection:
+        connection.exec_driver_sql(
+            "CREATE TABLE account_identities (id TEXT PRIMARY KEY, platform TEXT, "
+            "canonical_email TEXT, state TEXT, current_account_id INTEGER, "
+            "created_at DATETIME, updated_at DATETIME)"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO account_identities "
+            "(id, platform, canonical_email, state, current_account_id) "
+            "VALUES ('legacy', 'chatgpt', 'legacy@example.com', 'ambiguous', 1)"
+        )
+
+    for _ in range(2):
+        db.init_account_pool_schema(engine)
+
+    with Session(engine) as session:
+        identity = session.get(db.AccountIdentityModel, "legacy")
+        assert identity.state == "ambiguous"
+        assert identity.ambiguity_reason == ""
 
 
 def test_schema_initializer_registers_durable_operations_tables_in_a_fresh_process():
@@ -151,7 +175,15 @@ def test_schema_migration_adds_quota_amount_columns_before_backfill():
     assert values == (1234, 567, None)
 
 
-def test_schema_migration_survives_duplicate_strong_aliases():
+@pytest.mark.parametrize("alias_type,second_email,expected_state,expected_aliases", [
+    ("workspace_id", "two@example.com", "active", 2),
+    ("chatgpt_account_id", "two@example.com", "active", 2),
+    ("workspace_id", "one@example.com", "ambiguous", 2),
+    ("credential_fingerprint", "two@example.com", "ambiguous", 1),
+])
+def test_schema_migration_preserves_shared_workspace_members(
+    alias_type, second_email, expected_state, expected_aliases,
+):
     engine = make_engine()
     db.init_account_pool_schema(engine)
     timestamp = "2026-09-02T00:00:00+00:00"
@@ -168,22 +200,22 @@ def test_schema_migration_survives_duplicate_strong_aliases():
         connection.exec_driver_sql(
             "INSERT INTO account_identities "
             "(id, platform, canonical_email, state, current_account_id, created_at, updated_at) "
-            "VALUES ('i-2', 'chatgpt', 'two@example.com', 'active', 2, ?, ?)" ,
-            (timestamp, timestamp),
+            "VALUES ('i-2', 'chatgpt', ?, 'active', 2, ?, ?)" ,
+            (second_email, timestamp, timestamp),
         )
         connection.exec_driver_sql(
             "INSERT INTO account_identity_aliases "
             "(identity_id, platform, alias_type, normalized_value, source, first_seen_at, last_seen_at) "
-            "VALUES ('i-1', 'chatgpt', 'workspace_id', 'shared', '', ?, ?)"
+            "VALUES ('i-1', 'chatgpt', ?, 'shared', '', ?, ?)"
             ,
-            (timestamp, timestamp),
+            (alias_type, timestamp, timestamp),
         )
         connection.exec_driver_sql(
             "INSERT INTO account_identity_aliases "
             "(identity_id, platform, alias_type, normalized_value, source, first_seen_at, last_seen_at) "
-            "VALUES ('i-2', 'chatgpt', 'workspace_id', 'shared', '', ?, ?)"
+            "VALUES ('i-2', 'chatgpt', ?, 'shared', '', ?, ?)"
             ,
-            (timestamp, timestamp),
+            (alias_type, timestamp, timestamp),
         )
 
     db.init_account_pool_schema(engine)
@@ -195,7 +227,11 @@ def test_schema_migration_survives_duplicate_strong_aliases():
                 "SELECT id, state FROM account_identities WHERE id IN ('i-1', 'i-2')"
             )
         }
-    assert states == {"i-1": "ambiguous", "i-2": "ambiguous"}
+        aliases = connection.exec_driver_sql(
+            "SELECT identity_id FROM account_identity_aliases WHERE normalized_value = 'shared'"
+        ).fetchall()
+    assert states == {"i-1": expected_state, "i-2": expected_state}
+    assert len(aliases) == expected_aliases
 
 
 def test_account_cleanup_retires_control_plane_state_but_preserves_quota():

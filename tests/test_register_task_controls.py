@@ -524,7 +524,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         thread_errors: list[BaseException] = []
         automation_lease = gate.try_enter_automation(lambda: None)
         self.assertIsNotNone(automation_lease)
-        real_log = __import__("api.tasks", fromlist=["_log"])._log
+        real_log = tasks_module._log_control_in_memory
 
         def observe_log(current_task_id, message):
             real_log(current_task_id, message)
@@ -545,7 +545,7 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
             ), mock.patch(
                 "api.tasks._run_register_inner"
             ) as inner, mock.patch(
-                "api.tasks._log",
+                "api.tasks._log_control_in_memory",
                 side_effect=observe_log,
             ), mock.patch(
                 "api.tasks.sms_pool_service.release_task"

@@ -207,6 +207,46 @@ describe('Accounts ChatGPT staged login integration', () => {
     expect(screen.getByTestId('account-source-summary').textContent).toContain('本地账号 1 · 远端账号 19 · 远端正常 10 · 远端调度中 9')
   })
 
+  it('filters the account card list to local accounts explicitly', async () => {
+    const localAccount = { ...eligibleAccount, email: 'local@example.com', account_source: 'local' }
+    const remoteAccount = {
+      ...eligibleAccount,
+      id: 91,
+      email: 'remote@example.com',
+      password: '',
+      account_source: 'codex2api',
+      remote_only: true,
+      extra_json: JSON.stringify({ remote_only: true }),
+    }
+    vi.mocked(apiFetch).mockImplementation(async (path) => {
+      if (path.startsWith('/accounts?')) {
+        const localOnly = path.includes('account_source=local')
+        return {
+          items: localOnly ? [localAccount] : [localAccount, remoteAccount],
+          total: localOnly ? 1 : 2,
+          summary: { total: localOnly ? 1 : 2, normal: localOnly ? 1 : 2 },
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+
+    const user = userEvent.setup()
+    render(<Accounts />)
+    expect(await screen.findByText('local@example.com')).toBeTruthy()
+    expect(screen.getByText('remote@example.com')).toBeTruthy()
+
+    await user.click(screen.getByText('本地账号', { selector: '.ant-segmented-item-label' }))
+
+    await waitFor(() => {
+      const requests = vi.mocked(apiFetch).mock.calls
+        .filter(([path]) => String(path).startsWith('/accounts?'))
+      expect(String(requests.at(-1)?.[0])).toContain('account_source=local')
+    })
+    expect(await screen.findByText('local@example.com')).toBeTruthy()
+    expect(screen.queryByText('remote@example.com')).toBeNull()
+  })
+
   it('clears selected records without changing the current account filter', async () => {
     const user = userEvent.setup()
     render(<Accounts />)

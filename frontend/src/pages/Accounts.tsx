@@ -294,6 +294,7 @@ interface AccountSourceSummary {
 }
 
 type AccountOperationalFilter = '' | 'normal' | 'scheduling' | 'rate_limited' | 'abnormal'
+type AccountSourceFilter = '' | 'local' | 'codex2api'
 
 function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): AccountOperationalSummary | null {
   if (!value || typeof value !== 'object') return null
@@ -825,6 +826,7 @@ export default function Accounts() {
   const [accountSummary, setAccountSummary] = useState<AccountOperationalSummary | null>(null)
   const [accountSourceSummary, setAccountSourceSummary] = useState<AccountSourceSummary | null>(null)
   const [operationalFilter, setOperationalFilter] = useState<AccountOperationalFilter>('')
+  const [accountSourceFilter, setAccountSourceFilter] = useState<AccountSourceFilter>('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)
   const [loading, setLoading] = useState(false)
@@ -894,6 +896,7 @@ export default function Accounts() {
     setSubscriptionPlan('')
     setAccountSummary(null)
     setOperationalFilter('')
+    setAccountSourceFilter('')
     setSelectedRowKeys([])
     setCostAccount(null)
     setReloginStartError('')
@@ -979,6 +982,7 @@ export default function Accounts() {
       if (filterStatus) params.set('status', filterStatus)
       if (subscriptionPlan) params.set('subscription_plan', subscriptionPlan)
       if (operationalFilter) params.set('operational_status', operationalFilter)
+      if (accountSourceFilter) params.set('account_source', accountSourceFilter)
       const data = await apiFetch(`/accounts?${params}`)
       if (requestEpoch !== accountLoadEpochRef.current) return
       const ordered = (data.items || []).map(normalizeAccount).map((account: any) => {
@@ -1026,7 +1030,7 @@ export default function Accounts() {
     } finally {
       if (requestEpoch === accountLoadEpochRef.current) setLoading(false)
     }
-  }, [currentPlatform, search, filterStatus, subscriptionPlan, operationalFilter, page, pageSize])
+  }, [currentPlatform, search, filterStatus, subscriptionPlan, operationalFilter, accountSourceFilter, page, pageSize])
 
   useEffect(() => {
     loadRef.current = load
@@ -1731,6 +1735,23 @@ export default function Accounts() {
           </Space>
         )}
       />
+      {isChatgptPlatform && (
+        <Segmented
+          aria-label="账号来源"
+          value={accountSourceFilter || 'all'}
+          onChange={(value) => {
+            setPage(1)
+            setOperationalFilter('')
+            setSelectedRowKeys([])
+            setAccountSourceFilter(value === 'all' ? '' : value as AccountSourceFilter)
+          }}
+          options={[
+            { value: 'all', label: '全部账号' },
+            { value: 'local', label: '本地账号' },
+            { value: 'codex2api', label: '远端账号' },
+          ]}
+        />
+      )}
       {isChatgptPlatform && accountSummary ? (
         <AccountOperationalSummaryView
           summary={accountSummary}

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import hmac
 import json
@@ -126,12 +127,16 @@ def _identity_ids_for_aliases(
     return result
 
 
-def _mark_ambiguous(session: Session, identity_ids: Iterable[str]) -> None:
+def _mark_ambiguous(
+    session: Session, identity_ids: Iterable[str], *, reason: str = "",
+) -> None:
     now = _utcnow()
     for identity_id in set(identity_ids):
         row = session.get(AccountIdentityModel, identity_id)
         if row is not None:
             row.state = "ambiguous"
+            if reason and not row.ambiguity_reason:
+                row.ambiguity_reason = reason
             row.updated_at = now
             session.add(row)
 
@@ -146,9 +151,10 @@ def _upsert_aliases(
     now = _utcnow()
     identity = session.get(AccountIdentityModel, identity_id)
     identity_platform = normalize_alias(identity.platform if identity else "")
+    identity_email = normalize_email(identity.canonical_email if identity else "")
     conflicts: set[str] = set()
     for alias_type, value in aliases:
-        rows = session.exec(
+        statement = (
             select(AccountIdentityAliasModel)
             .join(
                 AccountIdentityModel,
@@ -157,7 +163,15 @@ def _upsert_aliases(
             .where(AccountIdentityModel.platform == identity_platform)
             .where(AccountIdentityAliasModel.alias_type == alias_type)
             .where(AccountIdentityAliasModel.normalized_value == value)
-        ).all()
+        )
+        if alias_type in _IDENTITY_ALIAS_TYPES:
+            # Business workspace/account IDs identify the shared workspace,
+            # while the mailbox identifies its member. Fingerprints remain
+            # globally unique within the platform.
+            statement = statement.where(
+                AccountIdentityModel.canonical_email == identity_email
+            )
+        rows = session.exec(statement).all()
         other_ids = {
             str(row.identity_id)
             for row in rows
@@ -165,6 +179,10 @@ def _upsert_aliases(
         }
         if other_ids and alias_type in _STRONG_ALIAS_TYPES:
             conflicts.update(other_ids)
+            if alias_type == "credential_fingerprint":
+                _mark_ambiguous(
+                    session, other_ids | {identity_id}, reason="credential_fingerprint_conflict",
+                )
             continue
         own = next(
             (row for row in rows if str(row.identity_id) == identity_id),
@@ -630,7 +648,7 @@ def _repair_remote_projection_states(database_engine) -> int:
                 for account in rows:
                     identity_id = str(account.identity_id or "").strip()
                     identity = session.get(AccountIdentityModel, identity_id)
-                    if identity is None or identity.state != "ambiguous":
+                    if identity is None or identity.state != "ambiguous" or identity.ambiguity_reason:
                         continue
                     identity.state = "active"
                     identity.updated_at = _utcnow()
@@ -644,6 +662,146 @@ def _repair_remote_projection_states(database_engine) -> int:
         # failed repair must not prevent the application from serving cards.
         return 0
     return changed
+
+
+def _current_shared_workspace(account: AccountModel) -> str:
+    """Return one workspace only when current local/provider evidence agrees.
+
+    Historical aliases and mailbox login IDs are not authoritative workspace
+    evidence. A legacy account ID equal to the member email is a placeholder.
+    JWT claims here are only a consistency veto, never token authentication.
+    """
+    try:
+        extra = account.get_extra()
+    except (TypeError, ValueError):
+        return ""
+    if not isinstance(extra, Mapping):
+        return ""
+    email = normalize_email(account.email)
+    sources = [extra, extra.get("credentials")]
+    local = extra.get("chatgpt_local")
+    if isinstance(local, Mapping):
+        sources.extend(local.get(key) for key in ("subscription", "codex"))
+    snapshot = extra.get("codex_remote_snapshot")
+    if isinstance(snapshot, Mapping):
+        if normalize_email(snapshot.get("email")) != email:
+            return ""
+        if any(snapshot.get(key) for key in ("_inventory_missing", "_inventory_stale", "_inventory_error")):
+            return ""
+        sources.append(snapshot)
+        sources.append(snapshot.get("credentials"))
+    token = str(extra.get("access_token") or account.token or "")
+    if token.count(".") == 2:
+        try:
+            payload = token.split(".")[1]
+            claims = json.loads(base64.urlsafe_b64decode(payload + "=" * (-len(payload) % 4)))
+        except (TypeError, ValueError, UnicodeError):
+            return ""
+        if not isinstance(claims, Mapping):
+            return ""
+        if claims.get("email") and normalize_email(claims.get("email")) != email:
+            return ""
+        sources.extend((claims, claims.get("https://api.openai.com/auth")))
+    values = {
+        normalize_alias(source.get(key))
+        for source in sources if isinstance(source, Mapping)
+        for key in (
+            "workspace_id", "workspaceId", "effective_workspace_id",
+            "chatgpt_account_id", "chatgptAccountId", "account_id", "accountId",
+        )
+        if normalize_alias(source.get(key)) not in {"", email}
+    }
+    return next(iter(values)) if len(values) == 1 else ""
+
+
+def _repair_shared_workspace_member_states(database_engine) -> int:
+    """Repair the old cross-mailbox workspace conflict without clearing others.
+
+    This intentionally requires a single current workspace and mailbox per
+    identity. Existing alias conflicts, provider mismatches, or other explicit
+    quarantine reasons remain for operator review. Binding enablement is left
+    to the normal inventory reconciliation with fresh provider status.
+    """
+    with Session(database_engine) as session:
+        identities = {
+            row.id: row for row in session.exec(select(AccountIdentityModel).where(
+                AccountIdentityModel.platform == "chatgpt",
+            )).all()
+        }
+        email_ids: dict[str, set[str]] = {}
+        for identity in identities.values():
+            email_ids.setdefault(normalize_email(identity.canonical_email), set()).add(identity.id)
+        aliases_by_identity: dict[str, list[AccountIdentityAliasModel]] = {}
+        fingerprints: dict[str, set[str]] = {}
+        for alias in session.exec(select(AccountIdentityAliasModel).where(
+            AccountIdentityAliasModel.platform == "chatgpt",
+        )).all():
+            aliases_by_identity.setdefault(alias.identity_id, []).append(alias)
+            if alias.alias_type == "credential_fingerprint":
+                fingerprints.setdefault(alias.normalized_value, set()).add(alias.identity_id)
+        accounts = session.exec(select(AccountModel).where(
+            func.lower(AccountModel.platform) == "chatgpt",
+        )).all()
+        workspaces: dict[str, list[AccountModel]] = {}
+        accounts_by_identity: dict[str, list[AccountModel]] = {}
+        for account in accounts:
+            accounts_by_identity.setdefault(account.identity_id, []).append(account)
+            fingerprint = _account_identity_values(account)["credential_fingerprint"]
+            if account.identity_id:
+                fingerprints.setdefault(fingerprint, set()).add(account.identity_id)
+            workspace = _current_shared_workspace(account)
+            if workspace and normalize_email(account.email):
+                workspaces.setdefault(workspace, []).append(account)
+        fingerprint_conflicts = set().union(*(
+            owners for owners in fingerprints.values() if len(owners) > 1
+        ))
+        changed = 0
+        for workspace, members in workspaces.items():
+            if len({normalize_email(account.email) for account in members}) < 2:
+                continue
+            for account in members:
+                identity = identities.get(account.identity_id)
+                email = normalize_email(account.email)
+                if (
+                    identity is None or identity.state != "ambiguous"
+                    or identity.ambiguity_reason
+                    or _is_remote_only_projection(account)
+                    or email_ids.get(email) != {identity.id}
+                    or normalize_email(identity.canonical_email) != email
+                    or identity.current_account_id != account.id
+                    or len(accounts_by_identity.get(identity.id, [])) != 1
+                    or identity.id in fingerprint_conflicts
+                ):
+                    continue
+                aliases = aliases_by_identity.get(identity.id, [])
+                if any(
+                    alias.alias_type in _IDENTITY_ALIAS_TYPES
+                    and alias.normalized_value not in {workspace, email}
+                    for alias in aliases
+                ):
+                    continue
+                bindings = session.exec(select(AccountTargetBindingModel).where(
+                    AccountTargetBindingModel.identity_id == identity.id,
+                )).all()
+                if any(
+                    binding.local_account_id != account.id
+                    or normalize_email(binding.remote_email) not in {"", email}
+                    or binding.last_error not in {"", "身份存在歧义，等待人工确认"}
+                    for binding in bindings
+                ):
+                    continue
+                assignments = session.exec(select(AccountAssignmentModel).where(
+                    AccountAssignmentModel.identity_id == identity.id,
+                )).all()
+                if any("mismatch" in str(row.lease_reason or "") for row in assignments):
+                    continue
+                identity.state = "active"
+                identity.updated_at = _utcnow()
+                session.add(identity)
+                changed += 1
+        if changed:
+            session.commit()
+        return changed
 
 
 def reconcile_existing_accounts(database_engine=None) -> int:
@@ -695,6 +853,7 @@ def reconcile_existing_accounts(database_engine=None) -> int:
         )
         reconciled += 1
     _repair_remote_projection_states(target_engine)
+    _repair_shared_workspace_member_states(target_engine)
     return reconciled
 
 

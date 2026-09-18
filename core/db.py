@@ -258,6 +258,8 @@ class AccountIdentityModel(SQLModel, table=True):
     platform: str = Field(index=True)
     canonical_email: str = Field(index=True)
     state: str = Field(default="active", index=True)
+    # Retain real conflict evidence after legacy duplicate rows are removed.
+    ambiguity_reason: str = Field(default="", sa_column_kwargs={"server_default": ""})
     current_account_id: int = Field(default=0, index=True)
     created_at: datetime = Field(default_factory=_utcnow)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
@@ -2263,6 +2265,16 @@ def init_account_pool_schema(database_engine=None) -> None:
     from core import operations_models as _operations_models  # noqa: F401
     SQLModel.metadata.create_all(target_engine)
 
+    with target_engine.begin() as conn:
+        identity_columns = {
+            column["name"] for column in sqlalchemy_inspect(conn).get_columns("account_identities")
+        }
+        if "ambiguity_reason" not in identity_columns:
+            conn.exec_driver_sql(
+                "ALTER TABLE account_identities "
+                "ADD COLUMN ambiguity_reason TEXT NOT NULL DEFAULT ''"
+            )
+
     if target_engine.url.get_backend_name() != "sqlite":
         _migrate_operations_billing_snapshot_relational_schema(target_engine)
         _migrate_codex_inventory_snapshot_relational_schema(target_engine)
@@ -2515,7 +2527,13 @@ def init_account_pool_schema(database_engine=None) -> None:
                 "uq_account_identity_alias_platform_type_value",
                 "account_identity_aliases",
                 "platform, alias_type, normalized_value",
-                "WHERE alias_type != 'email'",
+                "WHERE alias_type NOT IN ('email', 'workspace_id', 'chatgpt_account_id')",
+            ),
+            (
+                "uq_account_identity_member_alias",
+                "account_identity_aliases",
+                "platform, identity_id, alias_type, normalized_value",
+                "WHERE alias_type IN ('workspace_id', 'chatgpt_account_id')",
             ),
             (
                 "uq_account_target_binding_identity_target",
@@ -2565,10 +2583,15 @@ def init_account_pool_schema(database_engine=None) -> None:
         # every affected identity by marking it ambiguous, then keep one
         # representative row so the new unique indexes can be installed.
         if "account_identity_aliases" in existing_tables:
+            # Workspace/account IDs are shared by distinct Business members.
+            # Upgrade the old global index before retaining their aliases.
+            conn.exec_driver_sql(
+                "DROP INDEX IF EXISTS uq_account_identity_alias_platform_type_value"
+            )
             duplicate_alias_rows = conn.exec_driver_sql(
                 "SELECT platform, alias_type, normalized_value "
                 "FROM account_identity_aliases "
-                "WHERE alias_type != 'email' "
+                "WHERE alias_type NOT IN ('email', 'workspace_id', 'chatgpt_account_id') "
                 "GROUP BY platform, alias_type, normalized_value "
                 "HAVING COUNT(*) > 1"
             ).fetchall()
@@ -2583,7 +2606,8 @@ def init_account_pool_schema(database_engine=None) -> None:
                     continue
                 for _alias_id, identity_id in rows:
                     conn.exec_driver_sql(
-                        "UPDATE account_identities SET state = 'ambiguous' "
+                        "UPDATE account_identities SET state = 'ambiguous', "
+                        "ambiguity_reason = 'legacy_duplicate_strong_alias' "
                         "WHERE id = ?",
                         (identity_id,),
                     )
@@ -2592,6 +2616,25 @@ def init_account_pool_schema(database_engine=None) -> None:
                         "DELETE FROM account_identity_aliases WHERE id = ?",
                         (alias_id,),
                     )
+            # Preserve the real conflict when the same mailbox has multiple
+            # identities claiming one workspace, but retain different members.
+            conn.exec_driver_sql(
+                "UPDATE account_identities SET state = 'ambiguous' WHERE id IN ("
+                "SELECT a.identity_id FROM account_identity_aliases a "
+                "JOIN account_identities i ON i.id = a.identity_id "
+                "JOIN account_identity_aliases b ON b.platform = a.platform "
+                "AND b.alias_type = a.alias_type AND b.normalized_value = a.normalized_value "
+                "AND b.identity_id != a.identity_id "
+                "JOIN account_identities j ON j.id = b.identity_id "
+                "WHERE a.alias_type IN ('workspace_id', 'chatgpt_account_id') "
+                "AND LOWER(TRIM(i.canonical_email)) = LOWER(TRIM(j.canonical_email)))"
+            )
+            conn.exec_driver_sql(
+                "DELETE FROM account_identity_aliases "
+                "WHERE alias_type IN ('workspace_id', 'chatgpt_account_id') "
+                "AND id NOT IN (SELECT MIN(id) FROM account_identity_aliases "
+                "GROUP BY platform, identity_id, alias_type, normalized_value)"
+            )
         if "account_target_bindings" in existing_tables:
             duplicate_binding_groups = conn.exec_driver_sql(
                 "SELECT identity_id, target_id FROM account_target_bindings "
@@ -2604,7 +2647,8 @@ def init_account_pool_schema(database_engine=None) -> None:
                     (identity_id, target_id),
                 ).fetchall()
                 conn.exec_driver_sql(
-                    "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                    "UPDATE account_identities SET state = 'ambiguous', "
+                    "ambiguity_reason = 'legacy_duplicate_identity_binding' WHERE id = ?",
                     (identity_id,),
                 )
                 for (binding_id,) in rows[1:]:
@@ -2629,7 +2673,8 @@ def init_account_pool_schema(database_engine=None) -> None:
                 ).fetchall()
                 for _binding_id, identity_id in rows:
                     conn.exec_driver_sql(
-                        "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                        "UPDATE account_identities SET state = 'ambiguous', "
+                        "ambiguity_reason = 'legacy_duplicate_remote_binding' WHERE id = ?",
                         (identity_id,),
                     )
                 for binding_id, _identity_id in rows[1:]:
@@ -2651,7 +2696,8 @@ def init_account_pool_schema(database_engine=None) -> None:
                     (identity_id,),
                 ).fetchall()
                 conn.exec_driver_sql(
-                    "UPDATE account_identities SET state = 'ambiguous' WHERE id = ?",
+                    "UPDATE account_identities SET state = 'ambiguous', "
+                    "ambiguity_reason = 'legacy_duplicate_assignment' WHERE id = ?",
                     (identity_id,),
                 )
                 for (assignment_id,) in rows[1:]:

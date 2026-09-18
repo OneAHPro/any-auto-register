@@ -31,7 +31,7 @@ import { TaskLogPanel } from './TaskLogPanel'
 type Props = {
   open: boolean
   onClose: () => void
-  onDone: () => void
+  onDone?: () => void
 }
 
 type LoginFormValues = {

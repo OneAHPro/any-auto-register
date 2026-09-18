@@ -1,7 +1,13 @@
 from sqlalchemy.pool import StaticPool
 from sqlmodel import Session, create_engine, select
 
-from api.accounts import AccountCreate, ImportRequest, create_account, import_accounts, list_accounts
+from api.accounts import (
+    AccountCreate,
+    ImportRequest,
+    create_account,
+    import_accounts,
+    list_accounts,
+)
 from core import db
 
 
@@ -116,6 +122,48 @@ def test_account_summary_separates_local_and_remote_sources():
     assert result["source_summary"]["local"]["total"] == 1
     assert result["source_summary"]["remote"]["total"] == 1
     assert result["source_summary"]["remote"]["normal"] == 1
+
+
+def test_account_source_filter_returns_only_requested_source():
+    engine = make_engine()
+    with Session(engine) as session:
+        session.add_all(
+            [
+                db.AccountModel(
+                    platform="chatgpt",
+                    email="local@example.com",
+                    password="password",
+                    account_source="local",
+                    extra_json='{"account_type":"chatgpt_password"}',
+                ),
+                db.AccountModel(
+                    platform="chatgpt",
+                    email="remote@example.com",
+                    password="",
+                    account_source="codex2api",
+                    extra_json='{"remote_only":true,"remote_status":"active"}',
+                ),
+            ]
+        )
+        session.commit()
+
+        local_result = list_accounts(
+            platform="chatgpt",
+            account_source="local",
+            page=1,
+            page_size=20,
+            session=session,
+        )
+        remote_result = list_accounts(
+            platform="chatgpt",
+            account_source="codex2api",
+            page=1,
+            page_size=20,
+            session=session,
+        )
+
+    assert [item["email"] for item in local_result["items"]] == ["local@example.com"]
+    assert [item["email"] for item in remote_result["items"]] == ["remote@example.com"]
 
 
 def test_schema_migration_promotes_legacy_remote_marker_to_source_column():

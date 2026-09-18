@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 
 import { apiFetch } from '@/lib/utils'
 import { TaskLogPanel } from './TaskLogPanel'
@@ -230,5 +230,103 @@ describe('TaskLogPanel terminal feedback', () => {
     })
     expect(await screen.findByText('重试成功')).toBeTruthy()
     expect(screen.getByText('登录完成')).toBeTruthy()
+  })
+})
+
+describe('TaskLogPanel live task controls and reconnects', () => {
+  const encoder = new TextEncoder()
+  const encodeEvent = (payload: Record<string, unknown>) =>
+    encoder.encode(`data: ${JSON.stringify(payload)}\n\n`)
+
+  function streamResponse(...payloads: Record<string, unknown>[]) {
+    return new Response(new ReadableStream({
+      start(controller) {
+        payloads.forEach(payload => controller.enqueue(encodeEvent(payload)))
+        controller.close()
+      },
+    }), { headers: { 'Content-Type': 'text/event-stream' } })
+  }
+
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.mocked(apiFetch).mockReset().mockImplementation(async (path) => {
+      if (path.endsWith('/retryable')) return { count: 0 }
+      return { logs: ['已读取任务快照'], status: 'running', success: 0, registered: 0, total: 1 }
+    })
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+  })
+
+  it.each([502, 503, 504, 'network'] as const)('resumes from the existing log cursor after a transient %s failure', async (failure) => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(streamResponse({ line: '正在登录' }))
+    if (failure === 'network') fetchMock.mockRejectedValueOnce(new TypeError('Failed to fetch'))
+    else fetchMock.mockResolvedValueOnce(new Response(null, { status: failure }))
+    fetchMock.mockResolvedValueOnce(streamResponse(
+      { line: '登录已成功', success: 1, registered: 1, total: 1 },
+      { done: true, status: 'done', success: 1, registered: 1, total: 1 },
+    ))
+    vi.stubGlobal('fetch', fetchMock)
+    const onDone = vi.fn()
+
+    render(<TaskLogPanel taskId="live-login" mode="login" onDone={onDone} />)
+    await act(async () => {})
+    expect(screen.getByText('已读取任务快照')).toBeTruthy()
+    expect(screen.getByText('正在登录')).toBeTruthy()
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+    expect(onDone).not.toHaveBeenCalled()
+    await act(async () => { await vi.advanceTimersByTimeAsync(2000) })
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      '/api/tasks/live-login/logs/stream?since=1',
+      '/api/tasks/live-login/logs/stream?since=2',
+      '/api/tasks/live-login/logs/stream?since=2',
+    ])
+    expect(screen.getAllByText('已读取任务快照')).toHaveLength(1)
+    expect(screen.getAllByText('正在登录')).toHaveLength(1)
+    expect(screen.getByText('登录已成功')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toBe('登录完成')
+    expect(onDone).toHaveBeenCalledTimes(1)
+    await act(async () => { await vi.advanceTimersByTimeAsync(8000) })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('announces stopping immediately and waits for the terminal stream event before completing', async () => {
+    let completeStop!: (value: unknown) => void
+    let stream!: ReadableStreamDefaultController<Uint8Array>
+    const stopRequest = new Promise(resolve => { completeStop = resolve })
+    vi.mocked(apiFetch).mockImplementation(async (path) => {
+      if (path.endsWith('/stop')) return stopRequest
+      if (path.endsWith('/retryable')) return { count: 0 }
+      return { logs: ['正在等待验证码'], status: 'running', total: 1 }
+    })
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(new ReadableStream({
+      start(controller) { stream = controller },
+    }))))
+    const onDone = vi.fn()
+    render(<TaskLogPanel taskId="stop-login" mode="login" onDone={onDone} />)
+    await act(async () => {})
+
+    fireEvent.click(screen.getByRole('button', { name: /停止任务/ }))
+    expect(screen.getByRole('status').textContent).toContain('正在停止任务')
+    expect((screen.getByRole('button', { name: /跳过当前账号/ }) as HTMLButtonElement).disabled).toBe(true)
+    expect(onDone).not.toHaveBeenCalled()
+
+    await act(async () => { completeStop({ status: 'stopping', control: { stop_requested: true } }) })
+    expect(screen.getByRole('status').textContent).toContain('正在停止任务')
+    expect(screen.queryByText('任务已停止')).toBeNull()
+    expect(onDone).not.toHaveBeenCalled()
+
+    await act(async () => {
+      stream.enqueue(encodeEvent({ line: '正在退出线程' }))
+      stream.enqueue(encodeEvent({ done: true, status: 'stopped', total: 1 }))
+      stream.close()
+    })
+    expect(screen.getByText('正在退出线程')).toBeTruthy()
+    expect(screen.getByRole('status').textContent).toBe('任务已停止')
+    expect(onDone).toHaveBeenCalledTimes(1)
   })
 })

@@ -512,6 +512,33 @@ def test_materialize_reactivates_existing_standby_assignment_when_account_return
         assert assignment.id == assignment_id
         assert assignment.state == 'active'
         assert session.exec(select(db.AccountModel)).one().email == 'returned@example.com'
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assert binding.enabled is True
+        assert binding.sync_status == 'synced'
+        assert binding.last_error == ''
+
+
+def test_materialize_clears_obsolete_ambiguity_error_after_identity_repair():
+    e = make_engine()
+    sync_inventory(e, target_id=1, clients={1: Client([
+        {'id': 9, 'email': 'repaired@example.com', 'status': 'active'},
+    ])})
+    materialize_inventory(e)
+    with Session(e) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        binding.enabled = False
+        binding.sync_status = 'ambiguous'
+        binding.last_error = '身份存在歧义，等待人工确认'
+        session.add(binding)
+        session.commit()
+
+    materialize_inventory(e)
+
+    with Session(e) as session:
+        binding = session.exec(select(db.AccountTargetBindingModel)).one()
+        assert binding.enabled is True
+        assert binding.sync_status == 'synced'
+        assert binding.last_error == ''
 
 def test_snapshots_are_isolated_by_target_and_idempotent():
     e=make_engine(); c1=Client([{'id':4,'email':'same@example.com'}]); c2=Client([{'id':4,'email':'same@example.com','plan_type':'pro'}])

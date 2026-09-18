@@ -71,7 +71,8 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
   const onDoneRef = useRef(onDone)
   const nextSinceRef = useRef(0)
 
-  const isFinished = terminalStatus !== 'idle' || stopRequested
+  const isStopping = stopLoading || stopRequested
+  const controlsDisabled = terminalStatus !== 'idle' || isStopping
   const wording = resolvedMode === 'remote_auth_monitor'
     ? {
         action: '探针检查',
@@ -114,7 +115,7 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
   }
 
   const handleSkipCurrent = async () => {
-    if (isFinished) return
+    if (controlsDisabled) return
     setSkipLoading(true)
     try {
       const response = await apiFetch(`/tasks/${activeTaskId}/skip-current`, { method: 'POST' }) as {
@@ -135,7 +136,7 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
   }
 
   const handleStopTask = async () => {
-    if (isFinished) return
+    if (controlsDisabled) return
     setStopLoading(true)
     try {
       await apiFetch(`/tasks/${activeTaskId}/stop`, { method: 'POST' })
@@ -287,7 +288,8 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
 
         if (!response.ok) {
           setError(`日志流连接失败 (${response.status})`)
-          return true
+          // Gateway outages are temporary; reconnect with the existing log cursor.
+          return ![502, 503, 504].includes(response.status)
         }
 
         if (!response.body) {
@@ -396,7 +398,9 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
               text: `${wording.action}失败（成功 ${summary.success} / ${summary.total}）`,
               color: '#dc2626',
             }
-          : null
+          : isStopping
+            ? { text: '正在停止任务，等待进行中的线程退出…', color: '#d97706' }
+            : null
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
@@ -458,7 +462,7 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
             icon={<FastForwardOutlined />}
             onClick={handleSkipCurrent}
             loading={skipLoading}
-            disabled={isFinished}
+            disabled={controlsDisabled}
           >
             跳过当前账号
           </Button>
@@ -468,7 +472,7 @@ export function TaskLogPanel({ taskId, onDone, mode = 'register' }: TaskLogPanel
             icon={<StopOutlined />}
             onClick={handleStopTask}
             loading={stopLoading}
-            disabled={isFinished}
+            disabled={controlsDisabled}
           >
             停止任务
           </Button>
