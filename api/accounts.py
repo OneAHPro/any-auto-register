@@ -1353,6 +1353,8 @@ def _display_representatives_with_members(
 
 
 def _account_is_remote_only_for_display(account: AccountModel) -> bool:
+    if _account_source(account) == "codex2api":
+        return True
     try:
         extra = account.get_extra()
     except Exception:
@@ -1647,6 +1649,7 @@ def _account_for_response(
         str(payload.get("extra_json") or "{}"),
         strip_credentials=not include_credentials,
     ))
+    payload["account_source"] = _account_source(account)
     # Keep the public JSON protocol while sourcing cost only from its own
     # column. Stale credential metadata must never restore a cleared cost.
     extra.pop("purchase_cost_cny", None)
@@ -1660,6 +1663,21 @@ def _account_for_response(
     return payload
 
 
+def _account_source(account: AccountModel) -> str:
+    """Return the durable account origin with legacy extra-json fallback."""
+
+    source = str(getattr(account, "account_source", "") or "").strip().lower()
+    if source in {"local", "codex2api"}:
+        return source
+    try:
+        extra = account.get_extra()
+    except Exception:
+        extra = {}
+    if isinstance(extra, Mapping) and bool(extra.get("remote_only")):
+        return "codex2api"
+    return "local"
+
+
 class AccountCreate(BaseModel):
     platform: str
     email: str
@@ -1667,6 +1685,27 @@ class AccountCreate(BaseModel):
     status: str = "registered"
     token: str = ""
     cashier_url: str = ""
+
+    @field_validator("platform", "email", "password")
+    @classmethod
+    def validate_required_text(cls, value: str, info):
+        normalized = str(value or "").strip()
+        if not normalized:
+            raise ValueError(f"{info.field_name} 不能为空")
+        return normalized
+
+    @field_validator("platform")
+    @classmethod
+    def normalize_platform(cls, value: str):
+        return value.lower()
+
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls, value: str):
+        normalized = value.lower()
+        if "@" not in normalized or normalized.startswith("@") or normalized.endswith("@"):
+            raise ValueError("邮箱格式不正确")
+        return normalized
 
 
 class AccountUpdate(BaseModel):
@@ -2204,10 +2243,35 @@ def _build_account_list(
         live_display,
         assignment_states,
     )
+    local_source_accounts = [
+        account
+        for account in visible_accounts
+        if not _account_is_remote_only_for_display(account)
+    ]
+    remote_source_accounts = [
+        account
+        for account in visible_accounts
+        if _account_is_remote_only_for_display(account)
+    ]
+    source_summary = {
+        "local": _account_operational_summary(
+            local_source_accounts,
+            [],
+            live_display,
+            assignment_states,
+        ),
+        "remote": _account_operational_summary(
+            remote_source_accounts,
+            remote_items,
+            live_display,
+            assignment_states,
+        ),
+    }
     if summary_only:
         return {
             "total": len(combined),
             "summary": operational_summary,
+            "source_summary": source_summary,
             "account_ids": [int(account.id) for account in visible_accounts if account.id is not None],
             "remote_count": len(remote_items),
         }
@@ -2597,6 +2661,7 @@ def _build_account_list(
     return {
         "total": total,
         "summary": operational_summary,
+        "source_summary": source_summary,
         "page": page,
         "items": response_items,
     }
@@ -2630,10 +2695,18 @@ def list_accounts(
 
 @router.post("")
 def create_account(body: AccountCreate, session: Session = Depends(get_session)):
+    existing = session.exec(
+        select(AccountModel)
+        .where(AccountModel.platform == body.platform)
+        .where(func.lower(AccountModel.email) == body.email.lower())
+    ).all()
+    if any(not _account_is_remote_only_for_display(item) for item in existing):
+        raise HTTPException(status_code=409, detail="该平台已存在相同邮箱的本地账号")
     acc = AccountModel(
         platform=body.platform,
         email=body.email,
         password=body.password,
+        account_source="local",
         status=body.status,
         token=body.token,
         cashier_url=body.cashier_url,
@@ -2641,6 +2714,13 @@ def create_account(body: AccountCreate, session: Session = Depends(get_session))
     session.add(acc)
     session.commit()
     session.refresh(acc)
+    try:
+        from services.account_identity import ensure_identity_for_model
+
+        ensure_identity_for_model(session.get_bind(), acc)
+        session.refresh(acc)
+    except Exception as exc:
+        logger.warning("新增本地账号的稳定身份投影延后: %s", type(exc).__name__)
     return _account_for_response(acc, session=session)
 
 
@@ -2706,11 +2786,12 @@ def import_accounts(
 ):
     """批量导入，每行格式: email password [extra]"""
     created = 0
+    created_accounts: list[AccountModel] = []
     for line in body.lines:
         parts = split_mail_import_fields(str(line or "").strip())
         if len(parts) < 2:
             continue
-        email, password = parts[0], parts[1]
+        email, password = parts[0].strip().lower(), parts[1]
         extra = " ".join(parts[2:]) if len(parts) > 2 else ""
         if extra:
             try:
@@ -2744,11 +2825,25 @@ def import_accounts(
                 if account_type
                 else "{}"
             )
-        acc = AccountModel(platform=body.platform, email=email,
-                           password=password, extra_json=extra)
+        acc = AccountModel(
+            platform=body.platform.strip().lower(),
+            email=email,
+            password=password,
+            account_source="local",
+            extra_json=extra,
+        )
         session.add(acc)
+        created_accounts.append(acc)
         created += 1
     session.commit()
+    from services.account_identity import ensure_identity_for_model
+
+    for account in created_accounts:
+        try:
+            session.refresh(account)
+            ensure_identity_for_model(session.get_bind(), account)
+        except Exception as exc:
+            logger.warning("批量导入本地账号的稳定身份投影延后: %s", type(exc).__name__)
     return {"created": created}
 
 

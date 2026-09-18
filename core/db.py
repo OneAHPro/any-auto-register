@@ -59,6 +59,9 @@ class AccountModel(SQLModel, table=True):
     region: str = ""
     token: str = ""
     status: str = "registered"
+    # ``local`` means the credential was imported or logged in through this
+    # application. ``codex2api`` is a credential-free remote projection.
+    account_source: str = Field(default="local", index=True)
     trial_end_time: int = 0
     cashier_url: str = ""
     extra_json: str = "{}"   # JSON 存储平台自定义字段
@@ -628,6 +631,7 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
             existing.region = account.region or ""
             existing.token = account.token or ""
             existing.status = account.status.value
+            existing.account_source = "local"
             existing.extra_json = json.dumps(incoming_extra, ensure_ascii=False)
             existing.cashier_url = incoming_extra.get("cashier_url", "")
             existing.updated_at = _utcnow()
@@ -643,6 +647,7 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
             region=account.region or "",
             token=account.token or "",
             status=account.status.value,
+            account_source="local",
             extra_json=json.dumps(account.extra or {}, ensure_ascii=False),
             cashier_url=(account.extra or {}).get("cashier_url", ""),
         )
@@ -2286,6 +2291,27 @@ def init_account_pool_schema(database_engine=None) -> None:
             if "purchase_cost_cents" not in account_columns:
                 conn.exec_driver_sql(
                     "ALTER TABLE accounts ADD COLUMN purchase_cost_cents INTEGER"
+                )
+            if "account_source" not in account_columns:
+                conn.exec_driver_sql(
+                    "ALTER TABLE accounts ADD COLUMN account_source TEXT DEFAULT 'local'"
+                )
+            # Rows created by older inventory syncs only carried this marker
+            # inside extra_json. Promote it once so list/stat paths have one
+            # durable source of truth.
+            if "extra_json" in account_columns:
+                conn.exec_driver_sql(
+                    "UPDATE accounts SET account_source = CASE "
+                    "WHEN lower(extra_json) LIKE '%\"remote_only\":true%' "
+                    "OR lower(extra_json) LIKE '%\"remote_only\": true%' "
+                    "THEN 'codex2api' "
+                    "WHEN account_source IS NULL OR trim(account_source) = '' "
+                    "THEN 'local' ELSE account_source END"
+                )
+            else:
+                conn.exec_driver_sql(
+                    "UPDATE accounts SET account_source = 'local' "
+                    "WHERE account_source IS NULL OR trim(account_source) = ''"
                 )
             conn.exec_driver_sql(
                 "UPDATE accounts SET identity_id = '' WHERE identity_id IS NULL"

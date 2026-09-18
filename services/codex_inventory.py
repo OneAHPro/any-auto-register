@@ -1092,6 +1092,7 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                     email=email,
                     password="",
                     token="",
+                    account_source="codex2api",
                     status="invalid" if remote_status in {"unauthorized", "auth_error", "invalid", "token_invalidated"} else "registered",
                     identity_id=identity_id,
                     extra_json=json.dumps({
@@ -1124,6 +1125,7 @@ def _materialize_inventory(database_engine) -> dict[str, int]:
                 _remember_remote_aliases(extra, row)
                 if extra.get("remote_only"):
                     extra["account_source"] = "codex2api"
+                    account.account_source = "codex2api"
                 account.set_extra(extra)
                 remote_status = str(row.get("remote_status") or row.get("status") or "").strip().lower()
                 if extra.get("remote_only"):

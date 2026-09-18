@@ -153,14 +153,58 @@ describe('Accounts ChatGPT staged login integration', () => {
     cleanup()
   })
 
-  it('presents an account workspace with supply access and no new-account registration action', async () => {
+  it('presents an account workspace with explicit local-account creation access', async () => {
     render(<Accounts />)
 
     await screen.findByText('eligible@example.com')
     expect(screen.getByRole('heading', { name: '账号池', level: 1 })).toBeTruthy()
     expect(screen.getByRole('link', { name: '补充账号' }).getAttribute('href')).toBe('/supply')
-    expect(screen.queryByRole('button', { name: /^注\s*册$/ })).toBeNull()
+    expect(screen.getByRole('button', { name: '新增本地账号' })).toBeTruthy()
     expect(screen.getByRole('region', { name: '账号筛选与批量操作' })).toBeTruthy()
+  })
+
+  it('creates a local account from the account-pool action', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path, options) => {
+      if (path.startsWith('/accounts?')) return { items: [eligibleAccount], total: 1 }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      if (path === '/accounts' && options?.method === 'POST') {
+        return { ...eligibleAccount, id: 44, email: 'new@example.com', account_source: 'local' }
+      }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    const user = userEvent.setup()
+    render(<Accounts />)
+    await screen.findByText('eligible@example.com')
+    await user.click(screen.getByRole('button', { name: '新增本地账号' }))
+    const dialog = screen.getByRole('dialog', { name: '新增本地账号' })
+    await user.type(within(dialog).getByRole('textbox', { name: '邮箱' }), 'new@example.com')
+    await user.type(within(dialog).getByLabelText('密码'), 'new-password')
+    await user.click(within(dialog).getByRole('button', { name: /^确\s*定$/ }))
+
+    await waitFor(() => expect(
+      vi.mocked(apiFetch).mock.calls.find(([path, options]) => path === '/accounts' && options?.method === 'POST')?.[1]?.body,
+    ).toBe(JSON.stringify({ email: 'new@example.com', password: 'new-password', status: 'registered', platform: 'chatgpt' })))
+  })
+
+  it('shows local and remote account totals separately when the API provides both sources', async () => {
+    vi.mocked(apiFetch).mockImplementation(async (path) => {
+      if (path.startsWith('/accounts?')) {
+        return {
+          items: [eligibleAccount],
+          total: 1,
+          summary: { total: 1, normal: 1 },
+          source_summary: {
+            local: { total: 1, normal: 1 },
+            remote: { total: 19, normal: 10, scheduling: 9 },
+          },
+        }
+      }
+      if (path.startsWith('/actions/')) return { actions: [] }
+      throw new Error(`unexpected path: ${path}`)
+    })
+    render(<Accounts />)
+    await screen.findByText('eligible@example.com')
+    expect(screen.getByTestId('account-source-summary').textContent).toContain('本地账号 1 · 远端账号 19 · 远端正常 10 · 远端调度中 9')
   })
 
   it('clears selected records without changing the current account filter', async () => {

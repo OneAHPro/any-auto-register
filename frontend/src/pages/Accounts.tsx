@@ -288,6 +288,11 @@ interface AccountOperationalSummary {
   errors: number
 }
 
+interface AccountSourceSummary {
+  local: AccountOperationalSummary
+  remote: AccountOperationalSummary
+}
+
 type AccountOperationalFilter = '' | 'normal' | 'scheduling' | 'rate_limited' | 'abnormal'
 
 function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): AccountOperationalSummary | null {
@@ -312,12 +317,22 @@ function normalizeAccountSummary(value: unknown, fallbackTotal: unknown = 0): Ac
   }
 }
 
+function normalizeAccountSourceSummary(value: unknown): AccountSourceSummary | null {
+  if (!value || typeof value !== 'object') return null
+  const source = value as Record<string, unknown>
+  const local = normalizeAccountSummary(source.local)
+  const remote = normalizeAccountSummary(source.remote)
+  return local && remote ? { local, remote } : null
+}
+
 function AccountOperationalSummaryView({
   summary,
+  sourceSummary,
   activeFilter,
   onSelectFilter,
 }: {
   summary: AccountOperationalSummary
+  sourceSummary?: AccountSourceSummary | null
   activeFilter: AccountOperationalFilter
   onSelectFilter: (filter: AccountOperationalFilter) => void
 }) {
@@ -351,6 +366,11 @@ function AccountOperationalSummaryView({
 
   return (
     <section className="account-summary" data-testid="account-summary" aria-label="账号状态汇总" aria-live="polite">
+      {sourceSummary ? (
+        <div className="account-summary__source-note" data-testid="account-source-summary">
+          本地账号 {sourceSummary.local.total} · 远端账号 {sourceSummary.remote.total} · 远端正常 {sourceSummary.remote.normal} · 远端调度中 {sourceSummary.remote.scheduling}
+        </div>
+      ) : null}
       {cards.map((card) => (
         <button
           className={`account-summary__card account-summary__card--${card.tone}${activeFilter === card.filter ? ' account-summary__card--active' : ''}`}
@@ -803,6 +823,7 @@ export default function Accounts() {
   const [platformActions, setPlatformActions] = useState<any[]>([])
   const [total, setTotal] = useState(0)
   const [accountSummary, setAccountSummary] = useState<AccountOperationalSummary | null>(null)
+  const [accountSourceSummary, setAccountSourceSummary] = useState<AccountSourceSummary | null>(null)
   const [operationalFilter, setOperationalFilter] = useState<AccountOperationalFilter>('')
   const [page, setPage] = useState(1)
   const [pageSize, setPageSize] = useState(50)
@@ -813,6 +834,7 @@ export default function Accounts() {
   const [selectedRowKeys, setSelectedRowKeys] = useState<React.Key[]>([])
 
   const [addModalOpen, setAddModalOpen] = useState(false)
+  const [addLoading, setAddLoading] = useState(false)
   const [importModalOpen, setImportModalOpen] = useState(false)
   const [codexImportModalOpen, setCodexImportModalOpen] = useState(false)
   const [accountLoadError, setAccountLoadError] = useState('')
@@ -978,6 +1000,7 @@ export default function Accounts() {
       setAccounts(ordered)
       setTotal(data.total)
       setAccountSummary(normalizeAccountSummary(data.summary, data.total))
+      setAccountSourceSummary(normalizeAccountSourceSummary(data.source_summary))
       setAccountLoadError('')
       // The snapshot is the first meaningful paint. Do not keep the list in
       // a loading state while the optional upstream reconciliation runs.
@@ -1365,14 +1388,22 @@ export default function Accounts() {
 
   const handleAdd = async () => {
     const values = await addForm.validateFields()
-    await apiFetch('/accounts', {
-      method: 'POST',
-      body: JSON.stringify({ ...values, platform: currentPlatform }),
-    })
-    message.success('添加成功')
-    setAddModalOpen(false)
-    addForm.resetFields()
-    load()
+    setAddLoading(true)
+    try {
+      await apiFetch('/accounts', {
+        method: 'POST',
+        body: JSON.stringify({ ...values, platform: currentPlatform }),
+      })
+      message.success('本地账号已新增')
+      setAddModalOpen(false)
+      addForm.resetFields()
+      await load()
+    } catch (error: unknown) {
+      const detail = error instanceof Error ? error.message : '新增本地账号失败'
+      message.error(detail)
+    } finally {
+      setAddLoading(false)
+    }
   }
 
   const handleImport = async () => {
@@ -1687,6 +1718,14 @@ export default function Accounts() {
         description="检查状态、额度与购入成本，按需补充账号或处理异常。"
         actions={(
           <Space wrap size={8}>
+            <Button
+              aria-label="新增本地账号"
+              type="primary"
+              icon={<PlusOutlined />}
+              onClick={() => setAddModalOpen(true)}
+            >
+              新增本地账号
+            </Button>
             <Button href="/supply" aria-label="补充账号" type="primary" icon={<PlusOutlined />}>补充账号</Button>
             <Button aria-label="刷新账号列表" icon={<ReloadOutlined spin={loading} />} onClick={() => { void refreshAccounts() }}>刷新</Button>
           </Space>
@@ -1695,6 +1734,7 @@ export default function Accounts() {
       {isChatgptPlatform && accountSummary ? (
         <AccountOperationalSummaryView
           summary={accountSummary}
+          sourceSummary={accountSourceSummary}
           activeFilter={operationalFilter}
           onSelectFilter={(filter) => {
             setPage(1)
@@ -2028,14 +2068,22 @@ export default function Accounts() {
       ) : null}
 
       <Modal
-        title="手动新增账号"
+        title="新增本地账号"
         open={addModalOpen}
         onCancel={() => { setAddModalOpen(false); addForm.resetFields(); }}
         onOk={handleAdd}
         okText="确定"
         cancelText="取消"
+        confirmLoading={addLoading}
         maskClosable={false}
       >
+        <Alert
+          type="info"
+          showIcon
+          message="本地账号"
+          description="保存后会作为本地凭据账号进入账号池；Codex2API 远端账号不会被创建为本地账号。"
+          style={{ marginBottom: 16 }}
+        />
         <Form form={addForm} layout="vertical">
           <Form.Item name="email" label="邮箱" rules={[{ required: true }]}>
             <Input />
