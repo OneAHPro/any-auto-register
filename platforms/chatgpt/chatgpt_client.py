@@ -31,6 +31,7 @@ from .utils import (
     seed_oai_device_cookie,
 )
 from .auth_outcomes import AuthOutcome
+from .auth_entry_errors import auth_entry_error, password_entry_ready, response_retry_after
 
 
 # Chrome 指纹配置
@@ -133,6 +134,7 @@ class ChatGPTClient:
         self.last_registration_state = FlowState()
         self.last_stage = ""
         self.last_authorize_status = 0
+        self.last_authorize_retry_after = 0
         self.last_auth_outcome = AuthOutcome.success(stage="init")
         self.phone_oauth_resume_context = None
         self.phone_oauth_resume_error = ""
@@ -652,6 +654,18 @@ class ChatGPTClient:
 
         return None
 
+    @staticmethod
+    def _wait_login_entry_retry(seconds):
+        from core.task_runtime import checkpoint_current_task_attempt
+
+        remaining = float(seconds)
+        while remaining > 0:
+            checkpoint_current_task_attempt()
+            interval = min(0.25, remaining)
+            time.sleep(interval)
+            remaining -= interval
+        checkpoint_current_task_attempt()
+
     def login_existing_account_and_get_session(
         self,
         email,
@@ -857,12 +871,39 @@ class ChatGPTClient:
         session_ready = False
         bootstrap_error = "打开 OpenAI 登录页失败"
         max_bootstrap_attempts = 6
+        entry_failures = 0
+        preserve_session = False
+
+        def recover_entry_error(error, retry_after=0):
+            nonlocal entry_failures, bootstrap_error, preserve_session
+            entry_failures += 1
+            self.last_auth_outcome = error.outcome()
+            bootstrap_error = error.message
+            delay = max(
+                float(retry_after or 0),
+                (30 if error.rate_limited else 2) * 2 ** (entry_failures - 1),
+            )
+            if (
+                not error.retryable or entry_failures >= 3
+                or bootstrap_attempt >= max_bootstrap_attempts - 1 or delay > 120
+            ):
+                if error.rate_limited:
+                    bootstrap_error += "，本次已停止重试，请等待限流解除后再试"
+                return False
+            self._log(f"{error.message}，等待 {delay:g} 秒后重试（可停止任务）")
+            self._wait_login_entry_retry(delay)
+            # Rate limiting is a cooldown, not a reason to rotate identity.
+            preserve_session = error.rate_limited
+            return True
+
         for bootstrap_attempt in range(max_bootstrap_attempts):
             if bootstrap_attempt > 0:
                 self._log(
                     f"登录入口重试 {bootstrap_attempt + 1}/{max_bootstrap_attempts}..."
                 )
-                self._reset_session()
+                if not preserve_session:
+                    self._reset_session()
+                preserve_session = False
             if not self.visit_homepage():
                 bootstrap_error = "访问 ChatGPT 首页失败"
                 continue
@@ -879,6 +920,12 @@ class ChatGPTClient:
                 bootstrap_error = "打开 OpenAI 登录页失败"
                 continue
 
+            entry_error = auth_entry_error(final_url, self.last_authorize_status)
+            if entry_error:
+                if recover_entry_error(entry_error, self.last_authorize_retry_after):
+                    continue
+                return False, bootstrap_error
+
             helper.adopt_browser_context(
                 self.session,
                 device_id=self.device_id,
@@ -887,12 +934,14 @@ class ChatGPTClient:
                 accept_language=self.accept_language,
             )
             final_parts = urlsplit(final_url)
-            is_openai_auth_page = final_parts.netloc.lower().endswith("openai.com")
+            is_openai_auth_page = final_parts.hostname == "auth.openai.com"
             has_login_session = bool(
                 self._get_cookie_value("login_session")
             )
+            password_page_ready = password_entry_ready(final_url, self.last_authorize_status)
             needs_oauth_bootstrap = is_openai_auth_page and (
-                self.last_authorize_status in {401, 403} or not has_login_session
+                self.last_authorize_status in {401, 403}
+                or (not has_login_session and not password_page_ready)
             )
             if needs_oauth_bootstrap:
                 self._log(
@@ -912,8 +961,20 @@ class ChatGPTClient:
                     user_agent=self.ua,
                     sec_ch_ua=self.sec_ch_ua,
                     impersonate=self.impersonate,
+                    allow_password_entry=True,
                 )
-                if bootstrapped_url and helper._get_cookie_value("login_session"):
+                fallback_error = getattr(helper, 'last_entry_error', None) or auth_entry_error(
+                    bootstrapped_url, helper.last_http_status,
+                )
+                if fallback_error:
+                    if recover_entry_error(fallback_error, getattr(helper, 'last_entry_retry_after', 0)):
+                        continue
+                    return False, bootstrap_error
+                if bootstrapped_url and (
+                    helper._get_cookie_value("login_session")
+                    or password_entry_ready(bootstrapped_url, helper.last_http_status)
+                ):
+                    final_url = bootstrapped_url
                     continue_referer = bootstrapped_url
                     session_ready = True
                     break
@@ -925,6 +986,7 @@ class ChatGPTClient:
             break
         if not final_url or not session_ready:
             return False, bootstrap_error
+        self.last_auth_outcome = AuthOutcome.success(stage='authorize')
 
         helper.adopt_browser_context(
             self.session,
@@ -949,7 +1011,7 @@ class ChatGPTClient:
 
             state_url = str(state.continue_url or state.current_url or "").lower()
             if (
-                state.page_type == "api_accounts_authorize"
+                state.page_type in {"api_accounts_authorize", "log_in", "login"}
                 or (
                     "/api/accounts/authorize" in state_url
                     and "/api/accounts/authorize/continue" not in state_url
@@ -1379,6 +1441,7 @@ class ChatGPTClient:
             str: 最终重定向的 URL
         """
         self.last_authorize_status = 0
+        self.last_authorize_retry_after = 0
         for attempt in range(max_retries):
             try:
                 if attempt > 0:
@@ -1404,6 +1467,7 @@ class ChatGPTClient:
 
                 final_url = str(r.url)
                 self.last_authorize_status = int(r.status_code or 0)
+                self.last_authorize_retry_after = response_retry_after(r)
                 redirects = len(getattr(r, "history", []) or [])
                 content_type = str(
                     (getattr(r, "headers", {}) or {}).get("content-type", "") or ""
@@ -1420,7 +1484,8 @@ class ChatGPTClient:
                     f"final_page={final_page} "
                     f"content_type={content_type or 'unknown'}"
                 )
-                self._log(f"重定向到: {final_url}")
+                safe_url = urlsplit(final_url)._replace(query='', fragment='').geturl()
+                self._log(f"重定向到: {safe_url}")
                 return final_url
 
             except Exception as e:

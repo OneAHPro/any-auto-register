@@ -1818,12 +1818,15 @@ class ExistingAccountLoginTests(unittest.TestCase):
                 "https://auth.openai.com/add-phone",
             ]
         )
-        client.authorize = mock.Mock(
-            side_effect=[
-                authorize_endpoint,
-                "https://auth.openai.com/add-phone",
-            ]
-        )
+        def authorize(url):
+            # The second transaction succeeds; its HTTP status and cookie
+            # must not retain the first transaction's synthetic 403.
+            if url.endswith('/add-phone'):
+                client.last_authorize_status = 200
+                client._get_cookie_value.return_value = 'fresh-login-session'
+            return url
+
+        client.authorize = mock.Mock(side_effect=authorize)
         client.last_authorize_status = 403
         client._get_cookie_value = mock.Mock(return_value="")
         client.fetch_chatgpt_session = mock.Mock(

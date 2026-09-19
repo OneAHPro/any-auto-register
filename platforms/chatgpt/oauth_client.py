@@ -26,6 +26,7 @@ except ImportError:
     import requests as curl_requests
 
 from .phone_service import create_phone_service
+from .auth_entry_errors import password_entry_ready
 from .auth_outcomes import (
     AuthFailureDomain,
     AuthOutcome,
@@ -1471,6 +1472,18 @@ class OAuthClient:
 
         return None, self._state_from_url(last_url or current_url)
 
+    def _capture_entry_error(self, response):
+        from .auth_entry_errors import auth_entry_error, response_retry_after
+
+        error = auth_entry_error(str(response.url), int(response.status_code or 0))
+        if error is None:
+            return False
+        self.last_entry_error = error
+        self.last_entry_retry_after = response_retry_after(response)
+        self.last_auth_outcome = error.outcome()
+        self._set_error(error.message)
+        return True
+
     def _bootstrap_oauth_session(
         self,
         authorize_url,
@@ -1479,9 +1492,13 @@ class OAuthClient:
         user_agent=None,
         sec_ch_ua=None,
         impersonate=None,
+        *,
+        allow_password_entry=False,
     ):
         """启动 OAuth 会话，确保 auth 域上的 login_session 已建立。"""
         self.last_http_status = 0
+        self.last_entry_error = None
+        self.last_entry_retry_after = 0
         if device_id:
             seed_oai_device_cookie(self.session, device_id)
 
@@ -1514,6 +1531,8 @@ class OAuthClient:
             authorize_final_url = str(r.url)
             redirects = len(getattr(r, "history", []) or [])
             self._log(f"/oauth/authorize -> {r.status_code}, redirects={redirects}")
+            if self._capture_entry_error(r):
+                return ""
 
             has_login_session = any(
                 (cookie.name if hasattr(cookie, "name") else str(cookie))
@@ -1524,7 +1543,10 @@ class OAuthClient:
         except Exception as e:
             self._log(f"/oauth/authorize 异常: {e}")
 
-        if 200 <= authorize_status < 400 and has_login_session:
+        if 200 <= authorize_status < 400 and (
+            has_login_session
+            or (allow_password_entry and password_entry_ready(authorize_final_url, authorize_status))
+        ):
             return authorize_final_url
 
         self._log("未获取到 login_session，尝试 /api/oauth/oauth2/auth...")
@@ -1556,6 +1578,8 @@ class OAuthClient:
             self._log(
                 f"/api/oauth/oauth2/auth -> {r2.status_code}, redirects={redirects2}"
             )
+            if self._capture_entry_error(r2):
+                return ""
 
             has_login_session = any(
                 (cookie.name if hasattr(cookie, "name") else str(cookie))
@@ -1568,7 +1592,10 @@ class OAuthClient:
         except Exception as e:
             self._log(f"/api/oauth/oauth2/auth 异常: {e}")
 
-        if 200 <= oauth2_status < 400 and has_login_session:
+        if 200 <= oauth2_status < 400 and (
+            has_login_session
+            or (allow_password_entry and password_entry_ready(authorize_final_url, oauth2_status))
+        ):
             return authorize_final_url
         return ""
 
@@ -4039,6 +4066,8 @@ class OAuthClient:
                     impersonate=impersonate,
                 )
                 if not authorize_final_url:
+                    if getattr(self, 'last_entry_error', None) is not None:
+                        return None
                     if resume_authenticated_session:
                         self._set_error(
                             "OpenAI 登录会话已失效，请先重新执行邮箱登录；"
