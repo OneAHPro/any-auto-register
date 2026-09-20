@@ -534,10 +534,10 @@ def resolve_chatgpt_auth_account_id(
     *,
     session: Session | None = None,
 ) -> int | None:
-    """Resolve exactly one ChatGPT account for an email.
+    """Resolve exactly one local ChatGPT credential owner for an email.
 
-    ``None`` means no account (and is retained for legacy fixtures); more
-    than one matching row is an identity conflict and must fail closed.
+    Credential-free inventory mirrors are display records, not login owners.
+    ``None`` means no local owner; multiple owners still fail closed.
     """
 
     normalized_email = str(email or "").strip().lower()
@@ -547,13 +547,37 @@ def resolve_chatgpt_auth_account_id(
         inspector = inspect(active_session.connection())
         if not inspector.has_table(AccountModel.__tablename__):
             return None
-        account_ids = active_session.exec(
-            select(AccountModel.id)
+        accounts = active_session.exec(
+            select(AccountModel)
             .where(func.lower(AccountModel.platform) == "chatgpt")
             .where(func.lower(AccountModel.email) == normalized_email)
             .order_by(AccountModel.id)
         ).all()
-        ids = [int(value) for value in account_ids if value is not None]
+        ids = []
+        for account in accounts:
+            extra = account.get_extra() or {}
+            if extra.get("remote_only") is True and not (
+                str(account.password or "").strip()
+                or extra.get("mailbox_login_context")
+                or any(extra.get(key) for key in (
+                    "password", "totp_secret", "mfa_secret", "totp", "totp_url",
+                ))
+            ):
+                # A stale mirror flag must not hide a canonical MFA owner
+                # whose legacy credential projection is missing.
+                state = (
+                    active_session.exec(
+                        select(ChatGPTAuthStateModel).where(
+                            ChatGPTAuthStateModel.account_id == account.id
+                        )
+                    ).first()
+                    if inspector.has_table(ChatGPTAuthStateModel.__tablename__)
+                    else None
+                )
+                if state is None or not state.active_mfa_generation:
+                    continue
+            if account.id is not None:
+                ids.append(int(account.id))
         if len(ids) > 1:
             raise ChatGPTAuthIdentityConflict(
                 "Multiple ChatGPT accounts match the login email"
