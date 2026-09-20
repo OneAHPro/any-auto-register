@@ -490,6 +490,16 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
                 mail_api_url=third,
                 account_type="chatgpt_password_reset_url_mail",
             )
+        # A Base32 third field identifies password + TOTP even when a long
+        # password also satisfies the permissive legacy OAuth length heuristic.
+        if _looks_like_mfa_secret(third):
+            return {
+                "email": email,
+                "password": second,
+                "totp_secret": _normalize_mfa_secret(third),
+                "account_type": "chatgpt_password_totp",
+                "mailbox": "INBOX",
+            }
         if _looks_like_oauth_pair(second, third):
             return {
                 "email": email,
@@ -497,7 +507,7 @@ def _normalize_sequence_record(entry: list[Any] | tuple[Any, ...]) -> dict[str, 
                 "refresh_token": third,
                 "mailbox": "INBOX",
             }
-        if _looks_like_mfa_secret(third) or _is_icloud_mail_address(email):
+        if _is_icloud_mail_address(email):
             return {
                 "email": email,
                 "password": second,
