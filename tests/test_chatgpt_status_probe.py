@@ -22,6 +22,18 @@ class DummyAccount:
 
 
 class ChatGPTStatusProbeTests(unittest.TestCase):
+    def test_business_workspace_is_paid_even_with_personal_free_plan(self):
+        with mock.patch(
+            "platforms.chatgpt.status_probe._probe_backend_me",
+            return_value=ProbeHTTPResult(
+                status_code=200, headers={}, body_text="", error_code="", message="ok",
+                body_json={"plan_type": "free", "orgs": {"data": [
+                    {"settings": {"workspace_plan_type": "business"}},
+                ]}},
+            ),
+        ):
+            self.assertEqual(probe_chatgpt_subscription("access-token")["plan"], "business")
+
     def test_subscription_probe_falls_back_to_access_token_plan_claim(self):
         payload = base64.urlsafe_b64encode(
             json.dumps(

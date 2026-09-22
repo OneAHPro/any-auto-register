@@ -47,6 +47,18 @@ from services.chatgpt_relogin import (
 
 class ChatGPTReloginTests(unittest.TestCase):
     def setUp(self):
+        plan_probe = mock.patch(
+            "platforms.chatgpt.refresh_token_registration_engine.probe_chatgpt_subscription",
+            return_value={"plan": "plus", "http_status": 200},
+        )
+        plan_probe.start()
+        self.addCleanup(plan_probe.stop)
+        refresh_plan_probe = mock.patch(
+            "platforms.chatgpt.status_probe.probe_chatgpt_subscription",
+            return_value={"plan": "plus", "http_status": 200},
+        )
+        refresh_plan_probe.start()
+        self.addCleanup(refresh_plan_probe.stop)
         self.engine = create_engine(
             "sqlite://",
             connect_args={"check_same_thread": False},

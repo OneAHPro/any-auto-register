@@ -338,7 +338,9 @@ class RegisterTaskControlFlowTests(unittest.TestCase):
         remove_account.assert_called_once_with(
             77,
             database_engine=tasks_module.engine,
-            codex2api_delete_on_account_remove_enabled=False,
+            codex2api_delete_on_account_remove_enabled=True,
+            expected_created_at=None,
+            expected_updated_at=None,
             task_control=mock.ANY,
             attempt_id=mock.ANY,
         )

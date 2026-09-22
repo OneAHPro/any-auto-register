@@ -58,7 +58,7 @@ class ChatGPTPlatform(BasePlatform):
             extra_config.get("chatgpt_existing_account_login_only", "") or ""
         ).strip().lower() in {"1", "true", "yes", "on"}
         if login_only:
-            extra_config.setdefault("chatgpt_subscription_gate_enabled", True)
+            extra_config["chatgpt_subscription_gate_enabled"] = True
         if not password:
             password = (
                 ""

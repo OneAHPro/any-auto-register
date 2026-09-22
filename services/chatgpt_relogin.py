@@ -55,6 +55,10 @@ from services.external_sync import sync_codex2api_account
 LogFn = Callable[[str], None]
 
 
+class ChatGPTFreePlanError(RuntimeError):
+    """A successful subscription probe confirmed the account is Free."""
+
+
 class ChatGPTMailboxOTPTimeoutError(RuntimeError):
     """The email OTP stage exhausted its full budget without any code."""
 
@@ -1083,6 +1087,7 @@ def _persist_password_reset_to_account(
     expected_password: str,
     password: str,
     mailbox_context: Mapping[str, Any],
+    on_persisted: Callable[[datetime], None] | None = None,
 ) -> bool:
     """Durably save a remotely-reset password on the ChatGPT account.
 
@@ -1170,6 +1175,7 @@ def _persist_password_reset_to_account(
             snapshot = AccountModel(**account.model_dump())
             snapshot.set_extra(current_extra)
 
+            written_at = datetime.now(timezone.utc).replace(tzinfo=None)
             result = session.exec(
                 update(AccountModel)
                 .where(AccountModel.id == normalized_id)
@@ -1183,12 +1189,14 @@ def _persist_password_reset_to_account(
                 .where(AccountModel.extra_json == account.extra_json)
                 .values(
                     password=normalized_password,
-                    updated_at=datetime.now(timezone.utc),
+                    updated_at=written_at,
                     extra_json=snapshot.extra_json,
                 )
             )
             if int(getattr(result, "rowcount", 0) or 0) == 1:
                 session.commit()
+                if on_persisted is not None:
+                    on_persisted(written_at)
                 return True
             session.rollback()
     return False
@@ -1209,6 +1217,7 @@ class _PersistedEmailService:
         persisted_account_email: str = "",
         persisted_account_created_at: datetime | None = None,
         persisted_account_password: str = "",
+        on_password_persisted: Callable[[datetime], None] | None = None,
     ) -> None:
         self.service_type = type("ServiceType", (), {"value": provider})()
         self._mailbox = mailbox
@@ -1236,6 +1245,7 @@ class _PersistedEmailService:
         self._persisted_account_email = _text(persisted_account_email)
         self._persisted_account_created_at = persisted_account_created_at
         self._persisted_account_password = str(persisted_account_password or "")
+        self._on_password_persisted = on_password_persisted
 
     def _ensure_mailbox_claimed(self) -> None:
         """Claim a file-pool receiver only when an email factor is requested."""
@@ -1430,6 +1440,7 @@ class _PersistedEmailService:
                 expected_password=self._persisted_account_password,
                 password=password,
                 mailbox_context=self._mailbox_context,
+                on_persisted=self._on_password_persisted,
             )
         commit = getattr(self._mailbox, "commit_password_reset", None)
         mailbox_committed = False
@@ -1480,6 +1491,7 @@ class _PersistedEmailService:
                 expected_password=self._persisted_account_password,
                 password=password,
                 mailbox_context=self._mailbox_context,
+                on_persisted=self._on_password_persisted,
             ):
                 return False
             if not mailbox_committed:
@@ -1802,6 +1814,7 @@ def _build_email_service(
         "persisted_account_email": saved.get("email", ""),
         "persisted_account_created_at": saved.get("created_at"),
         "persisted_account_password": saved.get("password", ""),
+        "on_password_persisted": lambda written_at: saved.update(updated_at=written_at),
     }
     if not force_password_reset:
         mailbox_context = promote_managed_mfa_login_context(
@@ -2280,6 +2293,7 @@ def _login_with_saved_credentials(
             "chatgpt_registration_mode": "refresh_token",
             "chatgpt_has_refresh_token_solution": True,
             "chatgpt_existing_account_login_only": True,
+            "chatgpt_subscription_gate_enabled": True,
             "chatgpt_existing_account_login_stage": "refresh_token",
             # Existing-account relogin stays phone-free by default, but an
             # explicit phone/SMS-pool request must reach the OAuth engine so
@@ -2343,6 +2357,8 @@ def _login_with_saved_credentials(
             )
             result = run_login(email_service, password="")
         if not bool(getattr(result, "success", False)):
+            if _text(getattr(result, "error_code", "")) == "free_plan":
+                raise ChatGPTFreePlanError("检测到 Free 套餐，停止同步并删除账号")
             detail = (
                 _text(getattr(result, "error_message", ""))
                 or "认证服务未返回成功状态"
@@ -2669,6 +2685,45 @@ def _remove_mailbox_otp_timed_out_account(
     )
 
 
+def _remove_free_local_account(
+    saved: Mapping[str, Any],
+    *,
+    log_fn: LogFn | None = None,
+    task_control=None,
+    attempt_id: int | None = None,
+) -> dict[str, Any]:
+    # Validate the email as well as the immutable creation time before the
+    # removal service uses the row's identity to contact Codex2API. Preserve
+    # the captured update version, including our own password-reset commit.
+    with Session(engine) as session:
+        account = session.get(AccountModel, int(saved["id"]))
+        if account is not None and (
+            _text(account.email).lower() != _text(saved["email"]).lower()
+            or account.created_at != saved["created_at"]
+        ):
+            return {
+                "ok": False, "relogin_ok": False, "account_removed": False,
+                "stage": "account_remove_failed", "error_code": "local_delete_conflict",
+                "removal_reason": "free_plan", "account_id": int(saved["id"]),
+                "email": str(saved["email"]),
+                "message": "确认 Free 套餐，但账号身份已变化，已停止删除和同步",
+            }
+    return _remove_local_account_after_terminal_login_failure(
+        int(saved["id"]),
+        email=str(saved["email"]),
+        created_at=saved["created_at"],
+        updated_at=saved["updated_at"],
+        failure_context="确认 Free 套餐，已停止外部同步",
+        removed_message="确认 Free 套餐，已删除账号及关联 Codex2API 凭据",
+        absent_message="确认 Free 套餐，账号已不存在，未执行外部同步",
+        removal_reason="free_plan",
+        log_fn=log_fn,
+        task_control=task_control,
+        attempt_id=attempt_id,
+        codex2api_delete_on_account_remove_enabled=True,
+    )
+
+
 def _relogin_chatgpt_account_locked(
     account_id: int,
     *,
@@ -2738,6 +2793,12 @@ def _relogin_chatgpt_account_locked(
         )
         _promote_successful_auth_identity(saved)
         _emit_observer(log_fn, "已获取并保存全新的 Access Token / Refresh Token")
+    except ChatGPTFreePlanError:
+        if saved is None:
+            raise RuntimeError("Free 套餐信号缺少对应的本地账号快照")
+        return _remove_free_local_account(
+            saved, log_fn=log_fn, task_control=task_control, attempt_id=attempt_id,
+        )
     except ChatGPTAccountDeactivatedError:
         if saved is None:
             raise RuntimeError("停用信号缺少对应的本地账号快照")
@@ -2968,6 +3029,20 @@ def _refresh_or_relogin_chatgpt_account_locked(
             refresh_result,
             previous_refresh_token=refresh_token,
         )
+        from platforms.chatgpt.status_probe import probe_chatgpt_subscription
+
+        _checkpoint_task(task_control, attempt_id)
+        probe = probe_chatgpt_subscription(
+            tokens["access_token"], proxy=_text(extra.get("proxy_used")) or None,
+        )
+        plan = _text(probe.get("plan")).lower() or "unknown"
+        _checkpoint_task(task_control, attempt_id)
+        if plan == "free":
+            result = _remove_free_local_account(
+                saved, log_fn=log_fn, task_control=task_control, attempt_id=attempt_id,
+            )
+            result.update(mode="refresh_token", refresh_ok=True, refresh_state="valid")
+            return result
         try:
             _checkpoint_task(task_control, attempt_id)
             account = _persist_fresh_tokens(
@@ -2992,7 +3067,17 @@ def _refresh_or_relogin_chatgpt_account_locked(
                 "message": f"RT 刷新成功，但本地令牌保存失败: {message}",
             }
 
-        _emit_observer(log_fn, "RT 刷新成功并已保存，正在覆盖 Codex2API 凭据")
+        # Keep the rotated RT even when subscription lookup is temporarily
+        # unavailable, but never upload before the fresh plan is checked.
+        if plan == "unknown":
+            return {
+                "ok": False, "relogin_ok": False, "refresh_ok": True,
+                "refresh_state": "valid", "mode": "refresh_token",
+                "stage": "subscription_probe_failed", "failure_domain": "network",
+                "account_id": account_id, "email": email,
+                "message": "RT 已刷新保存，但订阅套餐检测失败；保留账号并暂停外部同步",
+            }
+        _emit_observer(log_fn, "RT 刷新成功且已确认付费套餐，正在覆盖 Codex2API 凭据")
         try:
             with codex2api_account_mutation_lock():
                 sync_result = sync_codex2api_account(

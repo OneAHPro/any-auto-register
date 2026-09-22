@@ -58,7 +58,10 @@ def test_imported_long_password_reaches_login_engine_without_mailbox_wait(tmp_pa
     }
     oauth.last_workspace_id = 'fixture-workspace'
     oauth._get_cookie_value.return_value = 'fixture-session'
-    with patch('platforms.chatgpt.refresh_token_registration_engine.RefreshTokenRegistrationEngine._build_oauth_client', return_value=oauth):
+    with patch('platforms.chatgpt.refresh_token_registration_engine.RefreshTokenRegistrationEngine._build_oauth_client', return_value=oauth), patch(
+        'platforms.chatgpt.refresh_token_registration_engine.probe_chatgpt_subscription',
+        return_value={'plan': 'plus', 'http_status': 200},
+    ):
         account = platform.register()
     args = oauth.login_and_get_tokens.call_args
     assert args.args[1] == password

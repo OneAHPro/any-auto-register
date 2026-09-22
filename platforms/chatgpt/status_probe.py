@@ -169,6 +169,8 @@ def _normalize_plan_type(plan_type: str, workspace_plan_type: str) -> str:
         return "unknown"
     if "enterprise" in raw:
         return "enterprise"
+    if "business" in raw:
+        return "business"
     if "team" in raw:
         return "team"
     if "plus" in raw:

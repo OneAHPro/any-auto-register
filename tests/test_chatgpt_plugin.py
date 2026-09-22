@@ -770,6 +770,7 @@ class ChatGPTPluginTests(unittest.TestCase):
                     "chatgpt_registration_mode": "refresh_token",
                     "chatgpt_existing_account_login_only": True,
                     "_chatgpt_task_id": "task-free",
+                    "chatgpt_subscription_gate_enabled": False,
                 }
             ),
             mailbox=mailbox,
@@ -784,6 +785,7 @@ class ChatGPTPluginTests(unittest.TestCase):
 
         self.assertEqual(mailbox.discarded, [(mailbox.account, "free_plan")])
         self.assertEqual(mailbox.failed, [])
+        self.assertTrue(adapter.run.call_args.args[0].extra_config["chatgpt_subscription_gate_enabled"])
 
     def test_totp_only_account_without_secret_is_not_requeued(self):
         mailbox = _RequeueMailbox()
@@ -1105,6 +1107,9 @@ class ChatGPTPluginTests(unittest.TestCase):
                 "platforms.chatgpt.refresh_token_registration_engine."
                 "RefreshTokenRegistrationEngine._build_oauth_client",
                 return_value=oauth_client,
+            ), mock.patch(
+                "platforms.chatgpt.refresh_token_registration_engine.probe_chatgpt_subscription",
+                return_value={"plan": "plus", "http_status": 200},
             ):
                 account = platform.register()
 

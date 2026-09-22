@@ -3540,6 +3540,7 @@ def _load_unique_chatgpt_account_identity(
     email: str,
     *,
     database_engine=None,
+    prefer_local_credentials: bool = False,
 ):
     """Return the existing local identity for one email before a save."""
 
@@ -3550,6 +3551,12 @@ def _load_unique_chatgpt_account_identity(
     with Session(target_engine) as session:
         if not inspect(session.connection()).has_table(AccountModel.__tablename__):
             return None
+        if prefer_local_credentials:
+            from services.chatgpt_auth_state import resolve_chatgpt_auth_account_id
+
+            account_id = resolve_chatgpt_auth_account_id(normalized_email, session=session)
+            if account_id is not None:
+                return session.get(AccountModel, account_id)
         matches = session.exec(
             select(AccountModel)
             .where(func.lower(AccountModel.platform) == "chatgpt")
@@ -6211,6 +6218,7 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                         existing_identity = _load_unique_chatgpt_account_identity(
                             current_email,
                             database_engine=engine,
+                            prefer_local_credentials=True,
                         )
                         if existing_identity is not None:
                             from services.chatgpt_account_removal import remove_account
@@ -6218,14 +6226,16 @@ def _run_register_inner(task_id: str, req: RegisterTaskRequest):
                             removal = remove_account(
                                 int(existing_identity.id),
                                 database_engine=engine,
-                                codex2api_delete_on_account_remove_enabled=False,
+                                codex2api_delete_on_account_remove_enabled=True,
+                                expected_created_at=getattr(existing_identity, "created_at", None),
+                                expected_updated_at=getattr(existing_identity, "updated_at", None),
                                 task_control=control,
                                 attempt_id=attempt_id,
                             )
                             if removal.get("ok") or removal.get("status") == "already_absent":
                                 _log(
                                     task_id,
-                                    f"  [Free] 已移除本地账号投影: {current_email}",
+                                    f"  [Free] 已删除账号及关联 Codex2API 凭据: {current_email}",
                                 )
                             else:
                                 raise RuntimeError(
