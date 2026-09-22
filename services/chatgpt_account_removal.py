@@ -258,6 +258,7 @@ def _delete_local_snapshot(database_engine, snapshot: AccountSnapshot) -> str:
                 cleanup_chatgpt_account_dependents(
                     session,
                     snapshot.account_id,
+                    email=snapshot.email,
                 )
             session.commit()
             return "deleted"

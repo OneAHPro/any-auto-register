@@ -20,7 +20,13 @@ from core.base_mailbox import (
 )
 from core.config_store import config_store
 from core.chatgpt_login_context import promote_managed_mfa_login_context
-from core.db import AccountModel, OutlookAccountModel, engine
+from core.db import (
+    AccountModel,
+    OutlookAccountModel,
+    engine,
+    load_chatgpt_device_logout,
+    finalize_chatgpt_device_logout,
+)
 from core.task_runtime import TaskInterruption
 from platforms.chatgpt.chatgpt_registration_mode_adapter import (
     ChatGPTRegistrationContext,
@@ -2448,6 +2454,8 @@ def _persist_fresh_tokens(
             "idToken",
             "session_token",
             "sessionToken",
+            "oauth_resume_context",
+            "oauth_browser_context",
             "workspace_id",
             "workspaceId",
             "account_id",
@@ -2509,6 +2517,12 @@ def _persist_fresh_tokens(
             if updated_count != 1:
                 session.rollback()
                 raise RuntimeError("本地账号记录已发生变化，已停止保存新令牌")
+            if isinstance(metadata, dict):
+                finalize_chatgpt_device_logout(
+                    session,
+                    expected_email,
+                    str(metadata.get("device_logout_generation") or ""),
+                )
             session.commit()
         except Exception:
             session.rollback()
@@ -2966,6 +2980,18 @@ def _refresh_or_relogin_chatgpt_account_locked(
             "email": email,
             "message": f"RT 检测准备失败: {message}",
         }
+
+    if load_chatgpt_device_logout(
+        email, database_engine=engine, include_confirmed=True
+    ):
+        _emit_observer(log_fn, "检测到 MFA 修改后尚未完成设备退出，开始完整登录")
+        return _relogin_chatgpt_account_locked(
+            account_id,
+            log_fn=log_fn,
+            task_control=task_control,
+            attempt_id=attempt_id,
+            codex2api_delete_on_account_remove_enabled=codex2api_delete_on_account_remove_enabled,
+        )
 
     if not refresh_token:
         _emit_observer(log_fn, "账号缺少 Refresh Token，开始完整登录")

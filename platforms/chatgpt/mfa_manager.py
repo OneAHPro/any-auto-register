@@ -9,7 +9,7 @@ from typing import Any, Callable
 from urllib.parse import quote
 
 from core.icloud_mail import generate_totp
-
+from core.task_runtime import TaskInterruption
 
 CHATGPT_BASE = "https://chatgpt.com"
 AUTH_BASE = "https://auth.openai.com"
@@ -32,6 +32,7 @@ class ChatGPTMfaManager:
     """Enroll or replace ChatGPT TOTP using a recently authenticated session."""
 
     MFA_INFO_URL = f"{CHATGPT_BASE}/backend-api/accounts/mfa_info"
+    LOGOUT_ALL_URL = f"{CHATGPT_BASE}/backend-api/accounts/logout_all"
     DISABLE_URL = (
         f"{CHATGPT_BASE}/backend-api/accounts/mfa/user/disable_in_house"
     )
@@ -117,6 +118,44 @@ class ChatGPTMfaManager:
         if self.impersonate:
             result["impersonate"] = self.impersonate
         return result
+
+    def logout_all_devices(self) -> None:
+        """Revoke server sessions, only after the new MFA is durably saved."""
+        if not self.access_token:
+            raise MfaRotationError("[stage=mfa_logout_all] 缺少退出设备所需凭证")
+        try:
+            # Matches ChatGPT Security > Log out all (no request body).
+            # Never follow a redirect to a login page and mistake it for success.
+            response = self.session.post(
+                self.LOGOUT_ALL_URL,
+                **self._request_kwargs(
+                    headers=self._backend_headers(),
+                    allow_redirects=False,
+                ),
+            )
+            status = int(response.status_code)
+            if status == 204:
+                return
+            payload = response.json()
+            if (
+                status == 200
+                and isinstance(payload, dict)
+                and not payload.get("error")
+                and payload.get("success") is not False
+                and payload.get("ok") is not False
+                and str(payload.get("status") or "").lower()
+                not in {"error", "failed", "failure"}
+            ):
+                return
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            raise MfaRotationError(
+                "[stage=mfa_logout_all] 退出所有设备未获确认: " f"{type(exc).__name__}"
+            ) from None
+        raise MfaRotationError(
+            f"[stage=mfa_logout_all] 退出所有设备未获确认: HTTP {status}"
+        )
 
     @staticmethod
     def _response_payload(response) -> dict[str, Any]:

@@ -44,6 +44,49 @@ class ChatGPTMfaManagerTests(unittest.TestCase):
             **kwargs,
         )
 
+    def test_logout_all_devices_uses_server_endpoint_without_request_body(self):
+        session = mock.Mock()
+        session.post.return_value = _response({"success": True})
+        self._manager(session, [], impersonate="chrome").logout_all_devices()
+        call = session.post.call_args
+        self.assertEqual(
+            call.args, ("https://chatgpt.com/backend-api/accounts/logout_all",)
+        )
+        self.assertEqual(
+            call.kwargs["headers"]["Authorization"], "Bearer fixture-access-token"
+        )
+        self.assertEqual(call.kwargs["headers"]["chatgpt-account-id"], "account-1")
+        self.assertFalse(call.kwargs["allow_redirects"])
+        self.assertEqual(call.kwargs["timeout"], 30)
+        self.assertNotIn("json", call.kwargs)
+
+    def test_logout_all_devices_rejects_ambiguous_or_failed_response(self):
+        for response in (
+            _response({}, status_code=401),
+            _response({}, status_code=302),
+            _response({"success": False}),
+            _response({"error": {"code": "denied"}}),
+            _response({"status": "failed"}),
+            _response(None, text="<html>login</html>"),
+        ):
+            with self.subTest(response=response):
+                session = mock.Mock()
+                session.post.return_value = response
+                with self.assertRaisesRegex(MfaRotationError, "mfa_logout_all"):
+                    self._manager(session, []).logout_all_devices()
+
+    def test_logout_all_devices_accepts_empty_no_content_response(self):
+        session = mock.Mock()
+        session.post.return_value = _response(None, status_code=204)
+        self._manager(session, []).logout_all_devices()
+
+    def test_logout_all_devices_redacts_network_error(self):
+        session = mock.Mock()
+        session.post.side_effect = RuntimeError("sensitive-access-token")
+        with self.assertRaises(MfaRotationError) as caught:
+            self._manager(session, []).logout_all_devices()
+        self.assertNotIn("sensitive-access-token", str(caught.exception))
+
     def test_enrolls_totp_and_recovery_code_when_account_has_no_mfa(self):
         session = mock.Mock()
         session.get.side_effect = [

@@ -147,6 +147,8 @@ describe('ChatGPTExistingAccountLoginModal', () => {
     expect(screen.queryByLabelText('LeadBee 接码卡密')).toBeNull()
     expect(screen.getByRole('switch', { name: '登录后新增或轮换 MFA' }).getAttribute('aria-checked')).toBe('true')
     expect(screen.getByText(/共享接码地址仍可能被供货商访问/)).toBeTruthy()
+    expect(screen.getByText('退出所有设备')).toBeTruthy()
+    expect(screen.getByText('新 MFA 重新登录')).toBeTruthy()
 
     await user.click(screen.getByRole('button', { name: '开始登录并接码' }))
     expect(await screen.findByText('任务 login-task-1')).toBeTruthy()

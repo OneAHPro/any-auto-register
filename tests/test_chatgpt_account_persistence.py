@@ -27,6 +27,148 @@ class ChatGPTAccountPersistenceTests(unittest.TestCase):
         SQLModel.metadata.create_all(test_engine)
         return test_engine
 
+    def test_post_logout_web_login_discards_old_tokens_and_browser_context(self):
+        from platforms.chatgpt.chatgpt_registration_mode_adapter import (
+            RefreshTokenChatGPTRegistrationAdapter,
+        )
+        from platforms.chatgpt.refresh_token_registration_engine import (
+            RegistrationResult,
+        )
+
+        test_engine = self._test_engine()
+        existing = AccountModel(
+            platform="chatgpt", email="logout@example.test", password="saved-password"
+        )
+        existing.set_extra(
+            {
+                "refresh_token": "old-rt",
+                "refreshToken": "old-rt-alias",
+                "id_token": "old-id",
+                "session_token": "old-session",
+                "sessionToken": "old-session-alias",
+                "oauth_browser_context": {
+                    "cookies": [{"name": "old", "value": "old-cookie"}]
+                },
+                "oauth_resume_context": {"code_verifier": "old-verifier"},
+                "mailbox_login_context": {"extra": {"totp_secret": "SAVED-TOTP"}},
+            }
+        )
+        with Session(test_engine) as session:
+            session.add(existing)
+            session.commit()
+        result = RegistrationResult(
+            success=True,
+            email="logout@example.test",
+            access_token="fresh-at",
+            source="existing_account_web_login",
+            metadata={
+                "replace_session_credentials": True,
+                "phone_oauth_ready": False,
+                "oauth_browser_context": {},
+                "oauth_resume_context": {},
+            },
+        )
+        incoming = RefreshTokenChatGPTRegistrationAdapter().build_account(
+            result, "saved-password"
+        )
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, _ = db_module.save_account_with_creation_state(incoming)
+        extra = saved.get_extra()
+        self.assertEqual(extra["access_token"], "fresh-at")
+        for key in (
+            "refresh_token",
+            "refreshToken",
+            "id_token",
+            "session_token",
+            "sessionToken",
+            "oauth_browser_context",
+            "oauth_resume_context",
+        ):
+            self.assertFalse(extra.get(key), key)
+        self.assertEqual(
+            extra["mailbox_login_context"]["extra"]["totp_secret"], "SAVED-TOTP"
+        )
+
+    def test_new_session_save_consumes_confirmed_logout_in_same_transaction(self):
+        test_engine = self._test_engine()
+        with Session(test_engine) as session:
+            session.add(
+                db_module.ChatGPTDeviceLogoutModel(
+                    email="logout@example.test",
+                    generation="generation",
+                    logout_confirmed=True,
+                )
+            )
+            session.commit()
+        incoming = Account(
+            platform="chatgpt",
+            email="logout@example.test",
+            password="fixture",
+            token="new-at",
+            extra={
+                "device_logout_generation": "generation",
+                "refresh_token": "new-rt",
+            },
+        )
+        with mock.patch.object(db_module, "engine", test_engine):
+            saved, _ = db_module.save_account_with_creation_state(incoming)
+            self.assertFalse(
+                db_module.load_chatgpt_device_logout(
+                    saved.email, include_confirmed=True
+                )
+            )
+        self.assertEqual(saved.token, "new-at")
+        self.assertNotIn("device_logout_generation", saved.get_extra())
+        retry = Account(platform="chatgpt", email=saved.email, password="fixture", token="next-at", extra={"chatgpt_token_source": "existing_account_web_login"})
+        with mock.patch.object(db_module, "engine", test_engine):
+            retried, _ = db_module.save_account_with_creation_state(retry)
+        self.assertEqual(retried.token, "next-at")
+
+    def test_stale_logout_generation_rolls_back_new_session_save(self):
+        test_engine = self._test_engine()
+        with Session(test_engine) as session:
+            session.add(
+                db_module.ChatGPTDeviceLogoutModel(
+                    email="logout@example.test",
+                    generation="new-generation",
+                    logout_confirmed=True,
+                )
+            )
+            session.commit()
+        incoming = Account(
+            platform="chatgpt",
+            email="logout@example.test",
+            password="fixture",
+            token="stale-at",
+            extra={"device_logout_generation": "old-generation"},
+        )
+        with mock.patch.object(db_module, "engine", test_engine), self.assertRaises(
+            RuntimeError
+        ):
+            db_module.save_account_with_creation_state(incoming)
+        with Session(test_engine) as session:
+            self.assertEqual(session.exec(select(AccountModel)).all(), [])
+            self.assertIsNotNone(
+                session.get(db_module.ChatGPTDeviceLogoutModel, incoming.email)
+            )
+
+    def test_account_removal_clears_device_logout_obligation(self):
+        test_engine = self._test_engine()
+        with Session(test_engine) as session:
+            session.add(
+                db_module.ChatGPTDeviceLogoutModel(
+                    email="delete@example.test", generation="generation"
+                )
+            )
+            session.commit()
+            db_module.cleanup_chatgpt_account_dependents(
+                session, 123, email="delete@example.test"
+            )
+            session.commit()
+            self.assertIsNone(
+                session.get(db_module.ChatGPTDeviceLogoutModel, "delete@example.test")
+            )
+
     def test_at_only_login_preserves_existing_rt_and_account_metadata(self):
         test_engine = create_engine(
             "sqlite://",

@@ -411,7 +411,7 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 type="secondary"
                 style={{ margin: '4px 0 12px', fontSize: 13 }}
               >
-                无 MFA 自动新增；已有 MFA 自动废弃旧密钥并保存项目生成的新密钥。
+                无 MFA 自动新增；已有 MFA 自动更换密钥。保存新密钥后退出所有设备，再使用新 MFA 重新登录并上传凭证。
               </Typography.Paragraph>
               <Alert
                 type="warning"
@@ -506,6 +506,10 @@ export function ChatGPTExistingAccountLoginModal({ open, onClose, onDone }: Prop
                 {rotateMfa ? (
                   <>
                     <Tag color="gold" bordered={false}>MFA 新增/轮换</Tag>
+                    <Typography.Text type="secondary">→</Typography.Text>
+                    <Tag color="orange" bordered={false}>退出所有设备</Tag>
+                    <Typography.Text type="secondary">→</Typography.Text>
+                    <Tag color="blue" bordered={false}>新 MFA 重新登录</Tag>
                     <Typography.Text type="secondary">→</Typography.Text>
                   </>
                 ) : null}

@@ -19,6 +19,8 @@ from sqlmodel import Session
 from core.task_runtime import TaskInterruption
 from core.db import (
     load_chatgpt_mfa_rotation,
+    load_chatgpt_device_logout,
+    complete_chatgpt_device_logout,
     mark_chatgpt_mfa_rotation_activated,
     stage_chatgpt_mfa_rotation,
     update_chatgpt_mfa_rotation_recovery_code,
@@ -828,15 +830,23 @@ class RefreshTokenRegistrationEngine:
         normalized_code = str(recovery_code or "").strip()
         if not normalized_email or not normalized_code:
             return
-        journal = load_chatgpt_mfa_rotation(normalized_email)
+        journal = load_chatgpt_mfa_rotation(
+            normalized_email,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+        )
         if not str(journal.get("totp_secret") or "").strip():
             current_secret = str(self.totp_secret or "").strip()
             if not current_secret:
                 raise RuntimeError("MFA 恢复码写前记录缺少现有 TOTP")
-            stage_chatgpt_mfa_rotation(normalized_email, current_secret)
+            stage_chatgpt_mfa_rotation(
+                normalized_email,
+                current_secret,
+                database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+            )
         update_chatgpt_mfa_rotation_recovery_code(
             normalized_email,
             normalized_code,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
         )
 
     def _rotate_mfa_after_login(
@@ -860,26 +870,28 @@ class RefreshTokenRegistrationEngine:
                 impersonate=impersonate,
                 log_fn=self._log,
                 can_recover_by_email=email_adapter.supports_email_verification(),
-                can_recover_by_existing_totp=bool(
-                    str(self.totp_secret or "").strip()
-                ),
+                can_recover_by_existing_totp=bool(str(self.totp_secret or "").strip()),
                 allow_unrecoverable_replacement=bool(
                     self._existing_account_rotate_mfa_enabled()
                 ),
                 on_secret_enrolled=lambda secret: stage_chatgpt_mfa_rotation(
                     self.email or result.email,
                     secret,
+                    database_engine=self.extra_config.get("_chatgpt_auth_engine"),
                 ),
                 on_secret_activated=lambda rotated_at: (
                     mark_chatgpt_mfa_rotation_activated(
                         self.email or result.email,
                         rotated_at=rotated_at,
+                        require_device_logout=True,
+                        database_engine=self.extra_config.get("_chatgpt_auth_engine"),
                     )
                 ),
                 on_recovery_code=lambda recovery_code: (
                     update_chatgpt_mfa_rotation_recovery_code(
                         self.email or result.email,
                         recovery_code,
+                        database_engine=self.extra_config.get("_chatgpt_auth_engine"),
                     )
                 ),
             ).rotate()
@@ -905,6 +917,59 @@ class RefreshTokenRegistrationEngine:
             "warning",
         )
         return rotation
+
+    def _logout_all_devices_after_mfa_rotation(
+        self,
+        *,
+        result: RegistrationResult,
+        session,
+        access_token: str,
+        account_id: str = "",
+        user_agent: str = "",
+        impersonate: str = "",
+    ) -> bool:
+        # No pre-rotation PKCE/session may survive a logout attempt, including
+        # an ambiguous network failure. Confirmed logout stays durable until
+        # replacement credentials are saved; activated MFA remains in the WAL.
+        oauth_resume_cache.take(result.email)
+        auth_engine = self.extra_config.get("_chatgpt_auth_engine")
+        generation = load_chatgpt_device_logout(
+            result.email, database_engine=auth_engine
+        )
+        self._log("4. 新 MFA 已保存，开始退出所有设备...")
+        try:
+            ChatGPTMfaManager(
+                session=session,
+                access_token=access_token,
+                account_id=account_id,
+                user_agent=user_agent,
+                impersonate=impersonate,
+            ).logout_all_devices()
+            if generation and not complete_chatgpt_device_logout(
+                result.email,
+                generation,
+                database_engine=auth_engine,
+            ):
+                raise MfaRotationError(
+                    "[stage=mfa_logout_all] MFA 代次已变化，停止当前登录"
+                )
+        except TaskInterruption:
+            raise
+        except Exception as exc:
+            detail = (
+                str(exc) if isinstance(exc, MfaRotationError) else type(exc).__name__
+            )
+            result.error_message = (
+                f"[stage=mfa_logout_all] {detail}；新 MFA 已保存，本次不上传凭证"
+            )
+            result.error_code = "mfa_logout_all_failed"
+            self._log(result.error_message, "error")
+            return False
+        if not isinstance(result.metadata, dict):
+            result.metadata = {}
+        result.metadata["device_logout_generation"] = generation
+        self._log("退出所有设备请求已成功，开始使用新 MFA 全新登录")
+        return True
 
     def _read_int_config(
         self,
@@ -1112,160 +1177,6 @@ class RefreshTokenRegistrationEngine:
             if character.isalnum() or character in {"_", "-"}
         )[:64] or "unknown"
 
-    def _prepare_phone_oauth_after_mfa_rotation(
-        self,
-        chatgpt_client: ChatGPTClient,
-        email: str,
-        *,
-        max_attempts: int = 3,
-    ):
-        """Build a fresh PKCE transaction from the live post-rotation session."""
-        session = getattr(chatgpt_client, "session", None)
-        device_id = str(getattr(chatgpt_client, "device_id", "") or "")
-        user_agent = str(getattr(chatgpt_client, "ua", "") or "")
-        sec_ch_ua = str(getattr(chatgpt_client, "sec_ch_ua", "") or "")
-        accept_language = str(
-            getattr(chatgpt_client, "accept_language", "") or ""
-        )
-        impersonate = str(
-            getattr(chatgpt_client, "impersonate", "") or ""
-        )
-        bounded_attempts = max(1, min(int(max_attempts or 3), 3))
-        last_diagnostic = {
-            "stage": "phone_oauth_prepare",
-            "attempt": 0,
-            "page_type": "unknown",
-            "http_status": 0,
-            "recovery_status": "deferred",
-        }
-        for attempt in range(1, bounded_attempts + 1):
-            if attempt > 1:
-                delay = 0.5 * (attempt - 1)
-                self._log(
-                    "MFA 轮换后的手机 OAuth 事务将在短暂退避后重试: "
-                    f"attempt={attempt}"
-                )
-                time.sleep(delay)
-            helper = self._build_oauth_client()
-            helper.adopt_browser_context(
-                session,
-                device_id=device_id,
-                user_agent=user_agent,
-                sec_ch_ua=sec_ch_ua,
-                accept_language=accept_language,
-            )
-            try:
-                prepared = helper.prepare_phone_verification_transaction(
-                    email=str(email or "").strip(),
-                    device_id=device_id,
-                    user_agent=user_agent,
-                    sec_ch_ua=sec_ch_ua,
-                    accept_language=accept_language,
-                    impersonate=impersonate,
-                )
-            except TaskInterruption:
-                raise
-            except Exception:
-                prepared = None
-            state = (
-                getattr(prepared, "flow_state", None)
-                if prepared is not None
-                else getattr(helper, "last_state", None)
-            )
-            ready = self._phone_oauth_context_is_ready(prepared)
-            last_diagnostic = {
-                "stage": "phone_oauth_prepare",
-                "attempt": attempt,
-                "page_type": self._safe_phone_oauth_page_type(
-                    getattr(state, "page_type", "")
-                ),
-                "http_status": max(
-                    0,
-                    int(getattr(helper, "last_http_status", 0) or 0),
-                ),
-                "recovery_status": "recovered" if ready else "deferred",
-            }
-            if ready:
-                chatgpt_client.phone_oauth_resume_context = prepared
-                chatgpt_client.phone_oauth_resume_error = ""
-                chatgpt_client.phone_oauth_prepare_diagnostic = last_diagnostic
-                self._log(
-                    "MFA 轮换后已在当前认证会话中重建手机 OAuth 事务: "
-                    f"attempt={attempt}, "
-                    f"page_type={last_diagnostic['page_type']}"
-                )
-                return prepared
-            self._log(
-                "MFA 轮换后的手机 OAuth 事务尚未就绪: "
-                f"attempt={attempt}, "
-                f"page_type={last_diagnostic['page_type']}, "
-                f"http_status={last_diagnostic['http_status']}",
-                "warning",
-            )
-        chatgpt_client.phone_oauth_resume_context = None
-        chatgpt_client.phone_oauth_resume_error = (
-            "MFA 轮换后未能建立可续接的手机 OAuth 事务"
-        )
-        chatgpt_client.phone_oauth_prepare_diagnostic = last_diagnostic
-        return None
-
-    def _prepare_phone_oauth_with_fresh_login(
-        self,
-        chatgpt_client: ChatGPTClient,
-        email: str,
-        email_adapter: EmailServiceAdapter,
-    ):
-        """Fallback to one fresh credential login after session rebuild fails.
-
-        MFA rotation invalidates the browser transaction that was used to
-        perform the rotation.  If cloning that session cannot reach
-        ``add_phone``, a new login with the newly committed MFA is the only
-        valid source of a new PKCE transaction.  This method never starts a
-        phone provider; it only copies a validated context back to the
-        partial-login client.
-        """
-        fresh_client = self._build_chatgpt_client()
-        ok, session_result = fresh_client.login_existing_account_and_get_session(
-            email,
-            email_adapter,
-            password=self.password or "",
-            totp_secret=self.totp_secret or "",
-            mfa_recovery_code=str(
-                (self.email_info or {}).get("mfa_recovery_code") or ""
-            ),
-            password_reset_required=False,
-            otp_wait_timeout=600,
-            otp_resend_wait_timeout=300,
-            prepare_phone_oauth=True,
-        )
-        if not ok or not isinstance(session_result, dict):
-            self._log(
-                "MFA 轮换后全新凭据登录未建立手机 OAuth 事务，"
-                "保持手机验证待处理状态",
-                "warning",
-            )
-            return None
-        prepared = getattr(fresh_client, "phone_oauth_resume_context", None)
-        if not self._phone_oauth_context_is_ready(prepared):
-            self._log(
-                "MFA 轮换后全新凭据登录未返回可续接手机 OAuth 事务",
-                "warning",
-            )
-            return None
-        for attribute in (
-            "phone_oauth_resume_context",
-            "phone_oauth_resume_error",
-            "phone_oauth_browser_context",
-            "phone_oauth_prepare_diagnostic",
-        ):
-            setattr(
-                chatgpt_client,
-                attribute,
-                getattr(fresh_client, attribute, None),
-            )
-        self._log("MFA 轮换后已通过全新凭据登录重建手机 OAuth 事务")
-        return prepared
-
     def _reuse_register_browser_context(
         self,
         register_client: ChatGPTClient,
@@ -1447,8 +1358,17 @@ class RefreshTokenRegistrationEngine:
     ) -> RegistrationResult:
         self._log("2. 登录已有 ChatGPT 账号并提取 Access Token + Refresh Token...")
         rotation = None
-        authenticated_web_client = None
-        if self._existing_account_should_rotate_mfa():
+        logout_generation = load_chatgpt_device_logout(
+            result.email,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+            include_confirmed=True,
+        )
+        rotate_mfa_planned = self._existing_account_should_rotate_mfa()
+        pending_logout = load_chatgpt_device_logout(
+            result.email,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+        )
+        if rotate_mfa_planned or pending_logout:
             self._log("先建立 ChatGPT Web 会话，确保 MFA 轮换使用新鲜认证状态")
             web_client = self._build_chatgpt_client()
             web_ok, web_session_result = (
@@ -1458,19 +1378,25 @@ class RefreshTokenRegistrationEngine:
                     password=self.password or "",
                     totp_secret=self.totp_secret or "",
                     mfa_recovery_code=str(
-                        (self.email_info or {}).get("mfa_recovery_code")
-                        or ""
+                        (self.email_info or {}).get("mfa_recovery_code") or ""
                     ),
                     on_mfa_totp_staged=lambda secret: (
                         stage_chatgpt_mfa_rotation(
                             self.email or result.email,
                             secret,
+                            database_engine=self.extra_config.get(
+                                "_chatgpt_auth_engine"
+                            ),
                         )
                     ),
                     on_mfa_totp_activated=lambda rotated_at: (
                         mark_chatgpt_mfa_rotation_activated(
                             self.email or result.email,
                             rotated_at=rotated_at,
+                            require_device_logout=True,
+                            database_engine=self.extra_config.get(
+                                "_chatgpt_auth_engine"
+                            ),
                         )
                     ),
                     on_mfa_recovery_code=lambda recovery_code: (
@@ -1516,7 +1442,7 @@ class RefreshTokenRegistrationEngine:
             if enrollment_present:
                 if rotation is None:
                     return result
-            else:
+            elif rotate_mfa_planned:
                 rotation = self._rotate_mfa_after_login(
                     result=result,
                     email_adapter=email_adapter,
@@ -1534,7 +1460,19 @@ class RefreshTokenRegistrationEngine:
                 )
                 if rotation is None:
                     return result
-            authenticated_web_client = web_client
+            if not self._logout_all_devices_after_mfa_rotation(
+                result=result,
+                session=web_client.session,
+                access_token=web_access_token,
+                account_id=str(
+                    web_session.get("account_id")
+                    or web_session.get("workspace_id")
+                    or ""
+                ),
+                user_agent=str(getattr(web_client, "ua", "") or ""),
+                impersonate=str(getattr(web_client, "impersonate", "") or ""),
+            ):
+                return result
 
         oauth_client = self._build_oauth_client()
         oauth_client.config.setdefault(
@@ -1549,44 +1487,16 @@ class RefreshTokenRegistrationEngine:
             self._existing_account_phone_verification_enabled()
         )
         password_login = bool(self.password)
-        reuse_authenticated_session = authenticated_web_client is not None
-        oauth_device_id = ""
-        oauth_user_agent = None
-        oauth_sec_ch_ua = None
-        oauth_impersonate = None
-        if authenticated_web_client is not None:
-            self._reuse_register_browser_context(
-                authenticated_web_client,
-                oauth_client,
-            )
-            oauth_device_id = str(
-                getattr(authenticated_web_client, "device_id", "") or ""
-            )
-            oauth_user_agent = getattr(authenticated_web_client, "ua", None)
-            oauth_sec_ch_ua = getattr(
-                authenticated_web_client,
-                "sec_ch_ua",
-                None,
-            )
-            oauth_impersonate = getattr(
-                authenticated_web_client,
-                "impersonate",
-                None,
-            )
-            self._log(
-                "复用刚完成登录和 MFA 轮换的认证会话获取 Refresh Token，"
-                "不再重复登录 Google"
-            )
         oauth_login_kwargs = {
-            "device_id": oauth_device_id,
-            "user_agent": oauth_user_agent,
-            "sec_ch_ua": oauth_sec_ch_ua,
-            "impersonate": oauth_impersonate,
+            "device_id": "",
+            "user_agent": None,
+            "sec_ch_ua": None,
+            "impersonate": None,
             "skymail_client": email_adapter,
             "prefer_passwordless_login": not password_login,
             "allow_phone_verification": allow_phone_verification,
-            "force_new_browser": not reuse_authenticated_session,
-            "resume_authenticated_session": reuse_authenticated_session,
+            "force_new_browser": True,
+            "resume_authenticated_session": False,
             "force_chatgpt_entry": False,
             "screen_hint": "login",
             "force_password_login": password_login,
@@ -1597,11 +1507,14 @@ class RefreshTokenRegistrationEngine:
             "on_mfa_totp_staged": lambda secret: stage_chatgpt_mfa_rotation(
                 self.email or result.email,
                 secret,
+                database_engine=self.extra_config.get("_chatgpt_auth_engine"),
             ),
             "on_mfa_totp_activated": lambda rotated_at: (
                 mark_chatgpt_mfa_rotation_activated(
                     self.email or result.email,
                     rotated_at=rotated_at,
+                    require_device_logout=True,
+                    database_engine=self.extra_config.get("_chatgpt_auth_engine"),
                 )
             ),
             "on_mfa_recovery_code": lambda recovery_code: (
@@ -1618,70 +1531,90 @@ class RefreshTokenRegistrationEngine:
             "complete_about_you_if_needed": False,
             "login_source": "existing_account_login_only",
         }
-        tokens = oauth_client.login_and_get_tokens(
-            result.email,
-            self.password or "",
-            **oauth_login_kwargs,
-        )
-        if (
-            not tokens
-            and reuse_authenticated_session
-            and "OpenAI 登录会话已失效" in str(oauth_client.last_error or "")
-        ):
-            self._log(
-                "网页认证会话不能直接续接 Codex OAuth，"
-                "自动切换完整授权并使用项目保存的新 MFA",
-                "warning",
-            )
-            oauth_login_kwargs["resume_authenticated_session"] = False
-            oauth_login_kwargs["force_new_browser"] = False
+        for _oauth_attempt in range(2):
             tokens = oauth_client.login_and_get_tokens(
                 result.email,
                 self.password or "",
                 **oauth_login_kwargs,
             )
-        if not tokens:
-            result.error_message = (
-                oauth_client.last_error or "已有 ChatGPT 账号 OAuth 登录失败"
-            )
-            return result
-
-        access_token = str(tokens.get("access_token") or "").strip()
-        refresh_token = str(tokens.get("refresh_token") or "").strip()
-        missing_tokens = []
-        if not access_token:
-            missing_tokens.append("Access Token")
-        if not refresh_token:
-            missing_tokens.append("Refresh Token")
-        if missing_tokens:
-            result.error_message = (
-                "已有账号登录未同时获取 " + " 和 ".join(missing_tokens)
-            )
-            return result
-        if not self._apply_subscription_gate(result, access_token):
-            return result
-
-        raw_oauth_enrollment = getattr(
-            oauth_client,
-            "last_mfa_enrollment",
-            {},
-        )
-        oauth_enrollment = (
-            dict(raw_oauth_enrollment)
-            if isinstance(raw_oauth_enrollment, dict)
-            else {}
-        )
-        if oauth_enrollment:
-            enrollment_present, oauth_rotation = self._consume_mfa_enrollment(
-                result=result,
-                email_adapter=email_adapter,
-                session_data={"mfa_enrollment": oauth_enrollment},
-            )
-            if enrollment_present and oauth_rotation is None:
+            if not tokens:
+                if rotation is not None:
+                    result.error_code = "post_mfa_login_failed"
+                result.error_message = (
+                    oauth_client.last_error or "已有 ChatGPT 账号 OAuth 登录失败"
+                )
                 return result
-            if oauth_rotation is not None:
-                rotation = oauth_rotation
 
+            access_token = str(tokens.get("access_token") or "").strip()
+            refresh_token = str(tokens.get("refresh_token") or "").strip()
+            missing_tokens = []
+            if not access_token:
+                missing_tokens.append("Access Token")
+            if not refresh_token:
+                missing_tokens.append("Refresh Token")
+            if missing_tokens:
+                result.error_message = "已有账号登录未同时获取 " + " 和 ".join(
+                    missing_tokens
+                )
+                return result
+            if not self._apply_subscription_gate(result, access_token):
+                return result
+
+            raw_oauth_enrollment = getattr(
+                oauth_client,
+                "last_mfa_enrollment",
+                {},
+            )
+            oauth_enrollment = (
+                dict(raw_oauth_enrollment)
+                if isinstance(raw_oauth_enrollment, dict)
+                else {}
+            )
+            if oauth_enrollment:
+                enrollment_present, oauth_rotation = self._consume_mfa_enrollment(
+                    result=result,
+                    email_adapter=email_adapter,
+                    session_data={"mfa_enrollment": oauth_enrollment},
+                )
+                if enrollment_present and oauth_rotation is None:
+                    return result
+                if oauth_rotation is not None:
+                    if rotation is not None:
+                        result.error_code = "post_mfa_login_failed"
+                        result.error_message = "[stage=post_mfa_login] 新登录再次要求绑定 MFA，新密钥已保存，本次不上传凭证"
+                        return result
+                    rotation = oauth_rotation
+                    if not self._logout_all_devices_after_mfa_rotation(
+                        result=result,
+                        session=oauth_client.session,
+                        access_token=access_token,
+                        account_id=str(
+                            tokens.get("account_id")
+                            or self._extract_workspace_id(oauth_client)
+                            or ""
+                        ),
+                        user_agent=str(getattr(oauth_client, "ua", "") or ""),
+                        impersonate=str(getattr(oauth_client, "impersonate", "") or ""),
+                    ):
+                        return result
+                    oauth_client = self._build_oauth_client()
+                    oauth_client.config.setdefault(
+                        "chatgpt_oauth_otp_wait_seconds", otp_wait_seconds
+                    )
+                    oauth_client.config.setdefault(
+                        "chatgpt_oauth_otp_resend_wait_seconds", otp_resend_wait_seconds
+                    )
+                    oauth_login_kwargs["totp_secret"] = self.totp_secret or ""
+                    oauth_login_kwargs["mfa_recovery_code"] = str(
+                        (self.email_info or {}).get("mfa_recovery_code") or ""
+                    )
+                    oauth_login_kwargs["password_reset_required"] = False
+                    continue
+            break
+
+        logout_generation = (result.metadata or {}).get(
+            "device_logout_generation"
+        ) or logout_generation
         self._populate_result_from_tokens(
             result=result,
             tokens=tokens,
@@ -1691,6 +1624,9 @@ class RefreshTokenRegistrationEngine:
             register_client=None,
         )
         if isinstance(result.metadata, dict):
+            if logout_generation:
+                result.metadata["device_logout_generation"] = logout_generation
+                result.metadata["replace_session_credentials"] = True
             metadata_getter = getattr(
                 self.email_service,
                 "get_mailbox_metadata",
@@ -1710,6 +1646,8 @@ class RefreshTokenRegistrationEngine:
                     "recovery_code_saved": bool(rotation.recovery_code),
                     "rotated_at": rotation.rotated_at,
                     "mailbox_control_risk": "shared_receiver",
+                    "devices_logged_out": True,
+                    "fresh_login_completed": True,
                 }
         self._log("已有账号登录完成，Access Token 与 Refresh Token 均已获取")
         return result
@@ -1725,6 +1663,15 @@ class RefreshTokenRegistrationEngine:
         self._log("2. 登录已有 ChatGPT 账号并提取 Access Token...")
         chatgpt_client = self._build_chatgpt_client()
         rotate_mfa_planned = self._existing_account_should_rotate_mfa()
+        logout_generation = load_chatgpt_device_logout(
+            result.email,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+            include_confirmed=True,
+        )
+        pending_logout = load_chatgpt_device_logout(
+            result.email,
+            database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+        )
         ok, session_result = chatgpt_client.login_existing_account_and_get_session(
             result.email,
             email_adapter,
@@ -1736,11 +1683,14 @@ class RefreshTokenRegistrationEngine:
             on_mfa_totp_staged=lambda secret: stage_chatgpt_mfa_rotation(
                 self.email or result.email,
                 secret,
+                database_engine=self.extra_config.get("_chatgpt_auth_engine"),
             ),
             on_mfa_totp_activated=lambda rotated_at: (
                 mark_chatgpt_mfa_rotation_activated(
                     self.email or result.email,
                     rotated_at=rotated_at,
+                    require_device_logout=True,
+                    database_engine=self.extra_config.get("_chatgpt_auth_engine"),
                 )
             ),
             on_mfa_recovery_code=lambda recovery_code: (
@@ -1756,7 +1706,7 @@ class RefreshTokenRegistrationEngine:
             ),
             otp_wait_timeout=otp_wait_seconds,
             otp_resend_wait_timeout=otp_resend_wait_seconds,
-            prepare_phone_oauth=not rotate_mfa_planned,
+            prepare_phone_oauth=not (rotate_mfa_planned or pending_logout),
         )
         if not ok:
             result.error_message = str(
@@ -1777,7 +1727,7 @@ class RefreshTokenRegistrationEngine:
             return result
 
         rotation = None
-        post_mfa_rebuild_attempted = False
+        post_mfa_rebuild_attempted = bool(logout_generation and not pending_logout)
         enrollment_present, rotation = self._consume_mfa_enrollment(
             result=result,
             email_adapter=email_adapter,
@@ -1803,57 +1753,72 @@ class RefreshTokenRegistrationEngine:
             )
             if rotation is None:
                 return result
-            refreshed_browser_context = serialize_oauth_resume_context(
-                chatgpt_client.session,
-                device_id=str(getattr(chatgpt_client, "device_id", "") or ""),
+
+        if rotation is not None or pending_logout:
+            if not self._logout_all_devices_after_mfa_rotation(
+                result=result,
+                session=chatgpt_client.session,
+                access_token=access_token,
+                account_id=str(
+                    session_data.get("account_id")
+                    or session_data.get("workspace_id")
+                    or ""
+                ),
                 user_agent=str(getattr(chatgpt_client, "ua", "") or ""),
-                sec_ch_ua=str(
-                    getattr(chatgpt_client, "sec_ch_ua", "") or ""
-                ),
-                accept_language=str(
-                    getattr(chatgpt_client, "accept_language", "") or ""
-                ),
-                impersonate=str(
-                    getattr(chatgpt_client, "impersonate", "") or ""
-                ),
-                ttl_seconds=1800,
-            )
-            if isinstance(refreshed_browser_context, dict):
-                chatgpt_client.phone_oauth_browser_context = (
-                    refreshed_browser_context
-                )
-            chatgpt_client.phone_oauth_resume_context = None
-            chatgpt_client.phone_oauth_resume_error = (
-                "MFA 轮换后正在当前认证会话中重建手机验证事务"
-            )
-            self._log(
-                "MFA 轮换后已作废旧手机 OAuth 预建事务，正在使用当前会话重建"
-            )
-            prepared_after_rotation = self._prepare_phone_oauth_after_mfa_rotation(
-                chatgpt_client,
+                impersonate=str(getattr(chatgpt_client, "impersonate", "") or ""),
+            ):
+                return result
+            chatgpt_client = self._build_chatgpt_client()
+            ok, fresh_session = chatgpt_client.login_existing_account_and_get_session(
                 result.email,
+                email_adapter,
+                password=self.password or "",
+                totp_secret=self.totp_secret or "",
+                mfa_recovery_code=str(
+                    (self.email_info or {}).get("mfa_recovery_code") or ""
+                ),
+                on_mfa_totp_staged=lambda secret: stage_chatgpt_mfa_rotation(
+                    self.email or result.email,
+                    secret,
+                    database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+                ),
+                on_mfa_totp_activated=lambda rotated_at: mark_chatgpt_mfa_rotation_activated(
+                    self.email or result.email,
+                    rotated_at=rotated_at,
+                    require_device_logout=True,
+                    database_engine=self.extra_config.get("_chatgpt_auth_engine"),
+                ),
+                on_mfa_recovery_code=lambda recovery_code: self._stage_mfa_recovery_code(
+                    self.email or result.email, recovery_code
+                ),
+                password_reset_required=False,
+                otp_wait_timeout=otp_wait_seconds,
+                otp_resend_wait_timeout=otp_resend_wait_seconds,
+                prepare_phone_oauth=True,
             )
-            if prepared_after_rotation is None:
-                self._prepare_phone_oauth_with_fresh_login(
-                    chatgpt_client,
-                    result.email,
-                    email_adapter,
-                )
-            post_mfa_rebuild_attempted = True
-        elif rotation is not None:
-            # A mandatory enrollment mutates MFA even when an explicit
-            # rotation was not planned; any pre-enrollment PKCE is stale.
-            chatgpt_client.phone_oauth_resume_context = None
-            prepared_after_rotation = self._prepare_phone_oauth_after_mfa_rotation(
-                chatgpt_client,
-                result.email,
+            if (
+                not ok
+                or not isinstance(fresh_session, dict)
+                or not str(fresh_session.get("access_token") or "").strip()
+            ):
+                result.error_code = "post_mfa_login_failed"
+                result.error_message = "[stage=post_mfa_login] 退出设备后重新登录未获取凭证；新 MFA 已保存，本次不上传凭证"
+                if not ok and isinstance(fresh_session, str):
+                    self._log(fresh_session, "error")
+                return result
+            session_data = fresh_session
+            access_token = str(session_data["access_token"]).strip()
+            if not self._apply_subscription_gate(result, access_token):
+                return result
+            enrolled_again, _ = self._consume_mfa_enrollment(
+                result=result,
+                email_adapter=email_adapter,
+                session_data=session_data,
             )
-            if prepared_after_rotation is None:
-                self._prepare_phone_oauth_with_fresh_login(
-                    chatgpt_client,
-                    result.email,
-                    email_adapter,
-                )
+            if enrolled_again:
+                result.error_code = "post_mfa_login_failed"
+                result.error_message = "[stage=post_mfa_login] 新登录再次要求绑定 MFA，新密钥已保存，本次不上传凭证"
+                return result
             post_mfa_rebuild_attempted = True
 
         prepared_context = getattr(
@@ -1941,6 +1906,9 @@ class RefreshTokenRegistrationEngine:
             except Exception as exc:
                 self._log(f"读取邮箱登录上下文失败: {exc}", "warning")
 
+        logout_generation = (result.metadata or {}).get(
+            "device_logout_generation"
+        ) or logout_generation
         result.success = True
         result.access_token = access_token
         result.refresh_token = ""
@@ -1966,9 +1934,9 @@ class RefreshTokenRegistrationEngine:
             "workspace_id": result.workspace_id,
             "phone_verification_required": True,
             "phone_oauth_ready": prepared_ready,
-            "post_mfa_phone_oauth_rebuild_attempted": (
-                post_mfa_rebuild_attempted
-            ),
+            "post_mfa_phone_oauth_rebuild_attempted": (post_mfa_rebuild_attempted),
+            "replace_session_credentials": post_mfa_rebuild_attempted,
+            "device_logout_generation": logout_generation,
             "phone_oauth_prepare_error": str(
                 getattr(chatgpt_client, "phone_oauth_resume_error", "") or ""
             ).strip(),
@@ -1984,6 +1952,8 @@ class RefreshTokenRegistrationEngine:
                 "recovery_code_saved": bool(rotation.recovery_code),
                 "rotated_at": rotation.rotated_at,
                 "mailbox_control_risk": "shared_receiver",
+                "devices_logged_out": True,
+                "fresh_login_completed": True,
             }
         self._log("已有账号邮箱登录完成，Access Token 已获取；Refresh Token 等待手机验证")
         return result

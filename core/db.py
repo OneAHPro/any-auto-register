@@ -2,6 +2,7 @@
 from datetime import datetime, timezone
 import os
 import logging
+import uuid
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 from sqlalchemy import delete, event, func, update, UniqueConstraint
@@ -148,6 +149,17 @@ class ChatGPTMfaRotationJournalModel(SQLModel, table=True):
     rotated_at: str = ""
     created_at: datetime = Field(default_factory=_utcnow, index=True)
     updated_at: datetime = Field(default_factory=_utcnow, index=True)
+
+
+class ChatGPTDeviceLogoutModel(SQLModel, table=True):
+    """Logout obligation survives MFA journal promotion and process restarts."""
+
+    __tablename__ = "chatgpt_device_logout"
+
+    email: str = Field(primary_key=True)
+    generation: str
+    logout_confirmed: bool = False
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class ChatGPTAuthStateModel(SQLModel, table=True):
@@ -612,8 +624,10 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
                 == str(account.email or "").strip().lower()
             )
         ).first()
+        incoming_extra = dict(account.extra or {})
+        logout_generation = str(incoming_extra.pop("device_logout_generation", "") or "")
+        replace_session_credentials = incoming_extra.pop("replace_session_credentials", False) is True
         if existing:
-            incoming_extra = dict(account.extra or {})
             existing_web_login = bool(
                 str(account.platform or "").strip().lower() == "chatgpt"
                 and incoming_extra.get("chatgpt_token_source")
@@ -624,9 +638,30 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
                     existing.get_extra(),
                     incoming_extra,
                 )
+                if replace_session_credentials:
+                    # A logout invalidates every prior session credential.
+                    # Keep durable mailbox/MFA data, never merge old tokens
+                    # or cookies into the newly authenticated Web result.
+                    for key in (
+                        "access_token",
+                        "accessToken",
+                        "refresh_token",
+                        "refreshToken",
+                        "id_token",
+                        "idToken",
+                        "session_token",
+                        "sessionToken",
+                        "oauth_resume_context",
+                        "oauth_browser_context",
+                    ):
+                        merged_extra.pop(key, None)
+                        if key in incoming_extra:
+                            merged_extra[key] = incoming_extra[key]
                 if incoming_extra.get("phone_oauth_ready") is False:
                     merged_extra.pop("oauth_resume_context", None)
                 incoming_extra = merged_extra
+            incoming_extra.pop("device_logout_generation", None)
+            incoming_extra.pop("replace_session_credentials", None)
             if not existing_web_login or str(account.password or ""):
                 existing.password = account.password
             existing.user_id = account.user_id or ""
@@ -638,6 +673,11 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
             existing.cashier_url = incoming_extra.get("cashier_url", "")
             existing.updated_at = _utcnow()
             session.add(existing)
+            finalize_chatgpt_device_logout(
+                session,
+                account.email,
+                logout_generation,
+            )
             session.commit()
             session.refresh(existing)
             return attach_stable_identity(existing), False
@@ -650,10 +690,15 @@ def save_account_with_creation_state(account) -> tuple['AccountModel', bool]:
             token=account.token or "",
             status=account.status.value,
             account_source="local",
-            extra_json=json.dumps(account.extra or {}, ensure_ascii=False),
+            extra_json=json.dumps(incoming_extra, ensure_ascii=False),
             cashier_url=(account.extra or {}).get("cashier_url", ""),
         )
         session.add(m)
+        finalize_chatgpt_device_logout(
+            session,
+            account.email,
+            logout_generation,
+        )
         session.commit()
         session.refresh(m)
         return attach_stable_identity(m), True
@@ -718,10 +763,13 @@ def mark_chatgpt_mfa_rotation_activated(
     *,
     rotated_at: str = "",
     database_engine=None,
+    require_device_logout: bool = False,
 ) -> None:
     normalized_email = str(email or "").strip().lower()
     target_engine = database_engine or engine
     _ensure_chatgpt_mfa_rotation_journal(target_engine)
+    if require_device_logout:
+        _ensure_chatgpt_device_logout(target_engine)
     with Session(target_engine) as session:
         row = session.exec(
             select(ChatGPTMfaRotationJournalModel).where(
@@ -734,7 +782,70 @@ def mark_chatgpt_mfa_rotation_activated(
         row.rotated_at = str(rotated_at or "").strip()
         row.updated_at = _utcnow()
         session.add(row)
+        if require_device_logout:
+            pending = session.get(ChatGPTDeviceLogoutModel, normalized_email)
+            if pending is None:
+                pending = ChatGPTDeviceLogoutModel(
+                    email=normalized_email, generation=uuid.uuid4().hex
+                )
+            else:
+                pending.generation = uuid.uuid4().hex
+                pending.created_at = _utcnow()
+            pending.logout_confirmed = False
+            session.add(pending)
         session.commit()
+
+
+def _ensure_chatgpt_device_logout(database_engine=None) -> None:
+    ChatGPTDeviceLogoutModel.__table__.create(
+        bind=database_engine or engine, checkfirst=True
+    )
+
+
+def load_chatgpt_device_logout(
+    email: str, *, database_engine=None, include_confirmed: bool = False
+) -> str:
+    target_engine = database_engine or engine
+    _ensure_chatgpt_device_logout(target_engine)
+    with Session(target_engine) as session:
+        row = session.get(ChatGPTDeviceLogoutModel, str(email or "").strip().lower())
+        return (
+            row.generation
+            if row is not None and (include_confirmed or not row.logout_confirmed)
+            else ""
+        )
+
+
+def complete_chatgpt_device_logout(
+    email: str, generation: str, *, database_engine=None
+) -> bool:
+    target_engine = database_engine or engine
+    _ensure_chatgpt_device_logout(target_engine)
+    with Session(target_engine) as session:
+        result = session.exec(
+            update(ChatGPTDeviceLogoutModel)
+            .where(ChatGPTDeviceLogoutModel.email == str(email or "").strip().lower())
+            .where(ChatGPTDeviceLogoutModel.generation == generation)
+            .values(logout_confirmed=True)
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
+def finalize_chatgpt_device_logout(
+    session: Session, email: str, generation: str
+) -> None:
+    """Consume only the confirmed generation, in the credential-save transaction."""
+    if not generation:
+        return
+    result = session.exec(
+        delete(ChatGPTDeviceLogoutModel)
+        .where(ChatGPTDeviceLogoutModel.email == str(email or "").strip().lower())
+        .where(ChatGPTDeviceLogoutModel.generation == generation)
+        .where(ChatGPTDeviceLogoutModel.logout_confirmed.is_(True))
+    )
+    if result.rowcount != 1:
+        raise RuntimeError("设备退出记录已变化，已停止保存当前凭证")
 
 
 def update_chatgpt_mfa_rotation_recovery_code(
@@ -813,6 +924,7 @@ def cleanup_chatgpt_account_dependents(
     account_id: int,
     *,
     quarantine_reason: str = "account_deleted",
+    email: str = "",
 ) -> None:
     """Remove identity-scoped auth rows after the owning account is deleted.
 
@@ -826,6 +938,12 @@ def cleanup_chatgpt_account_dependents(
     normalized_id = int(account_id)
     if normalized_id <= 0:
         raise ValueError("ChatGPT account id must be positive")
+    if email:
+        session.exec(
+            delete(ChatGPTDeviceLogoutModel).where(
+                ChatGPTDeviceLogoutModel.email == str(email).strip().lower()
+            )
+        )
     now = _utcnow()
     session.exec(
         update(PurchaseCostRecordModel)
@@ -944,7 +1062,9 @@ def delete_incomplete_chatgpt_account(
         )
         deleted_count = int(getattr(result, "rowcount", 0) or 0)
         if deleted_count == 1:
-            cleanup_chatgpt_account_dependents(session, int(account_id))
+            cleanup_chatgpt_account_dependents(
+                session, int(account_id), email=account.email
+            )
             session.commit()
             return True
         session.rollback()
@@ -969,7 +1089,9 @@ def purge_incomplete_chatgpt_accounts(*, database_engine=None) -> int:
             account_id = int(account.id or 0)
             session.delete(account)
             if account_id > 0:
-                cleanup_chatgpt_account_dependents(session, account_id)
+                cleanup_chatgpt_account_dependents(
+                    session, account_id, email=account.email
+                )
         if incomplete:
             session.commit()
         return len(incomplete)

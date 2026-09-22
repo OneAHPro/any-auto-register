@@ -118,6 +118,10 @@ class BaseChatGPTRegistrationModeAdapter(ABC):
         }
         metadata = getattr(result, "metadata", None)
         if isinstance(metadata, dict):
+            if metadata.get("replace_session_credentials") is True:
+                extra["replace_session_credentials"] = True
+            if metadata.get("device_logout_generation"):
+                extra["device_logout_generation"] = metadata["device_logout_generation"]
             proxy_used = str(metadata.get("proxy_used") or "").strip()
             if proxy_used:
                 extra["proxy_used"] = proxy_used

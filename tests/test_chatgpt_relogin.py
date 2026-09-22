@@ -3635,6 +3635,32 @@ class ChatGPTReloginTests(unittest.TestCase):
         self.assertEqual(result["refresh_state"], "invalid")
         self.assertEqual(result["refresh_error_code"], "missing_refresh_token")
 
+    def test_pending_or_confirmed_device_logout_forces_full_login_before_rt_refresh(
+        self,
+    ):
+        from core.db import ChatGPTDeviceLogoutModel
+
+        with Session(self.engine) as session:
+            account = session.get(AccountModel, self.account_id)
+            session.add(
+                ChatGPTDeviceLogoutModel(
+                    email=account.email.lower(),
+                    generation="logout-generation",
+                    logout_confirmed=True,
+                )
+            )
+            session.commit()
+        with mock.patch("services.chatgpt_relogin.engine", self.engine), mock.patch(
+            "services.chatgpt_relogin.TokenRefreshManager"
+        ) as manager, mock.patch(
+            "services.chatgpt_relogin._relogin_chatgpt_account_locked",
+            return_value={"ok": True, "mode": "full_login"},
+        ) as full_login:
+            result = refresh_or_relogin_chatgpt_account(self.account_id)
+        self.assertTrue(result["ok"])
+        full_login.assert_called_once()
+        manager.assert_not_called()
+
     def test_auto_refresh_success_persists_rotated_tokens_and_syncs_without_login(self):
         refresh_result = SimpleNamespace(
             success=True,
